@@ -6,6 +6,8 @@
 ## Images are available from both Docker Hub and GHCR:
 ##   Docker Hub: bearyjd/vitalforge-weight, bearyjd/vitalforge-dashboard
 ##   GHCR:       ghcr.io/bearyjd/vitalforge-weight, ghcr.io/bearyjd/vitalforge-dashboard
+##
+## To update: docker compose -f docker-compose.prod.yml pull && docker compose -f docker-compose.prod.yml up -d
 
 services:
   vitalforge-weight:
