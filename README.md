@@ -36,14 +36,14 @@ Images are published to both registries on every push:
 
 | Registry | Weight | Dashboard |
 |---|---|---|
-| **Docker Hub** | `bearyjd/vitalforge-weight` | `bearyjd/vitalforge-dashboard` |
+| **Docker Hub** | `bearyj/vitalforge-weight` | `bearyj/vitalforge-dashboard` |
 | **GHCR** | `ghcr.io/bearyjd/vitalforge-weight` | `ghcr.io/bearyjd/vitalforge-dashboard` |
 
 Or pull individually:
 
 ```bash
-docker pull bearyjd/vitalforge-weight:latest
-docker pull bearyjd/vitalforge-dashboard:latest
+docker pull bearyj/vitalforge-weight:latest
+docker pull bearyj/vitalforge-dashboard:latest
 ```
 
 ## Setup (build from source)
@@ -161,8 +161,8 @@ Cookie-based session auth with a 30-day expiry. Set `VITALFORGE_PASS` in `.env` 
 
 Images are automatically built and pushed to **Docker Hub** and **GHCR** on every push to `main`:
 
-- `bearyjd/vitalforge-weight:latest` / `ghcr.io/bearyjd/vitalforge-weight:latest`
-- `bearyjd/vitalforge-dashboard:latest` / `ghcr.io/bearyjd/vitalforge-dashboard:latest`
+- `bearyj/vitalforge-weight:latest` / `ghcr.io/bearyjd/vitalforge-weight:latest`
+- `bearyj/vitalforge-dashboard:latest` / `ghcr.io/bearyjd/vitalforge-dashboard:latest`
 
 Tagged releases (`v1.0.0`) also produce versioned image tags.
 
