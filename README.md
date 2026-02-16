@@ -95,6 +95,8 @@ Visit `http://localhost:8085` for weight logging and `http://localhost:8086` for
 | `VITALFORGE_SECRET` | No | Secret key for signing session cookies |
 | `WEIGHT_URL` | No | Public URL for weight service (e.g. `https://weight.yourdomain.com`) |
 | `DASHBOARD_URL` | No | Public URL for dashboard service (e.g. `https://health.yourdomain.com`) |
+| `DEFAULT_UNIT` | No | Default weight unit: `lbs` or `kg` (default: `lbs`) |
+| `TZ` | No | IANA timezone for timestamps (e.g. `America/New_York`). Omit for browser default |
 
 Generate a random secret:
 

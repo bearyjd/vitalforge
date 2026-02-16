@@ -223,8 +223,8 @@
                 autocomplete="off"
             >
             <div class="unit-toggle">
-                <button class="unit-btn active" data-unit="lbs">lbs</button>
-                <button class="unit-btn" data-unit="kg">kg</button>
+                <button class="unit-btn{{ ' active' if default_unit == 'lbs' else '' }}" data-unit="lbs">lbs</button>
+                <button class="unit-btn{{ ' active' if default_unit != 'lbs' else '' }}" data-unit="kg">kg</button>
             </div>
         </div>
 
@@ -262,7 +262,9 @@
         const toast = document.getElementById("toast");
         const unitBtns = document.querySelectorAll(".unit-btn");
 
-        let currentUnit = "lbs";
+        let currentUnit = "{{ default_unit }}";
+        const configuredTz = "{{ tz }}";
+        const tzOption = configuredTz ? { timeZone: configuredTz } : {};
         let trendChart = null;
 
         unitBtns.forEach(btn => {
@@ -287,14 +289,14 @@
             const diffDays = Math.floor(diffMs / 86400000);
 
             if (diffDays === 0) {
-                return "Today " + d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+                return "Today " + d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", ...tzOption });
             } else if (diffDays === 1) {
-                return "Yesterday " + d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+                return "Yesterday " + d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", ...tzOption });
             } else if (diffDays < 7) {
-                return d.toLocaleDateString([], { weekday: "short" }) + " " +
-                       d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+                return d.toLocaleDateString([], { weekday: "short", ...tzOption }) + " " +
+                       d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", ...tzOption });
             }
-            return d.toLocaleDateString([], { month: "short", day: "numeric" });
+            return d.toLocaleDateString([], { month: "short", day: "numeric", ...tzOption });
         }
 
         async function loadRecent() {
@@ -310,7 +312,7 @@
                     const w = currentUnit === "kg" ? entry.weight_kg : entry.weight_lbs;
                     return `
                     <li class="recent-item" data-id="${entry.id}">
-                        <span class="recent-weight">${w} ${currentUnit}</span>`;
+                        <span class="recent-weight">${w} ${currentUnit}</span>
                         <div class="recent-meta">
                             <span class="sync-badge ${entry.synced_to_garmin ? "synced" : "local"}">
                                 ${entry.synced_to_garmin ? "Garmin" : "Local"}

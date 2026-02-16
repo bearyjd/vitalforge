@@ -79,6 +79,8 @@ async def index(request: Request):
     return templates.TemplateResponse("index.html", {
         "request": request,
         "weight_url": os.environ.get("WEIGHT_URL", ""),
+        "default_unit": os.environ.get("DEFAULT_UNIT", "lbs"),
+        "tz": os.environ.get("TZ", ""),
     })
 
 
