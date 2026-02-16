@@ -1,0 +1,8 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+jinja2==3.1.5
+aiosqlite==0.21.0
+garminconnect>=0.2.38
+python-multipart==0.0.20
+anthropic>=0.40.0
+itsdangerous>=2.1.0

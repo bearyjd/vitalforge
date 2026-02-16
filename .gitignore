@@ -1,0 +1,21 @@
+# Secrets
+.env
+
+# Python
+*.pyc
+__pycache__/
+
+# Data
+*.db
+*.sqlite
+.garmin_tokens/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

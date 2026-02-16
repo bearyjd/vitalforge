@@ -1,0 +1,28 @@
+## Production compose file — pulls pre-built images from GHCR
+## Usage:
+##   cp .env.example .env  # edit with your credentials
+##   docker compose -f docker-compose.prod.yml up -d
+
+services:
+  vitalforge-weight:
+    image: ghcr.io/bearyjd/vitalforge-weight:latest
+    ports:
+      - "8085:8085"
+    volumes:
+      - vitalforge-data:/app/data
+    env_file:
+      - .env
+    restart: unless-stopped
+
+  vitalforge-dashboard:
+    image: ghcr.io/bearyjd/vitalforge-dashboard:latest
+    ports:
+      - "8086:8086"
+    volumes:
+      - vitalforge-data:/app/data
+    env_file:
+      - .env
+    restart: unless-stopped
+
+volumes:
+  vitalforge-data:

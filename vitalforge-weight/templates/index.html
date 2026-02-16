@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <meta name="theme-color" content="#16213e">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <title>VitalForge Weight</title>
+    <link rel="manifest" href="/static/manifest.json">
+    <link rel="icon" href="/static/icon-192.png">
+    <link rel="apple-touch-icon" href="/static/icon-192.png">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #e0e0e0;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .nav {
+            width: 100%; background: #16213e;
+            border-bottom: 1px solid #2a2a4a;
+            display: flex; justify-content: center; gap: 0;
+        }
+        .nav a {
+            color: #6060a0; text-decoration: none; padding: 0.6rem 1.2rem;
+            font-size: 0.8rem; font-weight: 500; letter-spacing: 0.5px;
+            border-bottom: 2px solid transparent; transition: all 0.2s;
+        }
+        .nav a:hover { color: #e0e0e0; }
+        .nav a.active { color: #e0e0e0; border-bottom-color: #5c6bc0; }
+        .container {
+            width: 100%;
+            max-width: 420px;
+            padding: 2rem 1.5rem;
+        }
+        h1 {
+            font-size: 1.4rem;
+            color: #a0a0c0;
+            text-align: center;
+            margin-bottom: 2rem;
+            font-weight: 500;
+            letter-spacing: 0.5px;
+        }
+        .input-group {
+            margin-bottom: 1.5rem;
+        }
+        .weight-input {
+            width: 100%;
+            font-size: 2.8rem;
+            font-weight: 300;
+            text-align: center;
+            padding: 0.6em 0.4em;
+            background: #16213e;
+            border: 2px solid #2a2a5a;
+            border-radius: 12px;
+            color: #e0e0e0;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        .weight-input:focus {
+            border-color: #5c6bc0;
+        }
+        .weight-input::placeholder {
+            color: #4a4a6a;
+        }
+        .unit-toggle {
+            display: flex;
+            justify-content: center;
+            gap: 0;
+            margin-top: 0.75rem;
+        }
+        .unit-btn {
+            padding: 0.4em 1.5em;
+            font-size: 0.9rem;
+            border: 1px solid #2a2a5a;
+            background: #16213e;
+            color: #8080a0;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .unit-btn:first-child { border-radius: 6px 0 0 6px; }
+        .unit-btn:last-child { border-radius: 0 6px 6px 0; }
+        .unit-btn.active {
+            background: #5c6bc0;
+            color: #fff;
+            border-color: #5c6bc0;
+        }
+        .submit-btn {
+            width: 100%;
+            padding: 1em;
+            font-size: 1.2rem;
+            font-weight: 600;
+            background: #5c6bc0;
+            color: #fff;
+            border: none;
+            border-radius: 12px;
+            cursor: pointer;
+            transition: background 0.2s, transform 0.1s;
+            margin-bottom: 2rem;
+        }
+        .submit-btn:active {
+            transform: scale(0.98);
+            background: #4a5ab0;
+        }
+        .submit-btn:disabled {
+            background: #3a3a5a;
+            color: #6a6a8a;
+            cursor: not-allowed;
+            transform: none;
+        }
+        .recent-title {
+            font-size: 0.85rem;
+            color: #6a6a8a;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 0.75rem;
+        }
+        .recent-list {
+            list-style: none;
+        }
+        .recent-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0.75em 0;
+            border-bottom: 1px solid #1e1e3a;
+        }
+        .recent-item:last-child { border-bottom: none; }
+        .recent-weight {
+            font-size: 1.15rem;
+            font-weight: 500;
+            color: #d0d0e8;
+        }
+        .recent-meta {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+        .recent-date {
+            font-size: 0.8rem;
+            color: #5a5a7a;
+        }
+        .sync-badge {
+            font-size: 0.65rem;
+            padding: 0.15em 0.45em;
+            border-radius: 4px;
+            font-weight: 600;
+        }
+        .sync-badge.synced { background: #1b5e20; color: #a5d6a7; }
+        .sync-badge.local { background: #4a3a00; color: #ffe082; }
+        .delete-btn {
+            background: none;
+            border: none;
+            color: #5a5a7a;
+            cursor: pointer;
+            font-size: 1rem;
+            padding: 0.3em;
+            border-radius: 4px;
+            transition: color 0.2s;
+        }
+        .delete-btn:hover { color: #ef5350; }
+        .toast {
+            position: fixed;
+            bottom: 2rem;
+            left: 50%;
+            transform: translateX(-50%) translateY(100px);
+            padding: 0.8em 1.5em;
+            border-radius: 10px;
+            font-size: 0.95rem;
+            font-weight: 500;
+            opacity: 0;
+            transition: all 0.3s ease;
+            z-index: 100;
+            max-width: 90vw;
+            text-align: center;
+        }
+        .toast.show {
+            transform: translateX(-50%) translateY(0);
+            opacity: 1;
+        }
+        .toast.success { background: #1b5e20; color: #c8e6c9; }
+        .toast.error { background: #b71c1c; color: #ffcdd2; }
+        .empty-state {
+            text-align: center;
+            color: #4a4a6a;
+            padding: 1.5rem 0;
+            font-size: 0.9rem;
+        }
+        .trend-section {
+            margin-top: 1.5rem; padding-top: 1rem;
+            border-top: 1px solid #1e1e3a;
+        }
+        .trend-title {
+            font-size: 0.85rem; color: #6a6a8a;
+            text-transform: uppercase; letter-spacing: 1px;
+            margin-bottom: 0.75rem;
+        }
+        .trend-chart { width: 100%; }
+    </style>
+</head>
+<body>
+    <nav class="nav">
+        <a href="/" class="active">Weight</a>
+        <a href="#" id="dashLink">Dashboard</a>
+        <a href="/auth/logout">Logout</a>
+    </nav>
+    <div class="container">
+        <h1>VitalForge Weight</h1>
+
+        <div class="input-group">
+            <input
+                type="text"
+                inputmode="decimal"
+                class="weight-input"
+                id="weightInput"
+                placeholder="0.0"
+                autocomplete="off"
+            >
+            <div class="unit-toggle">
+                <button class="unit-btn active" data-unit="lbs">lbs</button>
+                <button class="unit-btn" data-unit="kg">kg</button>
+            </div>
+        </div>
+
+        <button class="submit-btn" id="submitBtn">Log Weight</button>
+
+        <div class="recent-title">Recent</div>
+        <ul class="recent-list" id="recentList">
+            <li class="empty-state">Loading...</li>
+        </ul>
+
+        <div class="trend-section" id="trendSection" style="display:none">
+            <div class="trend-title">30-Day Trend</div>
+            <canvas id="trendChart" class="trend-chart" height="120"></canvas>
+        </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <script>
+        // Nav link — same host, different port for local dev; subdomain for nginx
+        (function() {
+            const loc = window.location;
+            const dashLink = document.getElementById("dashLink");
+            if (loc.port) {
+                dashLink.href = loc.protocol + "//" + loc.hostname + ":8086/";
+            } else {
+                dashLink.href = loc.protocol + "//dashboard." + loc.hostname.replace(/^weight\./, "") + "/";
+            }
+        })();
+
+        const weightInput = document.getElementById("weightInput");
+        const submitBtn = document.getElementById("submitBtn");
+        const recentList = document.getElementById("recentList");
+        const toast = document.getElementById("toast");
+        const unitBtns = document.querySelectorAll(".unit-btn");
+
+        let currentUnit = "lbs";
+        let trendChart = null;
+
+        unitBtns.forEach(btn => {
+            btn.addEventListener("click", () => {
+                unitBtns.forEach(b => b.classList.remove("active"));
+                btn.classList.add("active");
+                currentUnit = btn.dataset.unit;
+            });
+        });
+
+        function showToast(message, type) {
+            toast.textContent = message;
+            toast.className = "toast " + type;
+            requestAnimationFrame(() => toast.classList.add("show"));
+            setTimeout(() => toast.classList.remove("show"), 3000);
+        }
+
+        function formatDate(isoString) {
+            const d = new Date(isoString);
+            const now = new Date();
+            const diffMs = now - d;
+            const diffDays = Math.floor(diffMs / 86400000);
+
+            if (diffDays === 0) {
+                return "Today " + d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+            } else if (diffDays === 1) {
+                return "Yesterday " + d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+            } else if (diffDays < 7) {
+                return d.toLocaleDateString([], { weekday: "short" }) + " " +
+                       d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+            }
+            return d.toLocaleDateString([], { month: "short", day: "numeric" });
+        }
+
+        async function loadRecent() {
+            try {
+                const res = await fetch("/api/weight/recent");
+                const data = await res.json();
+                if (data.length === 0) {
+                    recentList.innerHTML = '<li class="empty-state">No weigh-ins yet</li>';
+                    return;
+                }
+                // Show last 5 in UI
+                recentList.innerHTML = data.slice(0, 5).map(entry => {
+                    const w = currentUnit === "kg" ? entry.weight_kg : entry.weight_lbs;
+                    return `
+                    <li class="recent-item" data-id="${entry.id}">
+                        <span class="recent-weight">${w} ${currentUnit}</span>`;
+                        <div class="recent-meta">
+                            <span class="sync-badge ${entry.synced_to_garmin ? "synced" : "local"}">
+                                ${entry.synced_to_garmin ? "Garmin" : "Local"}
+                            </span>
+                            <span class="recent-date">${formatDate(entry.timestamp)}</span>
+                            <button class="delete-btn" onclick="deleteEntry(${entry.id})" title="Delete">&times;</button>
+                        </div>
+                    </li>`;
+                }).join("");
+            } catch (e) {
+                recentList.innerHTML = '<li class="empty-state">Failed to load</li>';
+            }
+        }
+
+        async function deleteEntry(id) {
+            if (!confirm("Delete this weigh-in?")) return;
+            try {
+                const res = await fetch(`/api/weight/${id}`, { method: "DELETE" });
+                if (res.ok) {
+                    showToast("Deleted", "success");
+                    loadRecent();
+                } else {
+                    showToast("Failed to delete", "error");
+                }
+            } catch (e) {
+                showToast("Network error", "error");
+            }
+        }
+
+        submitBtn.addEventListener("click", async () => {
+            const value = parseFloat(weightInput.value);
+            if (isNaN(value) || value <= 0 || value > 1000) {
+                showToast("Enter a valid weight", "error");
+                return;
+            }
+
+            submitBtn.disabled = true;
+            submitBtn.textContent = "Logging...";
+
+            try {
+                const res = await fetch("/api/weight", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ weight: value, unit: currentUnit }),
+                });
+                const data = await res.json();
+                if (res.ok && data.success) {
+                    const syncMsg = data.synced_to_garmin ? "" : " (local only)";
+                    const displayW = currentUnit === "kg" ? data.weight_kg : data.weight_lbs;
+                    showToast(`Logged ${displayW} ${currentUnit}${syncMsg}`, "success");
+                    weightInput.value = "";
+                    loadRecent();
+                    loadTrendChart();
+                } else {
+                    showToast(data.detail || "Failed to log weight", "error");
+                }
+            } catch (e) {
+                showToast("Network error", "error");
+            } finally {
+                submitBtn.disabled = false;
+                submitBtn.textContent = "Log Weight";
+            }
+        });
+
+        // Allow Enter key to submit
+        weightInput.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") submitBtn.click();
+        });
+
+        // Trend chart
+        async function loadTrendChart() {
+            try {
+                const res = await fetch("/api/weight/trend");
+                const data = await res.json();
+                if (data.length < 2) return;
+
+                document.getElementById("trendSection").style.display = "";
+                const sorted = data;
+                const labels = sorted.map(e => {
+                    const d = new Date(e.timestamp);
+                    return `${d.getMonth()+1}/${d.getDate()}`;
+                });
+                const values = sorted.map(e => currentUnit === "kg" ? e.weight_kg : e.weight_lbs);
+
+                if (trendChart) trendChart.destroy();
+                const ctx = document.getElementById("trendChart");
+                trendChart = new Chart(ctx, {
+                    type: "line",
+                    data: {
+                        labels,
+                        datasets: [{
+                            data: values,
+                            borderColor: "#5c6bc0",
+                            backgroundColor: "rgba(92,107,192,0.1)",
+                            fill: true,
+                            borderWidth: 2,
+                            pointRadius: 3,
+                            pointBackgroundColor: "#5c6bc0",
+                            tension: 0.3
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: { legend: { display: false } },
+                        scales: {
+                            x: { grid: { color: "#2a2a4a" }, ticks: { color: "#6a6a8a", font: { size: 10 } } },
+                            y: { grid: { color: "#2a2a4a" }, ticks: { color: "#6a6a8a", font: { size: 10 } } }
+                        }
+                    }
+                });
+            } catch {}
+        }
+
+        // Load recent entries on page load
+        loadRecent();
+        loadTrendChart();
+
+        // Register service worker
+        if ("serviceWorker" in navigator) {
+            navigator.serviceWorker.register("/static/sw.js");
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#1a1a2e">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <title>VitalForge Dashboard</title>
+    <link rel="manifest" href="/static/manifest.json">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #e0e0e0;
+            min-height: 100vh;
+            padding: 1rem;
+        }
+        .container { max-width: 900px; margin: 0 auto; }
+
+        /* Header */
+        .header {
+            display: flex; flex-wrap: wrap; align-items: center;
+            justify-content: space-between; gap: 0.75rem;
+            margin-bottom: 1rem; padding-bottom: 1rem;
+            border-bottom: 1px solid #2a2a4a;
+        }
+        .header h1 { font-size: 1.4rem; color: #c0c0e0; letter-spacing: 0.5px; }
+        .header-right { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+        .sync-info { font-size: 0.75rem; color: #6060a0; }
+        .sync-info.syncing { color: #ffa726; }
+        .btn {
+            background: #5c6bc0; color: #fff; border: none;
+            padding: 0.4rem 1rem; border-radius: 6px; cursor: pointer;
+            font-size: 0.8rem; transition: background 0.2s;
+        }
+        .btn:hover { background: #7c4dff; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-sm { padding: 0.3rem 0.6rem; font-size: 0.7rem; }
+        .btn-ghost { background: transparent; color: #6060a0; border: 1px solid #2a2a4a; }
+        .btn-ghost:hover { background: #2a2a4a; color: #e0e0e0; }
+
+        /* Toggles */
+        .range-toggle, .unit-toggle {
+            display: flex; gap: 0; border-radius: 6px;
+            overflow: hidden; border: 1px solid #2a2a4a;
+        }
+        .range-btn, .unit-btn {
+            background: transparent; color: #8080a0; border: none;
+            padding: 0.35rem 0.9rem; cursor: pointer;
+            font-size: 0.8rem; transition: all 0.2s;
+        }
+        .range-btn.active, .unit-btn.active { background: #5c6bc0; color: #fff; }
+        .range-btn:not(.active):hover, .unit-btn:not(.active):hover { background: #2a2a4a; }
+
+        /* Recommendations */
+        .recs-section {
+            background: #16213e; border-radius: 10px;
+            padding: 1rem; margin-bottom: 1rem;
+        }
+        .recs-header {
+            display: flex; justify-content: space-between;
+            align-items: center; margin-bottom: 0.75rem;
+        }
+        .recs-header h2 { font-size: 0.95rem; color: #a0a0c0; font-weight: 500; }
+        .recs-meta { font-size: 0.7rem; color: #6060a0; }
+        .rec-card {
+            padding: 0.7rem; margin-bottom: 0.5rem;
+            border-radius: 8px; background: #1a1a2e;
+            border-left: 3px solid #5c6bc0;
+        }
+        .rec-card.severity-alert { border-left-color: #ef5350; }
+        .rec-card.severity-warning { border-left-color: #ffa726; }
+        .rec-card.severity-info { border-left-color: #5c6bc0; }
+        .rec-title { font-size: 0.85rem; font-weight: 600; color: #e0e0e0; margin-bottom: 0.3rem; }
+        .rec-text { font-size: 0.8rem; color: #a0a0c0; line-height: 1.4; }
+        .rec-metrics { font-size: 0.65rem; color: #6060a0; margin-top: 0.3rem; }
+
+        /* Alert cards */
+        .alerts { margin-bottom: 1rem; }
+        .alert-card {
+            background: #3e2723; border-left: 4px solid #ffa726;
+            padding: 0.6rem 1rem; margin-bottom: 0.5rem;
+            border-radius: 0 6px 6px 0; display: flex;
+            justify-content: space-between; align-items: center;
+            font-size: 0.85rem; color: #ffe0b2;
+        }
+        .alert-dismiss {
+            background: none; border: none; color: #ffa726;
+            cursor: pointer; font-size: 1.1rem; padding: 0 0.3rem;
+        }
+
+        /* Top cards */
+        .top-cards {
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 0.75rem; margin-bottom: 1.5rem;
+        }
+        .card { background: #16213e; border-radius: 10px; padding: 1rem; text-align: center; }
+        .card-label {
+            font-size: 0.7rem; text-transform: uppercase;
+            letter-spacing: 1px; color: #6060a0; margin-bottom: 0.4rem;
+        }
+        .card-value { font-size: 1.6rem; font-weight: 700; color: #e0e0e0; }
+        .card-sub { font-size: 0.75rem; color: #8080a0; margin-top: 0.25rem; }
+        .trend-up { color: #ef5350; }
+        .trend-down { color: #26a69a; }
+        .trend-stable { color: #8080a0; }
+
+        /* Chart sections */
+        .chart-section { background: #16213e; border-radius: 10px; padding: 1rem; margin-bottom: 1rem; }
+        .chart-section h2 { font-size: 0.95rem; color: #a0a0c0; margin-bottom: 0.75rem; font-weight: 500; }
+        .chart-row { display: grid; grid-template-columns: 1fr; gap: 1rem; }
+        .chart-row.two-col { grid-template-columns: 1fr 1fr; }
+        .chart-wrap { position: relative; width: 100%; }
+        .chart-wrap canvas { width: 100% !important; }
+        .chart-label {
+            font-size: 0.7rem; color: #6060a0;
+            text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 0.3rem;
+        }
+
+        /* Nav */
+        .nav {
+            width: 100%; background: #16213e;
+            border-bottom: 1px solid #2a2a4a;
+            display: flex; justify-content: center; gap: 0;
+            margin-bottom: 1rem;
+        }
+        .nav a {
+            color: #6060a0; text-decoration: none; padding: 0.6rem 1.2rem;
+            font-size: 0.8rem; font-weight: 500; letter-spacing: 0.5px;
+            border-bottom: 2px solid transparent; transition: all 0.2s;
+        }
+        .nav a:hover { color: #e0e0e0; }
+        .nav a.active { color: #e0e0e0; border-bottom-color: #5c6bc0; }
+
+        @media (max-width: 600px) {
+            .top-cards { grid-template-columns: repeat(2, 1fr); }
+            .chart-row.two-col { grid-template-columns: 1fr; }
+            .header { flex-direction: column; align-items: flex-start; }
+            .card-value { font-size: 1.3rem; }
+        }
+    </style>
+</head>
+<body>
+    <nav class="nav">
+        <a href="#" id="weightLink">Weight</a>
+        <a href="/" class="active">Dashboard</a>
+        <a href="/auth/logout">Logout</a>
+    </nav>
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <h1>VitalForge Dashboard</h1>
+            <div class="header-right">
+                <span class="sync-info" id="syncInfo">Loading...</span>
+                <button class="btn btn-sm" id="syncBtn" onclick="triggerSync()">Sync</button>
+                <div class="unit-toggle">
+                    <button class="unit-btn" data-unit="lbs" onclick="setUnit('lbs')">lbs</button>
+                    <button class="unit-btn active" data-unit="kg" onclick="setUnit('kg')">kg</button>
+                </div>
+                <div class="range-toggle">
+                    <button class="range-btn" data-days="7" onclick="setRange(7)">7d</button>
+                    <button class="range-btn active" data-days="30" onclick="setRange(30)">30d</button>
+                    <button class="range-btn" data-days="90" onclick="setRange(90)">90d</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Recommendations -->
+        <div class="recs-section" id="recsSection" style="display:none">
+            <div class="recs-header">
+                <h2>Recommendations</h2>
+                <div>
+                    <span class="recs-meta" id="recsMeta"></span>
+                    <button class="btn btn-sm" onclick="loadRecommendations(true)">Refresh</button>
+                </div>
+            </div>
+            <div id="recsCards"></div>
+        </div>
+
+        <!-- Alerts -->
+        <div class="alerts" id="alerts"></div>
+
+        <!-- Top Cards -->
+        <div class="top-cards">
+            <div class="card">
+                <div class="card-label">Weight</div>
+                <div class="card-value" id="cardWeight">--</div>
+                <div class="card-sub" id="cardWeightSub"></div>
+            </div>
+            <div class="card">
+                <div class="card-label">VO2 Max</div>
+                <div class="card-value" id="cardVo2">--</div>
+                <div class="card-sub" id="cardVo2Sub"></div>
+            </div>
+            <div class="card">
+                <div class="card-label">Resting HR</div>
+                <div class="card-value" id="cardRhr">--</div>
+                <div class="card-sub" id="cardRhrSub"></div>
+            </div>
+            <div class="card">
+                <div class="card-label">HRV</div>
+                <div class="card-value" id="cardHrv">--</div>
+                <div class="card-sub" id="cardHrvSub"></div>
+            </div>
+        </div>
+
+        <!-- Sleep -->
+        <div class="chart-section">
+            <h2>Sleep</h2>
+            <div class="chart-row two-col">
+                <div class="chart-wrap">
+                    <div class="chart-label">Duration (hours)</div>
+                    <canvas id="chartSleepDuration"></canvas>
+                </div>
+                <div class="chart-wrap">
+                    <div class="chart-label">Sleep Score</div>
+                    <canvas id="chartSleepScore"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- Heart & Recovery -->
+        <div class="chart-section">
+            <h2>Heart &amp; Recovery</h2>
+            <div class="chart-row two-col">
+                <div class="chart-wrap">
+                    <div class="chart-label">Resting Heart Rate (bpm)</div>
+                    <canvas id="chartRhr"></canvas>
+                </div>
+                <div class="chart-wrap">
+                    <div class="chart-label">HRV (ms)</div>
+                    <canvas id="chartHrv"></canvas>
+                </div>
+            </div>
+            <div class="chart-row" style="margin-top:1rem">
+                <div class="chart-wrap">
+                    <div class="chart-label">Body Battery (daily range)</div>
+                    <canvas id="chartBodyBattery"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- Stress -->
+        <div class="chart-section">
+            <h2>Stress</h2>
+            <div class="chart-row">
+                <div class="chart-wrap">
+                    <div class="chart-label">Average Stress Level</div>
+                    <canvas id="chartStress"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- Body Composition -->
+        <div class="chart-section">
+            <h2>Body Composition</h2>
+            <div class="chart-row two-col">
+                <div class="chart-wrap">
+                    <div class="chart-label" id="weightChartLabel">Weight (kg)</div>
+                    <canvas id="chartWeight"></canvas>
+                </div>
+                <div class="chart-wrap">
+                    <div class="chart-label">Body Fat (%)</div>
+                    <canvas id="chartBodyFat"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- Activity -->
+        <div class="chart-section">
+            <h2>Activity</h2>
+            <div class="chart-row two-col">
+                <div class="chart-wrap">
+                    <div class="chart-label">Steps</div>
+                    <canvas id="chartSteps"></canvas>
+                </div>
+                <div class="chart-wrap">
+                    <div class="chart-label">Training Load</div>
+                    <canvas id="chartTrainingLoad"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        if ("serviceWorker" in navigator) {
+            navigator.serviceWorker.register("/static/sw.js");
+        }
+
+        // Nav link — same host, different port for local dev; subdomain for nginx
+        (function() {
+            const loc = window.location;
+            const wLink = document.getElementById("weightLink");
+            if (loc.port) {
+                wLink.href = loc.protocol + "//" + loc.hostname + ":8085/";
+            } else {
+                wLink.href = loc.protocol + "//weight." + loc.hostname.replace(/^dashboard\./, "") + "/";
+            }
+        })();
+
+        // ── State ──
+        let currentDays = 30;
+        let currentUnit = localStorage.getItem("vf_unit") || "kg";
+        const charts = {};
+        const metricCache = {};
+        const GRAMS_PER_LB = 453.592;
+
+        // Init unit toggle
+        document.querySelectorAll(".unit-btn").forEach(b => {
+            b.classList.toggle("active", b.dataset.unit === currentUnit);
+        });
+
+        // ── Color palette ──
+        const C = {
+            primary: "#5c6bc0", primaryFade: "rgba(92,107,192,0.15)",
+            secondary: "#7c4dff", secondaryFade: "rgba(124,77,255,0.15)",
+            accent: "#26a69a", accentFade: "rgba(38,166,154,0.15)",
+            grid: "#2a2a4a", text: "#8080a0", dot: "rgba(92,107,192,0.4)",
+        };
+
+        Chart.defaults.color = C.text;
+        Chart.defaults.font.size = 11;
+        Chart.defaults.plugins.legend.display = false;
+        Chart.defaults.elements.point.radius = 2;
+        Chart.defaults.elements.point.hoverRadius = 4;
+
+        // ── Unit conversion ──
+        function weightFromGrams(g) {
+            return currentUnit === "lbs" ? g / GRAMS_PER_LB : g / 1000;
+        }
+        function weightUnitLabel() { return currentUnit; }
+
+        // ── API helpers ──
+        async function fetchMetric(name, days) {
+            const key = `${name}_${days}`;
+            if (metricCache[key]) return metricCache[key];
+            try {
+                const res = await fetch(`/api/metrics/${name}?days=${days}`);
+                if (!res.ok) return { data: [] };
+                const json = await res.json();
+                metricCache[key] = json;
+                return json;
+            } catch { return { data: [] }; }
+        }
+
+        async function fetchSyncStatus() {
+            try { const res = await fetch("/api/sync/status"); return await res.json(); }
+            catch { return null; }
+        }
+
+        async function triggerSync() {
+            const btn = document.getElementById("syncBtn");
+            btn.disabled = true; btn.textContent = "Syncing...";
+            try {
+                await fetch("/api/sync", { method: "POST" });
+                const poll = setInterval(async () => {
+                    const status = await fetchSyncStatus();
+                    if (status && !status.syncing) {
+                        clearInterval(poll);
+                        btn.disabled = false; btn.textContent = "Sync";
+                        updateSyncInfo(status); clearCacheAndReload();
+                    }
+                }, 2000);
+            } catch { btn.disabled = false; btn.textContent = "Sync"; }
+        }
+
+        function updateSyncInfo(status) {
+            const el = document.getElementById("syncInfo");
+            if (!status || !status.last_sync_time) { el.textContent = "Never synced"; return; }
+            if (status.syncing) { el.textContent = "Syncing..."; el.classList.add("syncing"); return; }
+            el.classList.remove("syncing");
+            const d = new Date(status.last_sync_time);
+            el.textContent = `Last sync: ${d.toLocaleDateString()} ${d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+        }
+
+        // ── Toggles ──
+        function setRange(days) {
+            currentDays = days;
+            document.querySelectorAll(".range-btn").forEach(b => b.classList.toggle("active", parseInt(b.dataset.days) === days));
+            clearCacheAndReload();
+        }
+
+        function setUnit(unit) {
+            currentUnit = unit;
+            localStorage.setItem("vf_unit", unit);
+            document.querySelectorAll(".unit-btn").forEach(b => b.classList.toggle("active", b.dataset.unit === unit));
+            clearCacheAndReload();
+        }
+
+        function clearCacheAndReload() {
+            Object.keys(metricCache).forEach(k => delete metricCache[k]);
+            destroyAllCharts();
+            loadDashboard();
+        }
+
+        function destroyAllCharts() {
+            Object.values(charts).forEach(c => c.destroy());
+            Object.keys(charts).forEach(k => delete charts[k]);
+        }
+
+        // ── Chart factory ──
+        const commonScales = () => ({
+            x: { type: "category", grid: { color: C.grid, drawBorder: false }, ticks: { maxTicksLimit: 8, callback: function(val) { const l = this.getLabelForValue(val); return l ? l.slice(5) : ""; } } },
+            y: { grid: { color: C.grid, drawBorder: false }, ticks: { maxTicksLimit: 5 } }
+        });
+
+        function createLineChart(canvasId, labels, datasets, yConfig) {
+            const ctx = document.getElementById(canvasId);
+            if (!ctx) return null;
+            const scales = commonScales();
+            if (yConfig) Object.assign(scales.y, yConfig);
+            charts[canvasId] = new Chart(ctx, {
+                type: "line", data: { labels, datasets },
+                options: { responsive: true, maintainAspectRatio: true, aspectRatio: 2,
+                    interaction: { mode: "index", intersect: false }, scales,
+                    plugins: { tooltip: { backgroundColor: "#16213e", borderColor: C.grid, borderWidth: 1 } }
+                }
+            });
+            return charts[canvasId];
+        }
+
+        function createBarChart(canvasId, labels, data, color) {
+            const ctx = document.getElementById(canvasId);
+            if (!ctx) return null;
+            charts[canvasId] = new Chart(ctx, {
+                type: "bar",
+                data: { labels, datasets: [{ data, backgroundColor: color || C.primaryFade, borderColor: color || C.primary, borderWidth: 1, borderRadius: 3 }] },
+                options: { responsive: true, maintainAspectRatio: true, aspectRatio: 2,
+                    scales: { ...commonScales(), y: { ...commonScales().y, beginAtZero: true } },
+                    plugins: { tooltip: { backgroundColor: "#16213e", borderColor: C.grid, borderWidth: 1 } }
+                }
+            });
+            return charts[canvasId];
+        }
+
+        function rawAndAvgDatasets(rawVals, avgVals, color, secondaryColor) {
+            return [
+                { label: "Value", data: rawVals, borderColor: color || C.primary, backgroundColor: "transparent", borderWidth: 1, pointBackgroundColor: C.dot, pointRadius: 2, tension: 0.1 },
+                { label: "7d Avg", data: avgVals, borderColor: secondaryColor || C.secondary, backgroundColor: "transparent", borderWidth: 2.5, pointRadius: 0, tension: 0.4 }
+            ];
+        }
+
+        // ── Helpers ──
+        function avg(arr) { const v = arr.filter(x => x != null); return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null; }
+        function trendArrow(c, b) { if (c == null || b == null) return ""; const p = ((c - b) / b) * 100; return p > 1 ? " ↑" : p < -1 ? " ↓" : " →"; }
+        function trendClass(c, b, lower) { if (c == null || b == null) return "trend-stable"; const d = c - b; if (Math.abs(d / b) < 0.01) return "trend-stable"; const up = d > 0; return lower ? (up ? "trend-up" : "trend-down") : (up ? "trend-down" : "trend-up"); }
+
+        // ── Recommendations ──
+        async function loadRecommendations(refresh) {
+            try {
+                const url = refresh ? "/api/recommendations?refresh=true" : "/api/recommendations";
+                const res = await fetch(url);
+                if (!res.ok) return;
+                const data = await res.json();
+                const recs = data.recommendations || [];
+                if (recs.length === 0) return;
+
+                document.getElementById("recsSection").style.display = "";
+                const ago = data.generated_at ? timeAgo(data.generated_at * 1000) : "";
+                document.getElementById("recsMeta").textContent = ago ? `Updated ${ago}` : "";
+                document.getElementById("recsCards").innerHTML = recs.map(r =>
+                    `<div class="rec-card severity-${r.severity || 'info'}">
+                        <div class="rec-title">${esc(r.title)}</div>
+                        <div class="rec-text">${esc(r.text)}</div>
+                        ${r.metrics ? `<div class="rec-metrics">${r.metrics.join(", ")}</div>` : ""}
+                    </div>`
+                ).join("");
+            } catch {}
+        }
+
+        function timeAgo(ts) {
+            const diff = (Date.now() - ts) / 1000;
+            if (diff < 60) return "just now";
+            if (diff < 3600) return `${Math.round(diff / 60)}m ago`;
+            if (diff < 86400) return `${Math.round(diff / 3600)}h ago`;
+            return `${Math.round(diff / 86400)}d ago`;
+        }
+
+        function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+
+        // ── Alerts ──
+        function computeAlerts(metricData) {
+            const alerts = [];
+            const rhrData = metricData.resting_hr?.data || [];
+            if (rhrData.length >= 2) {
+                const a = avg(rhrData.map(d => d.value)), l = rhrData[rhrData.length - 1].value;
+                if (a && l > a * 1.1) alerts.push(`Resting HR elevated: ${l} bpm is ${Math.round(((l - a) / a) * 100)}% above your 30-day average (${Math.round(a)} bpm)`);
+            }
+            const hrvData = metricData.hrv?.data || [];
+            if (hrvData.length >= 7) {
+                const a = avg(hrvData.map(d => d.value)); let c = 0;
+                for (let i = hrvData.length - 1; i >= Math.max(0, hrvData.length - 7); i--) { if (hrvData[i].value < a) c++; else break; }
+                if (c >= 3) alerts.push(`HRV below baseline for ${c} consecutive days — consider a recovery day`);
+            }
+            const sleepData = metricData.sleep_duration?.data || [];
+            if (sleepData.length >= 3) {
+                let c = 0;
+                for (let i = sleepData.length - 1; i >= Math.max(0, sleepData.length - 7); i--) { if (sleepData[i].value < 6 * 3600) c++; else break; }
+                if (c >= 3) alerts.push(`Sleep under 6 hours for ${c} consecutive nights — sleep debt accumulating`);
+            }
+            return alerts;
+        }
+
+        function renderAlerts(alerts) {
+            document.getElementById("alerts").innerHTML = alerts.map((msg, i) =>
+                `<div class="alert-card"><span>${msg}</span><button class="alert-dismiss" onclick="this.parentElement.remove()">✕</button></div>`
+            ).join("");
+        }
+
+        // ── Top Cards ──
+        function updateTopCards(data) {
+            const wData = data.weight?.data || [];
+            if (wData.length) {
+                const latest = weightFromGrams(wData[wData.length - 1].value);
+                const recent7 = avg(wData.slice(-7).map(d => weightFromGrams(d.value)));
+                const arrow = trendArrow(latest, recent7);
+                const cls = trendClass(latest, recent7, true);
+                document.getElementById("cardWeight").innerHTML = `${latest.toFixed(1)}<span class="${cls}" style="font-size:0.9rem">${arrow}</span>`;
+                document.getElementById("cardWeightSub").textContent = `${weightUnitLabel()} · 7d avg ${recent7 ? recent7.toFixed(1) : "--"}`;
+            }
+            const vo2Data = data.vo2max?.data || [];
+            if (vo2Data.length) {
+                document.getElementById("cardVo2").textContent = vo2Data[vo2Data.length - 1].value;
+                document.getElementById("cardVo2Sub").textContent = "mL/kg/min";
+            }
+            const rhrData = data.resting_hr?.data || [];
+            if (rhrData.length) {
+                const tw = avg(rhrData.slice(-7).map(d => d.value)), lw = avg(rhrData.slice(-14, -7).map(d => d.value));
+                const v = tw ? Math.round(tw) : "--";
+                document.getElementById("cardRhr").innerHTML = `${v}<span class="${trendClass(tw, lw, true)}" style="font-size:0.9rem">${trendArrow(tw, lw)}</span>`;
+                document.getElementById("cardRhrSub").textContent = lw ? `bpm · last wk ${Math.round(lw)}` : "bpm";
+            }
+            const hrvData = data.hrv?.data || [];
+            if (hrvData.length) {
+                const a7 = avg(hrvData.slice(-7).map(d => d.value)), a30 = avg(hrvData.map(d => d.value));
+                const v = a7 ? Math.round(a7) : "--";
+                document.getElementById("cardHrv").innerHTML = `${v}<span class="${trendClass(a7, a30, false)}" style="font-size:0.9rem">${trendArrow(a7, a30)}</span>`;
+                document.getElementById("cardHrvSub").textContent = a30 ? `ms · 30d avg ${Math.round(a30)}` : "ms";
+            }
+        }
+
+        // ── Build Charts ──
+        function buildSleepCharts(data) {
+            const sd = data.sleep_duration?.data || [];
+            if (sd.length) createLineChart("chartSleepDuration", sd.map(d => d.date), rawAndAvgDatasets(sd.map(d => +(d.value / 3600).toFixed(2)), sd.map(d => +(d.moving_avg_7d / 3600).toFixed(2)), C.accent, C.primary));
+            const ss = data.sleep_score?.data || [];
+            if (ss.length) createLineChart("chartSleepScore", ss.map(d => d.date), rawAndAvgDatasets(ss.map(d => d.value), ss.map(d => d.moving_avg_7d), C.secondary, C.primary), { min: 0, max: 100 });
+        }
+
+        function buildHeartCharts(data) {
+            const rhr = data.resting_hr?.data || [];
+            if (rhr.length) createLineChart("chartRhr", rhr.map(d => d.date), rawAndAvgDatasets(rhr.map(d => d.value), rhr.map(d => d.moving_avg_7d), C.primary, C.secondary));
+            const hrv = data.hrv?.data || [];
+            if (hrv.length) createLineChart("chartHrv", hrv.map(d => d.date), rawAndAvgDatasets(hrv.map(d => d.value), hrv.map(d => d.moving_avg_7d), C.accent, C.primary));
+
+            const bbH = data.body_battery?.data || [], bbL = data.body_battery_low?.data || [];
+            if (bbH.length) {
+                const lm = {}; bbL.forEach(d => lm[d.date] = d.value);
+                const ctx = document.getElementById("chartBodyBattery");
+                if (ctx) {
+                    charts["chartBodyBattery"] = new Chart(ctx, {
+                        type: "line",
+                        data: { labels: bbH.map(d => d.date), datasets: [
+                            { label: "High", data: bbH.map(d => d.value), borderColor: C.accent, backgroundColor: C.accentFade, fill: "+1", borderWidth: 2, pointRadius: 1, tension: 0.3 },
+                            { label: "Low", data: bbH.map(d => lm[d.date] ?? null), borderColor: C.secondary, backgroundColor: "transparent", borderWidth: 2, pointRadius: 1, tension: 0.3 }
+                        ]},
+                        options: { responsive: true, maintainAspectRatio: true, aspectRatio: 2.5,
+                            interaction: { mode: "index", intersect: false },
+                            scales: { ...commonScales(), y: { ...commonScales().y, min: 0, max: 100 } },
+                            plugins: { legend: { display: true, labels: { boxWidth: 12, padding: 10 } }, tooltip: { backgroundColor: "#16213e", borderColor: C.grid, borderWidth: 1 } }
+                        }
+                    });
+                }
+            }
+        }
+
+        function buildStressChart(data) {
+            const s = data.stress?.data || [];
+            if (s.length) createLineChart("chartStress", s.map(d => d.date), rawAndAvgDatasets(s.map(d => d.value), s.map(d => d.moving_avg_7d), "#ffa726", C.primary), { min: 0 });
+        }
+
+        function buildBodyCompCharts(data) {
+            const w = data.weight?.data || [];
+            document.getElementById("weightChartLabel").textContent = `Weight (${weightUnitLabel()})`;
+            if (w.length) {
+                const raw = w.map(d => +weightFromGrams(d.value).toFixed(2));
+                const ma = w.map(d => +weightFromGrams(d.moving_avg_7d).toFixed(2));
+                createLineChart("chartWeight", w.map(d => d.date), rawAndAvgDatasets(raw, ma, C.primary, C.secondary));
+            }
+            const bf = data.body_fat?.data || [];
+            if (bf.length) createLineChart("chartBodyFat", bf.map(d => d.date), rawAndAvgDatasets(bf.map(d => d.value), bf.map(d => d.moving_avg_7d), C.accent, C.primary));
+        }
+
+        function buildActivityCharts(data) {
+            const s = data.steps?.data || [];
+            if (s.length) createBarChart("chartSteps", s.map(d => d.date), s.map(d => d.value), C.primary);
+            const t = data.training_load?.data || [];
+            if (t.length) createBarChart("chartTrainingLoad", t.map(d => d.date), t.map(d => d.value), C.secondary);
+        }
+
+        // ── Main load ──
+        async function loadDashboard() {
+            const metrics = ["sleep_duration", "sleep_score", "resting_hr", "hrv", "body_battery", "body_battery_low", "stress", "vo2max", "weight", "body_fat", "training_load", "steps"];
+            const results = await Promise.all(metrics.map(m => fetchMetric(m, currentDays)));
+            const data = {}; metrics.forEach((n, i) => data[n] = results[i]);
+
+            if (currentDays >= 30) { renderAlerts(computeAlerts(data)); }
+            else {
+                const am = ["resting_hr", "hrv", "sleep_duration"];
+                const ar = await Promise.all(am.map(m => fetchMetric(m, 30)));
+                const ad = {}; am.forEach((n, i) => ad[n] = ar[i]);
+                renderAlerts(computeAlerts(ad));
+            }
+
+            updateTopCards(data);
+            buildSleepCharts(data);
+            buildHeartCharts(data);
+            buildStressChart(data);
+            buildBodyCompCharts(data);
+            buildActivityCharts(data);
+        }
+
+        // ── Init ──
+        (async function init() {
+            const status = await fetchSyncStatus();
+            updateSyncInfo(status);
+            await loadDashboard();
+            loadRecommendations(false);
+        })();
+    </script>
+</body>
+</html>

@@ -1,0 +1,27 @@
+services:
+  vitalforge-weight:
+    build:
+      context: .
+      dockerfile: vitalforge-weight/Dockerfile
+    ports:
+      - "8085:8085"
+    volumes:
+      - vitalforge-data:/app/data
+    env_file:
+      - .env
+    restart: unless-stopped
+
+  vitalforge-dashboard:
+    build:
+      context: .
+      dockerfile: vitalforge-dashboard/Dockerfile
+    ports:
+      - "8086:8086"
+    volumes:
+      - vitalforge-data:/app/data
+    env_file:
+      - .env
+    restart: unless-stopped
+
+volumes:
+  vitalforge-data:
