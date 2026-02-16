@@ -93,6 +93,8 @@ Visit `http://localhost:8085` for weight logging and `http://localhost:8086` for
 | `VITALFORGE_USER` | No | Login username (default: `admin`) |
 | `VITALFORGE_PASS` | No | Login password. If empty, auth is disabled (open access) |
 | `VITALFORGE_SECRET` | No | Secret key for signing session cookies |
+| `WEIGHT_URL` | No | Public URL for weight service (e.g. `https://weight.yourdomain.com`) |
+| `DASHBOARD_URL` | No | Public URL for dashboard service (e.g. `https://health.yourdomain.com`) |
 
 Generate a random secret:
 

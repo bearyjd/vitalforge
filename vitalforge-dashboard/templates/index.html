@@ -290,14 +290,15 @@
             navigator.serviceWorker.register("/static/sw.js");
         }
 
-        // Nav link — same host, different port for local dev; subdomain for nginx
+        // Nav link — use configured URL, or fall back to port-based for local dev
         (function() {
-            const loc = window.location;
             const wLink = document.getElementById("weightLink");
-            if (loc.port) {
-                wLink.href = loc.protocol + "//" + loc.hostname + ":8085/";
+            const configured = "{{ weight_url }}";
+            if (configured) {
+                wLink.href = configured;
             } else {
-                wLink.href = loc.protocol + "//weight." + loc.hostname.replace(/^dashboard\./, "") + "/";
+                const loc = window.location;
+                wLink.href = loc.protocol + "//" + loc.hostname + ":8085/";
             }
         })();
 

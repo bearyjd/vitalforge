@@ -16,6 +16,7 @@ from shared.database import get_db, init_db
 from shared.garmin_client import authenticate, push_weight
 from shared.auth import add_auth_routes
 
+import os
 import logging
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -59,7 +60,10 @@ async def health():
 
 @app.get("/")
 async def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse("index.html", {
+        "request": request,
+        "dashboard_url": os.environ.get("DASHBOARD_URL", ""),
+    })
 
 
 @app.post("/api/weight")

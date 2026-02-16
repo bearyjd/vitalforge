@@ -244,14 +244,15 @@
     <div class="toast" id="toast"></div>
 
     <script>
-        // Nav link — same host, different port for local dev; subdomain for nginx
+        // Nav link — use configured URL, or fall back to port-based for local dev
         (function() {
-            const loc = window.location;
             const dashLink = document.getElementById("dashLink");
-            if (loc.port) {
-                dashLink.href = loc.protocol + "//" + loc.hostname + ":8086/";
+            const configured = "{{ dashboard_url }}";
+            if (configured) {
+                dashLink.href = configured;
             } else {
-                dashLink.href = loc.protocol + "//dashboard." + loc.hostname.replace(/^weight\./, "") + "/";
+                const loc = window.location;
+                dashLink.href = loc.protocol + "//" + loc.hostname + ":8086/";
             }
         })();
 

@@ -18,6 +18,7 @@ from shared.auth import add_auth_routes
 from sync import run_sync, scheduled_sync
 from recommendations import get_recommendations, get_rules_only
 
+import os
 import logging
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -75,7 +76,10 @@ async def health():
 
 @app.get("/")
 async def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse("index.html", {
+        "request": request,
+        "weight_url": os.environ.get("WEIGHT_URL", ""),
+    })
 
 
 @app.post("/api/sync")
