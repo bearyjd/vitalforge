@@ -1,6 +1,21 @@
 # VitalForge
 
-Personal health metrics platform powered by Garmin Connect. Two services:
+Personal health metrics platform powered by Garmin Connect.
+
+**Built to solve one problem:** stepping on a scale and getting that weight into Garmin Connect should be as fast as tapping your phone on an NFC tag.
+
+### The workflow
+
+1. Step on your scale, read your weight
+2. Tap your phone on an NFC sticker attached to the scale
+3. The VitalForge PWA opens instantly — type the number, hit Log
+4. Weight is pushed to Garmin Connect and saved locally in under a second
+
+No opening apps, no navigating menus, no waiting for Bluetooth sync. Just weigh, tap, done.
+
+From there, VitalForge grew into a full health dashboard that pulls all your Garmin data (sleep, HRV, resting HR, stress, body battery, VO2 max, training load) and surfaces trends and AI-powered recommendations.
+
+### Two services
 
 - **vitalforge-weight** (port 8085) — Mobile-first PWA for quick weight logging to Garmin Connect
 - **vitalforge-dashboard** (port 8086) — Health metrics dashboard with trends and AI-powered recommendations
