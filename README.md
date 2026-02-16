@@ -22,7 +22,7 @@ From there, VitalForge grew into a full health dashboard that pulls all your Gar
 
 ## Quick Start (pre-built images)
 
-Pull and run the latest images from GitHub Container Registry:
+No building required. Pull and run the latest images:
 
 ```bash
 curl -O https://raw.githubusercontent.com/bearyjd/vitalforge/main/docker-compose.prod.yml
@@ -30,6 +30,20 @@ curl -O https://raw.githubusercontent.com/bearyjd/vitalforge/main/.env.example
 cp .env.example .env
 # Edit .env with your Garmin credentials and auth settings
 docker compose -f docker-compose.prod.yml up -d
+```
+
+Images are published to both registries on every push:
+
+| Registry | Weight | Dashboard |
+|---|---|---|
+| **Docker Hub** | `bearyjd/vitalforge-weight` | `bearyjd/vitalforge-dashboard` |
+| **GHCR** | `ghcr.io/bearyjd/vitalforge-weight` | `ghcr.io/bearyjd/vitalforge-dashboard` |
+
+Or pull individually:
+
+```bash
+docker pull bearyjd/vitalforge-weight:latest
+docker pull bearyjd/vitalforge-dashboard:latest
 ```
 
 ## Setup (build from source)
@@ -145,10 +159,10 @@ Cookie-based session auth with a 30-day expiry. Set `VITALFORGE_PASS` in `.env` 
 
 ### Docker images
 
-Images are automatically built and pushed to GHCR on every push to `main`:
+Images are automatically built and pushed to **Docker Hub** and **GHCR** on every push to `main`:
 
-- `ghcr.io/bearyjd/vitalforge-weight:latest`
-- `ghcr.io/bearyjd/vitalforge-dashboard:latest`
+- `bearyjd/vitalforge-weight:latest` / `ghcr.io/bearyjd/vitalforge-weight:latest`
+- `bearyjd/vitalforge-dashboard:latest` / `ghcr.io/bearyjd/vitalforge-dashboard:latest`
 
 Tagged releases (`v1.0.0`) also produce versioned image tags.
 

@@ -1,11 +1,15 @@
-## Production compose file — pulls pre-built images from GHCR
+## Production compose file — pulls pre-built images (no build required)
 ## Usage:
 ##   cp .env.example .env  # edit with your credentials
 ##   docker compose -f docker-compose.prod.yml up -d
+##
+## Images are available from both Docker Hub and GHCR:
+##   Docker Hub: bearyjd/vitalforge-weight, bearyjd/vitalforge-dashboard
+##   GHCR:       ghcr.io/bearyjd/vitalforge-weight, ghcr.io/bearyjd/vitalforge-dashboard
 
 services:
   vitalforge-weight:
-    image: ghcr.io/bearyjd/vitalforge-weight:latest
+    image: bearyjd/vitalforge-weight:latest
     ports:
       - "8085:8085"
     volumes:
@@ -15,7 +19,7 @@ services:
     restart: unless-stopped
 
   vitalforge-dashboard:
-    image: ghcr.io/bearyjd/vitalforge-dashboard:latest
+    image: bearyjd/vitalforge-dashboard:latest
     ports:
       - "8086:8086"
     volumes:
