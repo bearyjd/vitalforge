@@ -1,0 +1,122 @@
+"""Tests for the vitalforge-dashboard service's read-only HTTP API.
+
+Key insight from the roadmap: dashboard read endpoints (`/api/metrics/*`,
+`/api/recommendations/rules-only`, `/api/sync/status`) never call Garmin at
+request time — they only read the local SQLite tables populated by
+`sync.py`. So these tests seed the DB directly and never need the fake
+Garmin client at all.
+"""
+
+from datetime import datetime, timedelta, timezone
+
+import pytest
+from httpx import ASGITransport, AsyncClient
+
+from shared.database import get_db
+
+
+def days_ago(n: int) -> str:
+    """A synthetic date string N days before now, for seeding within the
+    dashboard's default lookback window."""
+    return (datetime.now(timezone.utc) - timedelta(days=n)).strftime("%Y-%m-%d")
+
+
+@pytest.fixture
+async def client(dashboard_app_module):
+    transport = ASGITransport(app=dashboard_app_module.app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+
+
+async def seed_metric(table: str, column: str, rows: list[tuple[str, float]]):
+    """Insert (date, value) rows into a metric table for testing."""
+    db = await get_db()
+    try:
+        for date, value in rows:
+            await db.execute(
+                f"INSERT OR REPLACE INTO [{table}] (date, [{column}]) VALUES (?, ?)",
+                (date, value),
+            )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def test_health(client):
+    resp = await client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok", "service": "vitalforge-dashboard"}
+
+
+async def test_sync_status_never_synced(client):
+    resp = await client.get("/api/sync/status")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["last_sync_time"] is None
+    assert body["last_sync_result"] == "never"
+
+
+@pytest.mark.parametrize(
+    "metric_name,table,column",
+    [
+        ("sleep_duration", "sleep", "duration_seconds"),
+        ("sleep_score", "sleep", "sleep_score"),
+        ("resting_hr", "resting_hr", "value"),
+        ("hrv", "hrv", "last_night_avg"),
+        ("body_battery", "body_battery", "highest"),
+        ("body_battery_low", "body_battery", "lowest"),
+        ("stress", "stress", "avg_level"),
+        ("vo2max", "vo2max", "vo2max_value"),
+        ("weight", "weight_history", "weight_grams"),
+        ("body_fat", "weight_history", "body_fat"),
+        ("training_load", "training_load", "acute_load"),
+        ("steps", "steps", "value"),
+        ("active_calories", "active_calories", "value"),
+    ],
+)
+async def test_get_metric_returns_seeded_data(client, metric_name, table, column):
+    # Synthetic values only — never data from a real fitness.db.
+    await seed_metric(table, column, [(days_ago(2), 10.0), (days_ago(1), 20.0)])
+
+    resp = await client.get(f"/api/metrics/{metric_name}")
+    assert resp.status_code == 200
+    body = resp.json()
+
+    assert body["metric"] == metric_name
+    assert body["count"] == 2
+    assert [d["value"] for d in body["data"]] == [10.0, 20.0]
+    # 7-day moving average of a single point is just that point.
+    assert body["data"][0]["moving_avg_7d"] == 10.0
+    assert body["data"][1]["moving_avg_7d"] == 15.0
+
+
+async def test_get_metric_unknown_name_returns_400(client):
+    resp = await client.get("/api/metrics/not_a_real_metric")
+    assert resp.status_code == 400
+
+
+async def test_get_metric_respects_days_window(client):
+    # Seed one point far outside the default 30-day window.
+    await seed_metric("steps", "value", [(days_ago(365 * 5), 999.0)])
+
+    resp = await client.get("/api/metrics/steps?days=30")
+    assert resp.status_code == 200
+    assert resp.json()["count"] == 0
+
+
+async def test_recommendations_rules_only_empty_db(client):
+    resp = await client.get("/api/recommendations/rules-only")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "findings" in body
+    assert body["count"] == len(body["findings"])
+    assert isinstance(body["findings"], list)
+
+
+async def test_recommendations_rules_only_does_not_call_garmin(client, fake_garmin_client):
+    """Confirms the roadmap's key insight: no Garmin call for a read endpoint."""
+    await seed_metric("resting_hr", "value", [(days_ago(1), 55.0)])
+
+    resp = await client.get("/api/recommendations/rules-only")
+    assert resp.status_code == 200
+    assert fake_garmin_client.pushed_weights == []

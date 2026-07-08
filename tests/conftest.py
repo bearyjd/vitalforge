@@ -1,0 +1,148 @@
+"""Shared pytest fixtures for VitalForge.
+
+Isolates every test from real infrastructure:
+- SQLite DB lives in a per-test tmp_path, never `/app/data/fitness.db`.
+- Garmin Connect is never contacted; `shared.garmin_client` is monkeypatched
+  to a FakeGarminClient returning canned, synthetic responses.
+- `vitalforge-weight` and `vitalforge-dashboard` are hyphenated directory
+  names, so they're loaded via `importlib.import_module` (the same mechanism
+  uvicorn uses for the documented `uvicorn vitalforge-weight.app:app` command)
+  rather than a normal `import` statement.
+"""
+
+import importlib
+import json
+import sys
+from pathlib import Path
+
+import pytest
+import pytest_asyncio
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "garmin"
+
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+
+def load_fixture(name: str):
+    """Load a synthetic Garmin response fixture by file name (no extension)."""
+    with open(FIXTURES_DIR / f"{name}.json") as f:
+        return json.load(f)
+
+
+class FakeGarminClient:
+    """Stand-in for `garminconnect.Garmin`, returning synthetic fixture data.
+
+    Every pull method ignores its date/range arguments and returns the same
+    canned shape — sufficient for exercising the parsing logic in `sync.py`
+    and the app routes without ever touching a real Garmin account.
+    """
+
+    def __init__(self):
+        self.pushed_weights = []
+
+    def add_body_composition(self, timestamp, weight, **kwargs):
+        self.pushed_weights.append({"timestamp": timestamp, "weight": weight})
+        return {"success": True}
+
+    def get_sleep_data(self, date):
+        return load_fixture("sleep_data")
+
+    def get_user_summary(self, date):
+        return load_fixture("user_summary")
+
+    def get_hrv_data(self, date):
+        return load_fixture("hrv_data")
+
+    def get_body_battery(self, date):
+        return load_fixture("body_battery")
+
+    def get_stress_data(self, date):
+        return load_fixture("stress_data")
+
+    def get_max_metrics(self, date):
+        return load_fixture("max_metrics")
+
+    def get_weigh_ins(self, start_date, end_date):
+        return load_fixture("weigh_ins")
+
+    def get_training_status(self, date):
+        return load_fixture("training_status")
+
+
+@pytest.fixture
+def fake_garmin_client(monkeypatch):
+    """Patch `shared.garmin_client` so no real Garmin call can happen.
+
+    Returns the FakeGarminClient instance so tests can assert on pushed data
+    (e.g. `fake_garmin_client.pushed_weights`).
+    """
+    from shared import garmin_client
+
+    fake = FakeGarminClient()
+    monkeypatch.setattr(garmin_client, "_client", fake)
+    monkeypatch.setattr(garmin_client, "authenticate", lambda: None)
+    yield fake
+
+
+@pytest.fixture
+def tmp_db_path(tmp_path, monkeypatch):
+    """Point `shared.database.DB_PATH` at an isolated tmp SQLite file.
+
+    Never touches the real fitness.db. `shared.database.get_db()` re-reads
+    the module-level `DB_PATH` global on every call, so patching it here
+    (even after `shared.database` has already been imported elsewhere)
+    is sufficient to isolate every DB access made during the test.
+    """
+    from shared import database
+
+    db_path = tmp_path / "vf-test.db"
+    monkeypatch.setattr(database, "DB_PATH", db_path)
+    monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setenv("GARTH_TOKEN_DIR", str(tmp_path / "garth"))
+    return db_path
+
+
+@pytest_asyncio.fixture
+async def initialized_db(tmp_db_path):
+    """`tmp_db_path` plus a freshly created (empty) schema."""
+    from shared.database import init_db
+
+    await init_db()
+    return tmp_db_path
+
+
+def import_service_module(dotted_path: str):
+    """Import a module from a hyphenated service directory, e.g.
+
+    `import_service_module("vitalforge-weight.app")`.
+    """
+    return importlib.import_module(dotted_path)
+
+
+@pytest.fixture
+def weight_app_module(initialized_db, fake_garmin_client, monkeypatch):
+    """The `vitalforge-weight` FastAPI app module, Garmin/DB fully faked."""
+    module = import_service_module("vitalforge-weight.app")
+    # `authenticate`/`push_weight` were bound into app.py's namespace via
+    # `from shared.garmin_client import ...`, so patching the shared module
+    # alone doesn't reach them — patch the names the route handlers actually call.
+    monkeypatch.setattr(module, "authenticate", lambda: None)
+
+    def fake_push_weight(weight_grams, timestamp=None):
+        fake_garmin_client.pushed_weights.append(
+            {"weight_grams": weight_grams, "timestamp": timestamp}
+        )
+
+    monkeypatch.setattr(module, "push_weight", fake_push_weight)
+    return module
+
+
+@pytest.fixture
+def dashboard_app_module(initialized_db, fake_garmin_client, monkeypatch):
+    """The `vitalforge-dashboard` FastAPI app module, Garmin/DB fully faked."""
+    module = import_service_module("vitalforge-dashboard.app")
+    # Same direct-import situation as vitalforge-weight/app.py.
+    monkeypatch.setattr(module, "authenticate", lambda: None)
+    return module

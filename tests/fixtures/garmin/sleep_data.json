@@ -1,0 +1,16 @@
+{
+  "dailySleepDTO": {
+    "sleepTimeSeconds": 27000,
+    "deepSleepSeconds": 5400,
+    "lightSleepSeconds": 14400,
+    "remSleepSeconds": 6300,
+    "awakeSleepSeconds": 900,
+    "averageSpO2Value": 96.5,
+    "averageRespirationValue": 14.2,
+    "sleepScores": {
+      "overall": {
+        "value": 78
+      }
+    }
+  }
+}

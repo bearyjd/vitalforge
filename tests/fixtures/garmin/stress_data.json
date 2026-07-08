@@ -1,0 +1,8 @@
+{
+  "avgStressLevel": 28,
+  "maxStressLevel": 87,
+  "restStressDuration": 21600,
+  "lowStressDuration": 32400,
+  "mediumStressDuration": 9000,
+  "highStressDuration": 1800
+}

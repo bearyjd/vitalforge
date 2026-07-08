@@ -1,0 +1,12 @@
+{
+  "dailyWeightSummaries": [
+    {
+      "summaryDate": "2020-06-01",
+      "latestWeight": {
+        "weight": 81200,
+        "bmi": 24.1,
+        "bodyFat": 18.4
+      }
+    }
+  ]
+}

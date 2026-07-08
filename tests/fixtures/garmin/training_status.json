@@ -1,0 +1,17 @@
+{
+  "mostRecentVO2Max": {
+    "generic": {
+      "vo2MaxValue": 46.3,
+      "fitnessAge": 29
+    }
+  },
+  "mostRecentTrainingLoadBalance": {
+    "metricsTrainingLoadBalanceDTOMap": {
+      "fake-device-1": {
+        "monthlyLoadAerobicLow": 120.0,
+        "monthlyLoadAerobicHigh": 80.0,
+        "monthlyLoadAnaerobic": 15.0
+      }
+    }
+  }
+}
