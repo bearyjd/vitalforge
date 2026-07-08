@@ -4,11 +4,7 @@ import hashlib
 import json
 import logging
 import os
-import sys
 import time
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from shared.database import get_db
 
@@ -242,7 +238,7 @@ def run_rules(data: dict) -> list[dict]:
     weight_data = data.get("weight", [])
     if weight_data:
         # No weight data in 7+ days
-        from datetime import datetime, timedelta
+        from datetime import datetime
         last_date = weight_data[-1]["date"]
         days_since = (datetime.now().date() - datetime.strptime(last_date, "%Y-%m-%d").date()).days
         if days_since >= 7:

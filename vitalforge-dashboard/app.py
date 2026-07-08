@@ -1,25 +1,26 @@
 import asyncio
+import logging
+import os
 import sys
-from pathlib import Path
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.requests import Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from fastapi.requests import Request
 
-# Make shared module and sibling modules importable
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# `shared` is installed as a proper package (see pyproject.toml), so only the
+# sibling-module import below still needs a sys.path hack: `sync.py` and
+# `recommendations.py` live next to this file and are imported by bare name.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from recommendations import get_recommendations, get_rules_only
+from sync import run_sync, scheduled_sync
+
+from shared.auth import add_auth_routes
 from shared.database import get_db, init_db
 from shared.garmin_client import authenticate
-from shared.auth import add_auth_routes
-from sync import run_sync, scheduled_sync
-from recommendations import get_recommendations, get_rules_only
-
-import os
-import logging
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)

@@ -7,7 +7,10 @@ WORKDIR /app
 COPY vitalforge-weight/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+COPY pyproject.toml .
 COPY shared/ /app/shared/
+RUN pip install --no-cache-dir -e .
+
 COPY vitalforge-weight/ /app/vitalforge-weight/
 
 RUN mkdir -p /app/data && chown -R vitalforge:vitalforge /app

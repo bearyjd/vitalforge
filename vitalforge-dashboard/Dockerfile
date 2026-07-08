@@ -7,7 +7,10 @@ WORKDIR /app
 COPY vitalforge-dashboard/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+COPY pyproject.toml .
 COPY shared/ /app/shared/
+RUN pip install --no-cache-dir -e .
+
 COPY vitalforge-dashboard/ /app/vitalforge-dashboard/
 
 RUN mkdir -p /app/data && chown -R vitalforge:vitalforge /app

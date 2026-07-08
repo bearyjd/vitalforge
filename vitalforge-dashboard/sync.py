@@ -1,14 +1,10 @@
 import asyncio
 import logging
 import os
-import sys
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from shared.database import get_db
 from shared import garmin_client
+from shared.database import get_db
 
 logger = logging.getLogger(__name__)
 

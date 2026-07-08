@@ -1,14 +1,13 @@
 """Simple cookie-based session auth for VitalForge services."""
 
-import os
 import hmac
-import time
 import logging
-from functools import wraps
+import os
+import time
 
-from fastapi import Request, Response, HTTPException
+from fastapi import HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
-from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
 logger = logging.getLogger(__name__)
 

@@ -4,6 +4,9 @@
 # Python
 *.pyc
 __pycache__/
+.venv*/
+.pytest_cache/
+.ruff_cache/
 
 # Data
 *.db
@@ -19,3 +22,6 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local OMC/Claude session state
+.omc/

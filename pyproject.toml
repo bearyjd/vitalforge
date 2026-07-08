@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vitalforge"
+version = "0.1.0"
+description = "VitalForge personal health metrics platform"
+requires-python = ">=3.12"
+
+[tool.setuptools]
+# `shared/` is the only installable package in this repo; the two
+# `vitalforge-*` service directories are run in place (hyphenated names,
+# not meant to be pip-installed) and stay off sys.path via `pyproject.toml`
+# `pythonpath` for tests / an explicit PYTHONPATH=. at runtime.
+packages = ["shared"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = [
+    "E501",  # line length handled loosely across templated/string-heavy files
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "httpx>=0.27.0",
+    "ruff>=0.8.0",
+]

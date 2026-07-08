@@ -1,23 +1,18 @@
-import sys
+import logging
+import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
+from fastapi.requests import Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from fastapi.requests import Request
 from pydantic import BaseModel
 
-# Make shared module importable
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
+from shared.auth import add_auth_routes
 from shared.database import get_db, init_db
 from shared.garmin_client import authenticate, push_weight
-from shared.auth import add_auth_routes
-
-import os
-import logging
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
