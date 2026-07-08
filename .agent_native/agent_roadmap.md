@@ -1,0 +1,162 @@
+# VitalForge — Agent-Native Roadmap
+
+Goal: an AI agent can take a raw bug report or feature request against this repo and
+autonomously reproduce, implement, test, and verify it, with minimal human input.
+
+Ranked by **Human-Attention-Saved per Unit of Effort** (highest leverage first). Top 5 are
+scoped to be immediately actionable — concrete files, commands, and acceptance criteria.
+
+## 1. Add a pytest suite with a fake Garmin client — DONE
+
+Implemented: `pyproject.toml` (pytest/pytest-asyncio/httpx, `pythonpath = ["."]`,
+`asyncio_mode = "auto"`), `tests/conftest.py` (isolated tmp-path SQLite DB per test via
+`monkeypatch.setattr(shared.database, "DB_PATH", ...)`, `FakeGarminClient` patched onto
+`shared.garmin_client._client`/`authenticate`, plus per-app-module patches for the two
+`vitalforge-*/app.py` files since they import `authenticate`/`push_weight` by name rather
+than via the module), `tests/test_weight_api.py` (9 tests), `tests/test_dashboard_api.py`
+(19 tests incl. all 13 `METRIC_TABLES` keys). `vitalforge-weight` and `vitalforge-dashboard`
+are hyphenated directories, so both are loaded in tests via `importlib.import_module(...)` —
+the same mechanism `uvicorn vitalforge-weight.app:app` relies on.
+
+`.github/workflows/docker.yml` now has a `test` job (installs both requirements files +
+pytest/ruff, runs `ruff check .` then `pytest -q`) that gates `build-and-push` via `needs: test`.
+
+Verified: `pytest` — 28 passed, 0 failed, no Docker/network/Garmin, run from a fresh venv
+against the actual `requirements.txt` files.
+
+**Original rationale, for reference:**
+
+**Why this is #1:** there are zero automated tests, zero lint/type checks, and no CI test
+gate anywhere in the repo (`.github/workflows/docker.yml` only builds/pushes images). Right
+now an agent has no way to confirm a change works other than a human eyeballing `curl` output
+or Docker logs — every change requires a human in the loop to "look at it and say it's fine."
+
+**Effort:** medium (one afternoon). **Attention saved:** every future change, forever.
+
+**Files to add:**
+- `pyproject.toml` (repo root) — minimal, adds `pytest`, `pytest-asyncio`, `httpx` as dev deps,
+  and fixes the `shared/` import hack by declaring `shared` as a package on `sys.path` via
+  `[tool.pytest.ini_options] pythonpath = ["."]`. This also lets item 5 (packaging) piggyback
+  on the same file.
+- `tests/conftest.py` — fixtures that:
+  - set `DB_PATH` and `GARTH_TOKEN_DIR` to a `tmp_path` before importing `shared.database` /
+    `shared.garmin_client` (so tests never touch `/app/data` or a real `.garth` token cache),
+  - monkeypatch `shared.garmin_client.authenticate` to a no-op and `shared.garmin_client._client`
+    to a fake object exposing `add_body_composition`, `get_sleep_data`, `get_user_summary`,
+    `get_hrv_data`, `get_body_battery`, `get_stress_data`, `get_max_metrics`,
+    `get_weigh_ins`, `get_training_status` — each returning canned dicts shaped like real
+    Garmin responses (see item 2 for where those fixtures live).
+- `tests/test_weight_api.py` — `httpx.AsyncClient` against `vitalforge-weight/app.py`'s `app`:
+  POST `/api/weight` with `lbs` and `kg`, assert conversion math and `synced_to_garmin`;
+  GET `/api/weight/recent` and `/api/weight/trend`; DELETE `/api/weight/{id}` including the
+  404 case.
+- `tests/test_dashboard_api.py` — same pattern against `vitalforge-dashboard/app.py`: seed the
+  DB directly (reuse the seed helper from item 2), then hit `/api/metrics/{name}` for each key
+  in `METRIC_TABLES`, `/api/sync/status`, and `/api/recommendations/rules-only`.
+
+**Acceptance criteria:** `pytest` runs from repo root with no Docker, no network, and no real
+Garmin credentials, and exercises both services' full route tables. Add a `test` job to
+`.github/workflows/docker.yml` that runs `pytest` and gates the existing build-and-push job.
+
+## 2. Synthetic Garmin fixtures + a DB seed script — DONE
+
+Implemented: `tests/fixtures/garmin/*.json` (8 files, one per Garmin endpoint shape, all
+hand-built/invented values matching the field names `sync.py` reads — e.g.
+`sleepScores.overall.value`, `hrvSummary.lastNightAvg`, `latestWeight.weight`/`bmi`/`bodyFat`).
+`scripts/seed_db.py` — `python scripts/seed_db.py --days N --db-path PATH [--pattern
+normal|declining-hrv|declining-sleep|overtraining] [--seed N]` — inserts synthetic rows across
+all 10 metric tables (`sleep`, `resting_hr`, `hrv`, `body_battery`, `stress`, `vo2max`,
+`weight_history`, `training_load`, `steps`, `active_calories`) with a configurable linear
+trend, and refuses to write to any path named `fitness.db` or containing `.garth`.
+
+Verified end-to-end (confirms the roadmap's key insight — dashboard reads never touch Garmin):
+seeded a tmp DB with `--pattern overtraining`, then hit the real `vitalforge-dashboard` app
+(via `importlib.import_module` + `httpx.ASGITransport`, zero Garmin) — `/api/metrics/hrv`
+returned all seeded points and `/api/recommendations/rules-only` correctly fired
+`sleep_declining`, `hrv_below_baseline`, `rhr_trending_up` findings. Repeated with
+`--pattern declining-hrv`, confirming `hrv_below_baseline`/`hrv_weekly_drop` fire instead.
+
+**Original rationale, for reference:**
+
+**Why:** bug reports will reference specific data shapes ("my HRV chart is wrong after date
+X", "recommendations don't fire for declining sleep"). Because dashboard read endpoints never
+call Garmin at request time (they only read `shared/database.py`'s tables — confirmed by
+reading `vitalforge-dashboard/app.py`), an agent can reproduce almost any dashboard bug by
+seeding the DB directly, with zero Garmin dependency.
+
+**Effort:** small. **Attention saved:** turns "please share your data so I can debug this"
+into something an agent can self-serve.
+
+**Files to add:**
+- `tests/fixtures/garmin/*.json` — one file per Garmin endpoint shape (`sleep_data.json`,
+  `user_summary.json`, `hrv_data.json`, `body_battery.json`, `stress_data.json`,
+  `max_metrics.json`, `weigh_ins.json`, `training_status.json`), hand-built from the field
+  names `sync.py` actually reads (e.g. `sleepScores.overall.value`, `latestWeight.weight`,
+  `bmi`, `bodyFat` — see `vitalforge-dashboard/sync.py:47-56` and `:206-236`). Use invented
+  numbers only — never copy values from any real `fitness.db` or Garmin export found on disk.
+- `scripts/seed_db.py` — CLI script: `python scripts/seed_db.py --days 90 --db-path /tmp/vf.db`,
+  inserts synthetic rows across all tables in `shared/database.py::init_db` (sleep, resting_hr,
+  hrv, body_battery, stress, vo2max, weight_history, training_load, steps, active_calories)
+  with a configurable trend (e.g. `--pattern declining-hrv`, `--pattern overtraining`) so an
+  agent can reproduce a specific reported pattern and then check whether
+  `recommendations.py::run_rules` fires the corresponding finding.
+
+**Acceptance criteria:** `python scripts/seed_db.py --days 30` followed by starting the
+dashboard against that DB (`DB_PATH=...`) makes every chart and `/api/recommendations/rules-only`
+finding populated and inspectable without Garmin credentials.
+
+## 3. `CLAUDE.md` with verified commands and chokepoints — DONE this session
+
+Written to repo root. Documents: which compose file to use for dev vs. prod, that `shared/` is
+a shared-blast-radius module imported via a `sys.path` hack, that dashboard reads never hit
+Garmin, `DB_PATH`/`GARTH_TOKEN_DIR` overrides for sandboxed runs, the shared-secret cross-service
+cookie design (so an agent doesn't "fix" it), and the fact that no lint/test gate exists yet.
+
+## 4. Extract `shared/` into a real installable package — DONE
+
+Implemented: `pyproject.toml` now has a `[build-system]` (setuptools) and
+`[tool.setuptools] packages = ["shared"]`. Both Dockerfiles now `COPY pyproject.toml . &&
+COPY shared/ /app/shared/ && RUN pip install --no-cache-dir -e .` before copying the service
+directory, instead of a raw `COPY shared/`. Removed the `sys.path.insert(0, .../parent.parent)`
+"make shared importable" hack from all 4 files that had it: `vitalforge-weight/app.py`,
+`vitalforge-dashboard/app.py`, `vitalforge-dashboard/sync.py`,
+`vitalforge-dashboard/recommendations.py` (one more file than the roadmap's original "3 files"
+estimate — `recommendations.py` had the same hack). `vitalforge-dashboard/app.py` keeps its
+*second* `sys.path.insert` (for sibling bare-name imports of `sync`/`recommendations` — a
+separate, unrelated pattern, intentionally left alone).
+
+**Verified (no Docker, per hard rule):** in a fresh venv, `pip install -e .` then `cd /tmp &&
+python -c "import shared.database"` succeeds from an arbitrary cwd with no path hacks. Full
+pytest suite (28 tests) and `ruff check .` both pass afterward. **Not verified:** an actual
+`docker build`/`docker compose up` of the updated Dockerfiles — Docker was off-limits for this
+task, so treat the Dockerfile edits as reviewed-but-unbuilt and sanity-check them (or run
+`docker compose up --build`) before relying on them in production.
+
+## 5. Add ruff + a minimal `pyproject.toml` lint config — DONE
+
+Implemented: `[tool.ruff]` (line-length 120, target py312) and `[tool.ruff.lint]` (select
+E/F/W/I, ignore E501) in `pyproject.toml`. Fixed the small number of genuine findings by hand
+first (removed two truly-unused imports in `shared/auth.py` and one in
+`vitalforge-dashboard/recommendations.py`), then ran `ruff check . --fix` for the remaining
+purely-mechanical import-sort (I001) findings across 5 files. Added as a step in the CI `test`
+job from item 1 (`ruff check .` runs before `pytest`).
+
+**Verified:** `ruff check .` → `All checks passed!` in a fresh venv; full pytest suite still
+green after the import reordering (28 passed).
+
+---
+
+## Other findings (lower priority / informational)
+
+- **No API-level regression fixture for the recommendations engine.** `recommendations.py`'s
+  `run_rules` (530 lines, ~15 distinct pattern checks) has no test coverage of any kind. Once
+  item 1's harness exists, prioritize covering `run_rules` directly (pure function, no I/O)
+  over the LLM path (`get_llm_recommendations`, which should stay mocked/untested against the
+  real Anthropic API in CI).
+- **No screenshot/visual verification path** for either PWA UI (`templates/index.html` in each
+  service, Chart.js dashboard). Out of scope for the top-5 given the API-first surface, but
+  worth a Playwright smoke test later if UI regressions become common.
+- **No DB migration mechanism.** `shared/database.py::init_db` only does
+  `CREATE TABLE IF NOT EXISTS`, so schema changes that alter existing columns have no upgrade
+  path. Not urgent while the schema is additive-only, but flag it if a future task needs to
+  rename/alter a column.
