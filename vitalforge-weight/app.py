@@ -137,13 +137,24 @@ async def post_weight(data: WeightIn):
         # via datetime.now(timezone.utc).isoformat(), so the format is fixed-
         # width and zero-padded, unlike the mismatched-format pitfall
         # /api/weight/trend has). It's 1s wider than the real window so it
-        # can never exclude a row the authoritative julianday() clause below
-        # would accept; that clause is what idx_weight_log_timestamp cannot
-        # use directly (wrapping the column in julianday() makes the index
-        # unusable for range pruning), and what enforces both the lower AND
-        # upper bound of the +-60s window -- an earlier version of this query
-        # only had a lower bound, so a future-dated row (e.g. from clock
-        # skew) would match and silently swallow every later weigh-in.
+        # can never exclude a row the authoritative ABS(julianday()) clause
+        # below would accept; that clause is what idx_weight_log_timestamp
+        # cannot use directly (wrapping the column in julianday() makes the
+        # index unusable for range pruning).
+        #
+        # The authoritative window is symmetric (+-60s around this request's
+        # own `now`), not one-sided ending exactly at `now` -- an earlier
+        # version bounded it as [now-60s, now], which (2026-08-22) turned out
+        # to silently defeat dedup for genuinely-concurrent requests: two
+        # requests each capture their own `now` microseconds apart, and
+        # whichever captured the earlier `now` would run a query whose upper
+        # bound excluded the other's already-committed row, since that row's
+        # timestamp was technically "after" its own `now` snapshot -- both
+        # would then see no duplicate and both would insert (see
+        # tests/test_dedup_concurrency.py's repro in the same commit). A
+        # symmetric window fixes that while still rejecting the case it was
+        # originally added for -- a wildly clock-skewed poison row (e.g.
+        # minutes or years off) is still far outside +-60s either direction.
         sargable_cutoff = (now - timedelta(seconds=DEDUP_WINDOW_SECONDS + 1)).isoformat()
         cursor = await db.execute(
             "SELECT id, weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin, "
@@ -151,16 +162,14 @@ async def post_weight(data: WeightIn):
             "FROM weight_log "
             "WHERE timestamp >= ? "
             "AND ABS(weight_grams - ?) <= ? "
-            "AND julianday(timestamp) >= julianday(?, ?) "
-            "AND julianday(timestamp) <= julianday(?) "
+            "AND ABS(julianday(timestamp) - julianday(?)) <= ? / 86400.0 "
             "ORDER BY timestamp DESC LIMIT 1",
             (
                 sargable_cutoff,
                 weight_grams,
                 DEDUP_WEIGHT_TOLERANCE_GRAMS,
                 timestamp,
-                f"-{DEDUP_WINDOW_SECONDS} seconds",
-                timestamp,
+                DEDUP_WINDOW_SECONDS,
             ),
         )
         existing = await cursor.fetchone()
