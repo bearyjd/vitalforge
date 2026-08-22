@@ -13,13 +13,16 @@ Isolates every test from real infrastructure:
 import importlib
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import aiosqlite
 import pytest
 import pytest_asyncio
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "garmin"
+PRODUCTION_SCHEMA_SQL = Path(__file__).resolve().parent / "fixtures" / "production_schema.sql"
 
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -101,6 +104,56 @@ def tmp_db_path(tmp_path, monkeypatch):
     monkeypatch.setattr(database, "DB_PATH", db_path)
     monkeypatch.setenv("DB_PATH", str(db_path))
     monkeypatch.setenv("GARTH_TOKEN_DIR", str(tmp_path / "garth"))
+    return db_path
+
+
+@pytest_asyncio.fixture
+async def production_schema_db(tmp_path, monkeypatch):
+    """A tmp DB loaded from the real production schema dump, pre-migration,
+    seeded to production's actual row counts for the two tables Track B
+    touches (`weight_log`=17, `weight_history`=34 -- see
+    tests/fixtures/production_schema.sql). Never touches the real fitness.db.
+
+    The dump's `CREATE TABLE sqlite_sequence` statement is filtered out --
+    SQLite refuses to create that table directly (it's reserved, recreated
+    automatically from `weight_log`'s AUTOINCREMENT) -- see
+    docs/prp/01-plan.md SS4.1.
+    """
+    from shared import database
+
+    db_path = tmp_path / "production-schema.db"
+    monkeypatch.setattr(database, "DB_PATH", db_path)
+    monkeypatch.setenv("DB_PATH", str(db_path))
+
+    statements = [
+        stmt.strip()
+        for stmt in PRODUCTION_SCHEMA_SQL.read_text().split(";")
+        if stmt.strip() and "sqlite_sequence" not in stmt
+    ]
+
+    db = await aiosqlite.connect(str(db_path))
+    try:
+        for stmt in statements:
+            await db.execute(stmt)
+
+        now = datetime.now(timezone.utc)
+        for i in range(17):
+            ts = (now - timedelta(minutes=i)).isoformat()
+            await db.execute(
+                "INSERT INTO weight_log (weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin) "
+                "VALUES (?, ?, ?, ?, 1)",
+                (180.0 + i, 81.6 + i * 0.1, 81600 + i * 100, ts),
+            )
+        for i in range(34):
+            date = (now - timedelta(days=i)).strftime("%Y-%m-%d")
+            await db.execute(
+                "INSERT INTO weight_history (date, weight_grams, bmi, body_fat) VALUES (?, ?, ?, ?)",
+                (date, 81600 + i * 50, 24.0, 18.0),
+            )
+        await db.commit()
+    finally:
+        await db.close()
+
     return db_path
 
 
