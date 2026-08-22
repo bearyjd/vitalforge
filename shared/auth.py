@@ -14,10 +14,22 @@ logger = logging.getLogger(__name__)
 _SECRET = os.environ.get("VITALFORGE_SECRET", "default-dev-secret")
 _USER = os.environ.get("VITALFORGE_USER", "admin")
 _PASS = os.environ.get("VITALFORGE_PASS", "")
+_API_TOKEN = os.environ.get("VITALFORGE_API_TOKEN", "").strip()
 _COOKIE_NAME = "vf_session"
 _MAX_AGE = 30 * 24 * 3600  # 30 days
 
 _serializer = URLSafeTimedSerializer(_SECRET)
+
+
+def _warn_if_misconfigured():
+    if _API_TOKEN and not _PASS:
+        logger.warning(
+            "VITALFORGE_API_TOKEN is set but VITALFORGE_PASS is empty — "
+            "auth is DISABLED and the token is inert. Set VITALFORGE_PASS to enable auth."
+        )
+
+
+_warn_if_misconfigured()
 
 
 def _is_auth_configured() -> bool:
@@ -53,7 +65,29 @@ def require_auth(request: Request) -> str:
 
 
 def check_credentials(username: str, password: str) -> bool:
-    return hmac.compare_digest(username, _USER) and hmac.compare_digest(password, _PASS)
+    return hmac.compare_digest(username.encode("utf-8"), _USER.encode("utf-8")) and hmac.compare_digest(
+        password.encode("utf-8"), _PASS.encode("utf-8")
+    )
+
+
+def _bearer_token_valid(request: Request) -> bool:
+    """Constant-time check of the `Authorization: Bearer <token>` header.
+
+    Two independent empty-value guards (no configured token, no presented
+    value) because `hmac.compare_digest("", "")` is `True`. Compares bytes,
+    not str, so a non-ASCII token returns `False` instead of raising
+    `TypeError` (the same bug `check_credentials` had).
+    """
+    if not _API_TOKEN:
+        return False
+    header = request.headers.get("authorization", "")
+    scheme, _, value = header.partition(" ")
+    if scheme.lower() != "bearer":
+        return False
+    value = value.strip()
+    if not value:
+        return False
+    return hmac.compare_digest(value.encode("utf-8"), _API_TOKEN.encode("utf-8"))
 
 
 LOGIN_PAGE_HTML = """<!DOCTYPE html>
