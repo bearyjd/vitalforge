@@ -13,38 +13,30 @@ _client: Garmin | None = None
 
 
 def authenticate():
-    """Authenticate with Garmin Connect using garminconnect.
-
-    Attempts to load saved tokens first. If that fails, performs a fresh
-    login with credentials from environment variables and persists the
-    new tokens.
-    """
+    """Authenticate with Garmin Connect using garminconnect."""
     global _client
 
     GARTH_TOKEN_DIR.mkdir(parents=True, exist_ok=True)
     token_path = str(GARTH_TOKEN_DIR)
 
-    # Try resuming from saved tokens first
-    try:
-        client = Garmin()
-        client.login(tokenstore=token_path)
-        logger.info("Resumed Garmin session from saved tokens")
-        _client = client
-        # Re-save tokens to keep them fresh
-        _client.garth.dump(token_path)
-        return
-    except Exception:
-        pass
-
-    # Fresh login with credentials
+    # garminconnect>=0.3 dropped the `garth` library it used to wrap -- there
+    # is no `.garth` attribute anymore, and login(tokenstore=path) now
+    # resumes from saved tokens AND persists fresh ones internally in one
+    # call (falling back to self.username/self.password when nothing valid
+    # is on disk). The 2026-08-22 upgrade to ==0.3.11 (for
+    # add_body_composition) kept the old separate resume/`.garth.dump()`
+    # code here, which silently broke resume on every request and forced a
+    # real credential login every time, triggering a Garmin 429 (see
+    # docs/prp/03-live-validation.md's "2026-08-22 incident" section).
+    # tests/test_garmin_client_api.py guards this API surface -- re-run it
+    # (and read this function against the new source) before ever bumping
+    # this pin again.
     email = os.environ["GARMIN_EMAIL"]
     password = os.environ["GARMIN_PASSWORD"]
-    logger.info("Performing fresh Garmin login for %s", email)
     client = Garmin(email=email, password=password)
-    client.login()
-    client.garth.dump(token_path)
-    logger.info("Garmin tokens saved to %s", GARTH_TOKEN_DIR)
+    client.login(tokenstore=token_path)
     _client = client
+    logger.info("Garmin authenticated; tokens persisted to %s", GARTH_TOKEN_DIR)
 
 
 def get_client() -> Garmin:

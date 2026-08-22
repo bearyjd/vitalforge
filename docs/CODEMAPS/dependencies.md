@@ -1,4 +1,4 @@
-<!-- Generated: 2026-08-22 | Files scanned: 22 | Token estimate: ~600 -->
+<!-- Generated: 2026-08-22 | Files scanned: 24 | Token estimate: ~620 -->
 # Dependencies
 
 ## External services
@@ -31,7 +31,8 @@ directory (see `backend.md`).
 
 - `fastapi`, `uvicorn` — web framework/server (both services)
 - `aiosqlite` — async SQLite driver
-- `garminconnect` — Garmin Connect client (garth-based OAuth)
+- `garminconnect` — Garmin Connect client (garth-based OAuth); pinned `==0.3.11` (was
+  `>=0.2.38`) for `add_body_composition` support
 - `itsdangerous` — signed session cookies
 - `jinja2` — server-rendered templates
 - `anthropic` — optional LLM layer (dashboard only)

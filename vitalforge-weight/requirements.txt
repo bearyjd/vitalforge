@@ -2,6 +2,11 @@ fastapi==0.115.6
 uvicorn[standard]==0.34.0
 jinja2==3.1.5
 aiosqlite==0.21.0
+# Exact-pinned deliberately: 0.2.38->0.3.11 was a breaking rewrite (dropped
+# `garth`, changed the auth/token-persistence API) that broke shared/
+# garmin_client.py silently until 2026-08-22 -- see that file's authenticate()
+# and tests/test_garmin_client_api.py. Before bumping this again, re-read
+# authenticate() against the new version's source, not just the changelog.
 garminconnect==0.3.11
 python-multipart==0.0.20
 itsdangerous>=2.1.0

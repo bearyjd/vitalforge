@@ -1,4 +1,4 @@
-<!-- Generated: 2026-08-22 | Files scanned: 22 | Token estimate: ~550 -->
+<!-- Generated: 2026-08-22 | Files scanned: 24 | Token estimate: ~570 -->
 # Frontend
 
 No build step, no JS package manager. Each service is a single server-rendered Jinja2
@@ -11,7 +11,9 @@ the jsDelivr CDN. Each service is also an installable PWA (manifest + service wo
 vitalforge-weight/templates/index.html        (440 lines, single page)
   nav: "Weight" (active, only link)
   input-group: numeric weight input + lbs/kg unit-toggle buttons
-  submit-btn -> POST /api/weight
+  submit-btn -> POST /api/weight (sends `source: "pwa"`; no composition inputs in the
+                form yet — those fields are API-only so far, populated by non-PWA
+                clients like the Bascule Android app)
   recent-list  <- GET /api/weight/recent
   trend-section (canvas#trendChart, Chart.js) <- GET /api/weight/trend
   toast (transient success/error message)

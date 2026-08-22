@@ -1,9 +1,11 @@
 # 03 — Live validation: the B3 checkpoint
 
-**Status: not yet run.** This is the one step in the whole Track A/B effort
-that can't be faked or automated — it needs a real scale reading pushed
-through the real code to a real Garmin account. Everything below is
-prepared; nothing has been executed yet.
+**Status: root cause found and fixed (2026-08-22), re-verification pending.**
+Step 0 (deploy) and step 1 (local push) are done. Steps 2–4 (Garmin-side
+confirmation) hit a real bug — not just Garmin rate-limiting — now fixed in
+`shared/garmin_client.py`. See "2026-08-22 incident: root cause and fix"
+below. Re-run the checkpoint once deployed and enough time has passed for
+Garmin's rate limit to clear.
 
 **What's blocked on this:** B5 (dashboard exposure of composition data) and
 B6 (final docs pass). Both are otherwise ready to implement the moment this
@@ -116,6 +118,106 @@ locally, do not re-push" — not free (see that section's cost note before
 deciding to switch to it).
 
 ---
+
+## 2026-08-22 attempt
+
+Deployed latest images to `knowledge` (step 0 — `docker compose pull && up
+-d`, both services healthy, migration confirmed applied to `weight_log`).
+
+Pushed a real weigh-in via `curl` (session-cookie auth, since
+`VITALFORGE_API_TOKEN` isn't set in production — only `VITALFORGE_PASS` is
+configured, so the Bascule bearer-token path is untested by this):
+
+```
+weight: 200.4 lbs, body_fat_pct: 19.9, body_water_pct: 54.4,
+muscle_pct: 40.7, bone_mass_kg: 3.72 (converted from 8.2 lbs)
+```
+
+Response: `"success": true"`, all fields echoed back correctly,
+**`"synced_to_garmin": false"`, `"garmin_error": "'Garmin' object has no
+attribute 'garth'"`.
+
+**Root cause (from container logs, present since container startup at
+19:10:51 — not caused by this push):** Garmin Connect is rate-limiting
+login (`429 GarminConnectTooManyRequestsError: IP rate limited by Garmin`)
+from this host's IP. The resume-from-saved-token path
+(`shared/garmin_client.py:authenticate()`) is also failing — silently,
+since it's wrapped in a bare `except Exception: pass` with no logging — so
+every request falls through to a fresh login, which then hits the 429.
+Saved `oauth1_token.json`/`oauth2_token.json` exist (~18:15 today) but
+whatever's wrong with resuming them can't be diagnosed without adding
+logging to that except block.
+
+**Local write is a legitimate proof point on its own:** the composition
+DTO validation, mapping, and persistence (B2/B3's actual scope) worked
+correctly end-to-end — the failure is entirely in the pre-existing Garmin
+auth layer, not in anything Track A/B added.
+
+**Decision: wait for the rate limit to clear, then retry.** Stopped making
+further Garmin calls to avoid extending the lockout. Next attempt should
+be a single push, not a retry loop.
+
+**Open question for whoever retries:** what to do with this local-only row
+(has real composition data, `synced_to_garmin: false`, never reached
+Garmin) — leave it, or delete via `DELETE /api/weight/{id}` and re-push
+once auth is restored, to avoid an orphaned local-only entry alongside the
+eventually-synced one.
+
+## 2026-08-22 incident: root cause and fix
+
+The `garmin_error: "'Garmin' object has no attribute 'garth'"` from the
+attempt above turned out not to be Garmin-side rate limiting as the primary
+cause — that was a downstream symptom. Root cause, confirmed by reading the
+actually-installed `garminconnect` package source (not just its changelog):
+
+**What changed:** Commit `49fa674` (this session, part of B3) bumped
+`garminconnect` from `>=0.2.38` to `==0.3.11` for `add_body_composition`
+support. Between those versions, upstream (`cyberjunky/python-garminconnect`)
+rewrote the client to drop its dependency on the external `garth` OAuth
+library entirely — a built-in 5-strategy login chain
+(mobile+cffi/mobile+requests/widget+cffi/portal+cffi/portal+requests)
+and a new native token format (single `garmin_tokens.json` holding
+`di_token`/`di_refresh_token`/`di_client_id`) replaced it. Zero references
+to `garth` remain anywhere in 0.3.11's source.
+
+**Why it broke silently:** `shared/garmin_client.py::authenticate()` still
+assumed the old API:
+- Resume: `client.login(tokenstore=token_path)` — the old garth-era pattern
+  expected two files (`oauth1_token.json`/`oauth2_token.json`); 0.3.11
+  expects one (`garmin_tokens.json`). That file never existed, so resume
+  raised `FileNotFoundError` -> `GarminConnectConnectionError` on every call.
+- Persistence: `.garth.dump(token_path)` — `.garth` doesn't exist on 0.3.11's
+  `Garmin` at all; this is exactly the `AttributeError` in the logs.
+- Both were swallowed by a bare `except Exception: pass`, so every request
+  silently fell through to a **full fresh username/password login** instead
+  of resuming a session — something the old garth-based flow essentially
+  never needed after initial setup. Garmin's 429 was its own defense against
+  that repeated real-credential-login traffic; we'd never triggered it
+  before because resume used to actually work.
+- Side effect: this is the same shared module both services import, so the
+  dashboard's scheduled sync (sleep/HRV/RHR/stress/steps/etc., every 2h) was
+  very likely broken the same way, not just this weight-composition path.
+
+**Fix:** `Garmin(email=, password=).login(tokenstore=path)` in 0.3.11
+already does resume-with-credential-fallback *and* persists tokens
+internally in one call — the old two-block "try resume, except: fresh
+login, then `.garth.dump()`" structure was both broken and unnecessary.
+`authenticate()` is now a single straight-line call to that API. See the
+function's own comment for the same summary, and
+`tests/test_garmin_client_api.py` — a new regression test that imports the
+*real* `garminconnect.Garmin` class (no network I/O; every other test in
+this suite fakes Garmin entirely, which is why nothing caught this) and
+asserts the exact call shape `authenticate()` depends on. Both
+`requirements.txt` pins now carry a comment pointing back here for the next
+version bump.
+
+**Not yet done:** the stale `oauth1_token.json`/`oauth2_token.json` files on
+the production host (`knowledge`, `/app/data/.garth/`) are orphaned —
+0.3.11 doesn't read them (wrong filename) and they're harmless to leave, but
+worth deleting next time that host is touched. The fix itself hasn't been
+deployed/re-verified against live Garmin yet, deliberately — deploying it
+means one more real login attempt, which should wait for the 429 to clear
+rather than risk extending it.
 
 ## Next steps once this file has real answers
 

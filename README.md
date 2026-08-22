@@ -110,7 +110,7 @@ python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 vitalforge/
 ├── shared/                    # Shared Python modules
-│   ├── auth.py                # Cookie-based session authentication
+│   ├── auth.py                # Cookie-session + bearer-token authentication
 │   ├── database.py            # SQLite connection and schema setup
 │   └── garmin_client.py       # Garmin Connect API wrapper (garminconnect)
 ├── vitalforge-weight/         # Weight logging PWA service
@@ -288,10 +288,48 @@ If you don't use Tasker, the free "NFC Tools" app can open a URL on tap:
 |---|---|---|
 | `GET` | `/health` | Health check |
 | `GET` | `/` | Weight entry UI |
-| `POST` | `/api/weight` | Log weight (`{"weight": 185.4, "unit": "lbs"}`) |
+| `POST` | `/api/weight` | Log weight and optional body composition (see below) |
 | `GET` | `/api/weight/recent` | Last 10 weigh-ins |
 | `GET` | `/api/weight/trend` | Last 30 days for trend chart |
 | `DELETE` | `/api/weight/{id}` | Delete a weigh-in |
+
+**Body composition.** All composition fields are optional and independent of each other:
+
+```json
+{
+  "weight": 185.4,
+  "unit": "lbs",
+  "body_fat_pct": 19.9,
+  "body_water_pct": 54.4,
+  "muscle_pct": 40.7,
+  "bone_mass_kg": 3.72,
+  "source": "pwa"
+}
+```
+
+| Field | Required | Range | Notes |
+|---|---|---|---|
+| `weight` | Yes | 2–500 kg after unit conversion | |
+| `unit` | No | `lbs` or `kg` | defaults to `lbs` |
+| `body_fat_pct` | No | 3–75 | |
+| `body_water_pct` | No | 30–80 | |
+| `muscle_pct` | No | 10–90 | converted to a mass before being pushed to Garmin |
+| `bone_mass_kg` | No | 0.5–10 | |
+| `source` | No | `pwa`, `bascule`, `bridge`, or `tasker` | free-text tag, not tied to a specific credential |
+
+Every field pushed to Garmin is best-effort — the local write always succeeds
+independently of Garmin's response. `synced_to_garmin` reports whether the Garmin push
+worked; `garmin_error` is present when it didn't.
+
+**Deduplication.** A POST within 60 seconds and 50g of an existing entry is treated as
+the same weigh-in rather than a new one:
+
+- No new composition data → the existing row is returned unchanged
+  (`"deduplicated": true`).
+- New composition fields the existing row doesn't have yet → those fields are added to
+  the existing row and re-pushed to Garmin (`"deduplicated": true, "enriched": true`).
+- A field present on both sides with a different value → the original value is kept and
+  `"conflict": true` is returned; check server logs for which field(s) conflicted.
 
 ### Dashboard Service (port 8086)
 

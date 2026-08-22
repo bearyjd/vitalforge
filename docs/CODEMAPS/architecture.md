@@ -1,4 +1,4 @@
-<!-- Generated: 2026-08-22 | Files scanned: 22 | Token estimate: ~750 -->
+<!-- Generated: 2026-08-22 | Files scanned: 24 | Token estimate: ~800 -->
 # Architecture
 
 Two independent FastAPI microservices sharing one Python package (`shared/`) and one
@@ -26,9 +26,12 @@ vitalforge-weight (:8085)          vitalforge-dashboard (:8086)
 
 ## Data flow
 
-- **Weight entry**: browser -> `POST /api/weight` (weight svc) -> push to Garmin
-  (`garmin_client.push_weight`) -> insert into `weight_log` table. Garmin push failure
-  is caught and reported as `garmin_error`; the local DB write still happens.
+- **Weight entry**: client -> `POST /api/weight` (weight svc) -> atomic dedup check
+  (+-60s / +-50g window against `weight_log`; a match enriches the existing row instead of
+  inserting) -> commit -> push weight + body composition (`body_fat_pct`/`body_water_pct`/
+  `muscle_pct`/`bone_mass_kg`) to Garmin via `garmin_client.push_weight`
+  (`add_body_composition`). Garmin push failure is caught and reported as `garmin_error`;
+  the local DB write always happens first and is never rolled back for a Garmin failure.
 - **Dashboard sync**: `POST /api/sync` (dashboard svc) or the background
   `scheduled_sync()` loop -> pulls sleep/HRV/RHR/stress/body-battery/VO2/training-load/
   steps/calories/weight-history from Garmin -> upserts into 9 per-metric tables.
@@ -50,7 +53,10 @@ vitalforge-weight (:8085)          vitalforge-dashboard (:8086)
   entirely through the shared SQLite file and the shared session-cookie secret.
 - Auth (`shared/auth.py`) is a FastAPI HTTP middleware applied identically in both apps'
   `add_auth_routes(app)` call — same cookie name (`vf_session`), same HMAC secret
-  (`VITALFORGE_SECRET`), so one login covers both services behind the same domain.
+  (`VITALFORGE_SECRET`), so one login covers both services behind the same domain. `/api/*`
+  additionally accepts a `Authorization: Bearer <VITALFORGE_API_TOKEN>` header (checked
+  before the cookie) — the machine-client path for the parallel Bascule Android app, which
+  only ever POSTs `/api/weight` and doesn't hold a browser session.
 
 ## Deployment
 
