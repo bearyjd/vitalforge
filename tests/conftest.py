@@ -46,7 +46,7 @@ class FakeGarminClient:
         self.pushed_weights = []
 
     def add_body_composition(self, timestamp, weight, **kwargs):
-        self.pushed_weights.append({"timestamp": timestamp, "weight": weight})
+        self.pushed_weights.append({"timestamp": timestamp, "weight": weight, **kwargs})
         return {"success": True}
 
     def get_sleep_data(self, date):
@@ -183,9 +183,9 @@ def weight_app_module(initialized_db, fake_garmin_client, monkeypatch):
     # alone doesn't reach them — patch the names the route handlers actually call.
     monkeypatch.setattr(module, "authenticate", lambda: None)
 
-    def fake_push_weight(weight_grams, timestamp=None):
+    def fake_push_weight(weight_grams, timestamp=None, **kwargs):
         fake_garmin_client.pushed_weights.append(
-            {"weight_grams": weight_grams, "timestamp": timestamp}
+            {"weight_grams": weight_grams, "timestamp": timestamp, **kwargs}
         )
 
     monkeypatch.setattr(module, "push_weight", fake_push_weight)
@@ -217,8 +217,8 @@ def weight_live_server(tmp_db_path, fake_garmin_client, monkeypatch):
     module = import_service_module("vitalforge-weight.app")
     monkeypatch.setattr(module, "authenticate", lambda: None)
 
-    def fake_push_weight(weight_grams, timestamp=None):
-        fake_garmin_client.pushed_weights.append({"weight_grams": weight_grams, "timestamp": timestamp})
+    def fake_push_weight(weight_grams, timestamp=None, **kwargs):
+        fake_garmin_client.pushed_weights.append({"weight_grams": weight_grams, "timestamp": timestamp, **kwargs})
 
     monkeypatch.setattr(module, "push_weight", fake_push_weight)
 
