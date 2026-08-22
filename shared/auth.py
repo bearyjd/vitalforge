@@ -6,7 +6,7 @@ import os
 import time
 
 from fastapi import HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
 logger = logging.getLogger(__name__)
@@ -51,6 +51,8 @@ def validate_session(cookie: str) -> str | None:
 def get_current_user(request: Request) -> str | None:
     if not _is_auth_configured():
         return "anonymous"
+    if _bearer_token_valid(request):
+        return "api-token"
     cookie = request.cookies.get(_COOKIE_NAME)
     if not cookie:
         return None
@@ -172,7 +174,6 @@ LOGIN_PAGE_HTML = """<!DOCTYPE html>
 
 def add_auth_routes(app):
     """Add login/logout routes to a FastAPI app."""
-    from fastapi.responses import JSONResponse
 
     @app.get("/auth/login")
     async def login_page(request: Request):
@@ -211,7 +212,11 @@ def add_auth_routes(app):
         user = get_current_user(request)
         if user is None:
             if path.startswith("/api/"):
-                raise HTTPException(status_code=401, detail="Not authenticated")
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Not authenticated"},
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
             return RedirectResponse("/auth/login", status_code=302)
 
         return await call_next(request)
