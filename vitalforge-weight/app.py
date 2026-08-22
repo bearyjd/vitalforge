@@ -98,11 +98,20 @@ async def post_weight(data: WeightIn):
     now = datetime.now(timezone.utc)
     timestamp = now.isoformat()
 
+    muscle_mass_kg = weight_kg * data.muscle_pct / 100 if data.muscle_pct is not None else None
+
     # Push to Garmin Connect
     garmin_error = None
     try:
         authenticate()
-        push_weight(weight_grams, now)
+        push_weight(
+            weight_grams,
+            now,
+            percent_fat=data.body_fat_pct,
+            percent_hydration=data.body_water_pct,
+            muscle_mass_kg=muscle_mass_kg,
+            bone_mass_kg=data.bone_mass_kg,
+        )
         synced = 1
     except Exception as e:
         logger.error("Failed to push weight to Garmin: %s", e)
