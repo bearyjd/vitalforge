@@ -146,3 +146,47 @@ async def test_concurrent_writer_not_blocked_by_garmin_push(client, weight_app_m
         f"writer took {write_duration['seconds']:.2f}s -- looks like it waited for the push, "
         "meaning the write lock is still held during the Garmin call"
     )
+
+
+async def test_concurrent_writer_not_blocked_by_enrichment_push(client, weight_app_module, monkeypatch):
+    """Same property as above, for the enrichment branch specifically -- it's
+    a separate code path (a different `if` arm calling _push_composition at
+    the same nesting level), not exercised by the insert-path test."""
+    await seed_row(84096, seconds_ago=5)
+
+    push_started = threading.Event()
+
+    def slow_push(weight_grams, timestamp=None, **kwargs):
+        push_started.set()
+        time.sleep(1.0)
+
+    monkeypatch.setattr(weight_app_module, "push_weight", slow_push)
+
+    db_path = str(database.DB_PATH)
+    writer_succeeded = threading.Event()
+    write_duration = {}
+
+    def concurrent_writer():
+        assert push_started.wait(timeout=5), "push never started"
+        start = time.monotonic()
+        conn = sqlite3.connect(db_path, timeout=2)
+        try:
+            conn.execute("INSERT OR REPLACE INTO steps (date, value) VALUES (?, ?)", ("2026-01-01", 9000))
+            conn.commit()
+        finally:
+            conn.close()
+        write_duration["seconds"] = time.monotonic() - start
+        writer_succeeded.set()
+
+    writer_thread = threading.Thread(target=concurrent_writer)
+    writer_thread.start()
+
+    resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs", "body_fat_pct": 18.4})
+    assert resp.status_code == 200
+    assert resp.json()["enriched"] is True
+
+    writer_thread.join(timeout=5)
+    assert writer_succeeded.is_set(), "concurrent writer was blocked by the in-flight enrichment push"
+    assert write_duration["seconds"] < 0.5, (
+        f"writer took {write_duration['seconds']:.2f}s -- the enrichment push path holds the lock too"
+    )

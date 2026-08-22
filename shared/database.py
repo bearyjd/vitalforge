@@ -175,7 +175,10 @@ async def init_db():
         """)
 
         # Additive: the dedup lookup (docs/prp/00-design.md SS3.7) filters
-        # weight_log by timestamp on every POST.
+        # weight_log by timestamp on every POST. The query uses a sargable
+        # `timestamp >= ?` prefilter alongside the authoritative julianday()
+        # bounds specifically so this index can prune the scan -- wrapping
+        # the column in julianday() directly is not index-friendly.
         await db.execute("CREATE INDEX IF NOT EXISTS idx_weight_log_timestamp ON weight_log(timestamp)")
 
         await db.commit()

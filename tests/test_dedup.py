@@ -7,6 +7,7 @@ direct SQL, then POST "now". The window is evaluated against the request's
 own receipt time, so controlling only the stored row is sufficient.
 """
 
+import logging
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -60,6 +61,14 @@ async def seed_row(
         await db.close()
 
 
+async def row_count() -> int:
+    db = await get_db()
+    try:
+        return (await (await db.execute("SELECT COUNT(*) FROM weight_log")).fetchone())[0]
+    finally:
+        await db.close()
+
+
 async def test_duplicate_within_window_returns_deduplicated_true(client):
     row_id, ts = await seed_row(84096, seconds_ago=5)
     resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs"})
@@ -101,6 +110,7 @@ async def test_dedup_tolerance_51g_creates_second_row(client):
     resp = await client.post("/api/weight", json={"weight": (84096 + 51) / 1000, "unit": "kg"})
     body = resp.json()
     assert "deduplicated" not in body or body["deduplicated"] is not True
+    assert await row_count() == 2
 
 
 async def test_dedup_ignores_source(client):
@@ -117,6 +127,35 @@ async def test_weighins_600s_apart_both_stored(client):
     body = resp.json()
     assert "deduplicated" not in body or body["deduplicated"] is not True
     assert body["success"] is True
+    assert await row_count() == 2
+
+
+async def test_dedup_window_58s_collapses(client):
+    """A few seconds of margin inside the 60s edge, since real wall-clock
+    time elapses between seeding and the POST landing."""
+    await seed_row(84096, seconds_ago=58)
+    resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs"})
+    assert resp.json()["deduplicated"] is True
+
+
+async def test_dedup_window_62s_does_not_collapse(client):
+    await seed_row(84096, seconds_ago=62)
+    resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs"})
+    body = resp.json()
+    assert "deduplicated" not in body or body["deduplicated"] is not True
+    assert await row_count() == 2
+
+
+async def test_future_dated_row_does_not_swallow_real_weighin(client):
+    """Regression for the missing-upper-bound bug: a row timestamped in the
+    future (e.g. from clock skew) must not match every later request and
+    silently discard real weigh-ins forever."""
+    await seed_row(84096, seconds_ago=-3600)  # one hour in the future
+    resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "deduplicated" not in body or body["deduplicated"] is not True
+    assert await row_count() == 2
 
 
 async def test_enrichment_updates_null_columns_and_repushes(client, fake_garmin_client):
@@ -161,12 +200,14 @@ async def test_enrichment_push_failure_sets_synced_to_garmin_zero(client, weight
 
 async def test_conflicting_value_does_not_overwrite_and_flags_conflict(client, fake_garmin_client, caplog):
     row_id, ts = await seed_row(84096, seconds_ago=5, body_fat_pct=18.4)
-    resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs", "body_fat_pct": 20.0})
+    with caplog.at_level(logging.WARNING):
+        resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs", "body_fat_pct": 20.0})
     assert resp.status_code == 200
     body = resp.json()
     assert body["deduplicated"] is True
     assert body["conflict"] is True
     assert len(fake_garmin_client.pushed_weights) == 0
+    assert "body_fat_pct" in caplog.text
 
     db = await get_db()
     try:
@@ -174,3 +215,34 @@ async def test_conflicting_value_does_not_overwrite_and_flags_conflict(client, f
     finally:
         await db.close()
     assert row["body_fat_pct"] == 18.4
+
+
+async def test_enrichment_with_partial_conflict_updates_only_null_columns(client, fake_garmin_client):
+    """A request can enrich some fields and conflict on others in the same
+    POST -- each field is classified independently, not the request as a
+    whole. The stored value wins on the conflicting field; the null field
+    gets enriched; the re-push carries the final (post-merge) row."""
+    row_id, ts = await seed_row(84096, seconds_ago=5, body_fat_pct=18.4, bone_mass_kg=None)
+    resp = await client.post(
+        "/api/weight",
+        json={"weight": 185.4, "unit": "lbs", "body_fat_pct": 20.0, "bone_mass_kg": 3.2},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["deduplicated"] is True
+    assert body["enriched"] is True
+    assert body["conflict"] is True
+
+    db = await get_db()
+    try:
+        row = await (
+            await db.execute("SELECT body_fat_pct, bone_mass_kg FROM weight_log WHERE id = ?", (row_id,))
+        ).fetchone()
+    finally:
+        await db.close()
+    assert row["body_fat_pct"] == 18.4  # stored value wins, not overwritten
+    assert row["bone_mass_kg"] == 3.2  # null column enriched
+
+    pushed = fake_garmin_client.pushed_weights[-1]
+    assert pushed["percent_fat"] == 18.4  # the stored (not incoming) value
+    assert pushed["bone_mass_kg"] == 3.2

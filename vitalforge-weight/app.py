@@ -1,7 +1,7 @@
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -132,13 +132,36 @@ async def post_weight(data: WeightIn):
     db = await get_db()
     try:
         await db.execute("BEGIN IMMEDIATE")
+        # `timestamp >= ?` is a sargable prefilter (plain string comparison is
+        # safe here -- every row in this table is written by this same route
+        # via datetime.now(timezone.utc).isoformat(), so the format is fixed-
+        # width and zero-padded, unlike the mismatched-format pitfall
+        # /api/weight/trend has). It's 1s wider than the real window so it
+        # can never exclude a row the authoritative julianday() clause below
+        # would accept; that clause is what idx_weight_log_timestamp cannot
+        # use directly (wrapping the column in julianday() makes the index
+        # unusable for range pruning), and what enforces both the lower AND
+        # upper bound of the +-60s window -- an earlier version of this query
+        # only had a lower bound, so a future-dated row (e.g. from clock
+        # skew) would match and silently swallow every later weigh-in.
+        sargable_cutoff = (now - timedelta(seconds=DEDUP_WINDOW_SECONDS + 1)).isoformat()
         cursor = await db.execute(
             "SELECT id, weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin, "
             "body_fat_pct, body_water_pct, muscle_pct, bone_mass_kg "
             "FROM weight_log "
-            "WHERE ABS(weight_grams - ?) <= ? AND julianday(timestamp) >= julianday(?, ?) "
+            "WHERE timestamp >= ? "
+            "AND ABS(weight_grams - ?) <= ? "
+            "AND julianday(timestamp) >= julianday(?, ?) "
+            "AND julianday(timestamp) <= julianday(?) "
             "ORDER BY timestamp DESC LIMIT 1",
-            (weight_grams, DEDUP_WEIGHT_TOLERANCE_GRAMS, timestamp, f"-{DEDUP_WINDOW_SECONDS} seconds"),
+            (
+                sargable_cutoff,
+                weight_grams,
+                DEDUP_WEIGHT_TOLERANCE_GRAMS,
+                timestamp,
+                f"-{DEDUP_WINDOW_SECONDS} seconds",
+                timestamp,
+            ),
         )
         existing = await cursor.fetchone()
 
@@ -189,31 +212,50 @@ async def post_weight(data: WeightIn):
         await db.commit()
 
         # Push happens outside the transaction (see comment above); this
-        # connection stays open only to record the outcome afterward.
+        # connection stays open only to record the outcome afterward. By this
+        # point the row (and any enrichment) is already durably committed, so
+        # a failure here must never surface as a 500 over already-successful
+        # data -- it would tell the client the whole request failed when it
+        # didn't. _push_composition itself never raises; this guards the
+        # timestamp parse and the flag-update statement around it.
+        #
+        # Note: push_weight is synchronous and this route awaits nothing
+        # during it, so it blocks the whole event loop -- which is also what
+        # makes the flag-update below race-free against another request
+        # reading this same row's synced_to_garmin mid-push. That's a
+        # property of the current single-worker deployment, not something
+        # this code enforces; moving the push to a thread/worker pool would
+        # reopen a stale-read window here.
         garmin_error = None
-        if existing is None:
-            garmin_error = _push_composition(
-                weight_grams,
-                now,
-                {
-                    "body_fat_pct": data.body_fat_pct,
-                    "body_water_pct": data.body_water_pct,
-                    "muscle_pct": data.muscle_pct,
-                    "bone_mass_kg": data.bone_mass_kg,
-                },
-            )
-            synced = garmin_error is None
-        elif updates:
-            merged = {field: updates.get(field, existing[field]) for field in COMPOSITION_FIELDS}
-            original_ts = datetime.fromisoformat(existing["timestamp"])
-            garmin_error = _push_composition(existing["weight_grams"], original_ts, merged)
-            synced = garmin_error is None
-        else:
-            synced = bool(existing["synced_to_garmin"]) if existing is not None else False
+        try:
+            if existing is None:
+                garmin_error = _push_composition(
+                    weight_grams,
+                    now,
+                    {
+                        "body_fat_pct": data.body_fat_pct,
+                        "body_water_pct": data.body_water_pct,
+                        "muscle_pct": data.muscle_pct,
+                        "bone_mass_kg": data.bone_mass_kg,
+                    },
+                )
+                synced = garmin_error is None
+            elif updates:
+                merged = {field: updates.get(field, existing[field]) for field in COMPOSITION_FIELDS}
+                original_ts = datetime.fromisoformat(existing["timestamp"])
+                garmin_error = _push_composition(existing["weight_grams"], original_ts, merged)
+                synced = garmin_error is None
+            else:
+                synced = bool(existing["synced_to_garmin"])
 
-        if existing is None or updates:
-            await db.execute("UPDATE weight_log SET synced_to_garmin = ? WHERE id = ?", (int(synced), row_id))
-            await db.commit()
+            if existing is None or updates:
+                await db.execute("UPDATE weight_log SET synced_to_garmin = ? WHERE id = ?", (int(synced), row_id))
+                await db.commit()
+        except Exception as e:
+            logger.error("Post-commit sync-flag update failed for row %s: %s", row_id, e)
+            if garmin_error is None:
+                garmin_error = f"sync status update failed: {e}"
+            synced = False
     finally:
         await db.close()
 
