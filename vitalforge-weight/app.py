@@ -81,6 +81,32 @@ async def index(request: Request):
     })
 
 
+DEDUP_WEIGHT_TOLERANCE_GRAMS = 50
+DEDUP_WINDOW_SECONDS = 60
+COMPOSITION_FIELDS = ("body_fat_pct", "body_water_pct", "muscle_pct", "bone_mass_kg")
+
+
+def _push_composition(weight_grams: int, timestamp: datetime, composition: dict) -> str | None:
+    """Push weight + composition to Garmin; returns an error string, or None
+    on success. Never raises -- callers decide what to do with the row."""
+    try:
+        authenticate()
+        muscle_pct = composition.get("muscle_pct")
+        muscle_mass_kg = (weight_grams / 1000.0) * muscle_pct / 100 if muscle_pct is not None else None
+        push_weight(
+            weight_grams,
+            timestamp,
+            percent_fat=composition.get("body_fat_pct"),
+            percent_hydration=composition.get("body_water_pct"),
+            muscle_mass_kg=muscle_mass_kg,
+            bone_mass_kg=composition.get("bone_mass_kg"),
+        )
+        return None
+    except Exception as e:
+        logger.error("Failed to push weight to Garmin: %s", e)
+        return str(e)
+
+
 @app.post("/api/weight")
 async def post_weight(data: WeightIn):
     unit = data.unit.lower()
@@ -98,63 +124,128 @@ async def post_weight(data: WeightIn):
     now = datetime.now(timezone.utc)
     timestamp = now.isoformat()
 
-    muscle_mass_kg = weight_kg * data.muscle_pct / 100 if data.muscle_pct is not None else None
-
-    # Push to Garmin Connect
-    garmin_error = None
-    try:
-        authenticate()
-        push_weight(
-            weight_grams,
-            now,
-            percent_fat=data.body_fat_pct,
-            percent_hydration=data.body_water_pct,
-            muscle_mass_kg=muscle_mass_kg,
-            bone_mass_kg=data.bone_mass_kg,
-        )
-        synced = 1
-    except Exception as e:
-        logger.error("Failed to push weight to Garmin: %s", e)
-        garmin_error = str(e)
-        synced = 0
-
-    # Save to local database
+    # Atomic: read for a duplicate and (if any) write inside one transaction,
+    # so two concurrent requests can never both observe "no duplicate". The
+    # Garmin push happens after COMMIT, outside the lock -- see
+    # docs/prp/00-design.md SS3.7 for why (no timeout mechanism exists to
+    # bound the call otherwise, and it is synchronous).
     db = await get_db()
     try:
-        await db.execute(
-            "INSERT INTO weight_log (weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin, "
-            "body_fat_pct, body_water_pct, muscle_pct, bone_mass_kg, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                round(weight_lbs, 2),
-                round(weight_kg, 2),
-                weight_grams,
-                timestamp,
-                synced,
-                data.body_fat_pct,
-                data.body_water_pct,
-                data.muscle_pct,
-                data.bone_mass_kg,
-                data.source,
-            ),
+        await db.execute("BEGIN IMMEDIATE")
+        cursor = await db.execute(
+            "SELECT id, weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin, "
+            "body_fat_pct, body_water_pct, muscle_pct, bone_mass_kg "
+            "FROM weight_log "
+            "WHERE ABS(weight_grams - ?) <= ? AND julianday(timestamp) >= julianday(?, ?) "
+            "ORDER BY timestamp DESC LIMIT 1",
+            (weight_grams, DEDUP_WEIGHT_TOLERANCE_GRAMS, timestamp, f"-{DEDUP_WINDOW_SECONDS} seconds"),
         )
+        existing = await cursor.fetchone()
+
+        updates = {}
+        conflicts = []
+        if existing is not None:
+            for field in COMPOSITION_FIELDS:
+                incoming_value = getattr(data, field)
+                if incoming_value is None:
+                    continue
+                existing_value = existing[field]
+                if existing_value is None:
+                    updates[field] = incoming_value
+                elif existing_value != incoming_value:
+                    conflicts.append(field)
+
+        if existing is None:
+            cursor = await db.execute(
+                "INSERT INTO weight_log (weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin, "
+                "body_fat_pct, body_water_pct, muscle_pct, bone_mass_kg, source) "
+                "VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)",
+                (
+                    round(weight_lbs, 2),
+                    round(weight_kg, 2),
+                    weight_grams,
+                    timestamp,
+                    data.body_fat_pct,
+                    data.body_water_pct,
+                    data.muscle_pct,
+                    data.bone_mass_kg,
+                    data.source,
+                ),
+            )
+            row_id = cursor.lastrowid
+        elif updates:
+            set_clause = ", ".join(f"{field} = ?" for field in updates)
+            await db.execute(
+                f"UPDATE weight_log SET {set_clause} WHERE id = ?",
+                (*updates.values(), existing["id"]),
+            )
+            row_id = existing["id"]
+        else:
+            row_id = existing["id"]
+
+        if conflicts:
+            logger.warning("Weight POST conflicts with stored row %s on fields: %s", row_id, conflicts)
+
         await db.commit()
+
+        # Push happens outside the transaction (see comment above); this
+        # connection stays open only to record the outcome afterward.
+        garmin_error = None
+        if existing is None:
+            garmin_error = _push_composition(
+                weight_grams,
+                now,
+                {
+                    "body_fat_pct": data.body_fat_pct,
+                    "body_water_pct": data.body_water_pct,
+                    "muscle_pct": data.muscle_pct,
+                    "bone_mass_kg": data.bone_mass_kg,
+                },
+            )
+            synced = garmin_error is None
+        elif updates:
+            merged = {field: updates.get(field, existing[field]) for field in COMPOSITION_FIELDS}
+            original_ts = datetime.fromisoformat(existing["timestamp"])
+            garmin_error = _push_composition(existing["weight_grams"], original_ts, merged)
+            synced = garmin_error is None
+        else:
+            synced = bool(existing["synced_to_garmin"]) if existing is not None else False
+
+        if existing is None or updates:
+            await db.execute("UPDATE weight_log SET synced_to_garmin = ? WHERE id = ?", (int(synced), row_id))
+            await db.commit()
     finally:
         await db.close()
 
-    result = {
-        "success": True,
-        "weight_lbs": round(weight_lbs, 2),
-        "weight_kg": round(weight_kg, 2),
-        "timestamp": timestamp,
-        "synced_to_garmin": bool(synced),
-    }
+    if existing is None:
+        result = {
+            "success": True,
+            "weight_lbs": round(weight_lbs, 2),
+            "weight_kg": round(weight_kg, 2),
+            "timestamp": timestamp,
+            "synced_to_garmin": synced,
+        }
+        for field_name in (*COMPOSITION_FIELDS, "source"):
+            value = getattr(data, field_name)
+            if value is not None:
+                result[field_name] = value
+    else:
+        result = {
+            "success": True,
+            "deduplicated": True,
+            "id": row_id,
+            "weight_lbs": existing["weight_lbs"],
+            "weight_kg": existing["weight_kg"],
+            "timestamp": existing["timestamp"],
+            "synced_to_garmin": synced,
+        }
+        if updates:
+            result["enriched"] = True
+        if conflicts:
+            result["conflict"] = True
     if garmin_error:
         result["garmin_error"] = garmin_error
-    # Composition keys appear only when supplied (docs/prp/00-design.md SS4.4).
-    for field_name in ("body_fat_pct", "body_water_pct", "muscle_pct", "bone_mass_kg", "source"):
-        value = getattr(data, field_name)
-        if value is not None:
-            result[field_name] = value
+
     return result
 
 

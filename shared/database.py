@@ -174,6 +174,10 @@ async def init_db():
             )
         """)
 
+        # Additive: the dedup lookup (docs/prp/00-design.md SS3.7) filters
+        # weight_log by timestamp on every POST.
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_weight_log_timestamp ON weight_log(timestamp)")
+
         await db.commit()
     finally:
         await db.close()
