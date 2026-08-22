@@ -1,11 +1,15 @@
 # 03 — Live validation: the B3 checkpoint
 
-**Status: root cause found and fixed (2026-08-22), re-verification pending.**
-Step 0 (deploy) and step 1 (local push) are done. Steps 2–4 (Garmin-side
-confirmation) hit a real bug — not just Garmin rate-limiting — now fixed in
-`shared/garmin_client.py`. See "2026-08-22 incident: root cause and fix"
-below. Re-run the checkpoint once deployed and enough time has passed for
-Garmin's rate limit to clear.
+**Status: auth fix deployed and confirmed working (2026-08-22 22:32 UTC).**
+Both services authenticated successfully on restart — `mobile+cffi`/
+`mobile+requests` still hit Garmin's 429 (that part of the rate limit
+hadn't cleared yet), but garminconnect 0.3.11's cascading login chain fell
+through to a later strategy and succeeded, with tokens persisted correctly
+to `garmin_tokens.json`. No crash, no AttributeError. See "2026-08-22
+incident: root cause and fix" below for the full story. **Still needed:**
+step 1's composition push was never actually delivered to Garmin (it
+predates this fix) — push a fresh weigh-in now that auth is healthy, then
+do steps 2–4 for real.
 
 **What's blocked on this:** B5 (dashboard exposure of composition data) and
 B6 (final docs pass). Both are otherwise ready to implement the moment this
@@ -211,13 +215,31 @@ asserts the exact call shape `authenticate()` depends on. Both
 `requirements.txt` pins now carry a comment pointing back here for the next
 version bump.
 
-**Not yet done:** the stale `oauth1_token.json`/`oauth2_token.json` files on
-the production host (`knowledge`, `/app/data/.garth/`) are orphaned —
-0.3.11 doesn't read them (wrong filename) and they're harmless to leave, but
-worth deleting next time that host is touched. The fix itself hasn't been
-deployed/re-verified against live Garmin yet, deliberately — deploying it
-means one more real login attempt, which should wait for the 429 to clear
-rather than risk extending it.
+**2026-08-22 22:32 UTC deploy confirmation:** deployed to `knowledge`
+(commits through `1273a27` — the auth fix plus an unrelated dedup-window fix
+found investigating a separate flaky test, see `git log`). Both services'
+lifespan `authenticate()` succeeded on restart:
+
+```
+Authenticating with Garmin Connect...
+mobile+cffi returned 429: IP rate limited by Garmin
+mobile+requests returned 429: IP rate limited by Garmin
+Garmin authenticated; tokens persisted to /app/data/.garth
+```
+
+The 429 on the first two login strategies confirms Garmin's rate limit
+hadn't fully cleared, but 0.3.11's 5-strategy cascade fell through to a
+later one and succeeded — proving the fix works even under partial
+rate-limiting, not just once Garmin fully clears. `garmin_tokens.json` now
+exists (`0600`, matches the library's own hardening). Deleted the orphaned
+`oauth1_token.json`/`oauth2_token.json` from `/app/data/.garth/` now that
+they're confirmed unused.
+
+**Still not done:** step 1's original composition push (200.4 lbs / 19.9% /
+54.4% / 40.7% / 3.72kg) predates this fix and was never actually delivered
+to Garmin — a fresh push is needed now that auth is healthy, then steps 2–4
+for real (Garmin Connect visual check + the units read-back that unblocks
+B5).
 
 ## Next steps once this file has real answers
 
