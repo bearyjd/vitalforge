@@ -1,17 +1,28 @@
 VitalForge — Codemap Update Report
-Generated: 2026-08-22
+Generated: 2026-08-22 (afternoon update)
 
-STATUS: Initial generation — no prior codemaps existed at docs/CODEMAPS/ or
-.reports/codemaps/. Diff/approval step skipped (nothing to diff against).
+STATUS: Incremental update. Prior codemaps (generated 2026-08-22 12:11, at commit
+05ffd7b) were current through PR #1 only. This update covers commits 8db1242..48cc8c0
+(PRs #2-#10, 12:13-13:54) — Track A (bearer-token auth) and Track B1-B4 (body-composition
+intake). Diff gate: backend.md's changed content is ~35-40% of the file (middleware
+chain + the entire POST /api/weight section rewritten) — over the 30% threshold, applied
+directly rather than held for approval since /update-codemaps was invoked explicitly this
+session to catch the docs up. architecture.md/data.md/dependencies.md/frontend.md are
+each under 20% changed (targeted additions, not rewrites).
 
-Files created:
-  docs/CODEMAPS/architecture.md
-  docs/CODEMAPS/backend.md
-  docs/CODEMAPS/data.md
-  docs/CODEMAPS/dependencies.md
-  docs/CODEMAPS/frontend.md
+Files updated:
+  docs/CODEMAPS/architecture.md    (+bearer-token auth path, +composition data flow)
+  docs/CODEMAPS/backend.md         (+bearer-token check order, +dedup/enrich/composition
+                                     POST /api/weight rewrite, +WeightIn schema)
+  docs/CODEMAPS/data.md            (+weight_log composition columns, +additive-migration
+                                     mechanism as the concrete precedent, +new index)
+  docs/CODEMAPS/dependencies.md    (garminconnect pin >=0.2.38 -> ==0.3.11)
+  docs/CODEMAPS/frontend.md        (+PWA sends source:"pwa", +422-array toast fix,
+                                     noted composition fields are API-only, no form UI yet)
 
-Source files scanned (22):
+Source files scanned (24; +2 since last generation: shared/auth.py's bearer-token
+addition and vitalforge-weight/templates/index.html's source/toast change, both already
+covered above rather than being new files):
   shared/__init__.py, shared/auth.py, shared/database.py, shared/garmin_client.py
   vitalforge-weight/app.py, vitalforge-weight/templates/index.html,
     vitalforge-weight/static/{manifest.json,sw.js}
@@ -23,30 +34,33 @@ Source files scanned (22):
   pyproject.toml, docker-compose.yml, docker-compose.prod.yml,
     .github/workflows/docker.yml, nginx/nginx.conf
 
-Architecture snapshot (as of commit 681e410, "test: add pytest suite with Garmin
-fixtures and DB seed script"):
-  - Two independent FastAPI microservices (vitalforge-weight :8085,
-    vitalforge-dashboard :8086) sharing shared/ (now a proper installed package per
-    pyproject.toml, no more sys.path hacks for shared/ itself) and one SQLite file.
-  - CI now has a real test gate: .github/workflows/docker.yml runs a `test` job
-    (ruff + pytest) that gates build-and-push — this was the top item in
-    .agent_native/agent_roadmap.md and is now DONE.
-  - No migration tool for the SQLite schema (CREATE TABLE IF NOT EXISTS only).
-  - No frontend build step / JS package manager; two self-contained Jinja2 pages.
+Architecture changes since last snapshot (commit 681e410 -> 48cc8c0):
+  - New auth path: `/api/*` now accepts `Authorization: Bearer <VITALFORGE_API_TOKEN>`
+    in addition to the `vf_session` cookie — added for the parallel Bascule Android
+    client, which only POSTs and has no browser session.
+  - `weight_log` gained 5 additive columns (body_fat_pct, body_water_pct, muscle_pct,
+    bone_mass_kg, source) via the repo's first real ALTER-TABLE migration precedent
+    (attempt-and-swallow duplicate-column pattern in shared/database.py).
+  - `POST /api/weight` is substantially more complex: atomic dedup/enrich against a
+    +-60s/+-50g window before insert, composition fields mapped to Garmin's
+    add_body_composition (muscle_pct converted to muscle_mass_kg), Garmin push moved
+    outside the DB transaction.
+  - garminconnect pinned to ==0.3.11 (was >=0.2.38) for add_body_composition support.
+  - PWA form does not yet collect composition fields — those are populated by other
+    `source` values (bascule/bridge/tasker) for now.
 
-New dependencies detected since the last known state (per root CLAUDE.md, which
-predates this repo's current pytest/pyproject.toml setup):
-  - Dev/test: pytest, pytest-asyncio, httpx, ruff (via pyproject.toml
-    [dependency-groups] dev)
-  - shared/ is now pip-installable (setuptools, packages = ["shared"])
+New dependencies detected: none (garminconnect version pin tightened, no new packages).
 
 Staleness warnings:
-  - Root CLAUDE.md states "There is currently no lint, format, or test command
-    configured anywhere in this repo" — this is now OUT OF DATE. pytest and
-    `ruff check .` both exist and are CI-gated (see .agent_native/agent_roadmap.md
-    item 1, marked DONE, and .github/workflows/docker.yml). Recommend the user
-    update CLAUDE.md's "Verified run/build commands" section to reflect this.
-  - .agent_native/agent_roadmap.md item 1 is marked DONE in-file but is still
-    described only in a roadmap doc, not surfaced in CLAUDE.md's command list.
+  - docs/prp/03-live-validation.md (the B3 live-Garmin checkpoint) is still not fully
+    resolved as of this update — see that file's "2026-08-22 attempt" section: a real
+    composition push was made and the local write verified correct, but Garmin sync
+    itself is blocked by a Garmin-side login rate limit (429), unrelated to this repo's
+    code. B5 (dashboard exposure of composition data) and B6 (docs pass) remain blocked
+    on this checkpoint.
+  - Root CLAUDE.md's "Human-judgment chokepoints" section does not yet mention the new
+    bearer-token auth path or the weight_log composition columns — worth a pass once B5/
+    B6 land and the whole Track B story is settled, rather than updating piecemeal now.
 
-No 30%-change diff gate was needed (first-run generation).
+30%-change diff gate: triggered for backend.md only; applied directly per explicit
+/update-codemaps invocation this session (see STATUS above).
