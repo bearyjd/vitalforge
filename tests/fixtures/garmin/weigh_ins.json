@@ -1,11 +1,15 @@
 {
+  "_comment": "Key names verified 2026-08-22 against a real get_weigh_ins() response (values redacted, structure/keys real). See docs/prp/00-design.md §3.5 and 01-plan.md §4.2. bodyWater/boneMass/muscleMass are all synthetic here since the real account has never had composition data pushed to Garmin yet.",
   "dailyWeightSummaries": [
     {
       "summaryDate": "2020-06-01",
       "latestWeight": {
         "weight": 81200,
         "bmi": 24.1,
-        "bodyFat": 18.4
+        "bodyFat": 18.4,
+        "bodyWater": 55.2,
+        "boneMass": 3.2,
+        "muscleMass": 34.0
       }
     }
   ]
