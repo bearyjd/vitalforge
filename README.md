@@ -93,6 +93,7 @@ Visit `http://localhost:8085` for weight logging and `http://localhost:8086` for
 | `VITALFORGE_USER` | No | Login username (default: `admin`) |
 | `VITALFORGE_PASS` | No | Login password. If empty, auth is disabled (open access) |
 | `VITALFORGE_SECRET` | No | Secret key for signing session cookies |
+| `VITALFORGE_API_TOKEN` | No | Long-lived bearer token for unattended API clients (e.g. Tasker, Bascule). Empty disables bearer auth |
 | `WEIGHT_URL` | No | Public URL for weight service (e.g. `https://weight.yourdomain.com`) |
 | `DASHBOARD_URL` | No | Public URL for dashboard service (e.g. `https://health.yourdomain.com`) |
 | `DEFAULT_UNIT` | No | Default weight unit: `lbs` or `kg` (default: `lbs`) |
@@ -157,7 +158,19 @@ If no `ANTHROPIC_API_KEY` or `ANTHROPIC_BASE_URL` is set, the system falls back 
 
 ### Authentication
 
-Cookie-based session auth with a 30-day expiry. Set `VITALFORGE_PASS` in `.env` to enable. Both services share the same credentials. Leave `VITALFORGE_PASS` empty to disable auth (open access).
+Two credential types, both optional and checked independently — a request with either a valid cookie or a valid bearer token is authenticated, and a wrong or missing one never blocks the other:
+
+- **Cookie-based session auth** for browsers, 30-day expiry. Set `VITALFORGE_PASS` in `.env` to enable. Both services share the same credentials.
+- **Bearer-token auth** for unattended/machine clients (Tasker, scripts, the Bascule Android client). Set `VITALFORGE_API_TOKEN` to a long random value; requests present it as `Authorization: Bearer <token>`.
+
+Leave `VITALFORGE_PASS` empty to disable auth entirely (open access) for both services — it's the single master switch. A configured `VITALFORGE_API_TOKEN` is inert while `VITALFORGE_PASS` is empty.
+
+**Revoking a credential.** Rotating one does **not** revoke the other:
+
+- Rotate `VITALFORGE_SECRET` to invalidate every outstanding session cookie at once.
+- Rotate `VITALFORGE_API_TOKEN` to invalidate the bearer token — it has no expiry, so this is the only way to revoke it.
+
+If you suspect a credential was leaked, rotate **both**.
 
 ## Deployment
 
@@ -230,7 +243,7 @@ Log weight from your Android phone using Tasker without opening the browser.
    - URL: `https://weight.yourdomain.com/api/weight`
    - Headers: `Content-Type: application/json`
    - Body: `{"weight": %input, "unit": "lbs"}`
-   - If using auth, add header: `Cookie: vf_session=YOUR_SESSION_COOKIE`
+   - If using auth, add header: `Authorization: Bearer YOUR_API_TOKEN`
 4. Add action: **Alert > Flash**
    - Text: `Weight logged: %input lbs`
 
@@ -242,11 +255,11 @@ Log weight from your Android phone using Tasker without opening the browser.
 
 ### Auth with Tasker
 
-Since VitalForge uses cookie-based auth, the easiest approach:
+Tasker is an unattended client, so use bearer-token auth rather than a browser session cookie:
 
-1. Log in via browser and copy the `vf_session` cookie value from dev tools
-2. Add as header in HTTP Request: `Cookie: vf_session=YOUR_COOKIE_VALUE`
-3. Session lasts 30 days — log in again when it expires
+1. Generate a token and set it as `VITALFORGE_API_TOKEN` in `.env` (see [Environment Variables](#environment-variables))
+2. Add as header in HTTP Request: `Authorization: Bearer YOUR_API_TOKEN`
+3. The token has no expiry — it stays valid until you rotate `VITALFORGE_API_TOKEN`
 
 ## NFC Tag Integration
 
