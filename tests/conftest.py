@@ -146,3 +146,58 @@ def dashboard_app_module(initialized_db, fake_garmin_client, monkeypatch):
     # Same direct-import situation as vitalforge-weight/app.py.
     monkeypatch.setattr(module, "authenticate", lambda: None)
     return module
+
+
+@pytest.fixture
+def weight_live_server(tmp_db_path, fake_garmin_client, monkeypatch):
+    """The `vitalforge-weight` app, served for real over HTTP for Playwright.
+
+    Deliberately does NOT depend on `initialized_db`/`weight_app_module`:
+    both pull in an async fixture, and Playwright's sync API keeps its own
+    event loop running in this (main) test thread for the whole session, so
+    any `pytest-asyncio` fixture setup here collides with it (`RuntimeError:
+    Runner.run() cannot be called from a running event loop`). Instead,
+    `DB_PATH` is patched (via `tmp_db_path`, a plain sync fixture) and left
+    for the live server's own `lifespan` to call `init_db()` inside its
+    dedicated server thread, where no such conflict exists.
+    """
+    module = import_service_module("vitalforge-weight.app")
+    monkeypatch.setattr(module, "authenticate", lambda: None)
+
+    def fake_push_weight(weight_grams, timestamp=None):
+        fake_garmin_client.pushed_weights.append({"weight_grams": weight_grams, "timestamp": timestamp})
+
+    monkeypatch.setattr(module, "push_weight", fake_push_weight)
+
+    from tests.live_server import LiveServer
+
+    server = LiveServer(module.app)
+    server.start()
+    yield server.base_url
+    server.stop()
+
+
+@pytest.fixture
+def dashboard_live_server(tmp_db_path, fake_garmin_client, monkeypatch):
+    """The `vitalforge-dashboard` app, served for real over HTTP for Playwright.
+
+    See `weight_live_server` for why this avoids `initialized_db`/
+    `dashboard_app_module`. The real lifespan also kicks off `scheduled_sync()`
+    (a 90-day backfill against the fake Garmin client) as a background task —
+    stubbed out here since it's irrelevant to a UI smoke test and only adds
+    noise/latency.
+    """
+    module = import_service_module("vitalforge-dashboard.app")
+    monkeypatch.setattr(module, "authenticate", lambda: None)
+
+    async def _noop_scheduled_sync():
+        return None
+
+    monkeypatch.setattr(module, "scheduled_sync", _noop_scheduled_sync)
+
+    from tests.live_server import LiveServer
+
+    server = LiveServer(module.app)
+    server.start()
+    yield server.base_url
+    server.stop()

@@ -1,0 +1,52 @@
+VitalForge — Codemap Update Report
+Generated: 2026-08-22
+
+STATUS: Initial generation — no prior codemaps existed at docs/CODEMAPS/ or
+.reports/codemaps/. Diff/approval step skipped (nothing to diff against).
+
+Files created:
+  docs/CODEMAPS/architecture.md
+  docs/CODEMAPS/backend.md
+  docs/CODEMAPS/data.md
+  docs/CODEMAPS/dependencies.md
+  docs/CODEMAPS/frontend.md
+
+Source files scanned (22):
+  shared/__init__.py, shared/auth.py, shared/database.py, shared/garmin_client.py
+  vitalforge-weight/app.py, vitalforge-weight/templates/index.html,
+    vitalforge-weight/static/{manifest.json,sw.js}
+  vitalforge-dashboard/app.py, vitalforge-dashboard/sync.py,
+    vitalforge-dashboard/recommendations.py, vitalforge-dashboard/templates/index.html,
+    vitalforge-dashboard/static/{manifest.json,sw.js}
+  scripts/seed_db.py
+  tests/conftest.py, tests/test_weight_api.py, tests/test_dashboard_api.py
+  pyproject.toml, docker-compose.yml, docker-compose.prod.yml,
+    .github/workflows/docker.yml, nginx/nginx.conf
+
+Architecture snapshot (as of commit 681e410, "test: add pytest suite with Garmin
+fixtures and DB seed script"):
+  - Two independent FastAPI microservices (vitalforge-weight :8085,
+    vitalforge-dashboard :8086) sharing shared/ (now a proper installed package per
+    pyproject.toml, no more sys.path hacks for shared/ itself) and one SQLite file.
+  - CI now has a real test gate: .github/workflows/docker.yml runs a `test` job
+    (ruff + pytest) that gates build-and-push — this was the top item in
+    .agent_native/agent_roadmap.md and is now DONE.
+  - No migration tool for the SQLite schema (CREATE TABLE IF NOT EXISTS only).
+  - No frontend build step / JS package manager; two self-contained Jinja2 pages.
+
+New dependencies detected since the last known state (per root CLAUDE.md, which
+predates this repo's current pytest/pyproject.toml setup):
+  - Dev/test: pytest, pytest-asyncio, httpx, ruff (via pyproject.toml
+    [dependency-groups] dev)
+  - shared/ is now pip-installable (setuptools, packages = ["shared"])
+
+Staleness warnings:
+  - Root CLAUDE.md states "There is currently no lint, format, or test command
+    configured anywhere in this repo" — this is now OUT OF DATE. pytest and
+    `ruff check .` both exist and are CI-gated (see .agent_native/agent_roadmap.md
+    item 1, marked DONE, and .github/workflows/docker.yml). Recommend the user
+    update CLAUDE.md's "Verified run/build commands" section to reflect this.
+  - .agent_native/agent_roadmap.md item 1 is marked DONE in-file but is still
+    described only in a roadmap doc, not surfaced in CLAUDE.md's command list.
+
+No 30%-change diff gate was needed (first-run generation).

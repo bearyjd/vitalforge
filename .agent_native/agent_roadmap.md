@@ -148,14 +148,26 @@ green after the import reordering (28 passed).
 
 ## Other findings (lower priority / informational)
 
-- **No API-level regression fixture for the recommendations engine.** `recommendations.py`'s
-  `run_rules` (530 lines, ~15 distinct pattern checks) has no test coverage of any kind. Once
-  item 1's harness exists, prioritize covering `run_rules` directly (pure function, no I/O)
-  over the LLM path (`get_llm_recommendations`, which should stay mocked/untested against the
-  real Anthropic API in CI).
-- **No screenshot/visual verification path** for either PWA UI (`templates/index.html` in each
-  service, Chart.js dashboard). Out of scope for the top-5 given the API-first surface, but
-  worth a Playwright smoke test later if UI regressions become common.
+- **No API-level regression fixture for the recommendations engine — DONE.** `recommendations.py`'s
+  `run_rules` (526 lines, 18 distinct rule keys across sleep/recovery/stress/body-composition/
+  activity/correlations) is now covered directly in `tests/test_recommendations.py` (26 tests):
+  one positive trigger test per rule, a couple of boundary tests (e.g. 2 consecutive low-sleep
+  days doesn't trigger, 3 does), a "stable healthy data -> zero findings" test, and direct tests
+  of the numeric helpers (`avg`, `trend_slope`, `consecutive_below`/`consecutive_above`). Pure
+  function, no DB/HTTP/Garmin fixtures needed. The LLM path (`get_llm_recommendations`)
+  remains untested, as originally recommended — it should stay mocked/untested against the
+  real Anthropic API in CI.
+- **No screenshot/visual verification path — DONE.** `tests/test_smoke_ui.py` now runs 3
+  Playwright smoke tests (page loads, core elements render, zero console/page errors, one
+  real form-submit interaction) against both PWAs, served for real over HTTP via
+  `tests/live_server.py::LiveServer` (uvicorn in a background thread, same faked DB/Garmin
+  fixtures as the API tests). **Important:** these are marked `@pytest.mark.playwright` and
+  excluded from the default `pytest -q` run (`addopts` in `pyproject.toml`) — running them in
+  the same process as the async API tests breaks pytest-asyncio's fixture setup, since
+  pytest-playwright's browser fixture keeps its own event loop running in the main thread for
+  the rest of the session. Run them separately: `pytest -q -m playwright` (needs
+  `playwright install chromium` first). See `.github/workflows/docker.yml`'s `test` job for
+  the CI wiring.
 - **No DB migration mechanism.** `shared/database.py::init_db` only does
   `CREATE TABLE IF NOT EXISTS`, so schema changes that alter existing columns have no upgrade
   path. Not urgent while the schema is additive-only, but flag it if a future task needs to

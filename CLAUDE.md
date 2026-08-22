@@ -82,14 +82,50 @@ curl http://localhost:8086/health   # {"status": "ok", "service": "vitalforge-da
 pip install -r vitalforge-weight/requirements.txt
 DB_PATH=/tmp/vf-test.db GARTH_TOKEN_DIR=/tmp/vf-garth \
   uvicorn vitalforge-weight.app:app --host 0.0.0.0 --port 8085
+
+# Lint and test (repo root; mirrors .github/workflows/docker.yml's `test` job).
+# Use a venv, not the system/global Python — installing these into a shared interpreter
+# that other tools (e.g. an LLM proxy, MCP servers) also use WILL downgrade packages like
+# starlette/jinja2 out from under them:
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r vitalforge-weight/requirements.txt -r vitalforge-dashboard/requirements.txt
+pip install pytest pytest-asyncio httpx ruff playwright pytest-playwright
+pip install -e .
+ruff check .
+pytest -q
+
+# UI smoke tests (Playwright) — excluded from the default `pytest -q` run, see below:
+playwright install --with-deps chromium   # `--with-deps` needs apt; on non-apt systems
+                                           # (e.g. Fedora) run `playwright install chromium`
+                                           # and ensure browser system libs are present
+pytest -q -m playwright
 ```
 
-There is currently **no lint, format, or test command configured anywhere in this repo**
-(no `pytest`, `ruff`, `black`, `mypy`, or `pyproject.toml`; `.github/workflows/docker.yml`
-only builds and pushes Docker images — it runs no tests). Do not claim "tests pass" or "lint
-clean" — no such gate exists yet. See `.agent_native/agent_roadmap.md` item 1 to close this
-gap. If you add tests, wire them into `.github/workflows/docker.yml` as a separate job that
-gates the build/push job.
+`pyproject.toml` installs `shared/` as a real package (`pip install -e .`) and lists
+`pytest`, `pytest-asyncio`, `httpx`, `ruff`, `playwright`, `pytest-playwright` in a
+`[dependency-groups] dev` block (PEP 735 — informational for now; CI installs them
+directly rather than via a `--group` flag). `[tool.pytest.ini_options]` sets
+`pythonpath = ["."]`, `testpaths = ["tests"]`, `asyncio_mode = "auto"`, and
+`addopts = "-m 'not playwright'"` — **`playwright`-marked tests are excluded from the
+default `pytest -q` run on purpose**: `pytest-playwright`'s session-scoped `browser`
+fixture keeps its own event loop running in the main thread for the rest of the process,
+which breaks `pytest-asyncio`'s fixture setup for any async test that runs afterward in
+the same session (`RuntimeError: Runner.run() cannot be called from a running event
+loop`). Never remove that `addopts` line or merge the two suites into one `pytest`
+invocation — run `pytest -q -m playwright` as a genuinely separate process instead (see
+`tests/live_server.py` and `tests/test_smoke_ui.py`).
+`.github/workflows/docker.yml` has a `test` job (`ruff check .` then `pytest -q`, then a
+separate Playwright-browser-install step and `pytest -q -m playwright`) that gates
+`build-and-push` via `needs: test` — a failing lint or test blocks the image push.
+Tests live in `tests/` and never touch real infrastructure: `tests/conftest.py` points
+`shared.database.DB_PATH` at a per-test `tmp_path` and monkeypatches
+`shared.garmin_client` to a fake client backed by canned fixtures in
+`tests/fixtures/garmin/` — no live Garmin account or `/app/data` access required. The
+Playwright smoke tests reuse the same faked DB/Garmin setup but serve the app for real
+over HTTP (`tests/live_server.py::LiveServer`, real `uvicorn` in a background thread)
+since a browser needs an actual socket, not `httpx.ASGITransport`. There is still no
+`black`, `mypy`, or `bandit` configured. See `.agent_native/agent_roadmap.md` item 1 for
+the original test-suite rationale (marked DONE).
 
 ## Conventions observed in the existing code (follow these, don't impose new house style)
 

@@ -19,6 +19,16 @@ packages = ["shared"]
 pythonpath = ["."]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# `playwright`-marked tests are excluded by default: pytest-playwright's session-scoped
+# `browser` fixture keeps its own event loop running in the main thread for the rest of the
+# session, which breaks every pytest-asyncio fixture that sets up afterward (`RuntimeError:
+# Runner.run() cannot be called from a running event loop`). Run them in a separate
+# invocation — `pytest -m playwright` — never mixed into the same process as the async API
+# tests. See tests/test_smoke_ui.py and .github/workflows/docker.yml's `test` job.
+addopts = "-m 'not playwright'"
+markers = [
+    "playwright: browser-driven UI smoke test (requires `playwright install chromium`; run separately, see addopts above)",
+]
 
 [tool.ruff]
 line-length = 120
@@ -36,4 +46,6 @@ dev = [
     "pytest-asyncio>=0.24.0",
     "httpx>=0.27.0",
     "ruff>=0.8.0",
+    "playwright>=1.48.0",
+    "pytest-playwright>=0.5.2",
 ]
