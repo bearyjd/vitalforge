@@ -356,7 +356,7 @@
                 const res = await fetch("/api/weight", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ weight: value, unit: currentUnit }),
+                    body: JSON.stringify({ weight: value, unit: currentUnit, source: "pwa" }),
                 });
                 const data = await res.json();
                 if (res.ok && data.success) {
@@ -367,7 +367,13 @@
                     loadRecent();
                     loadTrendChart();
                 } else {
-                    showToast(data.detail || "Failed to log weight", "error");
+                    // data.detail is a string on 400/401/500, but an array of
+                    // {msg, loc, ...} objects on a 422 -- flatten it so the
+                    // toast never renders "[object Object]".
+                    const detail = Array.isArray(data.detail)
+                        ? data.detail.map((e) => e.msg || JSON.stringify(e)).join("; ")
+                        : data.detail;
+                    showToast(detail || "Failed to log weight", "error");
                 }
             } catch (e) {
                 showToast("Network error", "error");

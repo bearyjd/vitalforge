@@ -45,7 +45,10 @@ async def test_post_weight_kg_converts(client):
     assert body["weight_lbs"] == pytest.approx(81.5 * 2.20462, abs=0.01)
 
 
-async def test_post_weight_invalid_unit_rejected(client):
+async def test_invalid_unit_still_returns_400_not_422(client):
+    """Pins the one legacy 400 (a retained quirk, not a compatibility
+    requirement -- see docs/prp/00-design.md SS3.1) against the 422 migration
+    B2 applies to everything else this endpoint validates."""
     resp = await client.post("/api/weight", json={"weight": 150.0, "unit": "stone"})
     assert resp.status_code == 400
 
@@ -104,3 +107,150 @@ async def test_delete_weight_success(client):
 async def test_delete_weight_missing_returns_404(client):
     resp = await client.delete("/api/weight/999999")
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# B2: body-composition intake (docs/prp/01-plan.md SSB2)
+# ---------------------------------------------------------------------------
+
+COMPOSITION_PAYLOAD = {
+    "weight": 180.0,
+    "unit": "lbs",
+    "body_fat_pct": 18.4,
+    "body_water_pct": 55.2,
+    "muscle_pct": 40.1,
+    "bone_mass_kg": 3.2,
+    "source": "bascule",
+}
+
+
+async def test_composition_fields_accepted_and_echoed(client):
+    resp = await client.post("/api/weight", json=COMPOSITION_PAYLOAD)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["body_fat_pct"] == 18.4
+    assert body["body_water_pct"] == 55.2
+    assert body["muscle_pct"] == 40.1
+    assert body["bone_mass_kg"] == 3.2
+    assert body["source"] == "bascule"
+
+
+async def test_weight_only_payload_still_succeeds(client):
+    resp = await client.post("/api/weight", json={"weight": 180.0, "unit": "lbs"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["success"] is True
+    for field in ("body_fat_pct", "body_water_pct", "muscle_pct", "bone_mass_kg", "source"):
+        assert field not in body
+
+
+async def test_unknown_field_rejected_422(client):
+    resp = await client.post("/api/weight", json={"weight": 180.0, "unit": "lbs", "bodyFat": 20})
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail[0]["type"] == "extra_forbidden"
+    assert detail[0]["loc"] == ["body", "bodyFat"]
+
+
+@pytest.mark.parametrize("value", [2.9, 75.1])
+async def test_body_fat_below_floor_or_above_ceiling_rejected_422(client, value):
+    resp = await client.post("/api/weight", json={"weight": 180.0, "unit": "lbs", "body_fat_pct": value})
+    assert resp.status_code == 422
+
+
+async def test_body_fat_fraction_rejected_422(client):
+    resp = await client.post("/api/weight", json={"weight": 180.0, "unit": "lbs", "body_fat_pct": 0.20})
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("value", [29.9, 80.1])
+async def test_body_water_bounds_rejected_422(client, value):
+    resp = await client.post("/api/weight", json={"weight": 180.0, "unit": "lbs", "body_water_pct": value})
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("value", [9.9, 90.1])
+async def test_muscle_pct_bounds_rejected_422(client, value):
+    resp = await client.post("/api/weight", json={"weight": 180.0, "unit": "lbs", "muscle_pct": value})
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("value", [0.4, 10.1])
+async def test_bone_mass_kg_bounds_rejected_422(client, value):
+    resp = await client.post("/api/weight", json={"weight": 180.0, "unit": "lbs", "bone_mass_kg": value})
+    assert resp.status_code == 422
+
+
+async def test_bone_mass_in_grams_rejected_422(client):
+    """3200 (grams) is the unit-error case the 0.5-10.0 kg bound exists for."""
+    resp = await client.post("/api/weight", json={"weight": 180.0, "unit": "lbs", "bone_mass_kg": 3200})
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("weight,unit", [(1200.0, "kg"), (1.0, "kg")])
+async def test_weight_above_500kg_or_below_2kg_rejected_422(client, weight, unit):
+    resp = await client.post("/api/weight", json={"weight": weight, "unit": unit})
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail[0]["loc"] == ["body"]
+    assert "2 and 500 kg" in detail[0]["msg"]
+
+
+async def test_weight_bound_applies_after_unit_conversion(client):
+    """1200 lbs is ~544 kg -- the bound is on derived kg, not the raw field."""
+    resp = await client.post("/api/weight", json={"weight": 1200.0, "unit": "lbs"})
+    assert resp.status_code == 422
+
+
+async def test_pwa_toast_flattens_array_detail():
+    """F8c -- the template's error path must flatten a 422 detail array
+    instead of rendering it as [object Object]."""
+    from pathlib import Path
+
+    template = (
+        Path(__file__).resolve().parent.parent / "vitalforge-weight" / "templates" / "index.html"
+    ).read_text()
+    assert "Array.isArray(data.detail)" in template
+
+
+async def test_source_literal_rejects_unknown_value_422(client):
+    resp = await client.post("/api/weight", json={"weight": 180.0, "unit": "lbs", "source": "basucle"})
+    assert resp.status_code == 422
+
+
+async def test_source_optional_defaults_to_null(client):
+    resp = await client.post("/api/weight", json={"weight": 180.0, "unit": "lbs"})
+    assert resp.status_code == 200
+    assert "source" not in resp.json()
+
+    from shared.database import get_db
+
+    db = await get_db()
+    try:
+        row = await (await db.execute("SELECT source FROM weight_log ORDER BY id DESC LIMIT 1")).fetchone()
+    finally:
+        await db.close()
+    assert row["source"] is None
+
+
+async def test_composition_persisted_to_weight_log(client):
+    resp = await client.post("/api/weight", json=COMPOSITION_PAYLOAD)
+    assert resp.status_code == 200
+
+    from shared.database import get_db
+
+    db = await get_db()
+    try:
+        row = await (
+            await db.execute(
+                "SELECT body_fat_pct, body_water_pct, muscle_pct, bone_mass_kg, source "
+                "FROM weight_log ORDER BY id DESC LIMIT 1"
+            )
+        ).fetchone()
+    finally:
+        await db.close()
+    assert row["body_fat_pct"] == 18.4
+    assert row["body_water_pct"] == 55.2
+    assert row["muscle_pct"] == 40.1
+    assert row["bone_mass_kg"] == 3.2
+    assert row["source"] == "bascule"
