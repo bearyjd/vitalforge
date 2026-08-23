@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -6,7 +7,10 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.requests import Request
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -42,6 +46,37 @@ add_auth_routes(app)
 
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
+
+
+def _scrub_non_finite(value):
+    if isinstance(value, float) and not math.isfinite(value):
+        return repr(value)
+    if isinstance(value, dict):
+        return {k: _scrub_non_finite(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_scrub_non_finite(v) for v in value]
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exception_handler(request: Request, exc: RequestValidationError):
+    """FastAPI's default handler JSON-encodes `exc.errors()` verbatim,
+    including the rejected `input` value -- but `json.dumps` (Starlette's
+    JSONResponse.render, allow_nan=False) rejects NaN/Infinity, which
+    `json.loads` (and httpx's/requests' JSON encoders) accept as a
+    non-standard extension. A composition value of NaN or Infinity is
+    correctly rejected by Field's ge/le bounds, but then crashes this
+    handler with a 500 text/plain response instead of returning the
+    documented 422 -- silently reclassifying a terminal, don't-retry error
+    into a retryable one for the client (docs/prp/00-design.md SS4.5; Phase
+    4 adversarial review finding). Scrub non-finite floats out of the error
+    payload before encoding so the intended 422 actually reaches the
+    client.
+    """
+    return JSONResponse(
+        status_code=422,
+        content={"detail": _scrub_non_finite(jsonable_encoder(exc.errors()))},
+    )
 
 
 class WeightIn(BaseModel):
