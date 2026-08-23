@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.requests import Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from shared.auth import add_auth_routes
 from shared.database import get_db, init_db
@@ -54,6 +54,18 @@ class WeightIn(BaseModel):
     muscle_pct: float | None = Field(default=None, ge=10.0, le=90.0)
     bone_mass_kg: float | None = Field(default=None, ge=0.5, le=10.0)
     source: Literal["pwa", "bascule", "bridge", "tasker"] | None = None
+
+    @field_validator("weight", "body_fat_pct", "body_water_pct", "muscle_pct", "bone_mass_kg", mode="before")
+    @classmethod
+    def _reject_bool(cls, value):
+        # bool is a subclass of int in Python, so Pydantic's lax float mode
+        # otherwise silently coerces JSON true/false to 1.0/0.0 -- which
+        # bone_mass_kg's 0.5-10.0 kg bound doesn't exclude (Phase 4
+        # adversarial review finding: `bone_mass_kg: true` reached the DB
+        # and the Garmin FIT payload as a measured 1kg bone mass).
+        if isinstance(value, bool):
+            raise ValueError("must be a number, not a boolean")
+        return value
 
     @model_validator(mode="after")
     def _validate_weight_bounds(self):

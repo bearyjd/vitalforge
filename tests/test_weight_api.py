@@ -187,6 +187,21 @@ async def test_bone_mass_in_grams_rejected_422(client):
     assert resp.status_code == 422
 
 
+@pytest.mark.parametrize("field", ["weight", "body_fat_pct", "body_water_pct", "muscle_pct", "bone_mass_kg"])
+async def test_boolean_value_rejected_not_silently_coerced(client, field):
+    """Pydantic v2 treats bool as an int subtype, so a bare `float` field
+    would otherwise silently coerce JSON true/false to 1.0/0.0.
+    bone_mass_kg's 0.5-10.0 kg bound does not exclude 1.0, so
+    `bone_mass_kg: true` would reach the DB and the Garmin FIT payload as a
+    measured 1kg bone mass without an explicit guard (Phase 4 adversarial
+    review finding). Asserts on the specific error, not just the status
+    code, so this can't pass by coincidence via a field's own range bound."""
+    payload = {"weight": 180.0, "unit": "lbs", field: True}
+    resp = await client.post("/api/weight", json=payload)
+    assert resp.status_code == 422
+    assert "boolean" in resp.text
+
+
 @pytest.mark.parametrize("weight,unit", [(1200.0, "kg"), (1.0, "kg")])
 async def test_weight_above_500kg_or_below_2kg_rejected_422(client, weight, unit):
     resp = await client.post("/api/weight", json={"weight": weight, "unit": unit})

@@ -59,7 +59,7 @@ async def lifespan(app: FastAPI):
         logger.warning("Garmin authentication failed (will retry on first sync): %s", e)
 
     # Start background sync scheduler
-    sync_task = asyncio.create_task(scheduled_sync())
+    sync_task = asyncio.create_task(scheduled_sync(_sync_lock))
     yield
     sync_task.cancel()
 

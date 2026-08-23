@@ -298,12 +298,20 @@ async def run_sync(days: int = 7):
     return result
 
 
-async def scheduled_sync():
-    """Background loop that syncs every SYNC_INTERVAL_HOURS."""
+async def scheduled_sync(lock: asyncio.Lock):
+    """Background loop that syncs every SYNC_INTERVAL_HOURS.
+
+    Takes the same lock `/api/sync`'s manual trigger holds during `run_sync`
+    (see vitalforge-dashboard/app.py's `_sync_lock`) -- every write here goes
+    through `upsert()`'s last-writer-wins INSERT OR REPLACE, so without
+    shared serialization a manual sync and this backfill/scheduled loop can
+    interleave and let an older pull silently overwrite a newer one.
+    """
     # Initial backfill of 90 days
     logger.info("Running initial 90-day backfill...")
     try:
-        await run_sync(days=90)
+        async with lock:
+            await run_sync(days=90)
     except Exception as e:
         logger.error("Initial backfill failed: %s", e)
 
@@ -311,6 +319,7 @@ async def scheduled_sync():
         await asyncio.sleep(SYNC_INTERVAL_HOURS * 3600)
         try:
             logger.info("Running scheduled sync...")
-            await run_sync(days=3)
+            async with lock:
+                await run_sync(days=3)
         except Exception as e:
             logger.error("Scheduled sync failed: %s", e)
