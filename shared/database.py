@@ -29,6 +29,17 @@ _WEIGHT_HISTORY_ADDITIVE_COLUMNS = [
     "muscle_mass_g REAL",
 ]
 
+# Additive column for the users table -- incremented on password change so
+# every previously-issued session cookie for that account (which embeds the
+# version at issue time) stops validating immediately, instead of staying
+# valid until its 30-day expiry regardless of the password change (fix-review
+# finding). `DEFAULT 1` is a constant, not the non-constant-default case the
+# comment above warns about -- SQLite's ALTER TABLE ADD COLUMN with a
+# constant default is a fast, metadata-only change, not a table rewrite.
+_USERS_ADDITIVE_COLUMNS = [
+    "session_version INTEGER NOT NULL DEFAULT 1",
+]
+
 
 async def _add_columns(db, table: str, column_ddls: list[str]):
     """Attempt-and-swallow, not PRAGMA-table_info-then-act: both services run
@@ -167,9 +178,15 @@ async def init_db():
                 username TEXT NOT NULL UNIQUE,
                 password_hash TEXT NOT NULL,
                 role TEXT NOT NULL CHECK (role IN ('admin', 'user')),
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                session_version INTEGER NOT NULL DEFAULT 1
             )
         """)
+
+        # Additive migration for users on databases that already have the
+        # table from an earlier commit of this same branch (a fresh DB
+        # already has the column from the CREATE TABLE above).
+        await _add_columns(db, "users", _USERS_ADDITIVE_COLUMNS)
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS training_load (

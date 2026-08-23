@@ -61,7 +61,8 @@ async def test_cookie_client_regression_flow(weight_app_module, monkeypatch):
     persisting into the client jar, so relying on that would be pinned to
     ambiguous, disappearing behavior rather than modeling a real session."""
     user_id = await _configure_auth(monkeypatch)
-    cookies = {"vf_session": create_session_cookie("testuser", user_id)}
+    # fresh row, DB default session_version
+    cookies = {"vf_session": create_session_cookie("testuser", user_id, 1)}
     transport = ASGITransport(app=weight_app_module.app)
     async with AsyncClient(transport=transport, base_url="http://test", cookies=cookies) as ac:
         post_resp = await ac.post("/api/weight", json=FULL_PAYLOAD)
@@ -85,7 +86,8 @@ async def test_mixed_clients_interleaved_no_auth_leakage(weight_app_module, monk
     itself keeps no cross-client state."""
     user_id = await _configure_auth(monkeypatch)
     token_headers = {"Authorization": f"Bearer {TOKEN}"}
-    cookies = {"vf_session": create_session_cookie("testuser", user_id)}
+    # fresh row, DB default session_version
+    cookies = {"vf_session": create_session_cookie("testuser", user_id, 1)}
     transport = ASGITransport(app=weight_app_module.app)
 
     async with (

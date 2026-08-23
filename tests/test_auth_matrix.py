@@ -139,7 +139,7 @@ async def test_behavior_matrix(cell_id, config, credential_form, expected_status
     valid_cookie = "no-user-seeded-for-this-config"
     if config.seed_user:
         user_id = await seed_user("testuser")
-        valid_cookie = create_session_cookie("testuser", user_id)
+        valid_cookie = create_session_cookie("testuser", user_id, 1)  # fresh row, DB default session_version
 
     headers, cookies = CREDENTIAL_FORMS[credential_form](valid_cookie)
     resp = await matrix_client.get("/api/thing", headers=headers, cookies=cookies)

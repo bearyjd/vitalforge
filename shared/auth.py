@@ -98,36 +98,44 @@ async def _is_auth_configured() -> bool:
         await db.close()
 
 
-def create_session_cookie(username: str, user_id: int) -> str:
-    return _serializer.dumps({"user": username, "uid": user_id, "t": int(time.time())})
+def create_session_cookie(username: str, user_id: int, session_version: int) -> str:
+    return _serializer.dumps(
+        {"user": username, "uid": user_id, "sv": session_version, "t": int(time.time())}
+    )
 
 
-def validate_session(cookie: str) -> tuple[str, int] | None:
-    """Returns (username, user_id) from the signed payload, or None if the
-    signature is invalid/expired. get_current_user checks both against the
-    users table -- a valid signature alone only proves this server issued
-    the cookie at some point, not that it still names the same account. A
-    deleted user's username can be reused by a later, different account;
-    without the id, the old cookie would authenticate as the new account
-    (security-review finding, reproduced)."""
+def validate_session(cookie: str) -> tuple[str, int, int] | None:
+    """Returns (username, user_id, session_version) from the signed
+    payload, or None if the signature is invalid/expired. get_current_user
+    checks all three against the users table -- a valid signature alone
+    only proves this server issued the cookie at some point, not that it
+    still names the same account (a deleted user's username can be reused
+    by a later, different account -- caught by user_id) or that the
+    account's password hasn't changed since (caught by session_version,
+    incremented on every password change so older cookies stop validating
+    immediately instead of staying valid until their 30-day expiry --
+    security-review finding)."""
     try:
         data = _serializer.loads(cookie, max_age=_MAX_AGE)
         username = data.get("user")
         user_id = data.get("uid")
-        if username is None or user_id is None:
+        session_version = data.get("sv")
+        if username is None or user_id is None or session_version is None:
             return None
-        return username, user_id
+        return username, user_id, session_version
     except (BadSignature, SignatureExpired):
         return None
 
 
-async def _get_user_id(username: str) -> int | None:
+async def _get_user_id_and_session_version(username: str) -> tuple[int, int] | None:
     db = await get_db()
     try:
-        row = await (await db.execute("SELECT id FROM users WHERE username = ?", (username,))).fetchone()
+        row = await (
+            await db.execute("SELECT id, session_version FROM users WHERE username = ?", (username,))
+        ).fetchone()
     finally:
         await db.close()
-    return row["id"] if row is not None else None
+    return (row["id"], row["session_version"]) if row is not None else None
 
 
 async def get_current_user(request: Request) -> str | None:
@@ -141,11 +149,14 @@ async def get_current_user(request: Request) -> str | None:
     session = validate_session(cookie)
     if session is None:
         return None
-    username, user_id = session
+    username, user_id, session_version = session
     db = await get_db()
     try:
         row = await (
-            await db.execute("SELECT 1 FROM users WHERE id = ? AND username = ?", (user_id, username))
+            await db.execute(
+                "SELECT 1 FROM users WHERE id = ? AND username = ? AND session_version = ?",
+                (user_id, username, session_version),
+            )
         ).fetchone()
     finally:
         await db.close()
@@ -685,16 +696,18 @@ def add_auth_routes(app):
         password = body.get("password", "")
         if not await check_credentials(username, password):
             raise HTTPException(status_code=401, detail="Invalid credentials")
-        user_id = await _get_user_id(username)
-        if user_id is None:
+        id_and_version = await _get_user_id_and_session_version(username)
+        if id_and_version is None:
             # Narrow TOCTOU: the account was deleted between the
             # check_credentials() call above and this one. Fail the login
             # rather than issue a cookie with no matching account -- it
             # would just be permanently invalid anyway (get_current_user's
-            # id+username check could never match), but failing loudly here
-            # is clearer than a cookie that silently never authenticates.
+            # id+username+version check could never match), but failing
+            # loudly here is clearer than a cookie that silently never
+            # authenticates.
             raise HTTPException(status_code=401, detail="Invalid credentials")
-        cookie = create_session_cookie(username, user_id)
+        user_id, session_version = id_and_version
+        cookie = create_session_cookie(username, user_id, session_version)
         response = JSONResponse({"success": True})
         response.set_cookie(_COOKIE_NAME, cookie, max_age=_MAX_AGE, httponly=True, samesite="lax")
         return response
@@ -719,8 +732,13 @@ def add_auth_routes(app):
             raise HTTPException(status_code=422, detail="New password required")
         db = await get_db()
         try:
+            # session_version bump invalidates every previously-issued
+            # cookie for this account, including whatever session made
+            # this very request -- appropriate for a password change
+            # (security-review finding: this used to leave old sessions
+            # valid until their 30-day expiry regardless).
             await db.execute(
-                "UPDATE users SET password_hash = ? WHERE username = ?",
+                "UPDATE users SET password_hash = ?, session_version = session_version + 1 WHERE username = ?",
                 (_hash_password(data.new_password), user),
             )
             await db.commit()
@@ -801,6 +819,15 @@ def add_auth_routes(app):
                 updates["password_hash"] = _hash_password(new_password)
             if updates:
                 set_clause = ", ".join(f"{field} = ?" for field in updates)
+                if new_password:
+                    # Same session-invalidation reasoning as
+                    # change_own_password -- an admin-initiated reset must
+                    # revoke the target's existing sessions too. Not a bind
+                    # parameter (self-referential expression, no external
+                    # value), so appended to the SQL text directly rather
+                    # than through the `updates` dict/set_clause machinery
+                    # above, which only handles `field = ?` pairs.
+                    set_clause += ", session_version = session_version + 1"
                 await db.execute(f"UPDATE users SET {set_clause} WHERE id = ?", (*updates.values(), user_id))
             await db.commit()
         finally:

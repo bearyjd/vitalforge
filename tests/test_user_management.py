@@ -32,8 +32,8 @@ async def client(initialized_db):
 
 
 async def _cookies_for(username: str) -> dict:
-    user_id = await shared_auth._get_user_id(username)
-    return {"vf_session": create_session_cookie(username, user_id)}
+    user_id, session_version = await shared_auth._get_user_id_and_session_version(username)
+    return {"vf_session": create_session_cookie(username, user_id, session_version)}
 
 
 # --- XSS regression (fix-review finding) --------------------------------------------
@@ -87,6 +87,49 @@ async def test_change_own_password_succeeds_with_correct_current_password(client
     assert resp.status_code == 200
     assert await shared_auth.check_credentials("alice", "old-password") is False
     assert await shared_auth.check_credentials("alice", "new-password") is True
+
+
+async def test_change_own_password_revokes_existing_sessions(client):
+    """MEDIUM security-review finding: a password change used to leave
+    every already-issued cookie for that account valid until its own
+    30-day expiry -- if the change was prompted by a suspected leak, the
+    leaked cookie kept working regardless. Capturing the cookie BEFORE the
+    change (via _cookies_for, which reads the account's current
+    session_version at call time) and reusing it after is the regression
+    check: session_version increments on the UPDATE, so the pre-change
+    cookie's embedded version stops matching."""
+    await seed_user("alice", password="old-password")
+    old_cookie = await _cookies_for("alice")
+
+    resp = await client.post(
+        "/auth/account/password",
+        json={"current_password": "old-password", "new_password": "new-password"},
+        cookies=old_cookie,
+    )
+    assert resp.status_code == 200
+
+    # Same cookie that authenticated the request above -- now stale.
+    resp = await client.get("/auth/account", cookies=old_cookie)
+    assert resp.status_code == 401
+
+    # A freshly-issued cookie for the same account still works.
+    new_cookie = await _cookies_for("alice")
+    resp = await client.get("/auth/account", cookies=new_cookie)
+    assert resp.status_code == 200
+
+
+async def test_admin_password_reset_revokes_the_targets_existing_sessions(client):
+    await seed_user("root", role="admin")
+    bob_id = await seed_user("bob", password="old-password")
+    bob_old_cookie = await _cookies_for("bob")
+
+    resp = await client.patch(
+        f"/auth/admin/users/{bob_id}", json={"password": "reset-password"}, cookies=await _cookies_for("root")
+    )
+    assert resp.status_code == 200
+
+    resp = await client.get("/auth/account", cookies=bob_old_cookie)
+    assert resp.status_code == 401
 
 
 async def test_change_own_password_empty_new_password_rejected(client):
