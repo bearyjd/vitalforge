@@ -69,6 +69,26 @@ async def row_count() -> int:
         await db.close()
 
 
+async def seed_row_raw_timestamp(weight_grams: int, timestamp: str) -> int:
+    """Like seed_row, but inserts an arbitrary literal `timestamp` string
+    instead of computing one from `seconds_ago` -- for testing rows whose
+    timestamp doesn't match the format this route itself writes (e.g. a
+    pre-existing/legacy row, per the open item in docs/prp/01-plan.md SS4.1)."""
+    weight_kg = weight_grams / 1000.0
+    weight_lbs = weight_kg * 2.20462
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "INSERT INTO weight_log (weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin) "
+            "VALUES (?, ?, ?, ?, 1)",
+            (round(weight_lbs, 2), round(weight_kg, 2), weight_grams, timestamp),
+        )
+        await db.commit()
+        return cursor.lastrowid
+    finally:
+        await db.close()
+
+
 async def test_duplicate_within_window_returns_deduplicated_true(client):
     row_id, ts = await seed_row(84096, seconds_ago=5)
     resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs"})
@@ -151,6 +171,20 @@ async def test_future_dated_row_does_not_swallow_real_weighin(client):
     future (e.g. from clock skew) must not match every later request and
     silently discard real weigh-ins forever."""
     await seed_row(84096, seconds_ago=-3600)  # one hour in the future
+    resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "deduplicated" not in body or body["deduplicated"] is not True
+    assert await row_count() == 2
+
+
+async def test_malformed_timestamp_row_does_not_error_the_dedup_query(client):
+    """A row whose `timestamp` isn't ISO8601 (e.g. a legacy/pre-format-change
+    row -- see docs/prp/01-plan.md SS4.1's open item on unverified historical
+    timestamp formats) must not make the dedup SELECT raise. julianday() on
+    an unparseable string returns NULL, and NULL comparisons are false in
+    SQL, so the row is silently excluded from matching -- not a crash."""
+    await seed_row_raw_timestamp(84096, "not-a-real-timestamp")
     resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs"})
     assert resp.status_code == 200
     body = resp.json()
