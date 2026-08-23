@@ -13,6 +13,7 @@ from httpx import ASGITransport, AsyncClient, Headers
 
 from shared import auth as shared_auth
 from shared.auth import add_auth_routes, create_session_cookie
+from tests.conftest import seed_user
 
 
 def _build_matrix_app() -> FastAPI:
@@ -35,17 +36,21 @@ def _build_matrix_app() -> FastAPI:
 
 
 @pytest.fixture
-async def matrix_client():
+async def matrix_client(initialized_db):
     transport = ASGITransport(app=_build_matrix_app())
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
 
 
 @pytest.fixture
-def configured_auth(monkeypatch):
-    """VITALFORGE_PASS set, no token -- auth is on, plain cookie auth."""
-    monkeypatch.setattr(shared_auth, "_PASS", "correct-pass")
+async def configured_auth(initialized_db, monkeypatch):
+    """A user exists in the DB, no bearer token configured -- auth is on,
+    plain cookie auth. Depends on `initialized_db` directly (not just on
+    `matrix_client` also depending on it) so the `users` table is guaranteed
+    to exist before seeding, regardless of which order a test lists its
+    fixture parameters in."""
     monkeypatch.setattr(shared_auth, "_API_TOKEN", "")
+    await seed_user("someone")
 
 
 async def test_api_path_returns_401_json_not_500(configured_auth, matrix_client):
@@ -81,25 +86,26 @@ async def test_html_path_redirects_to_login_not_401(configured_auth, matrix_clie
 
 
 async def test_valid_cookie_still_works_with_token_enabled(monkeypatch, matrix_client):
-    monkeypatch.setattr(shared_auth, "_PASS", "correct-pass")
     monkeypatch.setattr(shared_auth, "_API_TOKEN", "correct-token")
+    await seed_user("testuser")
     cookie = create_session_cookie("testuser")
     resp = await matrix_client.get("/api/thing", cookies={"vf_session": cookie})
     assert resp.status_code == 200
 
 
 @pytest.mark.parametrize(
-    "pass_value,token_value",
+    "seed_a_user,token_value",
     [
-        ("correct-pass", "correct-token"),
-        ("correct-pass", ""),
-        ("", "correct-token"),
-        ("", ""),
+        (True, "correct-token"),
+        (True, ""),
+        (False, "correct-token"),
+        (False, ""),
     ],
 )
-async def test_health_exempt_in_all_four_configs(monkeypatch, matrix_client, pass_value, token_value):
-    monkeypatch.setattr(shared_auth, "_PASS", pass_value)
+async def test_health_exempt_in_all_four_configs(monkeypatch, matrix_client, seed_a_user, token_value):
     monkeypatch.setattr(shared_auth, "_API_TOKEN", token_value)
+    if seed_a_user:
+        await seed_user("someone")
     # No /health stub on this app; add_auth_routes only special-cases the path,
     # it doesn't require a route to exist there. Assert it's not blocked by auth
     # (a 404 from no-route-registered is fine; 401/302 would mean auth ran).
@@ -116,8 +122,8 @@ async def test_auth_and_static_paths_exempt_from_enforcement(configured_auth, ma
 
 
 async def test_auth_login_with_valid_bearer_redirects_to_root(monkeypatch, matrix_client):
-    monkeypatch.setattr(shared_auth, "_PASS", "correct-pass")
     monkeypatch.setattr(shared_auth, "_API_TOKEN", "correct-token")
+    await seed_user("someone")
     resp = await matrix_client.get(
         "/auth/login",
         headers={"Authorization": "Bearer correct-token"},
@@ -128,16 +134,16 @@ async def test_auth_login_with_valid_bearer_redirects_to_root(monkeypatch, matri
 
 
 async def test_bearer_first_authorization_header_wins(monkeypatch, matrix_client):
-    monkeypatch.setattr(shared_auth, "_PASS", "correct-pass")
     monkeypatch.setattr(shared_auth, "_API_TOKEN", "correct-token")
+    await seed_user("someone")
     headers = Headers([("authorization", "Bearer JUNK"), ("authorization", "Bearer correct-token")])
     resp = await matrix_client.get("/api/thing", headers=headers)
     assert resp.status_code == 401
 
 
 async def test_weight_service_api_401_shape(weight_app_module, monkeypatch):
-    monkeypatch.setattr(shared_auth, "_PASS", "correct-pass")
     monkeypatch.setattr(shared_auth, "_API_TOKEN", "")
+    await seed_user("someone")
     transport = ASGITransport(app=weight_app_module.app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         resp = await ac.get("/api/weight/recent")
@@ -146,8 +152,8 @@ async def test_weight_service_api_401_shape(weight_app_module, monkeypatch):
 
 
 async def test_dashboard_service_api_401_shape(dashboard_app_module, monkeypatch):
-    monkeypatch.setattr(shared_auth, "_PASS", "correct-pass")
     monkeypatch.setattr(shared_auth, "_API_TOKEN", "")
+    await seed_user("someone")
     transport = ASGITransport(app=dashboard_app_module.app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         resp = await ac.get("/api/sync/status")

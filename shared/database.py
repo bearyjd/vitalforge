@@ -162,6 +162,16 @@ async def init_db():
         await _add_columns(db, "weight_history", _WEIGHT_HISTORY_ADDITIVE_COLUMNS)
 
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL CHECK (role IN ('admin', 'user')),
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS training_load (
                 date TEXT PRIMARY KEY,
                 acute_load REAL,
@@ -203,3 +213,12 @@ async def init_db():
         await db.commit()
     finally:
         await db.close()
+
+    # Local import: shared.auth imports get_db from this module, so a
+    # module-level import here would cycle. bootstrap_first_admin opens its
+    # own connection and is idempotent (checked via "does any user exist
+    # yet"), so it's safe to call after this function's own connection has
+    # already closed.
+    from shared.auth import bootstrap_first_admin
+
+    await bootstrap_first_admin()

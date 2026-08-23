@@ -13,7 +13,8 @@ import pytest
 from starlette.requests import Request
 
 from shared import auth as shared_auth
-from shared.auth import _bearer_token_valid, check_credentials
+from shared.auth import _bearer_token_valid, _hash_password, _verify_password, check_credentials
+from tests.conftest import seed_user
 
 
 def make_request(headers: list[tuple[str, str]] | None = None) -> Request:
@@ -92,23 +93,40 @@ def test_bearer_surrounding_whitespace_stripped(set_token):
     assert _bearer_token_valid(make_request([("authorization", "Bearer   correct-token   ")])) is True
 
 
-def test_check_credentials_non_ascii_password_returns_false_not_typeerror(monkeypatch):
-    monkeypatch.setattr(shared_auth, "_USER", "admin")
-    monkeypatch.setattr(shared_auth, "_PASS", "correct-pass")
-    assert check_credentials("admin", "tökén") is False
+def test_hash_password_round_trips_via_verify():
+    stored = _hash_password("a-real-password")
+    assert _verify_password("a-real-password", stored) is True
+    assert _verify_password("wrong-password", stored) is False
 
 
-def test_check_credentials_valid_pair_accepted(monkeypatch):
-    monkeypatch.setattr(shared_auth, "_USER", "admin")
-    monkeypatch.setattr(shared_auth, "_PASS", "correct-pass")
-    assert check_credentials("admin", "correct-pass") is True
+def test_hash_password_uses_a_different_salt_each_call():
+    a = _hash_password("same-password")
+    b = _hash_password("same-password")
+    assert a != b  # different salt -> different stored value, even for the same password
 
 
-def test_check_credentials_rejects_wrong_user_and_wrong_pass(monkeypatch):
-    monkeypatch.setattr(shared_auth, "_USER", "admin")
-    monkeypatch.setattr(shared_auth, "_PASS", "correct-pass")
-    assert check_credentials("wrong-user", "correct-pass") is False
-    assert check_credentials("admin", "wrong-pass") is False
+def test_verify_password_malformed_stored_hash_returns_false_not_raise():
+    assert _verify_password("anything", "not-the-right-format-at-all") is False
+
+
+async def test_check_credentials_non_ascii_password_returns_false_not_typeerror(initialized_db):
+    await seed_user("admin", password="correct-pass")
+    assert await check_credentials("admin", "tökén") is False
+
+
+async def test_check_credentials_valid_pair_accepted(initialized_db):
+    await seed_user("admin", password="correct-pass")
+    assert await check_credentials("admin", "correct-pass") is True
+
+
+async def test_check_credentials_rejects_wrong_user_and_wrong_pass(initialized_db):
+    await seed_user("admin", password="correct-pass")
+    assert await check_credentials("wrong-user", "correct-pass") is False
+    assert await check_credentials("admin", "wrong-pass") is False
+
+
+async def test_check_credentials_unknown_username_returns_false(initialized_db):
+    assert await check_credentials("nobody", "anything") is False
 
 
 def test_startup_warns_when_token_set_and_pass_empty(monkeypatch, caplog):
