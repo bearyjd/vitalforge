@@ -42,25 +42,37 @@ async def test_scheduled_sync_serializes_against_shared_lock(monkeypatch):
     manual sync and the initial 90-day backfill could interleave -- and
     since every write goes through upsert()'s last-writer-wins
     INSERT OR REPLACE, an older pull finishing after a newer one could
-    silently overwrite it."""
+    silently overwrite it.
+
+    Covers BOTH `async with lock:` sites in scheduled_sync -- the initial
+    backfill and the periodic loop iteration -- not just the first. An
+    earlier version of this test only ever observed the backfill call (the
+    loop's `asyncio.sleep(SYNC_INTERVAL_HOURS * 3600)` never completed
+    before the test cancelled the task), so deleting the loop's `async
+    with lock:` would have left this test green (Phase 4 fix-review
+    finding). Setting SYNC_INTERVAL_HOURS to 0 collapses that sleep to
+    effectively-zero, letting a second call happen inside the test's
+    timeout."""
     sync = import_service_module("vitalforge-dashboard.sync")
+    monkeypatch.setattr(sync, "SYNC_INTERVAL_HOURS", 0)
     lock = asyncio.Lock()
-    called = asyncio.Event()
-    held_during_call = []
+    seen = []
+    second_call = asyncio.Event()
 
     async def fake_run_sync(days):
-        held_during_call.append(lock.locked())
-        called.set()
+        seen.append((days, lock.locked()))
+        if len(seen) >= 2:
+            second_call.set()
 
     monkeypatch.setattr(sync, "run_sync", fake_run_sync)
 
     task = asyncio.create_task(sync.scheduled_sync(lock))
     try:
-        await asyncio.wait_for(called.wait(), timeout=1.0)
+        await asyncio.wait_for(second_call.wait(), timeout=5.0)
     finally:
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
 
-    assert held_during_call == [True]
+    assert seen == [(90, True), (3, True)]
     assert not lock.locked()
