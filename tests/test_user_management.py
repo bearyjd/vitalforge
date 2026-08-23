@@ -6,6 +6,8 @@ Uses the same throwaway-app pattern as test_auth_matrix.py/test_auth_middleware.
 so these routes are tested in isolation from either real service.
 """
 
+import asyncio
+
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
@@ -284,6 +286,51 @@ async def test_can_delete_an_admin_when_another_admin_remains(client):
     assert resp.status_code == 200
 
 
+async def test_concurrent_deletes_of_the_last_two_admins_cannot_both_succeed(client):
+    """CRITICAL security-review finding: the last-admin guard used to do
+    SELECT COUNT(*) -> decide -> DELETE with no transaction wrapping the
+    two. Two concurrent requests deleting the two different last-remaining
+    admins could both read admin_count=2, both pass the guard, and leave
+    zero admins -- reproduced end to end (both DELETEs returned 200,
+    followed by an unauthenticated request reaching real data, since an
+    empty users table means auth is off). BEGIN IMMEDIATE now makes the
+    count-then-write atomic per request, so the second request's
+    transaction can't start until the first's has committed and it then
+    sees the reduced count. Loops several times since a race is
+    nondeterministic -- a single passing iteration doesn't prove the race
+    is closed, but this codebase's own existing concurrency tests
+    (test_dedup_concurrency.py) use the same asyncio.gather-based approach
+    without needing more than that to catch a real regression reliably."""
+    for i in range(10):
+        # Reset to exactly zero admins before each attempt -- a surviving
+        # (409'd) admin from a prior iteration would otherwise pad the
+        # count above 1 for the next pair, masking the very race this
+        # test exists to catch (both deletes would then legitimately
+        # succeed, since other admins genuinely do remain).
+        db = await get_db()
+        try:
+            await db.execute("DELETE FROM users WHERE role = 'admin'")
+            await db.commit()
+        finally:
+            await db.close()
+
+        alice_id = await seed_user(f"admin-a-{i}", role="admin")
+        bob_id = await seed_user(f"admin-b-{i}", role="admin")
+        results = await asyncio.gather(
+            client.delete(f"/auth/admin/users/{alice_id}", cookies=_cookies_for(f"admin-a-{i}")),
+            client.delete(f"/auth/admin/users/{bob_id}", cookies=_cookies_for(f"admin-b-{i}")),
+        )
+        statuses = sorted(r.status_code for r in results)
+        assert statuses == [200, 409], f"iteration {i}: both requests must not both succeed, got {statuses}"
+
+        db = await get_db()
+        try:
+            remaining = (await (await db.execute("SELECT COUNT(*) FROM users WHERE role = 'admin'")).fetchone())[0]
+        finally:
+            await db.close()
+        assert remaining == 1, f"iteration {i}: expected exactly 1 admin remaining, got {remaining}"
+
+
 async def test_can_delete_a_non_admin_freely(client):
     await seed_user("root", role="admin")
     bob_id = await seed_user("bob", role="user")
@@ -309,8 +356,6 @@ async def test_bootstrap_first_admin_survives_concurrent_startup(initialized_db,
     service's startup."""
     monkeypatch.setattr(shared_auth, "_USER", "bootstrapped-admin")
     monkeypatch.setattr(shared_auth, "_PASS", "bootstrapped-password")
-
-    import asyncio
 
     results = await asyncio.gather(
         shared_auth.bootstrap_first_admin(),

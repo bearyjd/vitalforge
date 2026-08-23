@@ -716,14 +716,25 @@ def add_auth_routes(app):
         new_password = data.password
         db = await get_db()
         try:
+            # BEGIN IMMEDIATE makes the count-then-write atomic: two
+            # concurrent demotes of the two different last-two admins
+            # could otherwise both read admin_count=2 before either
+            # commits, both pass the guard, and leave zero admins
+            # (security-review finding, reproduced end to end). The second
+            # request's BEGIN IMMEDIATE blocks until the first commits, so
+            # it then sees the already-reduced count. Same pattern as
+            # vitalforge-weight/app.py's dedup transaction.
+            await db.execute("BEGIN IMMEDIATE")
             target = await (await db.execute("SELECT role FROM users WHERE id = ?", (user_id,))).fetchone()
             if target is None:
+                await db.rollback()
                 raise HTTPException(status_code=404, detail="User not found")
             if new_role is not None and target["role"] == "admin" and new_role != "admin":
                 admin_count = (
                     await (await db.execute("SELECT COUNT(*) FROM users WHERE role = 'admin'")).fetchone()
                 )[0]
                 if admin_count <= 1:
+                    await db.rollback()
                     raise HTTPException(status_code=409, detail="Cannot demote the last remaining admin")
             updates = {}
             if new_role is not None:
@@ -733,7 +744,7 @@ def add_auth_routes(app):
             if updates:
                 set_clause = ", ".join(f"{field} = ?" for field in updates)
                 await db.execute(f"UPDATE users SET {set_clause} WHERE id = ?", (*updates.values(), user_id))
-                await db.commit()
+            await db.commit()
         finally:
             await db.close()
         return {"success": True}
@@ -743,14 +754,18 @@ def add_auth_routes(app):
         await _require_admin(request)
         db = await get_db()
         try:
+            # See admin_update_user's comment -- same TOCTOU race, same fix.
+            await db.execute("BEGIN IMMEDIATE")
             target = await (await db.execute("SELECT username, role FROM users WHERE id = ?", (user_id,))).fetchone()
             if target is None:
+                await db.rollback()
                 raise HTTPException(status_code=404, detail="User not found")
             if target["role"] == "admin":
                 admin_count = (
                     await (await db.execute("SELECT COUNT(*) FROM users WHERE role = 'admin'")).fetchone()
                 )[0]
                 if admin_count <= 1:
+                    await db.rollback()
                     raise HTTPException(status_code=409, detail="Cannot delete the last remaining admin")
             await db.execute("DELETE FROM users WHERE id = ?", (user_id,))
             await db.commit()
