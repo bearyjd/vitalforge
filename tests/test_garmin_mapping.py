@@ -81,9 +81,13 @@ async def test_muscle_pct_derives_muscle_mass_kg(client, weight_app_module, fake
     # mapping instead of being bypassed by the double.
     monkeypatch.setattr(weight_app_module, "push_weight", garmin_client.push_weight)
 
-    resp = await client.post("/api/weight", json={"weight": 100.0, "unit": "kg", "muscle_pct": 40.0})
+    # weight=80kg, muscle_pct=40% -> 32.0kg. Deliberately not 100kg: at 100kg
+    # the conversion (weight_kg * pct/100) is numerically the identity map on
+    # the percent value, so a 100kg fixture can't distinguish "converted to a
+    # mass" from "passed through as a raw percent" -- see Phase 4 review.
+    resp = await client.post("/api/weight", json={"weight": 80.0, "unit": "kg", "muscle_pct": 40.0})
     assert resp.status_code == 200
-    assert fake_garmin_client.pushed_weights[-1]["muscle_mass"] == pytest.approx(40.0)
+    assert fake_garmin_client.pushed_weights[-1]["muscle_mass"] == pytest.approx(32.0)
 
 
 async def test_weight_only_push_sends_no_composition_values(client, fake_garmin_client):
