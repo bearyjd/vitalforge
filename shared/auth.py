@@ -207,6 +207,20 @@ async def bootstrap_first_admin():
     processes calling this concurrently against a fresh DB, one raises)."""
     if not _PASS:
         return
+    if _USER in _RESERVED_USERNAMES:
+        # admin_create_user rejects these; the bootstrap path bypassed that
+        # guard entirely (fix-review finding) -- VITALFORGE_USER=api-token
+        # would seed an admin account under the same name get_current_user
+        # returns for every valid bearer-token request, handing that role
+        # to anyone holding the shared token. _USER is operator-set, not
+        # attacker-controlled, but refuse it here too rather than silently
+        # creating the same collision through a different door.
+        logger.error(
+            "VITALFORGE_USER=%r is a reserved name and cannot be used to seed the "
+            "first admin account. Set VITALFORGE_USER to something else and restart.",
+            _USER,
+        )
+        return
     db = await get_db()
     try:
         row = await (await db.execute("SELECT 1 FROM users LIMIT 1")).fetchone()

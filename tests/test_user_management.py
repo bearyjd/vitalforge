@@ -425,6 +425,26 @@ async def test_bootstrap_first_admin_noop_when_a_user_already_exists(initialized
     assert await shared_auth.get_current_user_role("bootstrapped-admin") is None
 
 
+@pytest.mark.parametrize("reserved", ["anonymous", "api-token"])
+async def test_bootstrap_first_admin_refuses_reserved_username(initialized_db, monkeypatch, reserved):
+    """Fix-review finding: admin_create_user's _RESERVED_USERNAMES guard
+    didn't cover the bootstrap path -- VITALFORGE_USER=api-token would
+    seed an admin account under the same name every valid bearer-token
+    request resolves to, handing that role to anyone holding the shared
+    token."""
+    monkeypatch.setattr(shared_auth, "_USER", reserved)
+    monkeypatch.setattr(shared_auth, "_PASS", "bootstrapped-password")
+    await shared_auth.bootstrap_first_admin()
+
+    db = await get_db()
+    try:
+        count = (await (await db.execute("SELECT COUNT(*) FROM users")).fetchone())[0]
+    finally:
+        await db.close()
+    assert count == 0
+    assert await shared_auth.get_current_user_role(reserved) is None
+
+
 # --- Live role re-check (the core property this plan exists to guarantee) ----------
 
 
