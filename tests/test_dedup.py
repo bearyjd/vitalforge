@@ -232,6 +232,87 @@ async def test_enrichment_push_failure_sets_synced_to_garmin_zero(client, weight
     assert "garmin_error" in body
 
 
+async def test_source_only_enrichment_does_not_repush_to_garmin(client, fake_garmin_client):
+    """Fix-review finding on the O2 fix (8062a9f): adding `source` to
+    ENRICHABLE_FIELDS meant a source-only enrich (no composition field
+    actually changed) populated the same `updates` dict the Garmin re-push
+    branch and the synced_to_garmin flag-persist both gate on -- so a row
+    that was already correctly synced got a spurious re-push of unchanged
+    composition data, and if that incidental push ever failed, a
+    previously-true synced_to_garmin flag flipped to false with no way to
+    recover it (a later identical POST finds no updates at all and just
+    echoes the now-corrupted stored value). Only an *actual composition*
+    change should trigger a re-push or touch the flag; `source` alone must
+    not."""
+    row_id, ts = await seed_row(84096, seconds_ago=5, body_fat_pct=18.4, bone_mass_kg=3.2, synced_to_garmin=1)
+    resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs", "source": "bascule"})
+    body = resp.json()
+    assert body["enriched"] is True  # source itself is still recorded
+    assert body["synced_to_garmin"] is True  # untouched, not silently flipped
+    assert len(fake_garmin_client.pushed_weights) == 0  # no spurious re-push of unchanged composition
+
+    db = await get_db()
+    try:
+        row = await (
+            await db.execute("SELECT source, synced_to_garmin FROM weight_log WHERE id = ?", (row_id,))
+        ).fetchone()
+    finally:
+        await db.close()
+    assert row["source"] == "bascule"  # the enrichment itself still happened
+    assert row["synced_to_garmin"] == 1
+
+
+async def test_source_only_enrichment_does_not_fabricate_synced_true(client, fake_garmin_client):
+    """The composition_changed gate must not over-correct: a source-only
+    enrich against a row that was NOT synced must not push, and must not
+    fabricate a `true` flag in the other direction either -- it stays
+    whatever it already was."""
+    row_id, ts = await seed_row(84096, seconds_ago=5, body_fat_pct=18.4, synced_to_garmin=0)
+    resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs", "source": "bascule"})
+    body = resp.json()
+    assert body["enriched"] is True
+    assert body["synced_to_garmin"] is False
+    assert len(fake_garmin_client.pushed_weights) == 0
+
+    db = await get_db()
+    try:
+        row = await (
+            await db.execute("SELECT source, synced_to_garmin FROM weight_log WHERE id = ?", (row_id,))
+        ).fetchone()
+    finally:
+        await db.close()
+    assert row["source"] == "bascule"
+    assert row["synced_to_garmin"] == 0
+
+
+async def test_pure_source_conflict_with_no_composition_change_does_not_repush(client, fake_garmin_client):
+    """Isolates the source-conflict case from
+    test_dedup_enrichment_conflicting_source_kept_not_overwritten, which
+    always pairs it with a body_fat_pct enrichment (so composition_changed
+    is already true there regardless of this gate). A POST that conflicts
+    on source alone, with no composition fields at all, must not push and
+    must not touch synced_to_garmin -- there is nothing here for the
+    composition_changed gate to even see."""
+    row_id, ts = await seed_row(84096, seconds_ago=5, source="tasker", synced_to_garmin=1)
+    resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs", "source": "bascule"})
+    body = resp.json()
+    assert body["conflict"] is True
+    assert body["conflict_fields"] == ["source"]
+    assert "enriched" not in body
+    assert body["synced_to_garmin"] is True
+    assert len(fake_garmin_client.pushed_weights) == 0
+
+    db = await get_db()
+    try:
+        row = await (
+            await db.execute("SELECT source, synced_to_garmin FROM weight_log WHERE id = ?", (row_id,))
+        ).fetchone()
+    finally:
+        await db.close()
+    assert row["source"] == "tasker"
+    assert row["synced_to_garmin"] == 1
+
+
 async def test_conflicting_value_does_not_overwrite_and_flags_conflict(client, fake_garmin_client, caplog):
     row_id, ts = await seed_row(84096, seconds_ago=5, body_fat_pct=18.4)
     with caplog.at_level(logging.WARNING):

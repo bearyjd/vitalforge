@@ -301,6 +301,16 @@ async def post_weight(data: WeightIn):
 
         await db.commit()
 
+        # `updates` can now be source-only (ENRICHABLE_FIELDS includes
+        # `source`, which has no Garmin analog) -- only an actual
+        # composition change should trigger a re-push or touch
+        # synced_to_garmin. Gating those two on plain `updates` re-pushed
+        # unchanged composition data on every source-only enrich and could
+        # flip a previously-true synced_to_garmin to a permanently stale
+        # false if that incidental push ever failed (fix-review finding on
+        # the ENRICHABLE_FIELDS change above).
+        composition_changed = any(field in COMPOSITION_FIELDS for field in updates)
+
         # Push happens outside the transaction (see comment above); this
         # connection stays open only to record the outcome afterward. By this
         # point the row (and any enrichment) is already durably committed, so
@@ -331,7 +341,7 @@ async def post_weight(data: WeightIn):
                     },
                 )
                 synced = garmin_error is None
-            elif updates:
+            elif composition_changed:
                 merged = {field: updates.get(field, existing[field]) for field in COMPOSITION_FIELDS}
                 # Parsed locally, not left to the outer except below: a row
                 # whose timestamp SQLite's own julianday() accepted (so the
@@ -351,7 +361,7 @@ async def post_weight(data: WeightIn):
             else:
                 synced = bool(existing["synced_to_garmin"])
 
-            if existing is None or updates:
+            if existing is None or composition_changed:
                 await db.execute("UPDATE weight_log SET synced_to_garmin = ? WHERE id = ?", (int(synced), row_id))
                 await db.commit()
         except Exception as e:
