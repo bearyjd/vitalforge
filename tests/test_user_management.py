@@ -33,6 +33,30 @@ def _cookies_for(username: str) -> dict:
     return {"vf_session": create_session_cookie(username)}
 
 
+# --- XSS regression (fix-review finding) --------------------------------------------
+
+
+async def test_admin_users_page_does_not_render_username_via_innerhtml(client):
+    """Fix-review finding: the users table used to build each row with
+    `row.innerHTML = `<td>${u.username}</td>...``, so a username containing
+    markup would execute in any admin's browser on page load -- a username
+    is untrusted input (an admin creating an account doesn't get to pick
+    what a future account's owner named themselves via self-service, once
+    that exists). Every cell must be built via textContent/option.value,
+    matching how the Delete button was already built correctly. This is a
+    static check on the served page, not a browser-executed one -- no
+    fixture in this repo runs an authenticated page through a real browser
+    yet, so this is the practical regression guard: verify the vulnerable
+    pattern is gone and the safe one is present, in the actual HTTP
+    response, not just the source constant."""
+    await seed_user("root", role="admin")
+    resp = await client.get("/auth/admin/users", cookies=_cookies_for("root"))
+    assert resp.status_code == 200
+    html = resp.text
+    assert "innerHTML = `<td>" not in html
+    assert "usernameCell.textContent = u.username" in html
+
+
 # --- Self-service password change -------------------------------------------------
 
 
@@ -62,12 +86,30 @@ async def test_change_own_password_succeeds_with_correct_current_password(client
     assert await shared_auth.check_credentials("alice", "new-password") is True
 
 
+async def test_change_own_password_empty_new_password_rejected(client):
+    await seed_user("alice", password="old-password")
+    resp = await client.post(
+        "/auth/account/password",
+        json={"current_password": "old-password", "new_password": ""},
+        cookies=_cookies_for("alice"),
+    )
+    assert resp.status_code == 422
+    assert await shared_auth.check_credentials("alice", "old-password") is True  # unchanged
+
+
 async def test_change_own_password_requires_auth(client):
+    """Fix-review finding: the route returns 401 for both "not
+    authenticated" and "current password incorrect" -- asserting only the
+    status code can't distinguish them, so this could have passed even if
+    require_auth's own check were deleted (the request has no real
+    username, so check_credentials would fail too, coincidentally also
+    401). Asserting the detail message pins it to the specific check."""
     await seed_user("someone")  # turn auth on -- an empty users table means open access
     resp = await client.post(
         "/auth/account/password", json={"current_password": "x", "new_password": "y"}
     )
     assert resp.status_code == 401
+    assert resp.json()["detail"] == "Not authenticated"
 
 
 # --- Admin route access ------------------------------------------------------------
@@ -134,6 +176,53 @@ async def test_create_user_missing_fields_rejected(client):
     assert resp.status_code == 422
 
 
+async def test_create_user_invalid_role_rejected(client):
+    await seed_user("root", role="admin")
+    resp = await client.post(
+        "/auth/admin/users",
+        json={"username": "bob", "password": "x", "role": "superadmin"},
+        cookies=_cookies_for("root"),
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"json": {"username": 123, "password": "x", "role": "user"}},
+        {"content": "[1, 2, 3]", "headers": {"Content-Type": "application/json"}},
+        {"content": "not json{{{", "headers": {"Content-Type": "application/json"}},
+    ],
+    ids=["non-string-username", "json-list-body", "malformed-json"],
+)
+async def test_create_user_malformed_input_returns_422_not_500(client, kwargs):
+    """Fix-review finding: hand-rolled `body.get(...)` parsing crashed with
+    an uncaught AttributeError/JSONDecodeError -> 500 on these three inputs
+    before this route took a Pydantic body model, same as this repo's own
+    documented 422-not-500 convention (see
+    test_weight_api.py::test_non_finite_float_rejected_422_not_500)."""
+    await seed_user("root", role="admin")
+    resp = await client.post("/auth/admin/users", cookies=_cookies_for("root"), **kwargs)
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("reserved", ["anonymous", "api-token"])
+async def test_create_user_reserved_username_rejected(client, reserved):
+    """Fix-review finding: get_current_user() returns these two strings as
+    sentinels in the same channel as real usernames (`anonymous` when auth
+    is off, `api-token` for any valid bearer request). An account actually
+    named one of them would collide -- every holder of the shared bearer
+    token would inherit whatever role the `api-token` account has."""
+    await seed_user("root", role="admin")
+    resp = await client.post(
+        "/auth/admin/users",
+        json={"username": reserved, "password": "x", "role": "admin"},
+        cookies=_cookies_for("root"),
+    )
+    assert resp.status_code == 422
+    assert await shared_auth.get_current_user_role(reserved) is None
+
+
 # --- Admin: edit user (role change / password reset) -------------------------------
 
 
@@ -153,6 +242,22 @@ async def test_admin_can_promote_a_user_to_admin(client):
     resp = await client.patch(f"/auth/admin/users/{bob_id}", json={"role": "admin"}, cookies=_cookies_for("root"))
     assert resp.status_code == 200
     assert await shared_auth.get_current_user_role("bob") == "admin"
+
+
+async def test_admin_update_nonexistent_user_returns_404(client):
+    await seed_user("root", role="admin")
+    resp = await client.patch("/auth/admin/users/999999", json={"role": "admin"}, cookies=_cookies_for("root"))
+    assert resp.status_code == 404
+
+
+async def test_admin_update_invalid_role_rejected(client):
+    await seed_user("root", role="admin")
+    bob_id = await seed_user("bob", role="user")
+    resp = await client.patch(
+        f"/auth/admin/users/{bob_id}", json={"role": "superadmin"}, cookies=_cookies_for("root")
+    )
+    assert resp.status_code == 422
+    assert await shared_auth.get_current_user_role("bob") == "user"  # unchanged
 
 
 # --- Last-admin guard ----------------------------------------------------------------
@@ -193,6 +298,33 @@ async def test_delete_nonexistent_user_returns_404(client):
 
 
 # --- bootstrap_first_admin -----------------------------------------------------------
+
+
+async def test_bootstrap_first_admin_survives_concurrent_startup(initialized_db, monkeypatch):
+    """Fix-review finding: neither compose file declares `depends_on`, so
+    both services can start concurrently against the same SQLite file and
+    both call this on a fresh (empty) DB. Both SELECT empty, both attempt
+    the INSERT, one hits UNIQUE(username) -- that must be swallowed as
+    "someone else already seeded it", not propagate and crash that
+    service's startup."""
+    monkeypatch.setattr(shared_auth, "_USER", "bootstrapped-admin")
+    monkeypatch.setattr(shared_auth, "_PASS", "bootstrapped-password")
+
+    import asyncio
+
+    results = await asyncio.gather(
+        shared_auth.bootstrap_first_admin(),
+        shared_auth.bootstrap_first_admin(),
+        return_exceptions=True,
+    )
+    assert results == [None, None]  # neither call raised
+
+    db = await get_db()
+    try:
+        count = (await (await db.execute("SELECT COUNT(*) FROM users")).fetchone())[0]
+    finally:
+        await db.close()
+    assert count == 1
 
 
 async def test_bootstrap_first_admin_seeds_from_env_vars(initialized_db, monkeypatch):

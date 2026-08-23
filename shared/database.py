@@ -213,12 +213,3 @@ async def init_db():
         await db.commit()
     finally:
         await db.close()
-
-    # Local import: shared.auth imports get_db from this module, so a
-    # module-level import here would cycle. bootstrap_first_admin opens its
-    # own connection and is idempotent (checked via "does any user exist
-    # yet"), so it's safe to call after this function's own connection has
-    # already closed.
-    from shared.auth import bootstrap_first_admin
-
-    await bootstrap_first_admin()

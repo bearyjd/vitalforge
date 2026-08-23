@@ -6,11 +6,13 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
+from typing import Literal
 
 import aiosqlite
 from fastapi import HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+from pydantic import BaseModel, ConfigDict
 
 from shared.database import get_db
 
@@ -22,6 +24,17 @@ _PASS = os.environ.get("VITALFORGE_PASS", "")
 _API_TOKEN = os.environ.get("VITALFORGE_API_TOKEN", "").strip()
 _COOKIE_NAME = "vf_session"
 _MAX_AGE = 30 * 24 * 3600  # 30 days
+
+# get_current_user returns these two sentinel strings in the same channel
+# as real usernames ("anonymous" when auth is off, "api-token" for a valid
+# bearer request). A real account created with either name would collide:
+# get_current_user_role("api-token") would return that account's role, so
+# every holder of the shared bearer token would be authorized as whatever
+# role the "api-token" account has (fix-review finding, reproduced). Reject
+# both at account-creation time -- Phase B's per-user-api-tokens plan
+# removes the "api-token" sentinel entirely by resolving bearer auth to the
+# token's real owning username, but that hasn't merged yet.
+_RESERVED_USERNAMES = {"anonymous", "api-token"}
 
 # scrypt cost parameters for password hashing. n=2**14 (OWASP's minimum
 # recommendation for interactive/low-throughput logins) rather than a
@@ -131,6 +144,16 @@ async def get_current_user_role(username: str) -> str | None:
     return row["role"] if row is not None else None
 
 
+async def _require_admin(request: Request) -> str:
+    """require_auth() plus the admin-only role check every /auth/admin/*
+    route needs -- was five copies of the same three lines (fix-review
+    finding)."""
+    user = await require_auth(request)
+    if await get_current_user_role(user) != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    return user
+
+
 async def check_credentials(username: str, password: str) -> bool:
     db = await get_db()
     try:
@@ -151,9 +174,14 @@ async def bootstrap_first_admin():
     real (hashed) user record instead of the env-var pair. Does nothing if
     any user already exists, or if VITALFORGE_PASS is empty (matches
     today's "empty VITALFORGE_PASS = auth disabled" dev convenience -- an
-    empty users table IS that state now). Called from shared.database's
-    init_db(), not from either service's own lifespan, so it runs exactly
-    once per process startup regardless of which service starts it."""
+    empty users table IS that state now). Called from each service's own
+    lifespan, after init_db() -- both services start against the same
+    SQLite file with no `depends_on` ordering between them, so both can
+    reach the empty-table check before either commits its INSERT. The
+    UNIQUE(username) constraint is the actual race guard: the loser's
+    IntegrityError is caught and treated as "someone else already seeded
+    it", not a real failure (fix-review finding, reproduced: both
+    processes calling this concurrently against a fresh DB, one raises)."""
     if not _PASS:
         return
     db = await get_db()
@@ -161,11 +189,14 @@ async def bootstrap_first_admin():
         row = await (await db.execute("SELECT 1 FROM users LIMIT 1")).fetchone()
         if row is not None:
             return
-        await db.execute(
-            "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, 'admin', ?)",
-            (_USER, _hash_password(_PASS), datetime.now(timezone.utc).isoformat()),
-        )
-        await db.commit()
+        try:
+            await db.execute(
+                "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, 'admin', ?)",
+                (_USER, _hash_password(_PASS), datetime.now(timezone.utc).isoformat()),
+            )
+            await db.commit()
+        except aiosqlite.IntegrityError:
+            return
         logger.warning(
             "Seeded admin user %r from VITALFORGE_USER/VITALFORGE_PASS -- these env "
             "vars are no longer read for ongoing auth after this, only for this "
@@ -444,6 +475,9 @@ ADMIN_USERS_PAGE_HTML = """<!DOCTYPE html>
         <p style="margin-top:1rem"><a href="/">Back</a></p>
     </div>
     <script>
+        // Every cell built from server data uses textContent/option.value, never
+        // innerHTML -- a username is untrusted input as far as this page is
+        // concerned, and innerHTML would execute markup in it.
         async function loadUsers() {
             const res = await fetch("/auth/admin/users/list");
             const users = await res.json();
@@ -451,13 +485,41 @@ ADMIN_USERS_PAGE_HTML = """<!DOCTYPE html>
             body.innerHTML = "";
             for (const u of users) {
                 const row = document.createElement("tr");
-                row.innerHTML = `<td>${u.username}</td><td>${u.role}</td><td>${u.created_at}</td><td></td>`;
-                const cell = row.lastElementChild;
-                const btn = document.createElement("button");
-                btn.className = "danger";
-                btn.textContent = "Delete";
-                btn.onclick = () => deleteUser(u.id);
-                cell.appendChild(btn);
+
+                const usernameCell = document.createElement("td");
+                usernameCell.textContent = u.username;
+                row.appendChild(usernameCell);
+
+                const roleCell = document.createElement("td");
+                const roleSelect = document.createElement("select");
+                for (const r of ["user", "admin"]) {
+                    const opt = document.createElement("option");
+                    opt.value = r;
+                    opt.textContent = r;
+                    if (r === u.role) opt.selected = true;
+                    roleSelect.appendChild(opt);
+                }
+                roleSelect.onchange = () => updateRole(u.id, roleSelect.value);
+                roleCell.appendChild(roleSelect);
+                row.appendChild(roleCell);
+
+                const createdCell = document.createElement("td");
+                createdCell.textContent = u.created_at;
+                row.appendChild(createdCell);
+
+                const actionsCell = document.createElement("td");
+                const resetBtn = document.createElement("button");
+                resetBtn.textContent = "Reset Password";
+                resetBtn.onclick = () => resetPassword(u.id);
+                actionsCell.appendChild(resetBtn);
+
+                const delBtn = document.createElement("button");
+                delBtn.className = "danger";
+                delBtn.textContent = "Delete";
+                delBtn.onclick = () => deleteUser(u.id);
+                actionsCell.appendChild(delBtn);
+
+                row.appendChild(actionsCell);
                 body.appendChild(row);
             }
         }
@@ -487,6 +549,38 @@ ADMIN_USERS_PAGE_HTML = """<!DOCTYPE html>
             return false;
         }
 
+        async function updateRole(id, role) {
+            document.getElementById("error").textContent = "";
+            const res = await fetch(`/auth/admin/users/${id}`, {
+                method: "PATCH",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({role: role})
+            });
+            if (!res.ok) {
+                const body = await res.json();
+                document.getElementById("error").textContent = body.detail || "Failed to update role.";
+            }
+            loadUsers();  // re-render either way, so a rejected change reverts the dropdown
+        }
+
+        async function resetPassword(id) {
+            document.getElementById("error").textContent = "";
+            document.getElementById("success").textContent = "";
+            const newPassword = prompt("New password for this user:");
+            if (!newPassword) return;
+            const res = await fetch(`/auth/admin/users/${id}`, {
+                method: "PATCH",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({password: newPassword})
+            });
+            if (res.ok) {
+                document.getElementById("success").textContent = "Password reset.";
+            } else {
+                const body = await res.json();
+                document.getElementById("error").textContent = body.detail || "Failed to reset password.";
+            }
+        }
+
         async function deleteUser(id) {
             document.getElementById("error").textContent = "";
             const res = await fetch(`/auth/admin/users/${id}`, { method: "DELETE" });
@@ -502,6 +596,28 @@ ADMIN_USERS_PAGE_HTML = """<!DOCTYPE html>
     </script>
 </body>
 </html>"""
+
+
+class PasswordChangeIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    current_password: str
+    new_password: str
+
+
+class CreateUserIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    username: str
+    password: str
+    role: Literal["admin", "user"] = "user"
+
+
+class UpdateUserIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["admin", "user"] | None = None
+    password: str | None = None
 
 
 def add_auth_routes(app):
@@ -537,19 +653,17 @@ def add_auth_routes(app):
         return HTMLResponse(ACCOUNT_PAGE_HTML)
 
     @app.post("/auth/account/password")
-    async def change_own_password(request: Request):
+    async def change_own_password(request: Request, data: PasswordChangeIn):
         user = await require_auth(request)
-        body = await request.json()
-        current = body.get("current_password", "")
-        new = body.get("new_password", "")
-        if not await check_credentials(user, current):
+        if not await check_credentials(user, data.current_password):
             raise HTTPException(status_code=401, detail="Current password incorrect")
-        if not new:
+        if not data.new_password:
             raise HTTPException(status_code=422, detail="New password required")
         db = await get_db()
         try:
             await db.execute(
-                "UPDATE users SET password_hash = ? WHERE username = ?", (_hash_password(new), user)
+                "UPDATE users SET password_hash = ? WHERE username = ?",
+                (_hash_password(data.new_password), user),
             )
             await db.commit()
         finally:
@@ -558,16 +672,12 @@ def add_auth_routes(app):
 
     @app.get("/auth/admin/users")
     async def admin_users_page(request: Request):
-        user = await require_auth(request)
-        if await get_current_user_role(user) != "admin":
-            raise HTTPException(status_code=403, detail="Admin only")
+        await _require_admin(request)
         return HTMLResponse(ADMIN_USERS_PAGE_HTML)
 
     @app.get("/auth/admin/users/list")
     async def admin_list_users(request: Request):
-        user = await require_auth(request)
-        if await get_current_user_role(user) != "admin":
-            raise HTTPException(status_code=403, detail="Admin only")
+        await _require_admin(request)
         db = await get_db()
         try:
             rows = await (
@@ -578,22 +688,19 @@ def add_auth_routes(app):
         return [dict(row) for row in rows]
 
     @app.post("/auth/admin/users")
-    async def admin_create_user(request: Request):
-        user = await require_auth(request)
-        if await get_current_user_role(user) != "admin":
-            raise HTTPException(status_code=403, detail="Admin only")
-        body = await request.json()
-        username = body.get("username", "").strip()
-        password = body.get("password", "")
-        role = body.get("role", "user")
-        if not username or not password or role not in ("admin", "user"):
-            raise HTTPException(status_code=422, detail="username, password, and a valid role are required")
+    async def admin_create_user(request: Request, data: CreateUserIn):
+        await _require_admin(request)
+        username = data.username.strip()
+        if not username or not data.password:
+            raise HTTPException(status_code=422, detail="username and password are required")
+        if username in _RESERVED_USERNAMES:
+            raise HTTPException(status_code=422, detail=f"'{username}' is a reserved username")
         db = await get_db()
         try:
             try:
                 await db.execute(
                     "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, ?, ?)",
-                    (username, _hash_password(password), role, datetime.now(timezone.utc).isoformat()),
+                    (username, _hash_password(data.password), data.role, datetime.now(timezone.utc).isoformat()),
                 )
                 await db.commit()
             except aiosqlite.IntegrityError:
@@ -603,15 +710,10 @@ def add_auth_routes(app):
         return {"success": True}
 
     @app.patch("/auth/admin/users/{user_id}")
-    async def admin_update_user(request: Request, user_id: int):
-        user = await require_auth(request)
-        if await get_current_user_role(user) != "admin":
-            raise HTTPException(status_code=403, detail="Admin only")
-        body = await request.json()
-        new_role = body.get("role")
-        new_password = body.get("password")
-        if new_role is not None and new_role not in ("admin", "user"):
-            raise HTTPException(status_code=422, detail="Invalid role")
+    async def admin_update_user(request: Request, user_id: int, data: UpdateUserIn):
+        await _require_admin(request)
+        new_role = data.role
+        new_password = data.password
         db = await get_db()
         try:
             target = await (await db.execute("SELECT role FROM users WHERE id = ?", (user_id,))).fetchone()
@@ -638,9 +740,7 @@ def add_auth_routes(app):
 
     @app.delete("/auth/admin/users/{user_id}")
     async def admin_delete_user(request: Request, user_id: int):
-        user = await require_auth(request)
-        if await get_current_user_role(user) != "admin":
-            raise HTTPException(status_code=403, detail="Admin only")
+        await _require_admin(request)
         db = await get_db()
         try:
             target = await (await db.execute("SELECT username, role FROM users WHERE id = ?", (user_id,))).fetchone()
