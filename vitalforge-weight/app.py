@@ -187,15 +187,26 @@ async def post_weight(data: WeightIn):
     db = await get_db()
     try:
         await db.execute("BEGIN IMMEDIATE")
-        # `timestamp >= ?` is a sargable prefilter (plain string comparison is
-        # safe here -- every row in this table is written by this same route
-        # via datetime.now(timezone.utc).isoformat(), so the format is fixed-
-        # width and zero-padded, unlike the mismatched-format pitfall
-        # /api/weight/trend has). It's 1s wider than the real window so it
-        # can never exclude a row the authoritative ABS(julianday()) clause
-        # below would accept; that clause is what idx_weight_log_timestamp
-        # cannot use directly (wrapping the column in julianday() makes the
-        # index unusable for range pruning).
+        # `timestamp >= ?` is a sargable prefilter, not the authoritative
+        # bound -- plain string comparison is NOT reliably safe here despite
+        # every row coming from this same route's own
+        # `datetime.now(timezone.utc).isoformat()`: isoformat() omits the
+        # fractional part entirely when microseconds are exactly 0
+        # ("...11+00:00" vs "...11.482913+00:00"), and '.' (0x2e) sorts
+        # after '+' (0x2b), so a zero-microsecond row can sort BEFORE a
+        # same-second fractional one -- the format is neither fixed-width
+        # nor zero-padded (Phase 4 devil's-advocate review finding,
+        # verified: `sorted(["...11+00:00", "...11.482913+00:00"])` puts
+        # the fractional one first). This prefilter is still correct only
+        # because it's 1s wider than the authoritative window
+        # (DEDUP_WINDOW_SECONDS + 1, below) -- that one second of slack
+        # absorbs the entire sub-second ordering error, so this clause can
+        # never exclude a row the authoritative ABS(julianday()) clause
+        # below would accept. Do not narrow that `+ 1` on the strength of
+        # this comment's format claim -- it's the slack, not the format,
+        # that makes the prefilter safe. That clause is what
+        # idx_weight_log_timestamp cannot use directly (wrapping the column
+        # in julianday() makes the index unusable for range pruning).
         #
         # The authoritative window is symmetric (+-60s around this request's
         # own `now`), not one-sided ending exactly at `now` -- an earlier
@@ -306,6 +317,7 @@ async def post_weight(data: WeightIn):
         # this code enforces; moving the push to a thread/worker pool would
         # reopen a stale-read window here.
         garmin_error = None
+        synced = False
         try:
             if existing is None:
                 garmin_error = _push_composition(
@@ -321,9 +333,21 @@ async def post_weight(data: WeightIn):
                 synced = garmin_error is None
             elif updates:
                 merged = {field: updates.get(field, existing[field]) for field in COMPOSITION_FIELDS}
-                original_ts = datetime.fromisoformat(existing["timestamp"])
-                garmin_error = _push_composition(existing["weight_grams"], original_ts, merged)
-                synced = garmin_error is None
+                # Parsed locally, not left to the outer except below: a row
+                # whose timestamp SQLite's own julianday() accepted (so the
+                # dedup match above fired) but Python's fromisoformat()
+                # can't parse used to raise here and skip the
+                # synced_to_garmin flag-update entirely -- the response
+                # correctly said `false`, but the stored row kept whatever
+                # stale value it already had (Phase 4 adversarial review
+                # finding).
+                try:
+                    original_ts = datetime.fromisoformat(existing["timestamp"])
+                except ValueError as e:
+                    garmin_error = f"could not parse stored timestamp for Garmin push: {e}"
+                else:
+                    garmin_error = _push_composition(existing["weight_grams"], original_ts, merged)
+                    synced = garmin_error is None
             else:
                 synced = bool(existing["synced_to_garmin"])
 

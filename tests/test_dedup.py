@@ -342,3 +342,36 @@ async def test_dedup_enrichment_conflicting_source_kept_not_overwritten(client):
         await db.close()
     assert row["source"] == "tasker"  # original provenance kept, not silently overwritten
     assert row["body_fat_pct"] == 18.4
+
+
+async def test_unparseable_stored_timestamp_still_persists_sync_failure(client, fake_garmin_client):
+    """Phase 4 adversarial review finding: SQLite's julianday() accepts a
+    bare Julian-day-number string directly (so the dedup SELECT's window
+    match still fires on a row like this), but Python's
+    datetime.fromisoformat() cannot parse it -- and that parse used to be
+    the very first thing the enrichment-push branch did, so it raised
+    before the subsequent `UPDATE weight_log SET synced_to_garmin = ?`
+    ever ran. The in-memory response correctly said `false`, but the
+    stored row was left asserting its prior (here stale-true) value --
+    a flag that lies is worse than a flag that's merely False, since
+    nothing downstream knows to re-check it."""
+    db = await get_db()
+    try:
+        julian_now = (await (await db.execute("SELECT julianday('now')")).fetchone())[0]
+    finally:
+        await db.close()
+    row_id = await seed_row_raw_timestamp(84096, str(julian_now))
+    resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs", "body_fat_pct": 18.4})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["synced_to_garmin"] is False
+    assert len(fake_garmin_client.pushed_weights) == 0
+
+    db = await get_db()
+    try:
+        row = await (
+            await db.execute("SELECT synced_to_garmin FROM weight_log WHERE id = ?", (row_id,))
+        ).fetchone()
+    finally:
+        await db.close()
+    assert row["synced_to_garmin"] == 0
