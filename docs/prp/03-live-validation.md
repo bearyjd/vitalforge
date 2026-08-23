@@ -1,15 +1,11 @@
 # 03 — Live validation: the B3 checkpoint
 
-**Status: auth fix deployed and confirmed working (2026-08-22 22:32 UTC).**
-Both services authenticated successfully on restart — `mobile+cffi`/
-`mobile+requests` still hit Garmin's 429 (that part of the rate limit
-hadn't cleared yet), but garminconnect 0.3.11's cascading login chain fell
-through to a later strategy and succeeded, with tokens persisted correctly
-to `garmin_tokens.json`. No crash, no AttributeError. See "2026-08-22
-incident: root cause and fix" below for the full story. **Still needed:**
-step 1's composition push was never actually delivered to Garmin (it
-predates this fix) — push a fresh weigh-in now that auth is healthy, then
-do steps 2–4 for real.
+**Status: DONE.** Auth fix deployed and confirmed (2026-08-22 22:32 UTC);
+a real composition push reached Garmin successfully at 2026-08-23 01:28
+UTC (`"synced_to_garmin": true`); units confirmed as **grams** for both
+`boneMass` and `muscleMass` — see "2026-08-23 successful push" below. Only
+step 2 (your own eyes on Garmin Connect) and the optional step 4 remain,
+and neither blocks B5.
 
 **What's blocked on this:** B5 (dashboard exposure of composition data) and
 B6 (final docs pass). Both are otherwise ready to implement the moment this
@@ -91,14 +87,14 @@ The working hypothesis from design (§3.5) is **grams**, by precedent from
 back as `boneMass: 3200`, not `3.2`. But don't assume it — that's exactly
 what this step exists to settle.
 
-**Record here (values only, no need to paste full JSON):**
-- `boneMass` observed value + inferred unit (kg or g): ______________________
-- `muscleMass` observed value + inferred unit (kg or g): ______________________
-- `bodyFat` / `bodyWater` sanity check (should already have worked pre-Track-B, confirms nothing regressed): ______________________
+**Recorded 2026-08-23 01:29 UTC** (pushed `bone_mass_kg: 3.72`, `muscle_pct: 40.7` at weight 90.9kg):
+- `boneMass`: `3720` — **grams** (3.72kg × 1000 = 3720, confirms the design doc's grams hypothesis).
+- `muscleMass`: `36990` — **grams** (40.7% of 90.9kg ≈ 36.99kg ≈ 36990g, consistent with the same grams convention).
+- `bodyFat` / `bodyWater`: `19.9` / `54.4` — exact match to what was pushed, plain percentages, confirms nothing regressed.
 
-**This determines B5's column names** (`bone_mass_kg`/`muscle_mass_kg` vs.
-`bone_mass_g`/`muscle_mass_g` on `weight_history` — see
-`docs/prp/00-design.md` §3.5/§4.3 and `01-plan.md` §B5).
+**This determines B5's column names:** use the **grams** branch
+(`bone_mass_g`/`muscle_mass_g` on `weight_history`) — see
+`docs/prp/00-design.md` §3.5/§4.3 and `01-plan.md` §B5.
 
 ## 4. (Optional but valuable) Does Garmin collapse two same-timestamp uploads?
 
@@ -235,11 +231,28 @@ exists (`0600`, matches the library's own hardening). Deleted the orphaned
 `oauth1_token.json`/`oauth2_token.json` from `/app/data/.garth/` now that
 they're confirmed unused.
 
-**Still not done:** step 1's original composition push (200.4 lbs / 19.9% /
-54.4% / 40.7% / 3.72kg) predates this fix and was never actually delivered
-to Garmin — a fresh push is needed now that auth is healthy, then steps 2–4
-for real (Garmin Connect visual check + the units read-back that unblocks
-B5).
+## 2026-08-23 successful push
+
+Deleted the two stale unsynced local-only rows from before the fix (`id=18`
+200.4lbs w/ composition, `id=19` 200.3lbs weight-only — likely a redundant
+PWA test, since the PWA form doesn't collect composition fields) via
+`DELETE /api/weight/{id}`, then pushed one clean fresh entry:
+
+```
+POST /api/weight {"weight": 200.4, "unit": "lbs", "body_fat_pct": 19.9,
+"body_water_pct": 54.4, "muscle_pct": 40.7, "bone_mass_kg": 3.72,
+"source": "pwa"}
+```
+
+Response: `"success": true, "synced_to_garmin": true"` — **the push reached
+Garmin.** Step 3's units read-back (above) confirms grams for
+`boneMass`/`muscleMass`. This closes out steps 0, 1, and 3.
+
+**Remaining, neither blocks B5:**
+- Step 2 — open Garmin Connect yourself and confirm today's weigh-in shows
+  the right weight and composition fields.
+- Step 4 (optional) — the same-timestamp-collapse question; skip unless
+  you want to arrange it deliberately.
 
 ## Next steps once this file has real answers
 
