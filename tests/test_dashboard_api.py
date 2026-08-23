@@ -69,6 +69,9 @@ async def test_sync_status_never_synced(client):
         ("vo2max", "vo2max", "vo2max_value"),
         ("weight", "weight_history", "weight_grams"),
         ("body_fat", "weight_history", "body_fat"),
+        ("body_water", "weight_history", "body_water"),
+        ("bone_mass", "weight_history", "bone_mass_g"),
+        ("muscle_mass", "weight_history", "muscle_mass_g"),
         ("training_load", "training_load", "acute_load"),
         ("steps", "steps", "value"),
         ("active_calories", "active_calories", "value"),
@@ -93,6 +96,36 @@ async def test_get_metric_returns_seeded_data(client, metric_name, table, column
 async def test_get_metric_unknown_name_returns_400(client):
     resp = await client.get("/api/metrics/not_a_real_metric")
     assert resp.status_code == 400
+
+
+async def test_metric_tables_includes_body_water_muscle_bone(dashboard_app_module):
+    assert dashboard_app_module.METRIC_TABLES["body_water"] == ("weight_history", "body_water")
+    assert dashboard_app_module.METRIC_TABLES["bone_mass"] == ("weight_history", "bone_mass_g")
+    assert dashboard_app_module.METRIC_TABLES["muscle_mass"] == ("weight_history", "muscle_mass_g")
+
+
+@pytest.mark.parametrize("metric_name", ["body_water", "bone_mass", "muscle_mass"])
+async def test_composition_metrics_return_empty_series_when_garmin_values_null(client, metric_name):
+    """Production's actual state on launch day: every composition field is
+    null until the first Track B push round-trips through Garmin. The
+    endpoint must return an empty series, not error or crash the moving-
+    average loop."""
+    db = await get_db()
+    try:
+        await db.execute(
+            "INSERT INTO weight_history (date, weight_grams, bmi, body_fat, body_water, bone_mass_g, muscle_mass_g) "
+            "VALUES (?, 81200, 24.1, 18.4, NULL, NULL, NULL)",
+            (days_ago(1),),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+    resp = await client.get(f"/api/metrics/{metric_name}")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["count"] == 0
+    assert body["data"] == []
 
 
 async def test_get_metric_respects_days_window(client):

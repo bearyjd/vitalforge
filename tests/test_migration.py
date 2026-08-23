@@ -78,7 +78,8 @@ async def test_duplicate_column_error_swallowed_but_others_propagate():
         async def commit(self):
             pass
 
-    await database._add_weight_log_columns(DuplicateDB())  # no exception -- swallowed
+    # no exception -- swallowed
+    await database._add_columns(DuplicateDB(), "weight_log", database._WEIGHT_LOG_ADDITIVE_COLUMNS)
 
     class OtherErrorDB:
         async def execute(self, sql):
@@ -88,7 +89,7 @@ async def test_duplicate_column_error_swallowed_but_others_propagate():
             pass
 
     with pytest.raises(aiosqlite.OperationalError, match="database is locked"):
-        await database._add_weight_log_columns(OtherErrorDB())
+        await database._add_columns(OtherErrorDB(), "weight_log", database._WEIGHT_LOG_ADDITIVE_COLUMNS)
 
 
 async def test_existing_rows_have_null_composition_after_migration(production_schema_db):
@@ -127,6 +128,59 @@ async def test_migration_preserves_row_count(production_schema_db):
     finally:
         await db.close()
     assert after == 17
+
+
+WEIGHT_HISTORY_COMPOSITION_COLUMNS = {"body_water", "bone_mass_g", "muscle_mass_g"}
+
+
+async def test_fresh_db_weight_history_includes_composition_columns(tmp_db_path):
+    await database.init_db()
+    columns = await _table_columns(tmp_db_path, "weight_history")
+    assert WEIGHT_HISTORY_COMPOSITION_COLUMNS <= columns
+
+
+async def test_init_db_adds_composition_columns_to_existing_weight_history(production_schema_db):
+    before = await _table_columns(production_schema_db, "weight_history")
+    assert not (WEIGHT_HISTORY_COMPOSITION_COLUMNS & before)
+
+    await database.init_db()
+
+    after = await _table_columns(production_schema_db, "weight_history")
+    assert WEIGHT_HISTORY_COMPOSITION_COLUMNS <= after
+
+
+async def test_existing_weight_history_rows_have_null_composition_after_migration(production_schema_db):
+    await database.init_db()
+    db = await aiosqlite.connect(str(production_schema_db))
+    try:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT body_water, bone_mass_g, muscle_mass_g FROM weight_history")
+        rows = await cursor.fetchall()
+    finally:
+        await db.close()
+    assert len(rows) == 34
+    for row in rows:
+        assert row["body_water"] is None
+        assert row["bone_mass_g"] is None
+        assert row["muscle_mass_g"] is None
+
+
+async def test_weight_history_migration_preserves_existing_rows(production_schema_db):
+    db = await aiosqlite.connect(str(production_schema_db))
+    try:
+        before = (await (await db.execute("SELECT COUNT(*) FROM weight_history")).fetchone())[0]
+    finally:
+        await db.close()
+    assert before == 34
+
+    await database.init_db()
+
+    db = await aiosqlite.connect(str(production_schema_db))
+    try:
+        after = (await (await db.execute("SELECT COUNT(*) FROM weight_history")).fetchone())[0]
+    finally:
+        await db.close()
+    assert after == 34
 
 
 def test_concurrent_init_db_both_succeed(tmp_db_path):

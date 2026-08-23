@@ -227,6 +227,9 @@ async def sync_weight_history(start_date: str, end_date: str):
                     weight_grams=weight_g,
                     bmi=latest.get("bmi"),
                     body_fat=latest.get("bodyFat"),
+                    body_water=latest.get("bodyWater"),
+                    bone_mass_g=latest.get("boneMass"),
+                    muscle_mass_g=latest.get("muscleMass"),
                 )
 
 
