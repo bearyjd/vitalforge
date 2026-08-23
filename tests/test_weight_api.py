@@ -4,6 +4,8 @@ No Docker, no network, no real Garmin account — `weight_app_module` (see
 conftest.py) fully fakes Garmin and points the DB at a tmp_path SQLite file.
 """
 
+import json
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -185,6 +187,47 @@ async def test_bone_mass_in_grams_rejected_422(client):
     """3200 (grams) is the unit-error case the 0.5-10.0 kg bound exists for."""
     resp = await client.post("/api/weight", json={"weight": 180.0, "unit": "lbs", "bone_mass_kg": 3200})
     assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("field", ["weight", "body_fat_pct", "body_water_pct", "muscle_pct", "bone_mass_kg"])
+async def test_boolean_value_rejected_not_silently_coerced(client, field):
+    """Pydantic v2 treats bool as an int subtype, so a bare `float` field
+    would otherwise silently coerce JSON true/false to 1.0/0.0.
+    bone_mass_kg's 0.5-10.0 kg bound does not exclude 1.0, so
+    `bone_mass_kg: true` would reach the DB and the Garmin FIT payload as a
+    measured 1kg bone mass without an explicit guard (Phase 4 adversarial
+    review finding). Asserts on the specific error, not just the status
+    code, so this can't pass by coincidence via a field's own range bound."""
+    payload = {"weight": 180.0, "unit": "lbs", field: True}
+    resp = await client.post("/api/weight", json=payload)
+    assert resp.status_code == 422
+    assert "boolean" in resp.text
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("field", ["weight", "body_fat_pct", "body_water_pct", "muscle_pct", "bone_mass_kg"])
+async def test_non_finite_float_rejected_422_not_500(client, field, bad_value):
+    """`json.dumps` accepts bare NaN/Infinity by default (a non-standard
+    extension), so a bridge/scale that forwards a failed-reading NaN reaches
+    Pydantic's ge/le validators, which correctly reject it -- but FastAPI's
+    default RequestValidationError handler then tries to JSON-encode the
+    rejected value itself (`exc.errors()`'s `input` field) and crashes with
+    a 500 text/plain response instead of the documented 422, silently
+    reclassifying a terminal, don't-retry error (00-design.md SS4.5 rule 2)
+    into the retryable-with-backoff bucket (rule 3) -- and reintroduces the
+    500/text-plain shape on /api/weight that Track A eliminated (Phase 4
+    adversarial review finding).
+
+    Sent as a raw body via `content=`, not httpx's `json=` convenience
+    param -- httpx's own request-side JSON encoder rejects non-finite
+    floats before a request is even sent, but stdlib `json.dumps` (what a
+    real bridge/scale client would use) emits bare NaN/Infinity by default,
+    so this is what actually reaches the server over the wire."""
+    payload = {"weight": 180.0, "unit": "lbs", field: bad_value}
+    body = json.dumps(payload)
+    resp = await client.post("/api/weight", content=body, headers={"Content-Type": "application/json"})
+    assert resp.status_code == 422
+    assert resp.headers["content-type"].startswith("application/json")
 
 
 @pytest.mark.parametrize("weight,unit", [(1200.0, "kg"), (1.0, "kg")])

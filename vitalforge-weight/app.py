@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -6,10 +7,13 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.requests import Request
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from shared.auth import add_auth_routes
 from shared.database import get_db, init_db
@@ -44,6 +48,37 @@ app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), na
 templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
 
 
+def _scrub_non_finite(value):
+    if isinstance(value, float) and not math.isfinite(value):
+        return repr(value)
+    if isinstance(value, dict):
+        return {k: _scrub_non_finite(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_scrub_non_finite(v) for v in value]
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exception_handler(request: Request, exc: RequestValidationError):
+    """FastAPI's default handler JSON-encodes `exc.errors()` verbatim,
+    including the rejected `input` value -- but `json.dumps` (Starlette's
+    JSONResponse.render, allow_nan=False) rejects NaN/Infinity, which
+    `json.loads` (and httpx's/requests' JSON encoders) accept as a
+    non-standard extension. A composition value of NaN or Infinity is
+    correctly rejected by Field's ge/le bounds, but then crashes this
+    handler with a 500 text/plain response instead of returning the
+    documented 422 -- silently reclassifying a terminal, don't-retry error
+    into a retryable one for the client (docs/prp/00-design.md SS4.5; Phase
+    4 adversarial review finding). Scrub non-finite floats out of the error
+    payload before encoding so the intended 422 actually reaches the
+    client.
+    """
+    return JSONResponse(
+        status_code=422,
+        content={"detail": _scrub_non_finite(jsonable_encoder(exc.errors()))},
+    )
+
+
 class WeightIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -54,6 +89,18 @@ class WeightIn(BaseModel):
     muscle_pct: float | None = Field(default=None, ge=10.0, le=90.0)
     bone_mass_kg: float | None = Field(default=None, ge=0.5, le=10.0)
     source: Literal["pwa", "bascule", "bridge", "tasker"] | None = None
+
+    @field_validator("weight", "body_fat_pct", "body_water_pct", "muscle_pct", "bone_mass_kg", mode="before")
+    @classmethod
+    def _reject_bool(cls, value):
+        # bool is a subclass of int in Python, so Pydantic's lax float mode
+        # otherwise silently coerces JSON true/false to 1.0/0.0 -- which
+        # bone_mass_kg's 0.5-10.0 kg bound doesn't exclude (Phase 4
+        # adversarial review finding: `bone_mass_kg: true` reached the DB
+        # and the Garmin FIT payload as a measured 1kg bone mass).
+        if isinstance(value, bool):
+            raise ValueError("must be a number, not a boolean")
+        return value
 
     @model_validator(mode="after")
     def _validate_weight_bounds(self):
@@ -84,6 +131,14 @@ async def index(request: Request):
 DEDUP_WEIGHT_TOLERANCE_GRAMS = 50
 DEDUP_WINDOW_SECONDS = 60
 COMPOSITION_FIELDS = ("body_fat_pct", "body_water_pct", "muscle_pct", "bone_mass_kg")
+# Same first-write-wins-or-conflict treatment as COMPOSITION_FIELDS, plus
+# `source`. Kept separate from COMPOSITION_FIELDS (which also names exactly
+# what _push_composition forwards to Garmin) so that boundary stays
+# explicit; `source` has no Garmin analog and was previously excluded from
+# enrichment entirely, so a row's provenance label could permanently
+# misattribute composition data actually added by a different, later
+# client (Phase 4 adversarial review finding).
+ENRICHABLE_FIELDS = (*COMPOSITION_FIELDS, "source")
 
 
 def _push_composition(weight_grams: int, timestamp: datetime, composition: dict) -> str | None:
@@ -132,15 +187,26 @@ async def post_weight(data: WeightIn):
     db = await get_db()
     try:
         await db.execute("BEGIN IMMEDIATE")
-        # `timestamp >= ?` is a sargable prefilter (plain string comparison is
-        # safe here -- every row in this table is written by this same route
-        # via datetime.now(timezone.utc).isoformat(), so the format is fixed-
-        # width and zero-padded, unlike the mismatched-format pitfall
-        # /api/weight/trend has). It's 1s wider than the real window so it
-        # can never exclude a row the authoritative ABS(julianday()) clause
-        # below would accept; that clause is what idx_weight_log_timestamp
-        # cannot use directly (wrapping the column in julianday() makes the
-        # index unusable for range pruning).
+        # `timestamp >= ?` is a sargable prefilter, not the authoritative
+        # bound -- plain string comparison is NOT reliably safe here despite
+        # every row coming from this same route's own
+        # `datetime.now(timezone.utc).isoformat()`: isoformat() omits the
+        # fractional part entirely when microseconds are exactly 0
+        # ("...11+00:00" vs "...11.482913+00:00"), and '.' (0x2e) sorts
+        # after '+' (0x2b), so a zero-microsecond row can sort BEFORE a
+        # same-second fractional one -- the format is neither fixed-width
+        # nor zero-padded (Phase 4 devil's-advocate review finding,
+        # verified: `sorted(["...11+00:00", "...11.482913+00:00"])` puts
+        # the fractional one first). This prefilter is still correct only
+        # because it's 1s wider than the authoritative window
+        # (DEDUP_WINDOW_SECONDS + 1, below) -- that one second of slack
+        # absorbs the entire sub-second ordering error, so this clause can
+        # never exclude a row the authoritative ABS(julianday()) clause
+        # below would accept. Do not narrow that `+ 1` on the strength of
+        # this comment's format claim -- it's the slack, not the format,
+        # that makes the prefilter safe. That clause is what
+        # idx_weight_log_timestamp cannot use directly (wrapping the column
+        # in julianday() makes the index unusable for range pruning).
         #
         # The authoritative window is symmetric (+-60s around this request's
         # own `now`), not one-sided ending exactly at `now` -- an earlier
@@ -170,7 +236,7 @@ async def post_weight(data: WeightIn):
         sargable_cutoff = (now - timedelta(seconds=DEDUP_WINDOW_SECONDS + 1)).isoformat()
         cursor = await db.execute(
             "SELECT id, weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin, "
-            "body_fat_pct, body_water_pct, muscle_pct, bone_mass_kg "
+            "body_fat_pct, body_water_pct, muscle_pct, bone_mass_kg, source "
             "FROM weight_log "
             "WHERE timestamp >= ? "
             "AND ABS(weight_grams - ?) <= ? "
@@ -192,7 +258,7 @@ async def post_weight(data: WeightIn):
         updates = {}
         conflicts = []
         if existing is not None:
-            for field in COMPOSITION_FIELDS:
+            for field in ENRICHABLE_FIELDS:
                 incoming_value = getattr(data, field)
                 if incoming_value is None:
                     continue
@@ -251,6 +317,7 @@ async def post_weight(data: WeightIn):
         # this code enforces; moving the push to a thread/worker pool would
         # reopen a stale-read window here.
         garmin_error = None
+        synced = False
         try:
             if existing is None:
                 garmin_error = _push_composition(
@@ -266,9 +333,21 @@ async def post_weight(data: WeightIn):
                 synced = garmin_error is None
             elif updates:
                 merged = {field: updates.get(field, existing[field]) for field in COMPOSITION_FIELDS}
-                original_ts = datetime.fromisoformat(existing["timestamp"])
-                garmin_error = _push_composition(existing["weight_grams"], original_ts, merged)
-                synced = garmin_error is None
+                # Parsed locally, not left to the outer except below: a row
+                # whose timestamp SQLite's own julianday() accepted (so the
+                # dedup match above fired) but Python's fromisoformat()
+                # can't parse used to raise here and skip the
+                # synced_to_garmin flag-update entirely -- the response
+                # correctly said `false`, but the stored row kept whatever
+                # stale value it already had (Phase 4 adversarial review
+                # finding).
+                try:
+                    original_ts = datetime.fromisoformat(existing["timestamp"])
+                except ValueError as e:
+                    garmin_error = f"could not parse stored timestamp for Garmin push: {e}"
+                else:
+                    garmin_error = _push_composition(existing["weight_grams"], original_ts, merged)
+                    synced = garmin_error is None
             else:
                 synced = bool(existing["synced_to_garmin"])
 
@@ -291,7 +370,7 @@ async def post_weight(data: WeightIn):
             "timestamp": timestamp,
             "synced_to_garmin": synced,
         }
-        for field_name in (*COMPOSITION_FIELDS, "source"):
+        for field_name in ENRICHABLE_FIELDS:
             value = getattr(data, field_name)
             if value is not None:
                 result[field_name] = value
@@ -309,6 +388,7 @@ async def post_weight(data: WeightIn):
             result["enriched"] = True
         if conflicts:
             result["conflict"] = True
+            result["conflict_fields"] = conflicts
     if garmin_error:
         result["garmin_error"] = garmin_error
 

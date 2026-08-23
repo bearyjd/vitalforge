@@ -147,6 +147,11 @@ The dashboard automatically syncs data from Garmin Connect every 2 hours. You ca
 - Training load
 - Steps and active calories
 
+All of the above are synced, stored, and queryable via `/api/metrics/{name}` (see
+[API Reference](#api-reference)). The dashboard UI currently charts weight and body fat
+only — body water, bone mass, and muscle mass are not yet rendered as charts, though the
+data is there for anyone querying the API directly.
+
 ### Recommendations engine
 
 The recommendations feature uses a hybrid approach:
@@ -324,12 +329,16 @@ worked; `garmin_error` is present when it didn't.
 **Deduplication.** A POST within 60 seconds and 50g of an existing entry is treated as
 the same weigh-in rather than a new one:
 
-- No new composition data → the existing row is returned unchanged
+- No new data (including `source`) → the existing row is returned unchanged
   (`"deduplicated": true`).
-- New composition fields the existing row doesn't have yet → those fields are added to
-  the existing row and re-pushed to Garmin (`"deduplicated": true, "enriched": true`).
-- A field present on both sides with a different value → the original value is kept and
-  `"conflict": true` is returned; check server logs for which field(s) conflicted.
+- New composition fields or `source` the existing row doesn't have yet → those fields
+  are added to the existing row and (for composition fields) re-pushed to Garmin
+  (`"deduplicated": true, "enriched": true`).
+- A field present on both sides with a different value (composition fields or `source`)
+  → the original value is kept, and the response returns both `"conflict": true` and
+  `"conflict_fields"` (an array naming every field that conflicted, e.g.
+  `["body_fat_pct", "source"]`) so a client doesn't need server-log access to see what
+  was rejected.
 
 ### Dashboard Service (port 8086)
 
@@ -344,6 +353,11 @@ the same weigh-in rather than a new one:
 | `GET` | `/api/recommendations/rules-only` | Rules engine output without LLM |
 
 Available metrics: `sleep_duration`, `sleep_score`, `resting_hr`, `hrv`, `body_battery`, `body_battery_low`, `stress`, `vo2max`, `weight`, `body_fat`, `body_water`, `bone_mass`, `muscle_mass`, `training_load`, `steps`, `active_calories`
+
+`weight`, `bone_mass`, and `muscle_mass` are in **grams** (matching the `_kg`-suffixed
+request fields' storage convention, confirmed against a real Garmin read-back — see
+`docs/prp/00-design.md` §3.5/§4.3 and `docs/prp/03-live-validation.md`); `body_fat` and
+`body_water` are plain percentages, same as the request fields they come from.
 
 ## License
 

@@ -1433,6 +1433,20 @@ it produces the 200 with `synced_to_garmin: false`.
 5. Send `source: "bascule"`.
 6. Omit unmeasured fields entirely. Never send `null`, `0`, or a sentinel.
 7. Never log the `Authorization` header.
+8. **Treat `conflict: true` as silent data rejection on the named fields, not a
+   soft warning.** When a dedup match (§3.7) finds a field present on both the
+   stored row and your POST with a *different* value, the server keeps the
+   stored value and returns `conflict: true` plus `conflict_fields` (an array
+   naming every field that conflicted — composition fields and `source` alike;
+   response is otherwise still `200`, still `deduplicated: true`). Your
+   submitted value for those fields was **not** stored and was **not**
+   re-pushed to Garmin. This can happen on `source` too: if your POST's
+   `source` differs from the stored row's, the original is kept and `source`
+   appears in `conflict_fields` — do not assume a `conflict: true` response
+   means your provenance tag was recorded. (Added 2026-08-22, Phase 4
+   adversarial review finding — `conflict_fields` did not exist before this;
+   earlier versions of this contract returned only the bare `conflict: true`
+   boolean, with no way to tell which field(s) without server-log access.)
 
 ---
 

@@ -243,7 +243,7 @@ def dashboard_live_server(tmp_db_path, fake_garmin_client, monkeypatch):
     module = import_service_module("vitalforge-dashboard.app")
     monkeypatch.setattr(module, "authenticate", lambda: None)
 
-    async def _noop_scheduled_sync():
+    async def _noop_scheduled_sync(lock):
         return None
 
     monkeypatch.setattr(module, "scheduled_sync", _noop_scheduled_sync)
