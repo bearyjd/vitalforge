@@ -87,8 +87,8 @@ async def test_html_path_redirects_to_login_not_401(configured_auth, matrix_clie
 
 async def test_valid_cookie_still_works_with_token_enabled(monkeypatch, matrix_client):
     monkeypatch.setattr(shared_auth, "_API_TOKEN", "correct-token")
-    await seed_user("testuser")
-    cookie = create_session_cookie("testuser")
+    user_id = await seed_user("testuser")
+    cookie = create_session_cookie("testuser", user_id)
     resp = await matrix_client.get("/api/thing", cookies={"vf_session": cookie})
     assert resp.status_code == 200
 

@@ -31,8 +31,9 @@ async def client(initialized_db):
         yield ac
 
 
-def _cookies_for(username: str) -> dict:
-    return {"vf_session": create_session_cookie(username)}
+async def _cookies_for(username: str) -> dict:
+    user_id = await shared_auth._get_user_id(username)
+    return {"vf_session": create_session_cookie(username, user_id)}
 
 
 # --- XSS regression (fix-review finding) --------------------------------------------
@@ -52,7 +53,7 @@ async def test_admin_users_page_does_not_render_username_via_innerhtml(client):
     pattern is gone and the safe one is present, in the actual HTTP
     response, not just the source constant."""
     await seed_user("root", role="admin")
-    resp = await client.get("/auth/admin/users", cookies=_cookies_for("root"))
+    resp = await client.get("/auth/admin/users", cookies=await _cookies_for("root"))
     assert resp.status_code == 200
     html = resp.text
     assert "innerHTML = `<td>" not in html
@@ -67,7 +68,7 @@ async def test_change_own_password_requires_correct_current_password(client):
     resp = await client.post(
         "/auth/account/password",
         json={"current_password": "wrong-password", "new_password": "new-password"},
-        cookies=_cookies_for("alice"),
+        cookies=await _cookies_for("alice"),
     )
     assert resp.status_code == 401
 
@@ -81,7 +82,7 @@ async def test_change_own_password_succeeds_with_correct_current_password(client
     resp = await client.post(
         "/auth/account/password",
         json={"current_password": "old-password", "new_password": "new-password"},
-        cookies=_cookies_for("alice"),
+        cookies=await _cookies_for("alice"),
     )
     assert resp.status_code == 200
     assert await shared_auth.check_credentials("alice", "old-password") is False
@@ -93,7 +94,7 @@ async def test_change_own_password_empty_new_password_rejected(client):
     resp = await client.post(
         "/auth/account/password",
         json={"current_password": "old-password", "new_password": ""},
-        cookies=_cookies_for("alice"),
+        cookies=await _cookies_for("alice"),
     )
     assert resp.status_code == 422
     assert await shared_auth.check_credentials("alice", "old-password") is True  # unchanged
@@ -124,7 +125,7 @@ async def test_change_own_password_requires_auth(client):
 )
 async def test_admin_users_list_access_by_role(client, role, expected_status):
     await seed_user("someone", role=role)
-    resp = await client.get("/auth/admin/users/list", cookies=_cookies_for("someone"))
+    resp = await client.get("/auth/admin/users/list", cookies=await _cookies_for("someone"))
     assert resp.status_code == expected_status
 
 
@@ -142,7 +143,7 @@ async def test_admin_can_create_user(client):
     resp = await client.post(
         "/auth/admin/users",
         json={"username": "bob", "password": "bobs-password", "role": "user"},
-        cookies=_cookies_for("root"),
+        cookies=await _cookies_for("root"),
     )
     assert resp.status_code == 200
     assert await shared_auth.check_credentials("bob", "bobs-password") is True
@@ -154,7 +155,7 @@ async def test_non_admin_cannot_create_user(client):
     resp = await client.post(
         "/auth/admin/users",
         json={"username": "bob", "password": "x", "role": "user"},
-        cookies=_cookies_for("someone"),
+        cookies=await _cookies_for("someone"),
     )
     assert resp.status_code == 403
 
@@ -165,7 +166,7 @@ async def test_create_user_duplicate_username_rejected(client):
     resp = await client.post(
         "/auth/admin/users",
         json={"username": "bob", "password": "x", "role": "user"},
-        cookies=_cookies_for("root"),
+        cookies=await _cookies_for("root"),
     )
     assert resp.status_code == 409
 
@@ -173,7 +174,7 @@ async def test_create_user_duplicate_username_rejected(client):
 async def test_create_user_missing_fields_rejected(client):
     await seed_user("root", role="admin")
     resp = await client.post(
-        "/auth/admin/users", json={"username": "", "password": "", "role": "user"}, cookies=_cookies_for("root")
+        "/auth/admin/users", json={"username": "", "password": "", "role": "user"}, cookies=await _cookies_for("root")
     )
     assert resp.status_code == 422
 
@@ -183,7 +184,7 @@ async def test_create_user_invalid_role_rejected(client):
     resp = await client.post(
         "/auth/admin/users",
         json={"username": "bob", "password": "x", "role": "superadmin"},
-        cookies=_cookies_for("root"),
+        cookies=await _cookies_for("root"),
     )
     assert resp.status_code == 422
 
@@ -204,7 +205,7 @@ async def test_create_user_malformed_input_returns_422_not_500(client, kwargs):
     documented 422-not-500 convention (see
     test_weight_api.py::test_non_finite_float_rejected_422_not_500)."""
     await seed_user("root", role="admin")
-    resp = await client.post("/auth/admin/users", cookies=_cookies_for("root"), **kwargs)
+    resp = await client.post("/auth/admin/users", cookies=await _cookies_for("root"), **kwargs)
     assert resp.status_code == 422
 
 
@@ -219,7 +220,7 @@ async def test_create_user_reserved_username_rejected(client, reserved):
     resp = await client.post(
         "/auth/admin/users",
         json={"username": reserved, "password": "x", "role": "admin"},
-        cookies=_cookies_for("root"),
+        cookies=await _cookies_for("root"),
     )
     assert resp.status_code == 422
     assert await shared_auth.get_current_user_role(reserved) is None
@@ -232,7 +233,7 @@ async def test_admin_can_reset_another_users_password(client):
     await seed_user("root", role="admin")
     bob_id = await seed_user("bob", password="old-password")
     resp = await client.patch(
-        f"/auth/admin/users/{bob_id}", json={"password": "reset-password"}, cookies=_cookies_for("root")
+        f"/auth/admin/users/{bob_id}", json={"password": "reset-password"}, cookies=await _cookies_for("root")
     )
     assert resp.status_code == 200
     assert await shared_auth.check_credentials("bob", "reset-password") is True
@@ -241,14 +242,14 @@ async def test_admin_can_reset_another_users_password(client):
 async def test_admin_can_promote_a_user_to_admin(client):
     await seed_user("root", role="admin")
     bob_id = await seed_user("bob", role="user")
-    resp = await client.patch(f"/auth/admin/users/{bob_id}", json={"role": "admin"}, cookies=_cookies_for("root"))
+    resp = await client.patch(f"/auth/admin/users/{bob_id}", json={"role": "admin"}, cookies=await _cookies_for("root"))
     assert resp.status_code == 200
     assert await shared_auth.get_current_user_role("bob") == "admin"
 
 
 async def test_admin_update_nonexistent_user_returns_404(client):
     await seed_user("root", role="admin")
-    resp = await client.patch("/auth/admin/users/999999", json={"role": "admin"}, cookies=_cookies_for("root"))
+    resp = await client.patch("/auth/admin/users/999999", json={"role": "admin"}, cookies=await _cookies_for("root"))
     assert resp.status_code == 404
 
 
@@ -256,7 +257,7 @@ async def test_admin_update_invalid_role_rejected(client):
     await seed_user("root", role="admin")
     bob_id = await seed_user("bob", role="user")
     resp = await client.patch(
-        f"/auth/admin/users/{bob_id}", json={"role": "superadmin"}, cookies=_cookies_for("root")
+        f"/auth/admin/users/{bob_id}", json={"role": "superadmin"}, cookies=await _cookies_for("root")
     )
     assert resp.status_code == 422
     assert await shared_auth.get_current_user_role("bob") == "user"  # unchanged
@@ -267,14 +268,14 @@ async def test_admin_update_invalid_role_rejected(client):
 
 async def test_cannot_delete_the_last_remaining_admin(client):
     admin_id = await seed_user("root", role="admin")
-    resp = await client.delete(f"/auth/admin/users/{admin_id}", cookies=_cookies_for("root"))
+    resp = await client.delete(f"/auth/admin/users/{admin_id}", cookies=await _cookies_for("root"))
     assert resp.status_code == 409
     assert await shared_auth.get_current_user_role("root") == "admin"  # unchanged
 
 
 async def test_cannot_demote_the_last_remaining_admin(client):
     admin_id = await seed_user("root", role="admin")
-    resp = await client.patch(f"/auth/admin/users/{admin_id}", json={"role": "user"}, cookies=_cookies_for("root"))
+    resp = await client.patch(f"/auth/admin/users/{admin_id}", json={"role": "user"}, cookies=await _cookies_for("root"))
     assert resp.status_code == 409
     assert await shared_auth.get_current_user_role("root") == "admin"  # unchanged
 
@@ -282,7 +283,7 @@ async def test_cannot_demote_the_last_remaining_admin(client):
 async def test_can_delete_an_admin_when_another_admin_remains(client):
     root_id = await seed_user("root", role="admin")
     await seed_user("root2", role="admin")
-    resp = await client.delete(f"/auth/admin/users/{root_id}", cookies=_cookies_for("root2"))
+    resp = await client.delete(f"/auth/admin/users/{root_id}", cookies=await _cookies_for("root2"))
     assert resp.status_code == 200
 
 
@@ -317,8 +318,8 @@ async def test_concurrent_deletes_of_the_last_two_admins_cannot_both_succeed(cli
         alice_id = await seed_user(f"admin-a-{i}", role="admin")
         bob_id = await seed_user(f"admin-b-{i}", role="admin")
         results = await asyncio.gather(
-            client.delete(f"/auth/admin/users/{alice_id}", cookies=_cookies_for(f"admin-a-{i}")),
-            client.delete(f"/auth/admin/users/{bob_id}", cookies=_cookies_for(f"admin-b-{i}")),
+            client.delete(f"/auth/admin/users/{alice_id}", cookies=await _cookies_for(f"admin-a-{i}")),
+            client.delete(f"/auth/admin/users/{bob_id}", cookies=await _cookies_for(f"admin-b-{i}")),
         )
         statuses = sorted(r.status_code for r in results)
         assert statuses == [200, 409], f"iteration {i}: both requests must not both succeed, got {statuses}"
@@ -334,13 +335,13 @@ async def test_concurrent_deletes_of_the_last_two_admins_cannot_both_succeed(cli
 async def test_can_delete_a_non_admin_freely(client):
     await seed_user("root", role="admin")
     bob_id = await seed_user("bob", role="user")
-    resp = await client.delete(f"/auth/admin/users/{bob_id}", cookies=_cookies_for("root"))
+    resp = await client.delete(f"/auth/admin/users/{bob_id}", cookies=await _cookies_for("root"))
     assert resp.status_code == 200
 
 
 async def test_delete_nonexistent_user_returns_404(client):
     await seed_user("root", role="admin")
-    resp = await client.delete("/auth/admin/users/999999", cookies=_cookies_for("root"))
+    resp = await client.delete("/auth/admin/users/999999", cookies=await _cookies_for("root"))
     assert resp.status_code == 404
 
 
@@ -430,28 +431,56 @@ async def test_bootstrap_first_admin_noop_when_a_user_already_exists(initialized
 async def test_deleted_user_session_cookie_no_longer_authenticates(client):
     await seed_user("root", role="admin")
     bob_id = await seed_user("bob", role="user")
-    cookie = _cookies_for("bob")
+    cookie = await _cookies_for("bob")
 
     # Cookie works before deletion.
     resp = await client.get("/auth/admin/users/list", cookies=cookie)
     assert resp.status_code == 403  # correctly authenticated as bob, just not admin
 
-    await client.delete(f"/auth/admin/users/{bob_id}", cookies=_cookies_for("root"))
+    await client.delete(f"/auth/admin/users/{bob_id}", cookies=await _cookies_for("root"))
 
     # Same cookie, same signature -- but bob no longer exists.
     resp = await client.get("/auth/account", cookies=cookie)
     assert resp.status_code == 401
 
 
+async def test_deleted_users_cookie_does_not_authenticate_as_a_later_reused_username(client):
+    """HIGH security-review finding: the session cookie used to carry only
+    the username, not an account id -- deleting a user and creating a
+    NEW, different account with the SAME username let the old cookie
+    authenticate as the new account (reproduced: an old `user`-role
+    cookie resolved as the new `admin`-role account after the name was
+    reused). The cookie now carries both id and username, and
+    get_current_user requires both to match the current row -- a new
+    account gets a new id, so the old signature no longer matches
+    anything."""
+    await seed_user("root", role="admin")
+    await seed_user("shared_name", role="user")
+    old_cookie = await _cookies_for("shared_name")
+
+    db = await get_db()
+    try:
+        await db.execute("DELETE FROM users WHERE username = ?", ("shared_name",))
+        await db.commit()
+    finally:
+        await db.close()
+
+    # A different person, coincidentally given the same username, as admin.
+    await seed_user("shared_name", role="admin")
+
+    resp = await client.get("/auth/admin/users/list", cookies=old_cookie)
+    assert resp.status_code == 401  # not 200 -- must not resolve to the new account at all
+
+
 async def test_demoted_admin_session_loses_admin_access_immediately(client):
     root_id = await seed_user("root", role="admin")
     await seed_user("root2", role="admin")
-    cookie = _cookies_for("root")
+    cookie = await _cookies_for("root")
 
     resp = await client.get("/auth/admin/users/list", cookies=cookie)
     assert resp.status_code == 200
 
-    await client.patch(f"/auth/admin/users/{root_id}", json={"role": "user"}, cookies=_cookies_for("root2"))
+    await client.patch(f"/auth/admin/users/{root_id}", json={"role": "user"}, cookies=await _cookies_for("root2"))
 
     # Same cookie -- role is re-read live, not trusted from the signed payload.
     resp = await client.get("/auth/admin/users/list", cookies=cookie)

@@ -30,9 +30,9 @@ FULL_PAYLOAD = {
 TOKEN = "secret-token"
 
 
-async def _configure_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+async def _configure_auth(monkeypatch: pytest.MonkeyPatch) -> int:
     monkeypatch.setattr(shared_auth, "_API_TOKEN", TOKEN)
-    await seed_user("testuser")
+    return await seed_user("testuser")
 
 
 async def test_token_client_full_flow(weight_app_module, monkeypatch):
@@ -60,8 +60,8 @@ async def test_cookie_client_regression_flow(weight_app_module, monkeypatch):
     httpx deprecates (and eventually hard-errors on) per-request `cookies=`
     persisting into the client jar, so relying on that would be pinned to
     ambiguous, disappearing behavior rather than modeling a real session."""
-    await _configure_auth(monkeypatch)
-    cookies = {"vf_session": create_session_cookie("testuser")}
+    user_id = await _configure_auth(monkeypatch)
+    cookies = {"vf_session": create_session_cookie("testuser", user_id)}
     transport = ASGITransport(app=weight_app_module.app)
     async with AsyncClient(transport=transport, base_url="http://test", cookies=cookies) as ac:
         post_resp = await ac.post("/api/weight", json=FULL_PAYLOAD)
@@ -83,9 +83,9 @@ async def test_mixed_clients_interleaved_no_auth_leakage(weight_app_module, monk
     because httpx doesn't persist per-request cookies into the jar (a
     deprecated, ambiguous behavior slated to change), not because VitalForge
     itself keeps no cross-client state."""
-    await _configure_auth(monkeypatch)
+    user_id = await _configure_auth(monkeypatch)
     token_headers = {"Authorization": f"Bearer {TOKEN}"}
-    cookies = {"vf_session": create_session_cookie("testuser")}
+    cookies = {"vf_session": create_session_cookie("testuser", user_id)}
     transport = ASGITransport(app=weight_app_module.app)
 
     async with (

@@ -68,29 +68,28 @@ A3_CONFIG = Config(seed_user=False, token_value=CORRECT_TOKEN)
 A4_CONFIG = Config(seed_user=False, token_value="")
 
 
-def _valid_cookie() -> str:
-    return create_session_cookie("testuser")
-
-
-# Credential forms take no args -- they always present CORRECT_TOKEN/WRONG_TOKEN,
-# and it's each row's *config* (whether _API_TOKEN equals CORRECT_TOKEN) that
-# determines whether "the correct-looking token" actually matches.
+# Credential forms take the cookie value to use for "a currently valid
+# session" (C1/C8) as a parameter rather than looking it up themselves --
+# building a real cookie now needs a DB-backed user id lookup
+# (create_session_cookie(username, user_id)), which these plain sync
+# lambdas can't do internally. The test body seeds "testuser" (when the
+# config calls for it) and passes the resulting cookie in.
 CREDENTIAL_FORMS = {
-    "C0": lambda: ({}, {}),
-    "C1": lambda: ({}, {"vf_session": _valid_cookie()}),
-    "C2": lambda: ({}, {"vf_session": "garbage-not-a-real-cookie"}),
-    "C3": lambda: ({"Authorization": f"Bearer {CORRECT_TOKEN}"}, {}),
-    "C4": lambda: ({"Authorization": f"Bearer {WRONG_TOKEN}"}, {}),
-    "C5": lambda: ({"Authorization": "Bearer "}, {}),
-    "C6": lambda: ({"Authorization": f"Basic {CORRECT_TOKEN}"}, {}),
-    "C7": lambda: ({"Authorization": f"Bearer {CORRECT_TOKEN}"}, {"vf_session": "garbage-not-a-real-cookie"}),
-    "C8": lambda: ({"Authorization": f"Bearer {WRONG_TOKEN}"}, {"vf_session": _valid_cookie()}),
+    "C0": lambda vc: ({}, {}),
+    "C1": lambda vc: ({}, {"vf_session": vc}),
+    "C2": lambda vc: ({}, {"vf_session": "garbage-not-a-real-cookie"}),
+    "C3": lambda vc: ({"Authorization": f"Bearer {CORRECT_TOKEN}"}, {}),
+    "C4": lambda vc: ({"Authorization": f"Bearer {WRONG_TOKEN}"}, {}),
+    "C5": lambda vc: ({"Authorization": "Bearer "}, {}),
+    "C6": lambda vc: ({"Authorization": f"Basic {CORRECT_TOKEN}"}, {}),
+    "C7": lambda vc: ({"Authorization": f"Bearer {CORRECT_TOKEN}"}, {"vf_session": "garbage-not-a-real-cookie"}),
+    "C8": lambda vc: ({"Authorization": f"Bearer {WRONG_TOKEN}"}, {"vf_session": vc}),
     # Raw bytes, not a plain str dict: httpx's header dict encodes values as
     # strict ASCII and rejects "ö"/"é" outright, even though both are within
     # latin-1's range. Building via Headers(bytes) matches what Starlette
     # actually does on the wire -- latin-1-decode raw header bytes -- so this
     # is "Bearer tökén" UTF-8-encoded, exactly as a real client would send it.
-    "C9": lambda: (Headers([(b"authorization", "Bearer tökén".encode())]), {}),
+    "C9": lambda vc: (Headers([(b"authorization", "Bearer tökén".encode())]), {}),
 }
 
 ALLOW = 200
@@ -137,9 +136,11 @@ assert len(MATRIX) == 40
 )
 async def test_behavior_matrix(cell_id, config, credential_form, expected_status, monkeypatch, matrix_client):
     monkeypatch.setattr(shared_auth, "_API_TOKEN", config.token_value)
+    valid_cookie = "no-user-seeded-for-this-config"
     if config.seed_user:
-        await seed_user("testuser")
+        user_id = await seed_user("testuser")
+        valid_cookie = create_session_cookie("testuser", user_id)
 
-    headers, cookies = CREDENTIAL_FORMS[credential_form]()
+    headers, cookies = CREDENTIAL_FORMS[credential_form](valid_cookie)
     resp = await matrix_client.get("/api/thing", headers=headers, cookies=cookies)
     assert resp.status_code == expected_status, f"{cell_id}: expected {expected_status}, got {resp.status_code}"

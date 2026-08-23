@@ -92,16 +92,36 @@ async def _is_auth_configured() -> bool:
         await db.close()
 
 
-def create_session_cookie(username: str) -> str:
-    return _serializer.dumps({"user": username, "t": int(time.time())})
+def create_session_cookie(username: str, user_id: int) -> str:
+    return _serializer.dumps({"user": username, "uid": user_id, "t": int(time.time())})
 
 
-def validate_session(cookie: str) -> str | None:
+def validate_session(cookie: str) -> tuple[str, int] | None:
+    """Returns (username, user_id) from the signed payload, or None if the
+    signature is invalid/expired. get_current_user checks both against the
+    users table -- a valid signature alone only proves this server issued
+    the cookie at some point, not that it still names the same account. A
+    deleted user's username can be reused by a later, different account;
+    without the id, the old cookie would authenticate as the new account
+    (security-review finding, reproduced)."""
     try:
         data = _serializer.loads(cookie, max_age=_MAX_AGE)
-        return data.get("user")
+        username = data.get("user")
+        user_id = data.get("uid")
+        if username is None or user_id is None:
+            return None
+        return username, user_id
     except (BadSignature, SignatureExpired):
         return None
+
+
+async def _get_user_id(username: str) -> int | None:
+    db = await get_db()
+    try:
+        row = await (await db.execute("SELECT id FROM users WHERE username = ?", (username,))).fetchone()
+    finally:
+        await db.close()
+    return row["id"] if row is not None else None
 
 
 async def get_current_user(request: Request) -> str | None:
@@ -112,12 +132,15 @@ async def get_current_user(request: Request) -> str | None:
     cookie = request.cookies.get(_COOKIE_NAME)
     if not cookie:
         return None
-    username = validate_session(cookie)
-    if username is None:
+    session = validate_session(cookie)
+    if session is None:
         return None
+    username, user_id = session
     db = await get_db()
     try:
-        row = await (await db.execute("SELECT 1 FROM users WHERE username = ?", (username,))).fetchone()
+        row = await (
+            await db.execute("SELECT 1 FROM users WHERE id = ? AND username = ?", (user_id, username))
+        ).fetchone()
     finally:
         await db.close()
     return username if row is not None else None
@@ -636,7 +659,16 @@ def add_auth_routes(app):
         password = body.get("password", "")
         if not await check_credentials(username, password):
             raise HTTPException(status_code=401, detail="Invalid credentials")
-        cookie = create_session_cookie(username)
+        user_id = await _get_user_id(username)
+        if user_id is None:
+            # Narrow TOCTOU: the account was deleted between the
+            # check_credentials() call above and this one. Fail the login
+            # rather than issue a cookie with no matching account -- it
+            # would just be permanently invalid anyway (get_current_user's
+            # id+username check could never match), but failing loudly here
+            # is clearer than a cookie that silently never authenticates.
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        cookie = create_session_cookie(username, user_id)
         response = JSONResponse({"success": True})
         response.set_cookie(_COOKIE_NAME, cookie, max_age=_MAX_AGE, httponly=True, samesite="lax")
         return response
