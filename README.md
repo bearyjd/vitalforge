@@ -324,12 +324,16 @@ worked; `garmin_error` is present when it didn't.
 **Deduplication.** A POST within 60 seconds and 50g of an existing entry is treated as
 the same weigh-in rather than a new one:
 
-- No new composition data → the existing row is returned unchanged
+- No new data (including `source`) → the existing row is returned unchanged
   (`"deduplicated": true`).
-- New composition fields the existing row doesn't have yet → those fields are added to
-  the existing row and re-pushed to Garmin (`"deduplicated": true, "enriched": true`).
-- A field present on both sides with a different value → the original value is kept and
-  `"conflict": true` is returned; check server logs for which field(s) conflicted.
+- New composition fields or `source` the existing row doesn't have yet → those fields
+  are added to the existing row and (for composition fields) re-pushed to Garmin
+  (`"deduplicated": true, "enriched": true`).
+- A field present on both sides with a different value (composition fields or `source`)
+  → the original value is kept, and the response returns both `"conflict": true` and
+  `"conflict_fields"` (an array naming every field that conflicted, e.g.
+  `["body_fat_pct", "source"]`) so a client doesn't need server-log access to see what
+  was rejected.
 
 ### Dashboard Service (port 8086)
 

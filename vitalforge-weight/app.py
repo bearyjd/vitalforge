@@ -131,6 +131,14 @@ async def index(request: Request):
 DEDUP_WEIGHT_TOLERANCE_GRAMS = 50
 DEDUP_WINDOW_SECONDS = 60
 COMPOSITION_FIELDS = ("body_fat_pct", "body_water_pct", "muscle_pct", "bone_mass_kg")
+# Same first-write-wins-or-conflict treatment as COMPOSITION_FIELDS, plus
+# `source`. Kept separate from COMPOSITION_FIELDS (which also names exactly
+# what _push_composition forwards to Garmin) so that boundary stays
+# explicit; `source` has no Garmin analog and was previously excluded from
+# enrichment entirely, so a row's provenance label could permanently
+# misattribute composition data actually added by a different, later
+# client (Phase 4 adversarial review finding).
+ENRICHABLE_FIELDS = (*COMPOSITION_FIELDS, "source")
 
 
 def _push_composition(weight_grams: int, timestamp: datetime, composition: dict) -> str | None:
@@ -217,7 +225,7 @@ async def post_weight(data: WeightIn):
         sargable_cutoff = (now - timedelta(seconds=DEDUP_WINDOW_SECONDS + 1)).isoformat()
         cursor = await db.execute(
             "SELECT id, weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin, "
-            "body_fat_pct, body_water_pct, muscle_pct, bone_mass_kg "
+            "body_fat_pct, body_water_pct, muscle_pct, bone_mass_kg, source "
             "FROM weight_log "
             "WHERE timestamp >= ? "
             "AND ABS(weight_grams - ?) <= ? "
@@ -239,7 +247,7 @@ async def post_weight(data: WeightIn):
         updates = {}
         conflicts = []
         if existing is not None:
-            for field in COMPOSITION_FIELDS:
+            for field in ENRICHABLE_FIELDS:
                 incoming_value = getattr(data, field)
                 if incoming_value is None:
                     continue
@@ -338,7 +346,7 @@ async def post_weight(data: WeightIn):
             "timestamp": timestamp,
             "synced_to_garmin": synced,
         }
-        for field_name in (*COMPOSITION_FIELDS, "source"):
+        for field_name in ENRICHABLE_FIELDS:
             value = getattr(data, field_name)
             if value is not None:
                 result[field_name] = value
@@ -356,6 +364,7 @@ async def post_weight(data: WeightIn):
             result["enriched"] = True
         if conflicts:
             result["conflict"] = True
+            result["conflict_fields"] = conflicts
     if garmin_error:
         result["garmin_error"] = garmin_error
 

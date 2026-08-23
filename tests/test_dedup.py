@@ -280,3 +280,65 @@ async def test_enrichment_with_partial_conflict_updates_only_null_columns(client
     pushed = fake_garmin_client.pushed_weights[-1]
     assert pushed["percent_fat"] == 18.4  # the stored (not incoming) value
     assert pushed["bone_mass_kg"] == 3.2
+
+
+async def test_conflict_response_names_the_conflicting_fields(client, fake_garmin_client):
+    """Phase 4 adversarial review finding: `conflict: true` used to be a
+    black box -- the conflicting field names went only to a server-side
+    WARNING log, so a client had no way to know which value was rejected
+    without grepping server logs it likely can't see."""
+    await seed_row(84096, seconds_ago=5, body_fat_pct=18.4, muscle_pct=40.0)
+    resp = await client.post(
+        "/api/weight",
+        json={"weight": 185.4, "unit": "lbs", "body_fat_pct": 20.0, "muscle_pct": 41.0, "bone_mass_kg": 3.2},
+    )
+    body = resp.json()
+    assert body["conflict"] is True
+    assert sorted(body["conflict_fields"]) == ["body_fat_pct", "muscle_pct"]
+
+
+async def test_dedup_enrichment_fills_in_missing_source(client):
+    """Phase 4 adversarial review finding: a row whose first arrival omitted
+    `source` used to stay `source: NULL` forever, even once a later request
+    on the same weigh-in supplied one."""
+    row_id, ts = await seed_row(84096, seconds_ago=5)
+    resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs", "source": "bascule"})
+    assert resp.status_code == 200
+    assert resp.json()["enriched"] is True
+
+    db = await get_db()
+    try:
+        row = await (await db.execute("SELECT source FROM weight_log WHERE id = ?", (row_id,))).fetchone()
+    finally:
+        await db.close()
+    assert row["source"] == "bascule"
+
+
+async def test_dedup_enrichment_conflicting_source_kept_not_overwritten(client):
+    """Phase 4 adversarial review finding: source used to be excluded from
+    the enrichment merge entirely, so a later, different client's
+    composition payload silently landed under the first client's source
+    label -- misattributing the measurement with no visible sign anything
+    was dropped. It must now be classified the same way every other
+    enrichable field already is: stored value wins, and the mismatch is a
+    visible conflict, not a silent overwrite in either direction."""
+    row_id, ts = await seed_row(84096, seconds_ago=5, source="tasker")
+    resp = await client.post(
+        "/api/weight",
+        json={"weight": 185.4, "unit": "lbs", "source": "bascule", "body_fat_pct": 18.4},
+    )
+    body = resp.json()
+    assert body["deduplicated"] is True
+    assert body["enriched"] is True  # body_fat_pct still enriches
+    assert body["conflict"] is True
+    assert "source" in body["conflict_fields"]
+
+    db = await get_db()
+    try:
+        row = await (
+            await db.execute("SELECT source, body_fat_pct FROM weight_log WHERE id = ?", (row_id,))
+        ).fetchone()
+    finally:
+        await db.close()
+    assert row["source"] == "tasker"  # original provenance kept, not silently overwritten
+    assert row["body_fat_pct"] == 18.4
