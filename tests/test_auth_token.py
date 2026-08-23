@@ -129,6 +129,28 @@ async def test_check_credentials_unknown_username_returns_false(initialized_db):
     assert await check_credentials("nobody", "anything") is False
 
 
+async def test_check_credentials_pays_the_same_scrypt_cost_for_unknown_usernames(initialized_db, monkeypatch):
+    """Fix-review finding (MEDIUM, username-enumeration oracle): an unknown
+    username used to return False immediately, skipping the scrypt cost a
+    real check pays -- a measurable, exploitable timing signal (reviewer
+    measured ~27ms vs ~0.8ms). Asserting on wall-clock time would be flaky
+    in CI; asserting hashlib.scrypt was actually invoked either way is the
+    deterministic version of the same check."""
+    import hashlib as hashlib_module
+
+    calls = []
+    real_scrypt = hashlib_module.scrypt
+
+    def counting_scrypt(*args, **kwargs):
+        calls.append(1)
+        return real_scrypt(*args, **kwargs)
+
+    monkeypatch.setattr(hashlib_module, "scrypt", counting_scrypt)
+
+    await check_credentials("definitely-does-not-exist", "whatever")
+    assert len(calls) == 1
+
+
 def test_startup_warns_when_token_set_and_pass_empty(monkeypatch, caplog):
     monkeypatch.setattr(shared_auth, "_API_TOKEN", "sometoken")
     monkeypatch.setattr(shared_auth, "_PASS", "")

@@ -66,6 +66,12 @@ def _hash_password(password: str) -> str:
     return f"{salt.hex()}${derived.hex()}"
 
 
+# check_credentials() verifies against this when the username doesn't
+# exist, so an unknown username still pays the same scrypt cost a real
+# check would -- see check_credentials' own docstring for why.
+_DUMMY_PASSWORD_HASH = _hash_password("dummy-password-for-timing-parity-only-not-a-real-credential")
+
+
 def _verify_password(password: str, stored_hash: str) -> bool:
     """Never raises on a malformed stored_hash (e.g. a corrupted row) --
     returns False instead, same "fail closed, don't crash the request"
@@ -178,6 +184,12 @@ async def _require_admin(request: Request) -> str:
 
 
 async def check_credentials(username: str, password: str) -> bool:
+    """Always runs one scrypt verification, real or dummy -- an unknown
+    username used to return False immediately, skipping the ~29ms scrypt
+    cost a real check pays. That gap is a measurable, exploitable
+    username-enumeration oracle (security-review finding): an attacker can
+    tell a valid username from an invalid one by response time alone,
+    without ever guessing a password."""
     db = await get_db()
     try:
         row = await (
@@ -185,9 +197,9 @@ async def check_credentials(username: str, password: str) -> bool:
         ).fetchone()
     finally:
         await db.close()
-    if row is None:
-        return False
-    return _verify_password(password, row["password_hash"])
+    stored_hash = row["password_hash"] if row is not None else _DUMMY_PASSWORD_HASH
+    verified = _verify_password(password, stored_hash)
+    return verified if row is not None else False
 
 
 async def bootstrap_first_admin():
