@@ -39,7 +39,37 @@ signal in this document.
 | `2e6cdc9` | DA O4, DA O7 | README documents `/api/metrics/{name}`'s grams-vs-percent units and that the dashboard UI charts only weight/body fat today |
 | `2f1c651` | Fix-review finding | Closed a real test-coverage gap: the `c00d956` sync-lock test only ever exercised the initial backfill's lock acquisition, not the periodic loop's — deleting the loop's `async with lock:` would have left the suite green. Confirmed via the same mutation before fixing. |
 
-A third pass — a `code-reviewer` agent reviewing this branch's own diff (not the merged-whole reviews above) — independently confirmed both root causes in `c00d956` by rebuilding them standalone, verified no deadlock/starvation risk in the lock change (grepped every acquisition site), and refined the bool-coercion severity to MEDIUM (only `bone_mass_kg: true` was actually exploitable pre-fix — the other four fields already 422'd via their own range bounds; the fix's defense-in-depth on all five is still correct, just not five separate vulnerabilities). Its one actionable finding is `2f1c651`, above. It also flagged that `b2c15bd`'s validation-error handler applies to every endpoint in `vitalforge-weight`, not just `/api/weight` — confirmed intentional (correct wherever `RequestValidationError` can occur) and non-regressing, not a defect.
+A third pass — a `code-reviewer` agent reviewing this branch's own diff (not the merged-whole reviews above) — independently confirmed both root causes in `c00d956` by rebuilding them standalone, verified no deadlock/starvation risk in the lock change (grepped every acquisition site), and refined the bool-coercion severity to MEDIUM (only `bone_mass_kg: true` was actually exploitable pre-fix — the other four fields already 422'd via their own range bounds; the fix's defense-in-depth on all five is still correct, just not five separate vulnerabilities). Its one actionable finding at that point was `2f1c651`, above. It also flagged that `b2c15bd`'s validation-error handler applies to every endpoint in `vitalforge-weight`, not just `/api/weight` — confirmed intentional (correct wherever `RequestValidationError` can occur) and non-regressing, not a defect.
+
+### Follow-up: a regression introduced by this branch itself, found post-merge
+
+The same fix-review agent kept reviewing after `fix/phase4-review-findings` merged (PR #19,
+`de41614`) and found a real MEDIUM regression **in that merge**, reproduced end-to-end, not
+reasoned: `8062a9f`'s `ENRICHABLE_FIELDS` change (source now goes through the same
+classification loop as composition fields) meant `updates` could become source-only —
+but `updates` was also what the Garmin re-push branch and the `synced_to_garmin`
+flag-persist both gated on. Net effect: a source-only enrich re-pushed *unchanged*
+composition data to Garmin on every occurrence, and if that incidental push ever failed, a
+previously-true `synced_to_garmin` flag flipped to a permanently stale `false` with no
+recovery path (a later identical POST finds no updates at all and just echoes the
+corrupted stored value). The same failure mode was reachable via the unparseable-timestamp
+path from `288712e` too — a source-only enrich on such a row flipped the flag with no push
+even attempted.
+
+**Fixed in `fix/source-only-enrich-spurious-push` (commit `5b308ae`)**: introduced
+`composition_changed = any(field in COMPOSITION_FIELDS for field in updates)`, computed
+once, and gated both the Garmin-push branch and the flag-persist condition on it instead of
+on plain `updates`. The DB `UPDATE` that persists the enriched `source` value itself is
+untouched — it still fires on any `ENRICHABLE_FIELDS` change, only the Garmin-push/flag
+decision narrowed. Regression test covers both trigger paths (source-only against a
+normally-timestamped row, and source-only against an unparseable-timestamp row), confirmed
+RED against the actual merged code before fixing.
+
+**Process note**: this is exactly why a fix-review pass on a landed change is worth running
+to completion even after the branch merges — the regression existed in `main` for roughly
+20 minutes between PR #19 merging and this fix landing. No user-facing impact in that
+window (no real traffic hit the affected path), but it's the kind of gap that matters on a
+live system.
 
 All five commits: `ruff check .` clean, full non-Playwright suite green (252 passed, 3
 deselected throughout — no regressions at any step). Each fix has a dedicated regression
