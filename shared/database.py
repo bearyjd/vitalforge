@@ -18,8 +18,19 @@ _WEIGHT_LOG_ADDITIVE_COLUMNS = [
     "source TEXT",
 ]
 
+# Additive columns for weight_history's Garmin-sourced composition read path
+# (B5). Unit-suffixed per docs/prp/00-design.md SS3.5/SS4.3 -- the B3 live
+# checkpoint confirmed Garmin returns boneMass/muscleMass in grams, so these
+# must be `_g`, not `_kg` (mixing this up with weight_log's `_kg` convention
+# is exactly the silent lbs/kg-style bug the suffix exists to prevent).
+_WEIGHT_HISTORY_ADDITIVE_COLUMNS = [
+    "body_water REAL",
+    "bone_mass_g REAL",
+    "muscle_mass_g REAL",
+]
 
-async def _add_weight_log_columns(db):
+
+async def _add_columns(db, table: str, column_ddls: list[str]):
     """Attempt-and-swallow, not PRAGMA-table_info-then-act: both services run
     init_db() against the same file and docker-compose starts them together,
     so a pre-check would be TOCTOU-racy -- both could observe "absent" and
@@ -28,9 +39,9 @@ async def _add_weight_log_columns(db):
     cannot migrate fails its lifespan and is restarted rather than serving
     traffic against a half-migrated schema.
     """
-    for column_ddl in _WEIGHT_LOG_ADDITIVE_COLUMNS:
+    for column_ddl in column_ddls:
         try:
-            await db.execute(f"ALTER TABLE weight_log ADD COLUMN {column_ddl}")
+            await db.execute(f"ALTER TABLE {table} ADD COLUMN {column_ddl}")
             await db.commit()
         except aiosqlite.OperationalError as e:
             if "duplicate column name" not in str(e):
@@ -69,7 +80,7 @@ async def init_db():
 
         # Additive migration for weight_log on databases that already exist
         # (a fresh DB already has these columns from the CREATE TABLE above).
-        await _add_weight_log_columns(db)
+        await _add_columns(db, "weight_log", _WEIGHT_LOG_ADDITIVE_COLUMNS)
 
         # Phase 2: metric tables — one per metric type, all keyed by date
         await db.execute("""
@@ -138,9 +149,17 @@ async def init_db():
                 date TEXT PRIMARY KEY,
                 weight_grams INTEGER,
                 bmi REAL,
-                body_fat REAL
+                body_fat REAL,
+                body_water REAL,
+                bone_mass_g REAL,
+                muscle_mass_g REAL
             )
         """)
+
+        # Additive migration for weight_history on databases that already
+        # exist (a fresh DB already has these columns from the CREATE TABLE
+        # above).
+        await _add_columns(db, "weight_history", _WEIGHT_HISTORY_ADDITIVE_COLUMNS)
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS training_load (

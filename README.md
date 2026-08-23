@@ -143,7 +143,7 @@ The dashboard automatically syncs data from Garmin Connect every 2 hours. You ca
 - Body Battery (daily high/low)
 - Stress levels
 - VO2 Max
-- Weight and body fat %
+- Weight, body fat %, body water %, bone mass, and muscle mass
 - Training load
 - Steps and active calories
 
@@ -343,7 +343,7 @@ the same weigh-in rather than a new one:
 | `GET` | `/api/recommendations` | AI-powered health recommendations |
 | `GET` | `/api/recommendations/rules-only` | Rules engine output without LLM |
 
-Available metrics: `sleep_duration`, `sleep_score`, `resting_hr`, `hrv`, `body_battery`, `body_battery_low`, `stress`, `vo2max`, `weight`, `body_fat`, `training_load`, `steps`, `active_calories`
+Available metrics: `sleep_duration`, `sleep_score`, `resting_hr`, `hrv`, `body_battery`, `body_battery_low`, `stress`, `vo2max`, `weight`, `body_fat`, `body_water`, `bone_mass`, `muscle_mass`, `training_load`, `steps`, `active_calories`
 
 ## License
 
