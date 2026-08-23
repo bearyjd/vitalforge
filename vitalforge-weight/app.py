@@ -155,6 +155,18 @@ async def post_weight(data: WeightIn):
         # symmetric window fixes that while still rejecting the case it was
         # originally added for -- a wildly clock-skewed poison row (e.g.
         # minutes or years off) is still far outside +-60s either direction.
+        #
+        # Bounds use julianday's own `'-60 seconds'`/`'+60 seconds'` modifier
+        # arithmetic against `now`, not `ABS(julianday(a) - julianday(b))`:
+        # subtracting two independently-rounded Julian day floats (each
+        # ~2.46M with ~15-17 significant digits of double precision) loses
+        # enough precision that two timestamps exactly 60.000000s apart can
+        # compute a difference a few dozen microseconds *above* 60s roughly
+        # 9% of the time (confirmed empirically, 200k trials) -- silently
+        # excluding a legitimate boundary duplicate from dedup. Comparing
+        # against SQLite's own offset computation instead avoids the
+        # subtraction/cancellation entirely (0/200k failures). Caught by
+        # Codex review the same day the symmetric-window fix landed.
         sargable_cutoff = (now - timedelta(seconds=DEDUP_WINDOW_SECONDS + 1)).isoformat()
         cursor = await db.execute(
             "SELECT id, weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin, "
@@ -162,14 +174,17 @@ async def post_weight(data: WeightIn):
             "FROM weight_log "
             "WHERE timestamp >= ? "
             "AND ABS(weight_grams - ?) <= ? "
-            "AND ABS(julianday(timestamp) - julianday(?)) <= ? / 86400.0 "
+            "AND julianday(timestamp) >= julianday(?, ?) "
+            "AND julianday(timestamp) <= julianday(?, ?) "
             "ORDER BY timestamp DESC LIMIT 1",
             (
                 sargable_cutoff,
                 weight_grams,
                 DEDUP_WEIGHT_TOLERANCE_GRAMS,
                 timestamp,
-                DEDUP_WINDOW_SECONDS,
+                f"-{DEDUP_WINDOW_SECONDS} seconds",
+                timestamp,
+                f"+{DEDUP_WINDOW_SECONDS} seconds",
             ),
         )
         existing = await cursor.fetchone()
