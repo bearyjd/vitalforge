@@ -54,10 +54,11 @@ docker-compose.prod.yml   # PROD — pulls prebuilt images from Docker Hub / GHC
   serializer secret and cookie name (`vf_session`) are used in both apps. This is intentional
   (single login covers both services when behind the same domain), not a bug — don't
   "fix" it by giving each service its own secret.
-- **Auth is fully disabled when `VITALFORGE_PASS` is empty** (`shared/auth.py:25`,
-  `_is_auth_configured`). An agent testing locally without setting `VITALFORGE_PASS` will see
-  open, unauthenticated access — this is expected dev behavior, not a vulnerability to "fix"
-  unless the task is specifically about auth.
+- **Auth is fully disabled only while the `users` table is empty**
+  (`shared/auth.py`, `_is_auth_configured`). `VITALFORGE_USER`/`VITALFORGE_PASS` are one-time
+  bootstrap inputs for the first admin, not the ongoing auth switch. An empty table with no
+  bootstrap password still gives local development open access; once any account exists,
+  auth remains enabled even if those environment variables are later removed.
 - **Dashboard read endpoints do not call Garmin at request time.** `/api/metrics/{name}`,
   `/api/recommendations`, and `/api/recommendations/rules-only` only read from the local
   SQLite tables populated by `sync.py`. Garmin Connect is only contacted during

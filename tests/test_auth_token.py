@@ -151,34 +151,33 @@ async def test_check_credentials_pays_the_same_scrypt_cost_for_unknown_usernames
     assert len(calls) == 1
 
 
-def test_startup_warns_when_token_set_and_pass_empty(monkeypatch, caplog):
+def test_startup_warns_when_token_set_and_auth_not_configured(monkeypatch, caplog):
     monkeypatch.setattr(shared_auth, "_API_TOKEN", "sometoken")
-    monkeypatch.setattr(shared_auth, "_PASS", "")
     with caplog.at_level(logging.WARNING, logger=shared_auth.__name__):
-        shared_auth._warn_if_misconfigured()
-    assert "VITALFORGE_API_TOKEN is set but VITALFORGE_PASS is empty" in caplog.text
+        shared_auth._warn_if_misconfigured(auth_configured=False)
+    assert "VITALFORGE_API_TOKEN is set but the users table is empty" in caplog.text
 
 
 @pytest.mark.parametrize(
-    "token,password",
+    "token,auth_configured",
     [
-        ("sometoken", "somepass"),  # both set
-        ("", ""),  # neither set
+        ("sometoken", True),
+        ("", False),
     ],
 )
-def test_startup_silent_in_the_other_three_configs(monkeypatch, caplog, token, password):
+def test_startup_silent_when_token_active_or_unconfigured(
+    monkeypatch, caplog, token, auth_configured
+):
     monkeypatch.setattr(shared_auth, "_API_TOKEN", token)
-    monkeypatch.setattr(shared_auth, "_PASS", password)
     with caplog.at_level(logging.WARNING, logger=shared_auth.__name__):
-        shared_auth._warn_if_misconfigured()
+        shared_auth._warn_if_misconfigured(auth_configured=auth_configured)
     assert caplog.text == ""
 
 
 def test_startup_warning_contains_no_token_value(monkeypatch, caplog):
     monkeypatch.setattr(shared_auth, "_API_TOKEN", "super-secret-token-value")
-    monkeypatch.setattr(shared_auth, "_PASS", "")
     with caplog.at_level(logging.WARNING, logger=shared_auth.__name__):
-        shared_auth._warn_if_misconfigured()
+        shared_auth._warn_if_misconfigured(auth_configured=False)
     assert "super-secret-token-value" not in caplog.text
 
 
@@ -186,9 +185,19 @@ def test_resolve_secret_passes_through_configured_value():
     assert shared_auth._resolve_secret("a-real-secret-value") == "a-real-secret-value"
 
 
-def test_resolve_secret_generates_random_when_still_default():
-    result = shared_auth._resolve_secret("default-dev-secret")
-    assert result != "default-dev-secret"
+@pytest.mark.parametrize(
+    "insecure_value",
+    [
+        "",
+        "   ",
+        "default-dev-secret",
+        "change-this-to-a-random-string",
+        "your-random-secret-here",
+    ],
+)
+def test_resolve_secret_generates_random_for_blank_or_known_placeholder(insecure_value):
+    result = shared_auth._resolve_secret(insecure_value)
+    assert result != insecure_value
     assert len(result) > 20
 
 

@@ -7,7 +7,7 @@ import os
 import secrets
 import time
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import aiosqlite
 from fastapi import HTTPException, Request
@@ -19,7 +19,11 @@ from shared.database import get_db
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_SECRET_SENTINEL = "default-dev-secret"
+_INSECURE_SECRET_PLACEHOLDERS = {
+    "default-dev-secret",
+    "change-this-to-a-random-string",
+    "your-random-secret-here",
+}
 
 
 def _resolve_secret(configured: str) -> str:
@@ -29,11 +33,11 @@ def _resolve_secret(configured: str) -> str:
     about the session and cross-service consequences of leaving the real
     setting unconfigured.
     """
-    if configured != _DEFAULT_SECRET_SENTINEL:
+    if configured.strip() and configured.strip() not in _INSECURE_SECRET_PLACEHOLDERS:
         return configured
     generated = secrets.token_urlsafe(32)
     logger.warning(
-        "VITALFORGE_SECRET is unset (or still the placeholder default) -- "
+        "VITALFORGE_SECRET is unset, blank, or still a known placeholder -- "
         "generated a random secret for THIS PROCESS instead of using the "
         "public default. Every existing session cookie is now invalid, "
         "this will happen again on every restart, and (if you run both "
@@ -44,7 +48,7 @@ def _resolve_secret(configured: str) -> str:
     return generated
 
 
-_SECRET = _resolve_secret(os.environ.get("VITALFORGE_SECRET", _DEFAULT_SECRET_SENTINEL))
+_SECRET = _resolve_secret(os.environ.get("VITALFORGE_SECRET", ""))
 _USER = os.environ.get("VITALFORGE_USER", "admin")
 _PASS = os.environ.get("VITALFORGE_PASS", "")
 _API_TOKEN = os.environ.get("VITALFORGE_API_TOKEN", "").strip()
@@ -75,15 +79,25 @@ _SCRYPT_P = 1
 _serializer = URLSafeTimedSerializer(_SECRET)
 
 
-def _warn_if_misconfigured():
-    if _API_TOKEN and not _PASS:
+class _Identity(NamedTuple):
+    username: str
+    user_id: int | None
+    session_version: int | None
+    role: str | None
+
+
+def _warn_if_misconfigured(auth_configured: bool):
+    """Warn only when the DB-backed auth state is genuinely open.
+
+    VITALFORGE_PASS is now a one-time bootstrap input, not the auth master
+    switch, so it cannot determine whether the bearer token is active.
+    """
+    if _API_TOKEN and not auth_configured:
         logger.warning(
-            "VITALFORGE_API_TOKEN is set but VITALFORGE_PASS is empty — "
-            "auth is DISABLED and the token is inert. Set VITALFORGE_PASS to enable auth."
+            "VITALFORGE_API_TOKEN is set but the users table is empty — "
+            "auth is DISABLED and the token is inert. Create the first user "
+            "by setting VITALFORGE_USER/VITALFORGE_PASS and restarting."
         )
-
-
-_warn_if_misconfigured()
 
 
 def _request_is_https(request: Request) -> bool:
@@ -169,11 +183,19 @@ async def _get_user_id_and_session_version(username: str) -> tuple[int, int] | N
     return (row["id"], row["session_version"]) if row is not None else None
 
 
-async def get_current_user(request: Request) -> str | None:
+async def _get_current_identity(request: Request) -> _Identity | None:
+    """Return one account-bound identity and live role check.
+
+    Cookie identity and role are selected together using every value bound
+    into the signed session. Keeping this as one query prevents a deleted
+    username from being recreated between an identity lookup and a later
+    role lookup, which could otherwise lend the new account's role to the
+    old account's cookie.
+    """
     if not await _is_auth_configured():
-        return "anonymous"
+        return _Identity("anonymous", None, None, None)
     if _bearer_token_valid(request):
-        return "api-token"
+        return _Identity("api-token", None, None, None)
     cookie = request.cookies.get(_COOKIE_NAME)
     if not cookie:
         return None
@@ -185,13 +207,18 @@ async def get_current_user(request: Request) -> str | None:
     try:
         row = await (
             await db.execute(
-                "SELECT 1 FROM users WHERE id = ? AND username = ? AND session_version = ?",
+                "SELECT role FROM users WHERE id = ? AND username = ? AND session_version = ?",
                 (user_id, username, session_version),
             )
         ).fetchone()
     finally:
         await db.close()
-    return username if row is not None else None
+    return _Identity(username, user_id, session_version, row["role"]) if row is not None else None
+
+
+async def get_current_user(request: Request) -> str | None:
+    identity = await _get_current_identity(request)
+    return identity.username if identity is not None else None
 
 
 async def require_auth(request: Request) -> str:
@@ -202,11 +229,11 @@ async def require_auth(request: Request) -> str:
 
 
 async def get_current_user_role(username: str) -> str | None:
-    """Separate from get_current_user (which only confirms a session's
-    owner still exists) so route handlers that need the role for an
-    authorization decision (e.g. /auth/admin/* -- admin-only) fetch it
-    explicitly, rather than every request paying for a role lookup it
-    doesn't need."""
+    """Return a user's current role for management/display callers.
+
+    Authorization paths use _get_current_identity instead so cookie-bound
+    identity and role cannot be separated by username-reuse races.
+    """
     db = await get_db()
     try:
         row = await (await db.execute("SELECT role FROM users WHERE username = ?", (username,))).fetchone()
@@ -219,10 +246,37 @@ async def _require_admin(request: Request) -> str:
     """require_auth() plus the admin-only role check every /auth/admin/*
     route needs -- was five copies of the same three lines (fix-review
     finding)."""
-    user = await require_auth(request)
-    if await get_current_user_role(user) != "admin":
+    identity = await _get_current_identity(request)
+    if identity is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if identity.role != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
-    return user
+    return identity.username
+
+
+async def _authenticate_credentials(username: str, password: str) -> tuple[int, int] | None:
+    """Verify credentials and return identity from the exact row verified.
+
+    Fetching the password hash, account id, and session version together
+    prevents username deletion/recreation between password verification and
+    session issuance. If that row is later deleted or changed, the returned
+    id/version can only produce a cookie that fails closed.
+    """
+    db = await get_db()
+    try:
+        row = await (
+            await db.execute(
+                "SELECT id, password_hash, session_version FROM users WHERE username = ?",
+                (username,),
+            )
+        ).fetchone()
+    finally:
+        await db.close()
+    stored_hash = row["password_hash"] if row is not None else _DUMMY_PASSWORD_HASH
+    verified = _verify_password(password, stored_hash)
+    if row is None or not verified:
+        return None
+    return row["id"], row["session_version"]
 
 
 async def check_credentials(username: str, password: str) -> bool:
@@ -232,16 +286,7 @@ async def check_credentials(username: str, password: str) -> bool:
     username-enumeration oracle (security-review finding): an attacker can
     tell a valid username from an invalid one by response time alone,
     without ever guessing a password."""
-    db = await get_db()
-    try:
-        row = await (
-            await db.execute("SELECT password_hash FROM users WHERE username = ?", (username,))
-        ).fetchone()
-    finally:
-        await db.close()
-    stored_hash = row["password_hash"] if row is not None else _DUMMY_PASSWORD_HASH
-    verified = _verify_password(password, stored_hash)
-    return verified if row is not None else False
+    return await _authenticate_credentials(username, password) is not None
 
 
 async def bootstrap_first_admin():
@@ -259,26 +304,25 @@ async def bootstrap_first_admin():
     IntegrityError is caught and treated as "someone else already seeded
     it", not a real failure (fix-review finding, reproduced: both
     processes calling this concurrently against a fresh DB, one raises)."""
-    if not _PASS:
-        return
-    if _USER in _RESERVED_USERNAMES:
-        # admin_create_user rejects these; the bootstrap path bypassed that
-        # guard entirely (fix-review finding) -- VITALFORGE_USER=api-token
-        # would seed an admin account under the same name get_current_user
-        # returns for every valid bearer-token request, handing that role
-        # to anyone holding the shared token. _USER is operator-set, not
-        # attacker-controlled, but refuse it here too rather than silently
-        # creating the same collision through a different door.
-        logger.error(
-            "VITALFORGE_USER=%r is a reserved name and cannot be used to seed the "
-            "first admin account. Set VITALFORGE_USER to something else and restart.",
-            _USER,
-        )
-        return
     db = await get_db()
     try:
         row = await (await db.execute("SELECT 1 FROM users LIMIT 1")).fetchone()
         if row is not None:
+            return
+        if not _PASS:
+            _warn_if_misconfigured(auth_configured=False)
+            return
+        if _USER in _RESERVED_USERNAMES:
+            # admin_create_user rejects these; the bootstrap path bypassed
+            # that guard entirely (fix-review finding) --
+            # VITALFORGE_USER=api-token would seed an admin account under
+            # the same name get_current_user returns for every valid bearer
+            # request, handing that role to anyone holding the shared token.
+            logger.error(
+                "VITALFORGE_USER=%r is a reserved name and cannot be used to seed the "
+                "first admin account. Set VITALFORGE_USER to something else and restart.",
+                _USER,
+            )
             return
         try:
             await db.execute(
@@ -725,17 +769,8 @@ def add_auth_routes(app):
         body = await request.json()
         username = body.get("username", "")
         password = body.get("password", "")
-        if not await check_credentials(username, password):
-            raise HTTPException(status_code=401, detail="Invalid credentials")
-        id_and_version = await _get_user_id_and_session_version(username)
+        id_and_version = await _authenticate_credentials(username, password)
         if id_and_version is None:
-            # Narrow TOCTOU: the account was deleted between the
-            # check_credentials() call above and this one. Fail the login
-            # rather than issue a cookie with no matching account -- it
-            # would just be permanently invalid anyway (get_current_user's
-            # id+username+version check could never match), but failing
-            # loudly here is clearer than a cookie that silently never
-            # authenticates.
             raise HTTPException(status_code=401, detail="Invalid credentials")
         user_id, session_version = id_and_version
         cookie = create_session_cookie(username, user_id, session_version)
@@ -763,8 +798,13 @@ def add_auth_routes(app):
 
     @app.post("/auth/account/password")
     async def change_own_password(request: Request, data: PasswordChangeIn):
-        user = await require_auth(request)
-        if not await check_credentials(user, data.current_password):
+        identity = await _get_current_identity(request)
+        if identity is None:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        if identity.user_id is None:
+            raise HTTPException(status_code=401, detail="Current password incorrect")
+        verified_identity = await _authenticate_credentials(identity.username, data.current_password)
+        if verified_identity is None or verified_identity[0] != identity.user_id:
             raise HTTPException(status_code=401, detail="Current password incorrect")
         if not data.new_password:
             raise HTTPException(status_code=422, detail="New password required")
@@ -776,8 +816,8 @@ def add_auth_routes(app):
             # (security-review finding: this used to leave old sessions
             # valid until their 30-day expiry regardless).
             await db.execute(
-                "UPDATE users SET password_hash = ?, session_version = session_version + 1 WHERE username = ?",
-                (_hash_password(data.new_password), user),
+                "UPDATE users SET password_hash = ?, session_version = session_version + 1 WHERE id = ?",
+                (_hash_password(data.new_password), identity.user_id),
             )
             await db.commit()
         finally:

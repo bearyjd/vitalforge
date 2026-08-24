@@ -7,6 +7,8 @@ so these routes are tested in isolation from either real service.
 """
 
 import asyncio
+import logging
+from datetime import datetime, timezone
 
 import pytest
 from fastapi import FastAPI
@@ -176,6 +178,19 @@ async def test_admin_users_list_requires_auth(client):
     await seed_user("root", role="admin")  # turn auth on -- an empty users table means open access
     resp = await client.get("/auth/admin/users/list")
     assert resp.status_code == 401
+
+
+async def test_admin_authorization_does_not_requery_role_by_username(
+    client, monkeypatch
+):
+    await seed_user("root", role="admin")
+
+    async def stale_username_role_lookup(username):
+        raise AssertionError(f"split username role lookup for {username}")
+
+    monkeypatch.setattr(shared_auth, "get_current_user_role", stale_username_role_lookup)
+    resp = await client.get("/auth/admin/users/list", cookies=await _cookies_for("root"))
+    assert resp.status_code == 200
 
 
 # --- Admin: create user -------------------------------------------------------------
@@ -451,6 +466,19 @@ async def test_bootstrap_first_admin_noop_when_pass_empty(initialized_db, monkey
     assert count == 0
 
 
+async def test_bootstrap_does_not_warn_token_is_inert_when_users_exist(
+    initialized_db, monkeypatch, caplog
+):
+    await seed_user("existing", role="admin")
+    monkeypatch.setattr(shared_auth, "_PASS", "")
+    monkeypatch.setattr(shared_auth, "_API_TOKEN", "configured-token")
+
+    with caplog.at_level(logging.WARNING, logger=shared_auth.__name__):
+        await shared_auth.bootstrap_first_admin()
+
+    assert "token is inert" not in caplog.text
+
+
 async def test_bootstrap_first_admin_noop_when_a_user_already_exists(initialized_db, monkeypatch):
     await seed_user("existing", role="user")
     monkeypatch.setattr(shared_auth, "_USER", "bootstrapped-admin")
@@ -533,6 +561,47 @@ async def test_deleted_users_cookie_does_not_authenticate_as_a_later_reused_user
 
     resp = await client.get("/auth/admin/users/list", cookies=old_cookie)
     assert resp.status_code == 401  # not 200 -- must not resolve to the new account at all
+
+
+async def test_login_cookie_stays_bound_to_the_row_whose_password_was_verified(
+    client, monkeypatch
+):
+    old_id = await seed_user("shared_name", password="old-password")
+
+    async def verified_old_identity(username, password):
+        assert (username, password) == ("shared_name", "old-password")
+        db = await get_db()
+        try:
+            await db.execute("DELETE FROM users WHERE id = ?", (old_id,))
+            cursor = await db.execute(
+                "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, 'admin', ?)",
+                (
+                    "shared_name",
+                    shared_auth._hash_password("new-password"),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            await db.commit()
+            assert cursor.lastrowid != old_id
+        finally:
+            await db.close()
+        # Model deletion/recreation after the old row was fetched and its
+        # password verified. Session issuance must keep this old identity,
+        # never look the username up again and borrow the replacement id.
+        return old_id, 1
+
+    monkeypatch.setattr(shared_auth, "_authenticate_credentials", verified_old_identity)
+    resp = await client.post(
+        "/auth/login", json={"username": "shared_name", "password": "old-password"}
+    )
+    assert resp.status_code == 200
+    cookie = resp.cookies["vf_session"]
+    assert shared_auth.validate_session(cookie) == ("shared_name", old_id, 1)
+
+    # The replacement account exists and is an admin, but the old identity's
+    # newly issued cookie still fails closed rather than inheriting that role.
+    resp = await client.get("/auth/admin/users/list", cookies={"vf_session": cookie})
+    assert resp.status_code == 401
 
 
 async def test_demoted_admin_session_loses_admin_access_immediately(client):
