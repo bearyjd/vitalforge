@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from shared.auth import add_auth_routes
+from shared.auth import add_auth_routes, bootstrap_first_admin
 from shared.database import get_db, init_db
 from shared.garmin_client import authenticate, push_weight
 
@@ -31,6 +31,11 @@ GRAMS_PER_KG = 1000
 async def lifespan(app: FastAPI):
     logger.info("Initializing database...")
     await init_db()
+    # Both services call this independently against the same DB file with
+    # no startup ordering between them -- bootstrap_first_admin() is safe
+    # under that race itself (see its own docstring), so no coordination
+    # is needed here.
+    await bootstrap_first_admin()
     logger.info("Authenticating with Garmin Connect...")
     try:
         authenticate()

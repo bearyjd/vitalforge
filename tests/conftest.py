@@ -174,6 +174,26 @@ def import_service_module(dotted_path: str):
     return importlib.import_module(dotted_path)
 
 
+async def seed_user(username: str, password: str = "irrelevant-for-this-test", role: str = "user") -> int:
+    """Insert a user row directly via SQL, bypassing the route layer --
+    mirrors test_dedup.py's seed_row for auth-related tests that need a
+    real, DB-backed user for get_current_user's live re-check (users table
+    membership, not just a validly-signed cookie) to pass."""
+    from shared import auth as shared_auth
+    from shared.database import get_db
+
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, ?, ?)",
+            (username, shared_auth._hash_password(password), role, datetime.now(timezone.utc).isoformat()),
+        )
+        await db.commit()
+        return cursor.lastrowid
+    finally:
+        await db.close()
+
+
 @pytest.fixture
 def weight_app_module(initialized_db, fake_garmin_client, monkeypatch):
     """The `vitalforge-weight` FastAPI app module, Garmin/DB fully faked."""

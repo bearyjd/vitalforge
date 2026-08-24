@@ -1,13 +1,22 @@
-"""The 40-cell auth behavior matrix from docs/prp/00-design.md §2.5.
+"""The 40-cell auth behavior matrix from docs/prp/00-design.md §2.5, revised
+for the per-user, DB-backed auth model (`.claude/PRPs/plans/user-accounts-auth-model.plan.md`).
 
-Four configs (VITALFORGE_PASS set/unset x VITALFORGE_API_TOKEN set/unset) x
-ten credential forms (C0-C9), run against a throwaway FastAPI app so auth
-behavior is isolated from either real service's routes. `ids=` is set to the
-cell name (e.g. "A1-C3") so a failure names the exact matrix cell.
+Four configs (a "testuser" row exists in `users` or it doesn't, x
+VITALFORGE_API_TOKEN set/unset) x ten credential forms (C0-C9), run against a
+throwaway FastAPI app so auth behavior is isolated from either real service's
+routes. `ids=` is set to the cell name (e.g. "A1-C3") so a failure names the
+exact matrix cell.
 
-The A3/A4 rows (PASS unset -> auth fully off) are generated, not hand-written:
-per §2.5, a configured token never becomes load-bearing when PASS is empty --
-PASS is the single master switch for whether auth exists at all.
+The token dimension and its ten credential forms are unchanged from before
+this revision -- the auth-model plan explicitly does not touch
+`_bearer_token_valid`/`_API_TOKEN` (that's a separate, later plan). What
+changed is the master switch: "does `users` have any rows" replaced "is
+VITALFORGE_PASS set" (`_is_auth_configured` no longer reads `_PASS` at all),
+and a valid session cookie now ALSO requires its username to still exist in
+`users` (the live re-check in `get_current_user`), not just a valid
+signature -- so the A1/A2 rows (auth on) now seed a "testuser" row for the
+cookie-based cells to be meaningful, and A3/A4 (auth off) rely on the table
+being empty, not on any env var.
 """
 
 from dataclasses import dataclass
@@ -19,6 +28,7 @@ from httpx import ASGITransport, AsyncClient, Headers
 
 from shared import auth as shared_auth
 from shared.auth import add_auth_routes, create_session_cookie
+from tests.conftest import seed_user
 
 
 def _build_matrix_app() -> FastAPI:
@@ -37,7 +47,7 @@ def _build_matrix_app() -> FastAPI:
 
 
 @pytest.fixture
-async def matrix_client():
+async def matrix_client(initialized_db):
     transport = ASGITransport(app=_build_matrix_app())
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
@@ -45,49 +55,48 @@ async def matrix_client():
 
 @dataclass(frozen=True)
 class Config:
-    pass_value: str
+    seed_user: bool
     token_value: str
 
 
 CORRECT_TOKEN = "correct-token"
 WRONG_TOKEN = "wrong-token"
 
-A1_CONFIG = Config(pass_value="correct-pass", token_value=CORRECT_TOKEN)
-A2_CONFIG = Config(pass_value="correct-pass", token_value="")
-A3_CONFIG = Config(pass_value="", token_value=CORRECT_TOKEN)
-A4_CONFIG = Config(pass_value="", token_value="")
+A1_CONFIG = Config(seed_user=True, token_value=CORRECT_TOKEN)
+A2_CONFIG = Config(seed_user=True, token_value="")
+A3_CONFIG = Config(seed_user=False, token_value=CORRECT_TOKEN)
+A4_CONFIG = Config(seed_user=False, token_value="")
 
 
-def _valid_cookie() -> str:
-    return create_session_cookie("testuser")
-
-
-# Credential forms take no args -- they always present CORRECT_TOKEN/WRONG_TOKEN,
-# and it's each row's *config* (whether _API_TOKEN equals CORRECT_TOKEN) that
-# determines whether "the correct-looking token" actually matches.
+# Credential forms take the cookie value to use for "a currently valid
+# session" (C1/C8) as a parameter rather than looking it up themselves --
+# building a real cookie now needs a DB-backed user id lookup
+# (create_session_cookie(username, user_id)), which these plain sync
+# lambdas can't do internally. The test body seeds "testuser" (when the
+# config calls for it) and passes the resulting cookie in.
 CREDENTIAL_FORMS = {
-    "C0": lambda: ({}, {}),
-    "C1": lambda: ({}, {"vf_session": _valid_cookie()}),
-    "C2": lambda: ({}, {"vf_session": "garbage-not-a-real-cookie"}),
-    "C3": lambda: ({"Authorization": f"Bearer {CORRECT_TOKEN}"}, {}),
-    "C4": lambda: ({"Authorization": f"Bearer {WRONG_TOKEN}"}, {}),
-    "C5": lambda: ({"Authorization": "Bearer "}, {}),
-    "C6": lambda: ({"Authorization": f"Basic {CORRECT_TOKEN}"}, {}),
-    "C7": lambda: ({"Authorization": f"Bearer {CORRECT_TOKEN}"}, {"vf_session": "garbage-not-a-real-cookie"}),
-    "C8": lambda: ({"Authorization": f"Bearer {WRONG_TOKEN}"}, {"vf_session": _valid_cookie()}),
+    "C0": lambda vc: ({}, {}),
+    "C1": lambda vc: ({}, {"vf_session": vc}),
+    "C2": lambda vc: ({}, {"vf_session": "garbage-not-a-real-cookie"}),
+    "C3": lambda vc: ({"Authorization": f"Bearer {CORRECT_TOKEN}"}, {}),
+    "C4": lambda vc: ({"Authorization": f"Bearer {WRONG_TOKEN}"}, {}),
+    "C5": lambda vc: ({"Authorization": "Bearer "}, {}),
+    "C6": lambda vc: ({"Authorization": f"Basic {CORRECT_TOKEN}"}, {}),
+    "C7": lambda vc: ({"Authorization": f"Bearer {CORRECT_TOKEN}"}, {"vf_session": "garbage-not-a-real-cookie"}),
+    "C8": lambda vc: ({"Authorization": f"Bearer {WRONG_TOKEN}"}, {"vf_session": vc}),
     # Raw bytes, not a plain str dict: httpx's header dict encodes values as
     # strict ASCII and rejects "ö"/"é" outright, even though both are within
     # latin-1's range. Building via Headers(bytes) matches what Starlette
     # actually does on the wire -- latin-1-decode raw header bytes -- so this
     # is "Bearer tökén" UTF-8-encoded, exactly as a real client would send it.
-    "C9": lambda: (Headers([(b"authorization", "Bearer tökén".encode())]), {}),
+    "C9": lambda vc: (Headers([(b"authorization", "Bearer tökén".encode())]), {}),
 }
 
 ALLOW = 200
 DENY = 401
 
 MATRIX = [
-    # A1 -- PASS set, TOKEN set
+    # A1 -- testuser seeded (auth on), TOKEN set
     ("A1-C0", A1_CONFIG, "C0", DENY),
     ("A1-C1", A1_CONFIG, "C1", ALLOW),
     ("A1-C2", A1_CONFIG, "C2", DENY),
@@ -98,7 +107,7 @@ MATRIX = [
     ("A1-C7", A1_CONFIG, "C7", ALLOW),
     ("A1-C8", A1_CONFIG, "C8", ALLOW),
     ("A1-C9", A1_CONFIG, "C9", DENY),
-    # A2 -- PASS set, TOKEN unset/empty/whitespace (all collapse: stripped at import)
+    # A2 -- testuser seeded (auth on), TOKEN unset/empty/whitespace (all collapse: stripped at import)
     ("A2-C0", A2_CONFIG, "C0", DENY),
     ("A2-C1", A2_CONFIG, "C1", ALLOW),
     ("A2-C2", A2_CONFIG, "C2", DENY),
@@ -111,8 +120,9 @@ MATRIX = [
     ("A2-C9", A2_CONFIG, "C9", DENY),
 ]
 
-# A3/A4 -- PASS unset -> auth off entirely. get_current_user() returns "anonymous"
-# at step 1, before the bearer check ever runs, regardless of what's presented.
+# A3/A4 -- no user seeded (users table empty) -> auth off entirely.
+# get_current_user() returns "anonymous" at step 1, before the bearer check
+# ever runs, regardless of what's presented.
 MATRIX += [(f"A3-{c}", A3_CONFIG, c, ALLOW) for c in CREDENTIAL_FORMS]
 MATRIX += [(f"A4-{c}", A4_CONFIG, c, ALLOW) for c in CREDENTIAL_FORMS]
 
@@ -125,9 +135,12 @@ assert len(MATRIX) == 40
     ids=[row[0] for row in MATRIX],
 )
 async def test_behavior_matrix(cell_id, config, credential_form, expected_status, monkeypatch, matrix_client):
-    monkeypatch.setattr(shared_auth, "_PASS", config.pass_value)
     monkeypatch.setattr(shared_auth, "_API_TOKEN", config.token_value)
+    valid_cookie = "no-user-seeded-for-this-config"
+    if config.seed_user:
+        user_id = await seed_user("testuser")
+        valid_cookie = create_session_cookie("testuser", user_id, 1)  # fresh row, DB default session_version
 
-    headers, cookies = CREDENTIAL_FORMS[credential_form]()
+    headers, cookies = CREDENTIAL_FORMS[credential_form](valid_cookie)
     resp = await matrix_client.get("/api/thing", headers=headers, cookies=cookies)
     assert resp.status_code == expected_status, f"{cell_id}: expected {expected_status}, got {resp.status_code}"

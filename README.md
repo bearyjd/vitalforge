@@ -90,9 +90,9 @@ Visit `http://localhost:8085` for weight logging and `http://localhost:8086` for
 | `GARMIN_PASSWORD` | Yes | Your Garmin Connect password |
 | `ANTHROPIC_API_KEY` | No | Claude API key for AI recommendations (rules engine works without it) |
 | `ANTHROPIC_BASE_URL` | No | Custom API base URL (e.g. `http://localhost:4000` for LiteLLM proxy) |
-| `VITALFORGE_USER` | No | Login username (default: `admin`) |
-| `VITALFORGE_PASS` | No | Login password. If empty, auth is disabled (open access) |
-| `VITALFORGE_SECRET` | No | Secret key for signing session cookies |
+| `VITALFORGE_USER` | No | One-time bootstrap username (default: `admin`) — seeds the first admin account on first boot if no users exist yet; not read for ongoing auth after that (manage accounts from `/auth/admin/users` instead) |
+| `VITALFORGE_PASS` | No | One-time bootstrap password for the above. If empty and no users exist yet, auth is disabled (open access) |
+| `VITALFORGE_SECRET` | No | Secret key for signing session cookies. If unset or left as the placeholder default, a random one is generated per process at startup and a warning is logged — sessions won't survive a restart, and if you run both services, they won't share sign-on until this is set explicitly |
 | `VITALFORGE_API_TOKEN` | No | Long-lived bearer token for unattended API clients (e.g. Tasker, Bascule). Empty disables bearer auth |
 | `WEIGHT_URL` | No | Public URL for weight service (e.g. `https://weight.yourdomain.com`) |
 | `DASHBOARD_URL` | No | Public URL for dashboard service (e.g. `https://health.yourdomain.com`) |
@@ -163,19 +163,40 @@ If no `ANTHROPIC_API_KEY` or `ANTHROPIC_BASE_URL` is set, the system falls back 
 
 ### Authentication
 
-Two credential types, both optional and checked independently — a request with either a valid cookie or a valid bearer token is authenticated, and a wrong or missing one never blocks the other:
+VitalForge has real user accounts (a `users` table, shared by both services) instead of one
+password for everyone. Two roles:
 
-- **Cookie-based session auth** for browsers, 30-day expiry. Set `VITALFORGE_PASS` in `.env` to enable. Both services share the same credentials.
-- **Bearer-token auth** for unattended/machine clients (Tasker, scripts, the Bascule Android client). Set `VITALFORGE_API_TOKEN` to a long random value; requests present it as `Authorization: Bearer <token>`.
+- **admin** — everything a `user` can do, plus creating/editing/deleting any account from
+  `/auth/admin/users`.
+- **user** — logs weigh-ins, views the dashboard, manages their own password from
+  `/auth/account`.
 
-Leave `VITALFORGE_PASS` empty to disable auth entirely (open access) for both services — it's the single master switch. A configured `VITALFORGE_API_TOKEN` is inert while `VITALFORGE_PASS` is empty.
+**First boot.** If no users exist yet, `VITALFORGE_USER`/`VITALFORGE_PASS` seed one admin
+account automatically — after that, those two env vars are no longer read for ongoing auth,
+only for this one-time bootstrap. An empty `users` table (both env vars unset) means auth is
+disabled entirely (open access), matching local-dev convenience; the moment any account
+exists, auth is always on for both services.
+
+Two credential types, both optional and checked independently — a request with either a
+valid cookie or a valid bearer token is authenticated, and a wrong or missing one never
+blocks the other:
+
+- **Cookie-based session auth** for browsers, 30-day expiry. A signed cookie only proves
+  *who* you are — your role is re-read from the database on every request, so demoting or
+  deleting an account takes effect on its very next request, not after the cookie expires.
+- **Bearer-token auth** for unattended/machine clients (Tasker, scripts, the Bascule Android
+  client). Set `VITALFORGE_API_TOKEN` to a long random value; requests present it as
+  `Authorization: Bearer <token>`. (Still one shared token today — per-user, independently
+  revocable tokens are a separate, later change.)
 
 **Revoking a credential.** Rotating one does **not** revoke the other:
 
 - Rotate `VITALFORGE_SECRET` to invalidate every outstanding session cookie at once.
 - Rotate `VITALFORGE_API_TOKEN` to invalidate the bearer token — it has no expiry, so this is the only way to revoke it.
+- Delete a user's account from `/auth/admin/users` to revoke their access outright — takes
+  effect immediately, not just on their next login.
 
-If you suspect a credential was leaked, rotate **both**.
+If you suspect a credential was leaked, rotate **both** env-var-based credentials above.
 
 ## Deployment
 

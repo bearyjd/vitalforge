@@ -15,7 +15,7 @@ from httpx import ASGITransport, AsyncClient
 
 from shared import auth as shared_auth
 from shared.auth import create_session_cookie
-from tests.conftest import import_service_module
+from tests.conftest import import_service_module, seed_user
 
 FULL_PAYLOAD = {
     "weight": 180.0,
@@ -30,13 +30,13 @@ FULL_PAYLOAD = {
 TOKEN = "secret-token"
 
 
-def _configure_auth(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(shared_auth, "_PASS", "correct-pass")
+async def _configure_auth(monkeypatch: pytest.MonkeyPatch) -> int:
     monkeypatch.setattr(shared_auth, "_API_TOKEN", TOKEN)
+    return await seed_user("testuser")
 
 
 async def test_token_client_full_flow(weight_app_module, monkeypatch):
-    _configure_auth(monkeypatch)
+    await _configure_auth(monkeypatch)
     headers = {"Authorization": f"Bearer {TOKEN}"}
     transport = ASGITransport(app=weight_app_module.app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
@@ -60,8 +60,9 @@ async def test_cookie_client_regression_flow(weight_app_module, monkeypatch):
     httpx deprecates (and eventually hard-errors on) per-request `cookies=`
     persisting into the client jar, so relying on that would be pinned to
     ambiguous, disappearing behavior rather than modeling a real session."""
-    _configure_auth(monkeypatch)
-    cookies = {"vf_session": create_session_cookie("testuser")}
+    user_id = await _configure_auth(monkeypatch)
+    # fresh row, DB default session_version
+    cookies = {"vf_session": create_session_cookie("testuser", user_id, 1)}
     transport = ASGITransport(app=weight_app_module.app)
     async with AsyncClient(transport=transport, base_url="http://test", cookies=cookies) as ac:
         post_resp = await ac.post("/api/weight", json=FULL_PAYLOAD)
@@ -83,9 +84,10 @@ async def test_mixed_clients_interleaved_no_auth_leakage(weight_app_module, monk
     because httpx doesn't persist per-request cookies into the jar (a
     deprecated, ambiguous behavior slated to change), not because VitalForge
     itself keeps no cross-client state."""
-    _configure_auth(monkeypatch)
+    user_id = await _configure_auth(monkeypatch)
     token_headers = {"Authorization": f"Bearer {TOKEN}"}
-    cookies = {"vf_session": create_session_cookie("testuser")}
+    # fresh row, DB default session_version
+    cookies = {"vf_session": create_session_cookie("testuser", user_id, 1)}
     transport = ASGITransport(app=weight_app_module.app)
 
     async with (
