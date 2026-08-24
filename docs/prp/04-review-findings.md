@@ -170,5 +170,7 @@ decision than this review should make unilaterally.
 - [x] Docs pass — README env table, Authentication section, and Tasker section were
       already current from A3/B6 (confirmed via `tests/test_docs_drift.py`, not redone);
       this review added the metrics-units and dashboard-chart-coverage notes (O4, O7)
-- [ ] Two items await JD's decision before they can close (Codex #1, #3, above) — everything
-      else in this document is closed.
+- [x] The two items that awaited JD's decision (Codex #1 and #3) shipped in PR #21:
+      process-local random fallback secrets replace the public default, and TLS-aware
+      session cookies gain `Secure` for direct or proxy-reported HTTPS. The combined
+      multi-user/security-fix PR passed a fresh adversarial review and CI before merge.
