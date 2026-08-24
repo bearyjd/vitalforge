@@ -13,9 +13,8 @@ from datetime import datetime, timezone
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from shared import auth as shared_auth
 from shared.auth import create_session_cookie
-from tests.conftest import import_service_module, seed_user
+from tests.conftest import import_service_module, seed_token, seed_user
 
 FULL_PAYLOAD = {
     "weight": 180.0,
@@ -30,13 +29,14 @@ FULL_PAYLOAD = {
 TOKEN = "secret-token"
 
 
-async def _configure_auth(monkeypatch: pytest.MonkeyPatch) -> int:
-    monkeypatch.setattr(shared_auth, "_API_TOKEN", TOKEN)
-    return await seed_user("testuser")
+async def _configure_auth() -> int:
+    user_id = await seed_user("testuser")
+    await seed_token(user_id, raw_token=TOKEN)
+    return user_id
 
 
-async def test_token_client_full_flow(weight_app_module, monkeypatch):
-    await _configure_auth(monkeypatch)
+async def test_token_client_full_flow(weight_app_module):
+    await _configure_auth()
     headers = {"Authorization": f"Bearer {TOKEN}"}
     transport = ASGITransport(app=weight_app_module.app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
@@ -54,13 +54,13 @@ async def test_token_client_full_flow(weight_app_module, monkeypatch):
     assert recent[0]["weight_lbs"] == 180.0
 
 
-async def test_cookie_client_regression_flow(weight_app_module, monkeypatch):
+async def test_cookie_client_regression_flow(weight_app_module):
     """A2 regression: cookie auth stays unaffected once a bearer token is
     configured. Cookies are set at client construction, not per-request --
     httpx deprecates (and eventually hard-errors on) per-request `cookies=`
     persisting into the client jar, so relying on that would be pinned to
     ambiguous, disappearing behavior rather than modeling a real session."""
-    user_id = await _configure_auth(monkeypatch)
+    user_id = await _configure_auth()
     # fresh row, DB default session_version
     cookies = {"vf_session": create_session_cookie("testuser", user_id, 1)}
     transport = ASGITransport(app=weight_app_module.app)
@@ -76,7 +76,7 @@ async def test_cookie_client_regression_flow(weight_app_module, monkeypatch):
     assert recent[0]["weight_lbs"] == 180.0
 
 
-async def test_mixed_clients_interleaved_no_auth_leakage(weight_app_module, monkeypatch):
+async def test_mixed_clients_interleaved_no_auth_leakage(weight_app_module):
     """Each request's outcome must depend only on its own credentials. Uses
     three genuinely distinct AsyncClient instances (own connection, own
     cookie jar) against the same app/DB, rather than one shared client with
@@ -84,7 +84,7 @@ async def test_mixed_clients_interleaved_no_auth_leakage(weight_app_module, monk
     because httpx doesn't persist per-request cookies into the jar (a
     deprecated, ambiguous behavior slated to change), not because VitalForge
     itself keeps no cross-client state."""
-    user_id = await _configure_auth(monkeypatch)
+    user_id = await _configure_auth()
     token_headers = {"Authorization": f"Bearer {TOKEN}"}
     # fresh row, DB default session_version
     cookies = {"vf_session": create_session_cookie("testuser", user_id, 1)}

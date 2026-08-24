@@ -93,7 +93,7 @@ Visit `http://localhost:8085` for weight logging and `http://localhost:8086` for
 | `VITALFORGE_USER` | No | One-time bootstrap username (default: `admin`) — seeds the first admin account on first boot if no users exist yet; not read for ongoing auth after that (manage accounts from `/auth/admin/users` instead) |
 | `VITALFORGE_PASS` | No | One-time bootstrap password for the above. If empty and no users exist yet, auth is disabled (open access) |
 | `VITALFORGE_SECRET` | No | Secret key for signing session cookies. If unset or left as the placeholder default, a random one is generated per process at startup and a warning is logged — sessions won't survive a restart, and if you run both services, they won't share sign-on until this is set explicitly |
-| `VITALFORGE_API_TOKEN` | No | Long-lived bearer token for unattended API clients (e.g. Tasker, Bascule). Empty disables bearer auth |
+| `VITALFORGE_API_TOKEN` | No | Upgrade compatibility only: imported once as a named token owned by the first admin. Leave empty on new installs and create per-user tokens at `/auth/account` |
 | `WEIGHT_URL` | No | Public URL for weight service (e.g. `https://weight.yourdomain.com`) |
 | `DASHBOARD_URL` | No | Public URL for dashboard service (e.g. `https://health.yourdomain.com`) |
 | `DEFAULT_UNIT` | No | Default weight unit: `lbs` or `kg` (default: `lbs`) |
@@ -185,18 +185,22 @@ blocks the other:
   *who* you are — your role is re-read from the database on every request, so demoting or
   deleting an account takes effect on its very next request, not after the cookie expires.
 - **Bearer-token auth** for unattended/machine clients (Tasker, scripts, the Bascule Android
-  client). Set `VITALFORGE_API_TOKEN` to a long random value; requests present it as
-  `Authorization: Bearer <token>`. (Still one shared token today — per-user, independently
-  revocable tokens are a separate, later change.)
+  client). Each account creates named tokens from `/auth/account`; the raw value is shown
+  only once and requests present it as `Authorization: Bearer <token>`. Only a SHA-256 hash
+  is stored. Tokens inherit their owner's current role and can be revoked independently.
+  Existing `VITALFORGE_API_TOKEN` values are imported once for upgrade compatibility as a
+  token owned by the first admin.
 
 **Revoking a credential.** Rotating one does **not** revoke the other:
 
 - Rotate `VITALFORGE_SECRET` to invalidate every outstanding session cookie at once.
-- Rotate `VITALFORGE_API_TOKEN` to invalidate the bearer token — it has no expiry, so this is the only way to revoke it.
-- Delete a user's account from `/auth/admin/users` to revoke their access outright — takes
-  effect immediately, not just on their next login.
+- Revoke an individual bearer token from `/auth/account`, or from the administrator token
+  list. Tokens do not expire automatically.
+- Delete a user's account from `/auth/admin/users` to revoke their sessions and all of their
+  tokens outright — takes effect immediately, not just on their next login.
 
-If you suspect a credential was leaked, rotate **both** env-var-based credentials above.
+If a token is leaked, revoke that token. If the session signing secret is leaked, rotate
+`VITALFORGE_SECRET` to invalidate all cookies.
 
 ## Deployment
 
@@ -283,9 +287,9 @@ Log weight from your Android phone using Tasker without opening the browser.
 
 Tasker is an unattended client, so use bearer-token auth rather than a browser session cookie:
 
-1. Generate a token and set it as `VITALFORGE_API_TOKEN` in `.env` (see [Environment Variables](#environment-variables))
+1. Sign in as the account Tasker should use and create a named token at `/auth/account`
 2. Add as header in HTTP Request: `Authorization: Bearer YOUR_API_TOKEN`
-3. The token has no expiry — it stays valid until you rotate `VITALFORGE_API_TOKEN`
+3. The token has no expiry — revoke it from `/auth/account` when it is no longer needed
 
 ## NFC Tag Integration
 

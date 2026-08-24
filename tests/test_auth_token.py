@@ -1,11 +1,4 @@
-"""Unit tests for the A1 auth helper: `_bearer_token_valid` and the
-`check_credentials` non-ASCII fix (D3). Pure functions, no wiring — the
-bearer check isn't called from `get_current_user`/the middleware yet (A2).
-
-`_API_TOKEN`/`_PASS` are read at import time (see conftest.py's own note on
-`DB_PATH`), so tests vary them via `monkeypatch.setattr(shared.auth, ...)`,
-never `monkeypatch.setenv`.
-"""
+"""Unit tests for DB-backed bearer resolution and password helpers."""
 
 import logging
 
@@ -13,8 +6,8 @@ import pytest
 from starlette.requests import Request
 
 from shared import auth as shared_auth
-from shared.auth import _bearer_token_valid, _hash_password, _verify_password, check_credentials
-from tests.conftest import seed_user
+from shared.auth import _hash_password, _resolve_bearer_token, _verify_password, check_credentials
+from tests.conftest import seed_token, seed_user
 
 
 def make_request(headers: list[tuple[str, str]] | None = None) -> Request:
@@ -28,69 +21,66 @@ def bearer_request(value: str) -> Request:
     return make_request([("authorization", f"Bearer {value}")])
 
 
-@pytest.fixture
-def set_token(monkeypatch):
-    def _set(token: str):
-        monkeypatch.setattr(shared_auth, "_API_TOKEN", token)
-
-    return _set
+async def _seed_bearer_owner(raw_token: str = "correct-token", role: str = "user"):
+    user_id = await seed_user("token-owner", role=role)
+    await seed_token(user_id, raw_token=raw_token)
+    return user_id
 
 
-def test_bearer_valid_token_accepted(set_token):
-    set_token("correct-token")
-    assert _bearer_token_valid(bearer_request("correct-token")) is True
+async def test_bearer_valid_token_resolves_owner(initialized_db):
+    user_id = await _seed_bearer_owner()
+    identity = await _resolve_bearer_token(bearer_request("correct-token"))
+    assert identity is not None
+    assert identity.username == "token-owner"
+    assert identity.user_id == user_id
+    assert identity.role == "user"
 
 
-def test_bearer_wrong_token_rejected(set_token):
-    set_token("correct-token")
-    assert _bearer_token_valid(bearer_request("wrong-token")) is False
+async def test_bearer_wrong_token_rejected(initialized_db):
+    await _seed_bearer_owner()
+    assert await _resolve_bearer_token(bearer_request("wrong-token")) is None
 
 
-def test_bearer_empty_value_rejected(set_token):
-    set_token("correct-token")
-    assert _bearer_token_valid(make_request([("authorization", "Bearer ")])) is False
+async def test_bearer_empty_value_rejected(initialized_db):
+    assert await _resolve_bearer_token(make_request([("authorization", "Bearer ")])) is None
 
 
-def test_bearer_whitespace_only_value_rejected(set_token):
-    set_token("correct-token")
-    assert _bearer_token_valid(make_request([("authorization", "Bearer    ")])) is False
+async def test_bearer_whitespace_only_value_rejected(initialized_db):
+    assert await _resolve_bearer_token(make_request([("authorization", "Bearer    ")])) is None
 
 
-def test_bearer_rejected_when_token_unconfigured(set_token):
-    set_token("")
-    assert _bearer_token_valid(bearer_request("correct-token")) is False
-
-
-def test_bearer_rejected_when_token_configured_whitespace_only(set_token):
-    set_token("   ")
-    assert _bearer_token_valid(bearer_request("   ")) is False
+async def test_bearer_rejected_when_no_token_rows_exist(initialized_db):
+    await seed_user("token-owner")
+    assert await _resolve_bearer_token(bearer_request("correct-token")) is None
 
 
 @pytest.mark.parametrize("scheme", ["bearer", "BEARER", "BeArEr"])
-def test_bearer_scheme_case_insensitive(set_token, scheme):
-    set_token("correct-token")
-    assert _bearer_token_valid(make_request([("authorization", f"{scheme} correct-token")])) is True
+async def test_bearer_scheme_case_insensitive(initialized_db, scheme):
+    await _seed_bearer_owner()
+    identity = await _resolve_bearer_token(make_request([("authorization", f"{scheme} correct-token")]))
+    assert identity is not None
 
 
 @pytest.mark.parametrize(
     "header_value",
     ["Basic correct-token", "correct-token"],
 )
-def test_bearer_wrong_scheme_rejected(set_token, header_value):
-    set_token("correct-token")
-    assert _bearer_token_valid(make_request([("authorization", header_value)])) is False
+async def test_bearer_wrong_scheme_rejected(initialized_db, header_value):
+    await _seed_bearer_owner()
+    assert await _resolve_bearer_token(make_request([("authorization", header_value)])) is None
 
 
-def test_bearer_non_ascii_token_returns_false_not_typeerror(set_token):
-    set_token("correct-token")
+async def test_bearer_non_ascii_token_returns_none_not_typeerror(initialized_db):
+    await _seed_bearer_owner()
     # No exception is the assertion; a wrong result would also be a failure
     # since it's compared against a real token that can't match.
-    assert _bearer_token_valid(bearer_request("tökén")) is False
+    assert await _resolve_bearer_token(bearer_request("tökén")) is None
 
 
-def test_bearer_surrounding_whitespace_stripped(set_token):
-    set_token("correct-token")
-    assert _bearer_token_valid(make_request([("authorization", "Bearer   correct-token   ")])) is True
+async def test_bearer_surrounding_whitespace_stripped(initialized_db):
+    await _seed_bearer_owner()
+    identity = await _resolve_bearer_token(make_request([("authorization", "Bearer   correct-token   ")]))
+    assert identity is not None
 
 
 def test_hash_password_round_trips_via_verify():
@@ -149,36 +139,6 @@ async def test_check_credentials_pays_the_same_scrypt_cost_for_unknown_usernames
 
     await check_credentials("definitely-does-not-exist", "whatever")
     assert len(calls) == 1
-
-
-def test_startup_warns_when_token_set_and_auth_not_configured(monkeypatch, caplog):
-    monkeypatch.setattr(shared_auth, "_API_TOKEN", "sometoken")
-    with caplog.at_level(logging.WARNING, logger=shared_auth.__name__):
-        shared_auth._warn_if_misconfigured(auth_configured=False)
-    assert "VITALFORGE_API_TOKEN is set but the users table is empty" in caplog.text
-
-
-@pytest.mark.parametrize(
-    "token,auth_configured",
-    [
-        ("sometoken", True),
-        ("", False),
-    ],
-)
-def test_startup_silent_when_token_active_or_unconfigured(
-    monkeypatch, caplog, token, auth_configured
-):
-    monkeypatch.setattr(shared_auth, "_API_TOKEN", token)
-    with caplog.at_level(logging.WARNING, logger=shared_auth.__name__):
-        shared_auth._warn_if_misconfigured(auth_configured=auth_configured)
-    assert caplog.text == ""
-
-
-def test_startup_warning_contains_no_token_value(monkeypatch, caplog):
-    monkeypatch.setattr(shared_auth, "_API_TOKEN", "super-secret-token-value")
-    with caplog.at_level(logging.WARNING, logger=shared_auth.__name__):
-        shared_auth._warn_if_misconfigured(auth_configured=False)
-    assert "super-secret-token-value" not in caplog.text
 
 
 def test_resolve_secret_passes_through_configured_value():

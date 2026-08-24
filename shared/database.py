@@ -189,6 +189,28 @@ async def init_db():
         await _add_columns(db, "users", _USERS_ADDITIVE_COLUMNS)
 
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS api_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                label TEXT NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                last_used_at TEXT
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_api_tokens_user_id ON api_tokens(user_id)")
+
+        # Durable one-time markers for auth data migrations. A marker is
+        # separate from the migrated token row so revoking that token cannot
+        # cause a still-present legacy env var to resurrect it on restart.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS auth_migrations (
+                name TEXT PRIMARY KEY,
+                completed_at TEXT NOT NULL
+            )
+        """)
+
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS training_load (
                 date TEXT PRIMARY KEY,
                 acute_load REAL,

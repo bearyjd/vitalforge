@@ -1,16 +1,14 @@
 """The 40-cell auth behavior matrix from docs/prp/00-design.md §2.5, revised
 for the per-user, DB-backed auth model (`.claude/PRPs/plans/user-accounts-auth-model.plan.md`).
 
-Four configs (a "testuser" row exists in `users` or it doesn't, x
-VITALFORGE_API_TOKEN set/unset) x ten credential forms (C0-C9), run against a
+Four configs (a "testuser" row exists in `users` or it doesn't, x a
+DB-backed token exists/doesn't) x ten credential forms (C0-C9), run against a
 throwaway FastAPI app so auth behavior is isolated from either real service's
 routes. `ids=` is set to the cell name (e.g. "A1-C3") so a failure names the
 exact matrix cell.
 
-The token dimension and its ten credential forms are unchanged from before
-this revision -- the auth-model plan explicitly does not touch
-`_bearer_token_valid`/`_API_TOKEN` (that's a separate, later plan). What
-changed is the master switch: "does `users` have any rows" replaced "is
+The credential forms remain unchanged; the token dimension now seeds a hash-only
+row owned by testuser. The master switch remains "does `users` have any rows", which replaced "is
 VITALFORGE_PASS set" (`_is_auth_configured` no longer reads `_PASS` at all),
 and a valid session cookie now ALSO requires its username to still exist in
 `users` (the live re-check in `get_current_user`), not just a valid
@@ -26,9 +24,8 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from httpx import ASGITransport, AsyncClient, Headers
 
-from shared import auth as shared_auth
 from shared.auth import add_auth_routes, create_session_cookie
-from tests.conftest import seed_user
+from tests.conftest import seed_token, seed_user
 
 
 def _build_matrix_app() -> FastAPI:
@@ -134,12 +131,13 @@ assert len(MATRIX) == 40
     MATRIX,
     ids=[row[0] for row in MATRIX],
 )
-async def test_behavior_matrix(cell_id, config, credential_form, expected_status, monkeypatch, matrix_client):
-    monkeypatch.setattr(shared_auth, "_API_TOKEN", config.token_value)
+async def test_behavior_matrix(cell_id, config, credential_form, expected_status, matrix_client):
     valid_cookie = "no-user-seeded-for-this-config"
     if config.seed_user:
         user_id = await seed_user("testuser")
         valid_cookie = create_session_cookie("testuser", user_id, 1)  # fresh row, DB default session_version
+        if config.token_value:
+            await seed_token(user_id, raw_token=config.token_value)
 
     headers, cookies = CREDENTIAL_FORMS[credential_form](valid_cookie)
     resp = await matrix_client.get("/api/thing", headers=headers, cookies=cookies)

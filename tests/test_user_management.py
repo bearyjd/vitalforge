@@ -7,7 +7,6 @@ so these routes are tested in isolation from either real service.
 """
 
 import asyncio
-import logging
 from datetime import datetime, timezone
 
 import pytest
@@ -269,11 +268,8 @@ async def test_create_user_malformed_input_returns_422_not_500(client, kwargs):
 
 @pytest.mark.parametrize("reserved", ["anonymous", "api-token"])
 async def test_create_user_reserved_username_rejected(client, reserved):
-    """Fix-review finding: get_current_user() returns these two strings as
-    sentinels in the same channel as real usernames (`anonymous` when auth
-    is off, `api-token` for any valid bearer request). An account actually
-    named one of them would collide -- every holder of the shared bearer
-    token would inherit whatever role the `api-token` account has."""
+    """Keep the open-access sentinel and former shared-token sentinel
+    unavailable as real usernames, including across upgrades."""
     await seed_user("root", role="admin")
     resp = await client.post(
         "/auth/admin/users",
@@ -464,19 +460,6 @@ async def test_bootstrap_first_admin_noop_when_pass_empty(initialized_db, monkey
     finally:
         await db.close()
     assert count == 0
-
-
-async def test_bootstrap_does_not_warn_token_is_inert_when_users_exist(
-    initialized_db, monkeypatch, caplog
-):
-    await seed_user("existing", role="admin")
-    monkeypatch.setattr(shared_auth, "_PASS", "")
-    monkeypatch.setattr(shared_auth, "_API_TOKEN", "configured-token")
-
-    with caplog.at_level(logging.WARNING, logger=shared_auth.__name__):
-        await shared_auth.bootstrap_first_admin()
-
-    assert "token is inert" not in caplog.text
 
 
 async def test_bootstrap_first_admin_noop_when_a_user_already_exists(initialized_db, monkeypatch):

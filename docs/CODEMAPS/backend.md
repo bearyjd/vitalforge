@@ -10,14 +10,14 @@ per-request connection via `shared.database.get_db()` / `try/finally: await db.c
 `shared/auth.py::add_auth_routes(app)` registers, in order:
 1. `GET /auth/login`, `POST /auth/login`, `GET /auth/logout` routes
 2. `@app.middleware("http") auth_middleware` — skips `/auth/*`, `/health`, `/static/*`;
-   if `VITALFORGE_PASS` unset, auth is a no-op (`get_current_user` returns `"anonymous"`);
-   otherwise `get_current_user` checks, in order: (a) `Authorization: Bearer
-   <VITALFORGE_API_TOKEN>` header, constant-time compare, only valid if
-   `VITALFORGE_API_TOKEN` is set — the Bascule/machine-client path; (b) the `vf_session`
-   HMAC cookie. Either grants full API access (no scoping between them); failure is 401 on
-   `/api/*`, redirect elsewhere. `VITALFORGE_API_TOKEN` set without `VITALFORGE_PASS` is a
-   misconfiguration warned at import time — the token is inert (auth is fully off) in that
-   case.
+   auth is disabled only while the `users` table is empty. Otherwise it checks, in order:
+   (a) a named, DB-backed token from `Authorization: Bearer <token>`; (b) the `vf_session`
+   HMAC cookie. Token lookup hashes the presented value with SHA-256 and joins its owner in
+   one query, so it uses the owner's current role and account state. Failure is 401 on
+   `/api/*` and redirects elsewhere. `/auth/account` creates, lists, and revokes an
+   account's tokens; `/auth/admin/tokens` lists all tokens. The legacy
+   `VITALFORGE_API_TOKEN` environment value is imported once for the first admin after
+   bootstrap, with a durable migration marker so revocation survives restarts.
 
 ## vitalforge-weight (`vitalforge-weight/app.py`, :8085)
 
