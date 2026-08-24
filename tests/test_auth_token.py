@@ -180,3 +180,26 @@ def test_startup_warning_contains_no_token_value(monkeypatch, caplog):
     with caplog.at_level(logging.WARNING, logger=shared_auth.__name__):
         shared_auth._warn_if_misconfigured()
     assert "super-secret-token-value" not in caplog.text
+
+
+def test_resolve_secret_passes_through_configured_value():
+    assert shared_auth._resolve_secret("a-real-secret-value") == "a-real-secret-value"
+
+
+def test_resolve_secret_generates_random_when_still_default():
+    result = shared_auth._resolve_secret("default-dev-secret")
+    assert result != "default-dev-secret"
+    assert len(result) > 20
+
+
+def test_resolve_secret_generates_a_different_value_each_call():
+    a = shared_auth._resolve_secret("default-dev-secret")
+    b = shared_auth._resolve_secret("default-dev-secret")
+    assert a != b
+
+
+def test_resolve_secret_warning_names_the_risk_but_not_the_value(caplog):
+    with caplog.at_level(logging.WARNING, logger=shared_auth.__name__):
+        result = shared_auth._resolve_secret("default-dev-secret")
+    assert "VITALFORGE_SECRET" in caplog.text
+    assert result not in caplog.text

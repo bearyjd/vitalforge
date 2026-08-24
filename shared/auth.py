@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import logging
 import os
+import secrets
 import time
 from datetime import datetime, timezone
 from typing import Literal
@@ -18,7 +19,32 @@ from shared.database import get_db
 
 logger = logging.getLogger(__name__)
 
-_SECRET = os.environ.get("VITALFORGE_SECRET", "default-dev-secret")
+_DEFAULT_SECRET_SENTINEL = "default-dev-secret"
+
+
+def _resolve_secret(configured: str) -> str:
+    """Never sign sessions with the public default secret.
+
+    Generate a process-local replacement instead, while warning operators
+    about the session and cross-service consequences of leaving the real
+    setting unconfigured.
+    """
+    if configured != _DEFAULT_SECRET_SENTINEL:
+        return configured
+    generated = secrets.token_urlsafe(32)
+    logger.warning(
+        "VITALFORGE_SECRET is unset (or still the placeholder default) -- "
+        "generated a random secret for THIS PROCESS instead of using the "
+        "public default. Every existing session cookie is now invalid, "
+        "this will happen again on every restart, and (if you run both "
+        "services) they will each generate a DIFFERENT secret, breaking "
+        "single sign-on between them, until you set VITALFORGE_SECRET in "
+        ".env -- see README's Environment Variables section."
+    )
+    return generated
+
+
+_SECRET = _resolve_secret(os.environ.get("VITALFORGE_SECRET", _DEFAULT_SECRET_SENTINEL))
 _USER = os.environ.get("VITALFORGE_USER", "admin")
 _PASS = os.environ.get("VITALFORGE_PASS", "")
 _API_TOKEN = os.environ.get("VITALFORGE_API_TOKEN", "").strip()
@@ -58,6 +84,11 @@ def _warn_if_misconfigured():
 
 
 _warn_if_misconfigured()
+
+
+def _request_is_https(request: Request) -> bool:
+    forwarded = request.headers.get("x-forwarded-proto", "").lower()
+    return forwarded == "https" or request.url.scheme == "https"
 
 
 def _hash_password(password: str) -> str:
@@ -709,7 +740,14 @@ def add_auth_routes(app):
         user_id, session_version = id_and_version
         cookie = create_session_cookie(username, user_id, session_version)
         response = JSONResponse({"success": True})
-        response.set_cookie(_COOKIE_NAME, cookie, max_age=_MAX_AGE, httponly=True, samesite="lax")
+        response.set_cookie(
+            _COOKIE_NAME,
+            cookie,
+            max_age=_MAX_AGE,
+            httponly=True,
+            samesite="lax",
+            secure=_request_is_https(request),
+        )
         return response
 
     @app.get("/auth/logout")

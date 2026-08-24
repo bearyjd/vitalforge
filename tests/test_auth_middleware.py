@@ -133,6 +133,26 @@ async def test_auth_login_with_valid_bearer_redirects_to_root(monkeypatch, matri
     assert resp.headers["location"] == "/"
 
 
+async def test_login_cookie_not_secure_over_plain_request(matrix_client):
+    await seed_user("admin", password="correct-pass")
+    resp = await matrix_client.post(
+        "/auth/login", json={"username": "admin", "password": "correct-pass"}
+    )
+    assert resp.status_code == 200
+    assert "Secure" not in resp.headers["set-cookie"]
+
+
+async def test_login_cookie_secure_when_forwarded_https(matrix_client):
+    await seed_user("admin", password="correct-pass")
+    resp = await matrix_client.post(
+        "/auth/login",
+        json={"username": "admin", "password": "correct-pass"},
+        headers={"X-Forwarded-Proto": "https"},
+    )
+    assert resp.status_code == 200
+    assert "Secure" in resp.headers["set-cookie"]
+
+
 async def test_bearer_first_authorization_header_wins(monkeypatch, matrix_client):
     monkeypatch.setattr(shared_auth, "_API_TOKEN", "correct-token")
     await seed_user("someone")
