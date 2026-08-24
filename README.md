@@ -92,7 +92,7 @@ Visit `http://localhost:8085` for weight logging and `http://localhost:8086` for
 | `ANTHROPIC_BASE_URL` | No | Custom API base URL (e.g. `http://localhost:4000` for LiteLLM proxy) |
 | `VITALFORGE_USER` | No | One-time bootstrap username (default: `admin`) — seeds the first admin account on first boot if no users exist yet; not read for ongoing auth after that (manage accounts from `/auth/admin/users` instead) |
 | `VITALFORGE_PASS` | No | One-time bootstrap password for the above. If empty and no users exist yet, auth is disabled (open access) |
-| `VITALFORGE_SECRET` | No | Secret key for signing session cookies |
+| `VITALFORGE_SECRET` | No | Secret key for signing session cookies. If unset or left as the placeholder default, a random one is generated per process at startup and a warning is logged — sessions won't survive a restart, and if you run both services, they won't share sign-on until this is set explicitly |
 | `VITALFORGE_API_TOKEN` | No | Long-lived bearer token for unattended API clients (e.g. Tasker, Bascule). Empty disables bearer auth |
 | `WEIGHT_URL` | No | Public URL for weight service (e.g. `https://weight.yourdomain.com`) |
 | `DASHBOARD_URL` | No | Public URL for dashboard service (e.g. `https://health.yourdomain.com`) |
