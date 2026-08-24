@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from shared.auth import add_auth_routes, bootstrap_first_admin
+from shared.auth import add_auth_routes, bootstrap_first_admin, bootstrap_migrated_token
 from shared.database import get_db, init_db
 from shared.garmin_client import authenticate, push_weight
 
@@ -36,6 +36,7 @@ async def lifespan(app: FastAPI):
     # under that race itself (see its own docstring), so no coordination
     # is needed here.
     await bootstrap_first_admin()
+    await bootstrap_migrated_token()
     logger.info("Authenticating with Garmin Connect...")
     try:
         authenticate()

@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from recommendations import get_recommendations, get_rules_only
 from sync import run_sync, scheduled_sync
 
-from shared.auth import add_auth_routes, bootstrap_first_admin
+from shared.auth import add_auth_routes, bootstrap_first_admin, bootstrap_migrated_token
 from shared.database import get_db, init_db
 from shared.garmin_client import authenticate
 
@@ -57,6 +57,7 @@ async def lifespan(app: FastAPI):
     # under that race itself (see its own docstring), so no coordination
     # is needed here.
     await bootstrap_first_admin()
+    await bootstrap_migrated_token()
     logger.info("Authenticating with Garmin Connect...")
     try:
         authenticate()

@@ -21,6 +21,8 @@ def test_readme_env_table_lists_api_token():
 def test_readme_tasker_section_uses_bearer():
     tasker_section = README.split("## Tasker Integration", 1)[1].split("## NFC Tag Integration", 1)[0]
     assert "Authorization: Bearer" in tasker_section
+    assert "/auth/account" in tasker_section
+    assert "VITALFORGE_API_TOKEN" not in tasker_section
 
 
 def test_readme_tasker_section_no_longer_documents_cookie_copying():
@@ -31,7 +33,7 @@ def test_readme_tasker_section_no_longer_documents_cookie_copying():
 def test_readme_documents_both_revocation_procedures():
     auth_section = README.split("### Authentication", 1)[1].split("## Deployment", 1)[0]
     assert "VITALFORGE_SECRET" in auth_section
-    assert "VITALFORGE_API_TOKEN" in auth_section
+    assert "Revoke an individual bearer token" in auth_section
 
 
 def test_readme_documents_composition_fields():

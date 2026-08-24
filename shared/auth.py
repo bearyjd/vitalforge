@@ -51,19 +51,13 @@ def _resolve_secret(configured: str) -> str:
 _SECRET = _resolve_secret(os.environ.get("VITALFORGE_SECRET", ""))
 _USER = os.environ.get("VITALFORGE_USER", "admin")
 _PASS = os.environ.get("VITALFORGE_PASS", "")
-_API_TOKEN = os.environ.get("VITALFORGE_API_TOKEN", "").strip()
 _COOKIE_NAME = "vf_session"
 _MAX_AGE = 30 * 24 * 3600  # 30 days
+_LEGACY_TOKEN_MIGRATION = "legacy-api-token-v1"
 
-# get_current_user returns these two sentinel strings in the same channel
-# as real usernames ("anonymous" when auth is off, "api-token" for a valid
-# bearer request). A real account created with either name would collide:
-# get_current_user_role("api-token") would return that account's role, so
-# every holder of the shared bearer token would be authorized as whatever
-# role the "api-token" account has (fix-review finding, reproduced). Reject
-# both at account-creation time -- Phase B's per-user-api-tokens plan
-# removes the "api-token" sentinel entirely by resolving bearer auth to the
-# token's real owning username, but that hasn't merged yet.
+# "anonymous" remains the open-access sentinel. "api-token" was the old
+# shared-token sentinel; keep both reserved so upgrades cannot create an
+# ambiguous real account with a formerly special identity.
 _RESERVED_USERNAMES = {"anonymous", "api-token"}
 
 # scrypt cost parameters for password hashing. n=2**14 (OWASP's minimum
@@ -84,20 +78,6 @@ class _Identity(NamedTuple):
     user_id: int | None
     session_version: int | None
     role: str | None
-
-
-def _warn_if_misconfigured(auth_configured: bool):
-    """Warn only when the DB-backed auth state is genuinely open.
-
-    VITALFORGE_PASS is now a one-time bootstrap input, not the auth master
-    switch, so it cannot determine whether the bearer token is active.
-    """
-    if _API_TOKEN and not auth_configured:
-        logger.warning(
-            "VITALFORGE_API_TOKEN is set but the users table is empty — "
-            "auth is DISABLED and the token is inert. Create the first user "
-            "by setting VITALFORGE_USER/VITALFORGE_PASS and restarting."
-        )
 
 
 def _request_is_https(request: Request) -> bool:
@@ -194,8 +174,9 @@ async def _get_current_identity(request: Request) -> _Identity | None:
     """
     if not await _is_auth_configured():
         return _Identity("anonymous", None, None, None)
-    if _bearer_token_valid(request):
-        return _Identity("api-token", None, None, None)
+    bearer_identity = await _resolve_bearer_token(request)
+    if bearer_identity is not None:
+        return bearer_identity
     cookie = request.cookies.get(_COOKIE_NAME)
     if not cookie:
         return None
@@ -254,6 +235,19 @@ async def _require_admin(request: Request) -> str:
     return identity.username
 
 
+async def _require_account_identity(request: Request) -> _Identity:
+    identity = await _get_current_identity(request)
+    if identity is None or identity.user_id is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return identity
+
+
+async def _require_step_up(identity: _Identity, current_password: str):
+    verified = await _authenticate_credentials(identity.username, current_password)
+    if verified is None or verified[0] != identity.user_id:
+        raise HTTPException(status_code=401, detail="Current password incorrect")
+
+
 async def _authenticate_credentials(username: str, password: str) -> tuple[int, int] | None:
     """Verify credentials and return identity from the exact row verified.
 
@@ -310,7 +304,6 @@ async def bootstrap_first_admin():
         if row is not None:
             return
         if not _PASS:
-            _warn_if_misconfigured(auth_configured=False)
             return
         if _USER in _RESERVED_USERNAMES:
             # admin_create_user rejects these; the bootstrap path bypassed
@@ -343,24 +336,89 @@ async def bootstrap_first_admin():
         await db.close()
 
 
-def _bearer_token_valid(request: Request) -> bool:
-    """Constant-time check of the `Authorization: Bearer <token>` header.
+async def bootstrap_migrated_token():
+    """Migrate the legacy env token exactly once onto the first admin.
 
-    Two independent empty-value guards (no configured token, no presented
-    value) because `hmac.compare_digest("", "")` is `True`. Compares bytes,
-    not str, so a non-ASCII token returns `False` instead of raising
-    `TypeError` (the same bug `check_credentials` had).
+    The durable marker is committed atomically with the token. Both services
+    execute this during concurrent startup, so BEGIN IMMEDIATE serializes the
+    marker check and write. Keeping the marker after token revocation prevents
+    the legacy credential from being resurrected on a later restart.
     """
-    if not _API_TOKEN:
-        return False
+    legacy_token = os.environ.get("VITALFORGE_API_TOKEN", "").strip()
+    if not legacy_token:
+        return
+    db = await get_db()
+    try:
+        await db.execute("BEGIN IMMEDIATE")
+        migrated = await (
+            await db.execute("SELECT 1 FROM auth_migrations WHERE name = ?", (_LEGACY_TOKEN_MIGRATION,))
+        ).fetchone()
+        if migrated is not None:
+            await db.rollback()
+            return
+        admin = await (
+            await db.execute("SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1")
+        ).fetchone()
+        if admin is None:
+            await db.rollback()
+            logger.warning(
+                "VITALFORGE_API_TOKEN is set but no admin account exists to own its "
+                "DB-backed migration. Set VITALFORGE_USER/VITALFORGE_PASS and restart."
+            )
+            return
+        token_hash = hashlib.sha256(legacy_token.encode("utf-8")).hexdigest()
+        await db.execute(
+            "INSERT OR IGNORE INTO api_tokens (user_id, label, token_hash, created_at) "
+            "VALUES (?, 'migrated-from-env', ?, ?)",
+            (admin["id"], token_hash, datetime.now(timezone.utc).isoformat()),
+        )
+        await db.execute(
+            "INSERT INTO auth_migrations (name, completed_at) VALUES (?, ?)",
+            (_LEGACY_TOKEN_MIGRATION, datetime.now(timezone.utc).isoformat()),
+        )
+        await db.commit()
+        logger.warning(
+            "Migrated VITALFORGE_API_TOKEN into a DB-backed token owned by the first "
+            "admin account. The env var is no longer used for ongoing authentication; "
+            "manage tokens from /auth/account or /auth/admin/users."
+        )
+    finally:
+        await db.close()
+
+
+async def _resolve_bearer_token(request: Request) -> _Identity | None:
+    """Resolve a bearer value to its account-bound owning identity."""
     header = request.headers.get("authorization", "")
     scheme, _, value = header.partition(" ")
     if scheme.lower() != "bearer":
-        return False
+        return None
     value = value.strip()
     if not value:
-        return False
-    return hmac.compare_digest(value.encode("utf-8"), _API_TOKEN.encode("utf-8"))
+        return None
+    token_hash = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    db = await get_db()
+    try:
+        row = await (
+            await db.execute(
+                "SELECT api_tokens.id AS token_id, users.id AS user_id, users.username, "
+                "users.session_version, users.role FROM api_tokens "
+                "JOIN users ON users.id = api_tokens.user_id WHERE api_tokens.token_hash = ?",
+                (token_hash,),
+            )
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            await db.execute(
+                "UPDATE api_tokens SET last_used_at = ? WHERE id = ?",
+                (datetime.now(timezone.utc).isoformat(), row["token_id"]),
+            )
+            await db.commit()
+        except Exception as e:
+            logger.warning("Failed to update last_used_at for token id %s: %s", row["token_id"], e)
+        return _Identity(row["username"], row["user_id"], row["session_version"], row["role"])
+    finally:
+        await db.close()
 
 
 LOGIN_PAGE_HTML = """<!DOCTYPE html>
@@ -465,9 +523,10 @@ ACCOUNT_PAGE_HTML = """<!DOCTYPE html>
             background: #16213e;
             border-radius: 12px;
             padding: 2rem;
-            width: 360px;
+            width: min(620px, calc(100vw - 2rem));
         }
         h1 { font-size: 1.3rem; color: #c0c0e0; margin-bottom: 1.5rem; text-align: center; }
+        h2 { font-size: 1rem; color: #c0c0e0; margin: 1.8rem 0 0.8rem; }
         input {
             width: 100%;
             padding: 0.7rem;
@@ -492,6 +551,13 @@ ACCOUNT_PAGE_HTML = """<!DOCTYPE html>
         button:hover { background: #7c4dff; }
         .error { color: #ef5350; font-size: 0.85rem; margin-bottom: 0.8rem; text-align: center; }
         .success { color: #66bb6a; font-size: 0.85rem; margin-bottom: 0.8rem; text-align: center; }
+        table { width: 100%; border-collapse: collapse; margin-top: 0.8rem; }
+        th, td { text-align: left; padding: 0.45rem; border-bottom: 1px solid #2a2a4a; font-size: 0.82rem; }
+        td button { width: auto; padding: 0.4rem 0.7rem; background: #ef5350; }
+        .token-reveal { display: none; margin: 0.8rem 0; padding: 0.8rem; background: #1a1a2e; border-radius: 6px; }
+        .token-reveal code { display: block; overflow-wrap: anywhere; margin: 0.5rem 0; color: #80cbc4; }
+        .token-reveal button { width: auto; }
+        .hint { color: #aaa; font-size: 0.8rem; margin-bottom: 0.8rem; }
         a { color: #5c6bc0; text-decoration: none; display: block; text-align: center; margin-top: 1rem; font-size: 0.85rem; }
     </style>
 </head>
@@ -505,6 +571,22 @@ ACCOUNT_PAGE_HTML = """<!DOCTYPE html>
             <input type="password" id="new" placeholder="New password" autocomplete="new-password" required>
             <button type="submit">Change Password</button>
         </form>
+        <h2>API Tokens</h2>
+        <p class="hint">Create a named token for Tasker, Bascule, or another unattended client.</p>
+        <div class="token-reveal" id="token-reveal">
+            <strong>Copy this token now. It will not be shown again.</strong>
+            <code id="raw-token"></code>
+            <button type="button" onclick="copyToken()">Copy token</button>
+        </div>
+        <form onsubmit="return createToken(event)">
+            <input type="text" id="token-label" placeholder="Label (for example, Bascule)" required>
+            <input type="password" id="token-password" placeholder="Current password" autocomplete="current-password" required>
+            <button type="submit">Create Token</button>
+        </form>
+        <table>
+            <thead><tr><th>Label</th><th>Created</th><th>Last used</th><th></th></tr></thead>
+            <tbody id="tokens-body"></tbody>
+        </table>
         <a href="/">Back</a>
     </div>
     <script>
@@ -530,6 +612,76 @@ ACCOUNT_PAGE_HTML = """<!DOCTYPE html>
             }
             return false;
         }
+
+        async function loadTokens() {
+            const res = await fetch("/auth/tokens");
+            if (!res.ok) return;
+            const tokens = await res.json();
+            const body = document.getElementById("tokens-body");
+            body.textContent = "";
+            for (const token of tokens) {
+                const row = document.createElement("tr");
+                for (const value of [token.label, token.created_at, token.last_used_at || "never"]) {
+                    const cell = document.createElement("td");
+                    cell.textContent = value;
+                    row.appendChild(cell);
+                }
+                const action = document.createElement("td");
+                const button = document.createElement("button");
+                button.type = "button";
+                button.textContent = "Revoke";
+                button.onclick = () => revokeToken(token.id);
+                action.appendChild(button);
+                row.appendChild(action);
+                body.appendChild(row);
+            }
+        }
+
+        async function createToken(e) {
+            e.preventDefault();
+            document.getElementById("error").textContent = "";
+            const res = await fetch("/auth/tokens", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({
+                    label: document.getElementById("token-label").value,
+                    current_password: document.getElementById("token-password").value
+                })
+            });
+            const responseBody = await res.json();
+            if (res.ok) {
+                document.getElementById("raw-token").textContent = responseBody.token;
+                document.getElementById("token-reveal").style.display = "block";
+                document.getElementById("token-label").value = "";
+                document.getElementById("token-password").value = "";
+                loadTokens();
+            } else {
+                document.getElementById("error").textContent = responseBody.detail || "Failed to create token.";
+            }
+            return false;
+        }
+
+        async function copyToken() {
+            await navigator.clipboard.writeText(document.getElementById("raw-token").textContent);
+        }
+
+        async function revokeToken(id) {
+            const password = prompt("Enter your current password to revoke this token:");
+            if (!password) return;
+            const res = await fetch(`/auth/tokens/${id}/revoke`, {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({current_password: password})
+            });
+            if (res.ok) {
+                loadTokens();
+            } else {
+                const responseBody = await res.json();
+                document.getElementById("error").textContent = responseBody.detail || "Failed to revoke token.";
+            }
+        }
+
+        loadTokens();
     </script>
 </body>
 </html>"""
@@ -607,6 +759,11 @@ ADMIN_USERS_PAGE_HTML = """<!DOCTYPE html>
             </select>
             <button type="submit">Create</button>
         </form>
+        <h2>All API Tokens</h2>
+        <table>
+            <thead><tr><th>Owner</th><th>Label</th><th>Created</th><th>Last used</th><th></th></tr></thead>
+            <tbody id="admin-tokens-body"></tbody>
+        </table>
         <p style="margin-top:1rem"><a href="/">Back</a></p>
     </div>
     <script>
@@ -617,7 +774,7 @@ ADMIN_USERS_PAGE_HTML = """<!DOCTYPE html>
             const res = await fetch("/auth/admin/users/list");
             const users = await res.json();
             const body = document.getElementById("users-body");
-            body.innerHTML = "";
+            body.textContent = "";
             for (const u of users) {
                 const row = document.createElement("tr");
 
@@ -721,13 +878,56 @@ ADMIN_USERS_PAGE_HTML = """<!DOCTYPE html>
             const res = await fetch(`/auth/admin/users/${id}`, { method: "DELETE" });
             if (res.ok) {
                 loadUsers();
+                loadAllTokens();
             } else {
                 const body = await res.json();
                 document.getElementById("error").textContent = body.detail || "Failed to delete user.";
             }
         }
 
+        async function loadAllTokens() {
+            const res = await fetch("/auth/admin/tokens");
+            if (!res.ok) return;
+            const tokens = await res.json();
+            const body = document.getElementById("admin-tokens-body");
+            body.textContent = "";
+            for (const token of tokens) {
+                const row = document.createElement("tr");
+                for (const value of [token.owner, token.label, token.created_at, token.last_used_at || "never"]) {
+                    const cell = document.createElement("td");
+                    cell.textContent = value;
+                    row.appendChild(cell);
+                }
+                const action = document.createElement("td");
+                const button = document.createElement("button");
+                button.type = "button";
+                button.className = "danger";
+                button.textContent = "Revoke";
+                button.onclick = () => revokeManagedToken(token.id);
+                action.appendChild(button);
+                row.appendChild(action);
+                body.appendChild(row);
+            }
+        }
+
+        async function revokeManagedToken(id) {
+            const password = prompt("Enter your current password to revoke this token:");
+            if (!password) return;
+            const res = await fetch(`/auth/tokens/${id}/revoke`, {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({current_password: password})
+            });
+            if (res.ok) {
+                loadAllTokens();
+            } else {
+                const responseBody = await res.json();
+                document.getElementById("error").textContent = responseBody.detail || "Failed to revoke token.";
+            }
+        }
+
         loadUsers();
+        loadAllTokens();
     </script>
 </body>
 </html>"""
@@ -753,6 +953,19 @@ class UpdateUserIn(BaseModel):
 
     role: Literal["admin", "user"] | None = None
     password: str | None = None
+
+
+class CreateTokenIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    label: str
+    current_password: str
+
+
+class RevokeTokenIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    current_password: str
 
 
 def add_auth_routes(app):
@@ -824,6 +1037,81 @@ def add_auth_routes(app):
             await db.close()
         return {"success": True}
 
+    @app.get("/auth/tokens")
+    async def list_own_tokens(request: Request):
+        identity = await _require_account_identity(request)
+        db = await get_db()
+        try:
+            rows = await (
+                await db.execute(
+                    "SELECT id, label, created_at, last_used_at FROM api_tokens "
+                    "WHERE user_id = ? ORDER BY created_at, id",
+                    (identity.user_id,),
+                )
+            ).fetchall()
+        finally:
+            await db.close()
+        return [dict(row) for row in rows]
+
+    @app.post("/auth/tokens")
+    async def create_own_token(request: Request, data: CreateTokenIn):
+        identity = await _require_account_identity(request)
+        await _require_step_up(identity, data.current_password)
+        label = data.label.strip()
+        if not label:
+            raise HTTPException(status_code=422, detail="Label required")
+        raw_token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+        db = await get_db()
+        try:
+            # The project does not enable SQLite foreign keys. Serialize
+            # against account deletion and insert only while the exact
+            # authenticated account version still exists; otherwise a user
+            # deleted between step-up verification and this write could
+            # leave an orphaned credential row.
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "INSERT INTO api_tokens (user_id, label, token_hash, created_at) "
+                "SELECT id, ?, ?, ? FROM users WHERE id = ? AND session_version = ?",
+                (
+                    label,
+                    token_hash,
+                    datetime.now(timezone.utc).isoformat(),
+                    identity.user_id,
+                    identity.session_version,
+                ),
+            )
+            if cursor.rowcount != 1:
+                await db.rollback()
+                raise HTTPException(status_code=401, detail="Account changed; authenticate again")
+            await db.commit()
+        finally:
+            await db.close()
+        # This response is the only time the raw credential is exposed.
+        return JSONResponse(
+            {"token": raw_token, "label": label},
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/auth/tokens/{token_id}/revoke")
+    async def revoke_token(request: Request, token_id: int, data: RevokeTokenIn):
+        identity = await _require_account_identity(request)
+        await _require_step_up(identity, data.current_password)
+        db = await get_db()
+        try:
+            row = await (
+                await db.execute("SELECT user_id FROM api_tokens WHERE id = ?", (token_id,))
+            ).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="Token not found")
+            if row["user_id"] != identity.user_id and identity.role != "admin":
+                raise HTTPException(status_code=403, detail="Not your token")
+            await db.execute("DELETE FROM api_tokens WHERE id = ?", (token_id,))
+            await db.commit()
+        finally:
+            await db.close()
+        return {"success": True}
+
     @app.get("/auth/admin/users")
     async def admin_users_page(request: Request):
         await _require_admin(request)
@@ -836,6 +1124,23 @@ def add_auth_routes(app):
         try:
             rows = await (
                 await db.execute("SELECT id, username, role, created_at FROM users ORDER BY username")
+            ).fetchall()
+        finally:
+            await db.close()
+        return [dict(row) for row in rows]
+
+    @app.get("/auth/admin/tokens")
+    async def admin_list_all_tokens(request: Request):
+        await _require_admin(request)
+        db = await get_db()
+        try:
+            rows = await (
+                await db.execute(
+                    "SELECT api_tokens.id, api_tokens.label, api_tokens.created_at, "
+                    "api_tokens.last_used_at, users.username AS owner FROM api_tokens "
+                    "JOIN users ON users.id = api_tokens.user_id "
+                    "ORDER BY users.username, api_tokens.created_at, api_tokens.id"
+                )
             ).fetchall()
         finally:
             await db.close()
@@ -930,6 +1235,10 @@ def add_auth_routes(app):
                 if admin_count <= 1:
                     await db.rollback()
                     raise HTTPException(status_code=409, detail="Cannot delete the last remaining admin")
+            # SQLite foreign keys are not enabled in this project, so the
+            # REFERENCES declaration cannot cascade. Remove credentials in
+            # the same transaction before deleting their owner.
+            await db.execute("DELETE FROM api_tokens WHERE user_id = ?", (user_id,))
             await db.execute("DELETE FROM users WHERE id = ?", (user_id,))
             await db.commit()
         finally:

@@ -54,9 +54,11 @@ vitalforge-weight (:8085)          vitalforge-dashboard (:8086)
 - Auth (`shared/auth.py`) is a FastAPI HTTP middleware applied identically in both apps'
   `add_auth_routes(app)` call — same cookie name (`vf_session`), same HMAC secret
   (`VITALFORGE_SECRET`), so one login covers both services behind the same domain. `/api/*`
-  additionally accepts a `Authorization: Bearer <VITALFORGE_API_TOKEN>` header (checked
-  before the cookie) — the machine-client path for the parallel Bascule Android app, which
-  only ever POSTs `/api/weight` and doesn't hold a browser session.
+  additionally accepts a named, per-user token in `Authorization: Bearer <token>` (checked
+  before the cookie) — the machine-client path for clients such as the parallel Bascule
+  Android app. Only token hashes are stored; each request resolves the owning account and
+  its live role. Users manage their tokens at `/auth/account`, while admins can inspect and
+  revoke all tokens.
 
 ## Deployment
 

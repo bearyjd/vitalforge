@@ -10,8 +10,10 @@ Isolates every test from real infrastructure:
   rather than a normal `import` statement.
 """
 
+import hashlib
 import importlib
 import json
+import secrets
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -190,6 +192,24 @@ async def seed_user(username: str, password: str = "irrelevant-for-this-test", r
         )
         await db.commit()
         return cursor.lastrowid
+    finally:
+        await db.close()
+
+
+async def seed_token(user_id: int, label: str = "test-token", raw_token: str | None = None) -> tuple[int, str]:
+    """Insert a hash-only API token and return (row id, raw token)."""
+    from shared.database import get_db
+
+    raw = raw_token or secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "INSERT INTO api_tokens (user_id, label, token_hash, created_at) VALUES (?, ?, ?, ?)",
+            (user_id, label, token_hash, datetime.now(timezone.utc).isoformat()),
+        )
+        await db.commit()
+        return cursor.lastrowid, raw
     finally:
         await db.close()
 
