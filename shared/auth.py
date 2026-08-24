@@ -1064,14 +1064,34 @@ def add_auth_routes(app):
         token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
         db = await get_db()
         try:
-            await db.execute(
-                "INSERT INTO api_tokens (user_id, label, token_hash, created_at) VALUES (?, ?, ?, ?)",
-                (identity.user_id, label, token_hash, datetime.now(timezone.utc).isoformat()),
+            # The project does not enable SQLite foreign keys. Serialize
+            # against account deletion and insert only while the exact
+            # authenticated account version still exists; otherwise a user
+            # deleted between step-up verification and this write could
+            # leave an orphaned credential row.
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "INSERT INTO api_tokens (user_id, label, token_hash, created_at) "
+                "SELECT id, ?, ?, ? FROM users WHERE id = ? AND session_version = ?",
+                (
+                    label,
+                    token_hash,
+                    datetime.now(timezone.utc).isoformat(),
+                    identity.user_id,
+                    identity.session_version,
+                ),
             )
+            if cursor.rowcount != 1:
+                await db.rollback()
+                raise HTTPException(status_code=401, detail="Account changed; authenticate again")
             await db.commit()
         finally:
             await db.close()
-        return {"token": raw_token, "label": label}
+        # This response is the only time the raw credential is exposed.
+        return JSONResponse(
+            {"token": raw_token, "label": label},
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.post("/auth/tokens/{token_id}/revoke")
     async def revoke_token(request: Request, token_id: int, data: RevokeTokenIn):

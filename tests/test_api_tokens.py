@@ -63,6 +63,7 @@ async def test_create_token_returns_raw_once_and_stores_only_hash(client):
         cookies=await _cookies_for("alice"),
     )
     assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "no-store"
     raw = resp.json()["token"]
     assert resp.json()["label"] == "Bascule"
     assert len(raw) > 20
@@ -84,6 +85,31 @@ async def test_create_token_returns_raw_once_and_stores_only_hash(client):
     assert listed.json()[0]["label"] == "Bascule"
     assert "token" not in listed.json()[0]
     assert "token_hash" not in listed.json()[0]
+
+
+async def test_create_token_cannot_orphan_credential_if_account_disappears(
+    client, monkeypatch
+):
+    await seed_user("alice", password="correct-password")
+    original_step_up = shared_auth._require_step_up
+
+    async def verify_then_delete(identity, current_password):
+        await original_step_up(identity, current_password)
+        db = await get_db()
+        try:
+            await db.execute("DELETE FROM users WHERE id = ?", (identity.user_id,))
+            await db.commit()
+        finally:
+            await db.close()
+
+    monkeypatch.setattr(shared_auth, "_require_step_up", verify_then_delete)
+    resp = await client.post(
+        "/auth/tokens",
+        json={"label": "Tasker", "current_password": "correct-password"},
+        cookies=await _cookies_for("alice"),
+    )
+    assert resp.status_code == 401
+    assert await _token_count() == 0
 
 
 async def test_create_token_requires_correct_current_password(client):
