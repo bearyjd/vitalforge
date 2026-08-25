@@ -168,7 +168,73 @@ green after the import reordering (28 passed).
   the rest of the session. Run them separately: `pytest -q -m playwright` (needs
   `playwright install chromium` first). See `.github/workflows/docker.yml`'s `test` job for
   the CI wiring.
-- **No DB migration mechanism.** `shared/database.py::init_db` only does
-  `CREATE TABLE IF NOT EXISTS`, so schema changes that alter existing columns have no upgrade
-  path. Not urgent while the schema is additive-only, but flag it if a future task needs to
-  rename/alter a column.
+- **No DB migration mechanism — DONE.** `shared/database.py::init_db` now runs additive
+  `ALTER TABLE ADD COLUMN` migrations for `weight_log` (body-composition intake columns) and
+  `weight_history` (Garmin-sourced composition read path), plus an `auth_migrations` table that
+  durably marks one-time auth data migrations so they don't re-run. Still additive-only (no
+  column rename/drop/type-change support) — flag that gap if a future task needs to alter or
+  remove an existing column rather than add one.
+
+---
+
+## Feature roadmap — user-facing additions (competitive research, 2026-08-24)
+
+Sourced from a survey of open-source self-hosted health dashboards (garmin-grafana, aurboda,
+FIT Dashboard) and commercial wearable platforms (Whoop, Oura, Garmin Connect's own web app,
+TrainingPeaks, Apple Health). None of these are started; none have a design doc yet. Verified
+against the current codebase first — items that already exist (e.g. training-load/ACWR charting)
+were excluded rather than re-proposed. Ordered cheapest-to-build first; the last two are
+explicitly heavier and don't fit the current single-account architecture as-is (called out
+below), but are included per request.
+
+### Buildable from data already synced — no schema change, no new integration
+
+1. **Data export (CSV/JSON)** — near-universal in comparable products (garmin-grafana's CSV
+   export, Health Auto Export's JSON+CSV, Apple Health export tools); VitalForge has none today.
+   Shape: `GET /api/export?metric=all&days=N&format=csv|json` in `vitalforge-dashboard`,
+   streaming from the existing `METRIC_TABLES` map. Effort: small.
+
+2. **Composite readiness/recovery score (0–100)** — the single headline number Whoop
+   (Recovery) and Oura (Readiness) show, blending HRV-vs-personal-baseline, RHR trend, and
+   sleep. Every input (`hrv`, `resting_hr`, `sleep`, `body_battery` tables) is already synced;
+   VitalForge just has no aggregate. Shape: new `readiness.py` in `vitalforge-dashboard`, pure
+   function reusing `recommendations.py`'s `avg`/`trend_slope` pattern, one `/api/readiness`
+   endpoint, a headline tile in `index.html`. Effort: small–medium.
+
+3. **Notable-change / anomaly alerts** — Apple Health's "Trends" flags a metric moving outside
+   its own rolling baseline, distinct from the rules engine's fixed thresholds. Shape: one more
+   rule function reusing the existing `avg`/`trend_slope`/`consecutive_below` helpers already in
+   `recommendations.py`. Effort: small–medium.
+
+4. **Ad-hoc cross-metric correlation view** — the open-source `aurboda` project computes
+   Pearson correlation across tracked metrics on demand ("does evening exercise affect sleep
+   score?") instead of hardcoding specific pairs like the current rules engine does. Shape:
+   a Pearson-r stats helper + one endpoint returning a correlation matrix over synced metrics +
+   a Chart.js scatter/heatmap (Chart.js is already in the stack). Effort: medium.
+
+### Needs a schema change
+
+5. **Goal / target tracking** — set a target (weight, body-fat %) and see projected
+   time-to-goal, as in TrainingPeaks and consumer apps like iGoal Plus. `trend_slope` already
+   exists in the rules engine, so ETA math is mostly reuse. Shape: new `goals` table (`user_id`,
+   `metric`, `target_value`, `target_date`), small CRUD surface, progress widget. Effort: medium.
+
+### Needs a new external data source / bigger architectural lift
+
+6. **Local FIT-file import without cloud login** — modeled on FIT Dashboard: feed in FIT/TCX/GPX
+   files you already own, no Garmin Connect credentials required. This is a genuinely new
+   ingestion path alongside the existing Garmin Connect sync (`sync.py`), not an extension of
+   it — a file upload endpoint, a FIT/TCX parser dependency, and a mapping from parsed fields
+   into the existing metric tables (or a new raw-activity table, if the shape doesn't match
+   `METRIC_TABLES`). Real value mainly as a hedge if Garmin API access ever becomes unreliable.
+   Effort: large.
+
+7. **Family / multi-person comparison dashboards** — none of the researched products (open-source
+   or commercial) do this well for a single-account use case, and it cuts against VitalForge's
+   current per-user auth model (`shared/auth.py`, one `users` row = one Garmin-linked account,
+   sessions scoped to that user). Building it well would mean deciding whether "family" means
+   separate linked Garmin accounts under one household view (multiple `garmin_client` sessions,
+   real access-control questions about who can see whose data) or just side-by-side chart
+   overlays for accounts that already exist — those are very different scopes and need their own
+   design discussion before estimating effort. Flagging as the one item here that isn't
+   actionable without a scoping conversation first.
