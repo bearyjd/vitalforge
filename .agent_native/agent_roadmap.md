@@ -238,3 +238,182 @@ below), but are included per request.
    overlays for accounts that already exist — those are very different scopes and need their own
    design discussion before estimating effort. Flagging as the one item here that isn't
    actionable without a scoping conversation first.
+
+---
+
+## Implementation plans (workflow-generated, 2026-08-24)
+
+Each item below was independently planned against the real codebase, then verified for
+feasibility by a second agent that re-read the cited files rather than trusting the plan's
+claims. Verdicts below are APPROVE unless a required fix is called out.
+
+### 1. Data export (CSV/JSON)
+
+Add `GET /api/export?metric=all|<name>&days=N&format=csv|json` to `vitalforge-dashboard/app.py`,
+reusing `get_metrics()`'s exact query pattern against `METRIC_TABLES`. `metric=all` streams
+long/tidy `metric,date,value` rows (the 16 tables don't share a date domain, so a wide per-date
+join is out of scope for "small"); single-metric streams `date,value`. Response is a
+`StreamingResponse` with `Content-Disposition: attachment`. No schema change, no new dependency
+(csv/io stdlib), auth inherited for free from the existing `/api/*` middleware gate. Files:
+`vitalforge-dashboard/app.py`, a new `tests/test_export_api.py` (seed_metric pattern), an
+optional README row.
+
+**Verified feasible — one required fix.** The plan's `get_db()`/try-finally pattern must be
+scoped *inside* the async generator `StreamingResponse` consumes, not around a synchronous call
+before `StreamingResponse` is constructed — otherwise the connection closes before any row
+streams, or leaks. Everything else (METRIC_TABLES shape, auth inheritance, test helpers) checked
+out against the real files. **Effort confirmed: small**, on the order of a few hours.
+
+### 2. Composite readiness/recovery score (0–100)
+
+New `vitalforge-dashboard/readiness.py` scoring three independently-normalized 0-100 components
+— HRV-vs-30-day-baseline, RHR level+14-day-trend, and Garmin's native `sleep_score` — combined
+40/30/30, renormalizing across whichever inputs have enough trailing data (`MIN_DAYS_BASELINE=5`)
+rather than crashing or zeroing out. One `GET /api/readiness` endpoint returning
+`{"score": int|None, "components": {...}, "status": "ok"|"partial_data"|"insufficient_data"}`,
+plus a headline tile in `templates/index.html` above the existing 4-card grid. No schema change.
+
+**Verified feasible — one required fix.** `readiness.py`'s sibling import
+(`from recommendations import avg, trend_slope, get_all_metrics`) needs its own
+`sys.path.insert(0, str(Path(__file__).resolve().parent))` (matching `app.py`'s pattern) or a
+standalone `tests/test_readiness.py` importing it via `importlib.import_module` will raise
+`ModuleNotFoundError` — the plan's claim that this mirrors `sync.py`'s import style was wrong
+(`sync.py` never imports `recommendations.py`). Body_battery is deliberately excluded from v1
+scoring (correlated with HRV/sleep, not independent signal) — flag to confirm before building.
+**Effort confirmed: small–medium**, leaning small; the weighting formula itself is a reasoned
+judgment call, not derived from any disclosed Whoop/Oura algorithm.
+
+### 3. Notable-change / anomaly alerts
+
+One new `stdev()` helper plus a generic rule block appended to `run_rules()` in
+`recommendations.py`. For each of 10 tracked metrics, z-score the trailing 3-day average against
+a 21-day baseline ending 3 days back (excluding the anomaly window from its own baseline);
+`|z| >= 2.0` → warning, `|z| >= 3.0` → alert. Requires ≥10 baseline points or the metric is
+skipped (guards early-adoption users). No new endpoint, no schema change — flows through the
+existing `run_rules` → `/api/recommendations` pipeline and existing `.rec-card.severity-*` CSS.
+
+**Verified feasible — two required fixes.** (1) New finding dicts must include a `category` key
+— `_findings_to_recommendations()` hard-indexes `f["category"]` with no default, so omitting it
+causes a 500 on `/api/recommendations` for any user without an LLM key configured, precisely on
+otherwise-healthy days with few other findings. (2) The metric-lookup loop must use
+`data.get(metric, [])` not `data[metric]` — most existing tests pass partial data dicts and would
+KeyError otherwise. Also noted: for any 14-point linear-ramp series the z-score algebraically
+reduces to a slope-independent constant (~2.21), so several existing trend rules will
+systematically co-fire a shadow `_notable_change` finding — cosmetic redundancy, not a bug.
+**Effort confirmed: small–medium**, leaning small (~2-4 hours incl. tests).
+
+### 4. Ad-hoc cross-metric correlation view
+
+New `vitalforge-dashboard/correlations.py`: pure-Python `pearson_r()`, plus one
+`GET /api/correlations?metrics=a,b,c&days=30&lag=0&min_pairs=5` returning a row-major NxN matrix
+(`cells[i][j] = {"r": float|null, "n": int}`). All `METRIC_TABLES` tables are `date TEXT PRIMARY
+KEY`, so alignment is a plain dict inner-join; `lag` shifts the column series forward N calendar
+days before joining (so "yesterday's steps vs. tonight's sleep" is expressible, and makes the
+matrix asymmetric — all N² cells computed, not just the upper triangle). `r` is null (not NaN)
+below `min_pairs` or on zero-variance input. UI: a hand-rolled CSS-grid heatmap plus a Chart.js
+scatter drill-down on cell click, in a new `static/correlations.js` (index.html is already near
+its 800-line file cap). `weight_log` (timestamp-keyed) is deliberately excluded from v1 — it
+isn't dashboard-readable today per CLAUDE.md's Garmin-read boundary.
+
+**Verified feasible — no gap found, one cosmetic correction.** All cited line numbers, table
+shapes, and the "one connection per request not per metric" design (actually a correctness
+*improvement* over `recommendations.py`'s existing per-call-connection pattern) checked out.
+Minor: the plan overstated the failure mode of a raw NaN in JSON (Starlette's encoder raises
+`ValueError` server-side rather than emitting invalid JSON) — the fix (clamp/null before
+serializing) is unchanged either way. **Effort confirmed: medium** — the `lag` parameter forcing
+an asymmetric matrix, plus the new heatmap+scatter frontend module, are what keep this above
+"small."
+
+### 5. Goal / target tracking
+
+New `goals` table (`id, user_id REFERENCES users(id), metric, target_value, target_date,
+created_at`) plus `idx_goals_user_id` — a fresh `CREATE TABLE IF NOT EXISTS`, so none of
+`shared/database.py`'s `_add_columns()` ALTER-TABLE interrupted-boot hazard applies. New sibling
+module `vitalforge-dashboard/goals.py` (Pydantic models, CRUD, a `compute_progress()` using
+`recommendations.trend_slope` for ETA). Five routes: `POST/GET /api/goals`,
+`GET/PATCH/DELETE /api/goals/{id}`, with ownership enforcement (404 absent, 403 wrong owner,
+admin override) mirroring `revoke_token`'s existing pattern in `shared/auth.py`. `metric` is
+validated against `METRIC_TABLES.keys()` at the API layer, not a DB CHECK, to avoid a second
+place the metric enum can drift.
+
+**Verified feasible — one required fix.** The plan's proposed `require_user_id(request) -> int`
+helper can't support its own admin-override design — ownership checks need `identity.role`, and
+the existing `get_current_user_role()` is explicitly documented as unsafe for authorization
+(username-reuse races). Fix: widen the new public helper to return the full identity (or a
+`(user_id, role)` pair), not a bare int. Also flagged: in the current auth-not-configured dev
+mode, goal endpoints will 401 while every other dashboard endpoint works — goals literally
+require an owning account. **Effort confirmed: medium** — the schema piece is low-risk, but a
+new blast-radius-sensitive `shared/auth.py` accessor, genuinely new UI surface, and an
+ownership-matrix test suite with no full existing analog keep it out of "small."
+
+### 6. Local FIT-file import without cloud login
+
+**Central finding that reshapes this item:** `sync.py`'s `upsert()` does
+`INSERT OR REPLACE ... WHERE date = ?`, and `scheduled_sync()` re-pulls a 90-day backfill on every
+boot plus every `SYNC_INTERVAL_HOURS`. Writing FIT-derived data into any existing
+`METRIC_TABLES` table would be silently overwritten within hours — not a risk, a guaranteed data
+loss on a timer. A brand-new `activities` table is therefore mandatory, not a style choice:
+`id, start_time_utc, sport, duration_seconds, distance_m, calories, avg_hr, max_hr,
+elevation_gain_m, source_format CHECK IN ('fit','tcx','gpx'), file_sha256 UNIQUE, imported_at,
+raw_summary_json`. New `vitalforge-dashboard/fit_import.py` parses into a frozen `ActivityRecord`
+dataclass; `POST /api/import/activity` (multipart, auto-auth-protected) does two-stage dedup
+(file-hash exact match, then `(start_time_utc, sport)` natural-key/time-window match for
+cross-format duplicates) and never touches `sync.py`'s upsert path. `GET /api/activities[/{id}]`
+for reads. Parser must be pure-Python (no build toolchain in this repo's Dockerfiles) —
+`fitparse` for FIT, stdlib `xml.etree.ElementTree` for TCX, `gpxpy` for GPX.
+
+**Verified feasible — one required fix.** The two-stage dedup (hash pre-check, then insert) has
+the same TOCTOU race this repo already hit and fixed once for `weight_log` — two concurrent
+uploads of the same file can both pass the app-level hash check before either commits, and the
+second insert then hits a raw, unhandled `IntegrityError` (500) instead of a graceful
+`duplicated:true`. Fix: wrap the check-then-insert in `BEGIN IMMEDIATE`, mirroring
+`vitalforge-weight/app.py:195`, plus a concurrent-upload test mirroring
+`tests/test_dedup_concurrency.py`. Everything else — table design, parser library constraints,
+UTC-vs-local-date ambiguity, upload-size caps, content-sniffing over trusting file extensions —
+checked out. **Effort: recommend descoping.** The original "large" estimate (FIT+TCX+GPX unified)
+is defensible as stated, but a FIT-only first slice (new table, 3 endpoints, no metric-table
+writes) is **medium** — the hardest-sounding part of the original ask turned out to be actively
+wrong to do. TCX/GPX become small–medium follow-on phases once the scaffolding exists.
+
+### 7. Family / multi-person comparison dashboards — scoping options, not a plan
+
+**This corrects the roadmap item's own framing.** There is no per-user Garmin linkage today —
+one global `GARMIN_EMAIL`/`GARMIN_PASSWORD` pair and one module-level `_client` singleton serve
+every login; `users` is purely an app-login table, and zero metric tables have a `user_id`/
+`person_id` column (confirmed by grep across `sync.py`, `recommendations.py`,
+`vitalforge-weight/app.py`). So the roadmap's suggested cheap path — "overlay accounts that
+already exist" — isn't buildable as written, because there are no separate per-person datasets
+to overlay yet. Three real options, verified against the actual code:
+
+- **Option A — N single-person instances, one host, read-only overlay (small–medium, days).**
+  Run the existing Docker image once per person, each with its own `DB_PATH`/`GARTH_TOKEN_DIR`
+  and Garmin credentials (already env-overridable, unchanged from today's model). Add one
+  `GET /api/compare` route that fans out to each sibling's existing `/api/metrics/{name}` using
+  the per-user bearer tokens already shipped (PR #22), overlaid in one Chart.js chart. Zero
+  changes to `shared/`, `sync.py`, or any existing table — but this repo has never stored a
+  *reversible* credential before (existing tokens are one-way hashed for verifying inbound
+  auth), so a new `remote_sources` table holding an outbound-presentable token is a genuinely new
+  secret-handling precedent, even at low volume.
+- **Option B — same model, federated across separate households (medium).** Architecturally
+  identical to A; the added cost is entirely outside this codebase (VPN/reverse-proxy
+  reachability between hosts — `nginx/nginx.conf` already exists and could plausibly front this),
+  and the reversible-token concern matters more once it crosses the public internet.
+- **Option C — true multi-tenant, `person_id` on every metric table (large, multi-week).** The
+  only option enabling real cross-person queries/joins. Blocked on a genuine finding, not an
+  assumption: every metric table's PK is `date TEXT PRIMARY KEY` alone, and `upsert()`'s
+  `INSERT OR REPLACE` is keyed on exactly that — a merely-additive nullable `person_id` column is
+  *not* sufficient, since two people syncing the same calendar date would silently overwrite each
+  other's row. The PK must become `(person_id, date)`, requiring SQLite's create-copy-drop-rename
+  rebuild across ~10 date-keyed tables (`weight_log` is id-keyed and could take a cheaper additive
+  column) — this repo's own `shared/database.py` comments describe exactly this rewrite/
+  interruption hazard as something deliberately avoided until now. Also needs: a per-person
+  Garmin-client registry replacing the current singleton (a second, more sensitive new
+  reversible-secret surface — actual Garmin credentials, not just read tokens), staggered sync to
+  avoid multiplying the documented Garmin 429 rate-limit risk, and a real access-control/grant
+  model in `shared/auth.py` (a "person" isn't necessarily a login — e.g. a parent managing a
+  child's data).
+
+**Verified: all three options are grounded** in the actual schema, auth model, and sync
+behavior — no corrections needed beyond a footnote (Option C's "~11 tables" loosely includes
+`weight_log`, which doesn't actually need the PK rebuild). This remains the one item needing a
+human decision — which option, or none — before it gets a real implementation plan.
