@@ -21,6 +21,8 @@ from httpx import ASGITransport, AsyncClient
 readiness = importlib.import_module("vitalforge-dashboard.readiness")
 
 score_readiness = readiness.score_readiness
+_hrv_score = readiness._hrv_score
+_rhr_score = readiness._rhr_score
 MIN_BASELINE_DAYS = readiness.MIN_BASELINE_DAYS
 
 TODAY = datetime.now().date()
@@ -59,7 +61,7 @@ def test_full_data_scoring_flat_baselines():
 
 def test_full_data_scoring_hrv_above_baseline_scores_higher():
     data = {
-        # baseline (avg of all 10) = 43, recent 3d avg = 50 -> above baseline
+        # baseline (avg of the 7 pre-window days) = 40, recent 3d avg = 50 -> above baseline
         "hrv": series([40] * 7 + [50] * 3),
         "resting_hr": series([55] * 10),
         "sleep_score": series([80] * 10),
@@ -77,6 +79,57 @@ def test_full_data_scoring_elevated_rhr_scores_lower():
     }
     result = score_readiness(data)
     assert result["components"]["rhr"] < 50
+
+
+# ---------------------------------------------------------------------------
+# Baseline must exclude the recent evaluation window (regression coverage)
+# ---------------------------------------------------------------------------
+
+def test_hrv_score_baseline_excludes_recent_window():
+    """Regression test for a HIGH-severity bug: the baseline average used to
+    include the trailing RECENT_WINDOW_DAYS days -- the same days being
+    evaluated against it -- which diluted a real deviation into its own
+    baseline and biased the score back toward 'normal'.
+
+    7 days flat at 45, then a 3-day deviation up to 55.
+    Correct baseline = avg of the 7 pre-deviation days = 45 (window excluded).
+    recent = avg of the 3 deviation days = 55.
+    pct_diff = (55-45)/45 = 0.2222 -> score = 50 + 0.2222*200 = 94.44 -> 94.
+
+    With the bug (window included in baseline), baseline would be
+    avg of all 10 = 48, pct_diff = (55-48)/48 = 0.1458 -> score = 79 --
+    a materially smaller, wrongly-dampened deviation.
+    """
+    data = {
+        "hrv": series([45] * 7 + [55] * 3),
+        "resting_hr": series([55] * 10),
+        "sleep_score": series([80] * 10),
+    }
+    result = score_readiness(data)
+    assert result["components"]["hrv"] == 94
+
+
+def test_rhr_score_level_component_excludes_latest_day_from_baseline():
+    """Same regression, for `_rhr_score`'s level sub-score: the baseline
+    used to include the single latest day being evaluated against it.
+
+    9 days flat at 50, then a 1-day deviation up to 60.
+    Correct baseline (latest day excluded) = 50 -> level_score = 10,
+    blended (60/40) with the trend sub-score -> combined score 17.
+
+    With the bug (latest day included in baseline), baseline would be 51,
+    level_score = ~14.7, blended -> combined score 20 -- a wrongly-dampened
+    deviation pulled back toward 'normal'.
+    """
+    rhr_data = series([50] * 9 + [60])
+    result = _rhr_score(rhr_data)
+    assert round(result) == 17
+
+
+def test_hrv_score_flat_data_unaffected_by_baseline_window_exclusion():
+    """Sanity check: excluding the recent window from the baseline doesn't
+    change anything when the metric is genuinely flat throughout."""
+    assert _hrv_score(series([45] * 10)) == 50
 
 
 # ---------------------------------------------------------------------------

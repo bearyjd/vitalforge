@@ -28,6 +28,7 @@ from recommendations import avg, get_all_metrics, trend_slope
 
 MIN_BASELINE_DAYS = 5
 RECENT_WINDOW_DAYS = 3
+RHR_LEVEL_WINDOW_DAYS = 1  # the single "latest" day evaluated against baseline
 RHR_TREND_WINDOW_DAYS = 14
 RHR_TREND_SCALE = 40  # bpm/day slope that swings the trend sub-score by 100 pts
 RHR_LEVEL_WEIGHT = 0.6
@@ -45,11 +46,24 @@ def _recent_avg(data: list[dict], n: int = RECENT_WINDOW_DAYS) -> float | None:
     return avg([d["value"] for d in window])
 
 
+def _baseline_avg(data: list[dict], exclude_recent: int) -> float | None:
+    """Average of `data` excluding the trailing `exclude_recent` days (the
+    evaluation window), so a real deviation in the recent days isn't diluted
+    into the very baseline it's being compared against -- mirrors how
+    `recommendations.py`'s week-over-week comparison excludes its own
+    evaluation window from the baseline it uses (see `hrv_data[-14:-7]` in
+    `run_rules`). Falls back to averaging all of `data` if excluding the
+    window would leave nothing to average.
+    """
+    pool = data[:-exclude_recent] if len(data) > exclude_recent else data
+    return avg([d["value"] for d in pool])
+
+
 def _hrv_score(hrv_data: list[dict]) -> float | None:
     """HRV vs. its own trailing baseline: above baseline scores higher."""
     if len(hrv_data) < MIN_BASELINE_DAYS:
         return None
-    baseline = avg([d["value"] for d in hrv_data])
+    baseline = _baseline_avg(hrv_data, RECENT_WINDOW_DAYS)
     if not baseline:
         return None
     recent = _recent_avg(hrv_data)
@@ -69,7 +83,7 @@ def _rhr_score(rhr_data: list[dict]) -> float | None:
     """
     if len(rhr_data) < MIN_BASELINE_DAYS:
         return None
-    baseline = avg([d["value"] for d in rhr_data])
+    baseline = _baseline_avg(rhr_data, RHR_LEVEL_WINDOW_DAYS)
     if not baseline:
         return None
     latest = rhr_data[-1]["value"]
