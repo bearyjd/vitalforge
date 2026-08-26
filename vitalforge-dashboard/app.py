@@ -22,6 +22,7 @@ from fastapi.templating import Jinja2Templates
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import fit_import
+from correlations import compute_cell
 from goals import (
     GoalCreate,
     GoalOut,
@@ -316,6 +317,65 @@ async def api_recommendations(refresh: bool = Query(default=False)):
 async def api_rules_only():
     """Get rules engine output without LLM."""
     return await get_rules_only()
+
+
+@app.get("/api/correlations")
+async def api_correlations(
+    metrics: str = Query(..., description="Comma-separated metric names, e.g. sleep_duration,hrv"),
+    days: int = Query(default=30, ge=1, le=365),
+    lag: int = Query(default=0, ge=-365, le=365, description="Calendar days to shift each row metric forward before joining"),
+    min_pairs: int = Query(default=5, ge=2, description="Minimum aligned pairs required to report r instead of null"),
+):
+    """Ad-hoc cross-metric correlation matrix.
+
+    Returns a row-major NxN matrix where `cells[i][j]` correlates
+    `metrics[i]` (shifted forward `lag` days) against `metrics[j]`
+    (unshifted) — see `correlations.align_series` for why that makes the
+    matrix asymmetric when `lag != 0`. Every metric name must be a key in
+    `METRIC_TABLES`, which only ever contains date-keyed tables — this
+    endpoint has no path to `weight_log` (timestamp-keyed) at all.
+
+    Opens exactly one DB connection for the whole request and fetches
+    each requested metric's series once, regardless of how many N^2
+    cells reuse it.
+    """
+    metric_names = [m.strip() for m in metrics.split(",") if m.strip()]
+    if not metric_names:
+        raise HTTPException(status_code=400, detail="metrics parameter must contain at least one metric name")
+
+    unknown = [m for m in metric_names if m not in METRIC_TABLES]
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown metric(s): {', '.join(unknown)}. Valid: {', '.join(sorted(METRIC_TABLES))}",
+        )
+
+    db = await get_db()
+    try:
+        series: dict[str, dict[str, float]] = {}
+        for name in set(metric_names):
+            table, column = METRIC_TABLES[name]
+            cursor = await db.execute(
+                f"SELECT date, [{column}] as value FROM [{table}] WHERE date >= date('now', ?) ORDER BY date ASC",
+                (f"-{days} days",),
+            )
+            rows = await cursor.fetchall()
+            series[name] = {row["date"]: row["value"] for row in rows if row["value"] is not None}
+    finally:
+        await db.close()
+
+    cells = [
+        [compute_cell(series[row_name], series[col_name], lag, min_pairs) for col_name in metric_names]
+        for row_name in metric_names
+    ]
+
+    return {
+        "metrics": metric_names,
+        "days": days,
+        "lag": lag,
+        "min_pairs": min_pairs,
+        "cells": cells,
+    }
 
 
 # How close two uploads' (sport, start_time_utc) must be to be treated as
