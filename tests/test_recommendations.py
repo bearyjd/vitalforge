@@ -292,3 +292,16 @@ def test_metric_anomaly_skips_metric_with_insufficient_baseline_history():
     # the metric is skipped purely on baseline-count, not on zero stdev.
     data = {"resting_hr": series([48, 52] * 3 + [50] + [90, 90, 90])}
     assert find(run_rules(data), "resting_hr_anomaly") is None
+
+
+def test_metric_anomaly_fires_on_zero_variance_baseline_then_jump():
+    # 21-day baseline is perfectly flat (sd == 0) -> the ordinary z-score
+    # formula would divide by zero. A flat-then-jump series is exactly the
+    # "sudden real change" case this rule exists to catch, so it must still
+    # fire (at alert severity) instead of silently skipping.
+    data = {"vo2max": series([45] * 21 + [70, 70, 70])}
+    f = find(run_rules(data), "vo2max_anomaly")
+    assert f is not None
+    assert f["severity"] == "alert"
+    assert f["data"]["baseline_sd"] == 0
+    assert f["data"]["baseline_n"] == 21

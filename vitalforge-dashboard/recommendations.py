@@ -3,6 +3,7 @@
 import hashlib
 import json
 import logging
+import math
 import os
 import time
 
@@ -385,10 +386,21 @@ def run_rules(data: dict) -> list[dict]:
         baseline_values = [d["value"] for d in baseline_pts]
         baseline_mean = avg(baseline_values)
         baseline_sd = stdev(baseline_values)
-        if recent_avg is None or baseline_mean is None or not baseline_sd:
+        if recent_avg is None or baseline_mean is None or baseline_sd is None:
             continue
 
-        z = (recent_avg - baseline_mean) / baseline_sd
+        if baseline_sd == 0:
+            # Zero-variance baseline (metric was perfectly flat for the whole
+            # window) makes a real z-score undefined (division by zero). Any
+            # genuine deviation off that flat baseline is exactly the "sudden
+            # real change" case this rule exists to catch, so treat it as a
+            # maximal/alert-level anomaly instead of skipping. Floats that are
+            # equal only up to rounding still count as "no deviation".
+            if math.isclose(recent_avg, baseline_mean):
+                continue
+            z = 3.0 if recent_avg > baseline_mean else -3.0
+        else:
+            z = (recent_avg - baseline_mean) / baseline_sd
         if abs(z) >= 3.0:
             severity = "alert"
         elif abs(z) >= 2.0:
