@@ -1,4 +1,7 @@
 import asyncio
+import csv
+import io
+import json
 import logging
 import os
 import sys
@@ -7,6 +10,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.requests import Request
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -168,6 +172,101 @@ async def get_metrics(metric_name: str, days: int = Query(default=30, ge=1, le=3
         "count": len(data),
         "data": data,
     }
+
+
+async def _export_rows(metrics: list[str], days: int):
+    """Yield (metric_name, date, value) tuples for the given metrics.
+
+    Reuses get_metrics()'s exact query pattern (same WHERE/ORDER BY clause,
+    same NULL-value filtering) against one shared DB connection for the
+    whole export, rather than opening/closing a connection per metric.
+    `table`/`column` are always looked up from METRIC_TABLES (never taken
+    from the raw request), so the f-string interpolation into the SQL
+    identifier positions below is safe.
+    """
+    db = await get_db()
+    try:
+        for metric_name in metrics:
+            table, column = METRIC_TABLES[metric_name]
+            cursor = await db.execute(
+                f"SELECT date, [{column}] as value FROM [{table}] WHERE date >= date('now', ?) ORDER BY date ASC",
+                (f"-{days} days",),
+            )
+            rows = await cursor.fetchall()
+            for row in rows:
+                if row["value"] is not None:
+                    yield metric_name, row["date"], row["value"]
+    finally:
+        await db.close()
+
+
+async def _export_csv(metrics: list[str], days: int, include_metric_column: bool):
+    """Stream export rows as CSV text chunks."""
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+
+    writer.writerow(["metric", "date", "value"] if include_metric_column else ["date", "value"])
+    yield buf.getvalue()
+    buf.seek(0)
+    buf.truncate(0)
+
+    async for metric_name, date, value in _export_rows(metrics, days):
+        writer.writerow([metric_name, date, value] if include_metric_column else [date, value])
+        yield buf.getvalue()
+        buf.seek(0)
+        buf.truncate(0)
+
+
+async def _export_json(metrics: list[str], days: int, include_metric_column: bool):
+    """Stream export rows as a JSON array, one object per row."""
+    first = True
+    yield "["
+    async for metric_name, date, value in _export_rows(metrics, days):
+        if not first:
+            yield ","
+        first = False
+        record = {"date": date, "value": value}
+        if include_metric_column:
+            record = {"metric": metric_name, **record}
+        yield json.dumps(record)
+    yield "]"
+
+
+@app.get("/api/export")
+async def export_data(
+    metric: str = Query(default="all"),
+    days: int = Query(default=30, ge=1, le=365),
+    format: str = Query(default="csv"),
+):
+    """Stream metric data as a CSV or JSON file download.
+
+    `metric=all` streams long/tidy `metric,date,value` rows across every
+    known metric; a single metric name streams just `date,value`.
+    """
+    if metric != "all" and metric not in METRIC_TABLES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown metric '{metric}'. Valid: all, {', '.join(sorted(METRIC_TABLES))}",
+        )
+    if format not in {"csv", "json"}:
+        raise HTTPException(status_code=400, detail=f"Unknown format '{format}'. Valid: csv, json")
+
+    metrics_to_export = sorted(METRIC_TABLES) if metric == "all" else [metric]
+    include_metric_column = metric == "all"
+    filename = f"vitalforge-export-{metric}-{days}d.{format}"
+
+    if format == "csv":
+        generator = _export_csv(metrics_to_export, days, include_metric_column)
+        media_type = "text/csv"
+    else:
+        generator = _export_json(metrics_to_export, days, include_metric_column)
+        media_type = "application/json"
+
+    return StreamingResponse(
+        generator,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.get("/api/recommendations")
