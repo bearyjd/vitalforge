@@ -1256,9 +1256,10 @@ def add_auth_routes(app):
                     await db.rollback()
                     raise HTTPException(status_code=409, detail="Cannot delete the last remaining admin")
             # SQLite foreign keys are not enabled in this project, so the
-            # REFERENCES declaration cannot cascade. Remove credentials in
-            # the same transaction before deleting their owner.
+            # REFERENCES declaration cannot cascade. Remove credentials and
+            # goals in the same transaction before deleting their owner.
             await db.execute("DELETE FROM api_tokens WHERE user_id = ?", (user_id,))
+            await db.execute("DELETE FROM goals WHERE user_id = ?", (user_id,))
             await db.execute("DELETE FROM users WHERE id = ?", (user_id,))
             await db.commit()
         finally:
