@@ -7,6 +7,7 @@ never need the fake Garmin client.
 
 import csv
 import io
+import logging
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -132,3 +133,44 @@ async def test_export_empty_table_returns_empty_json_array_without_crashing(clie
     resp = await client.get("/api/export?metric=steps&format=json")
     assert resp.status_code == 200
     assert resp.json() == []
+
+
+async def test_export_mid_stream_db_failure_is_logged(client, dashboard_app_module, monkeypatch, caplog):
+    """A DB error partway through the streamed export must be logged server-side.
+
+    `StreamingResponse` has already sent a 200 and headers by the time
+    `_export_rows` can fail, so the client only ever sees a truncated
+    download — this asserts the failure is at least captured in the logs
+    rather than vanishing silently (the HIGH-severity review finding).
+    """
+    await seed_metric("steps", "value", [(days_ago(1), 1000.0)])
+
+    real_get_db = get_db
+
+    class FailingDB:
+        """Proxies to a real DB connection but fails every query, simulating
+        a mid-stream DB failure once the response has already started."""
+
+        def __init__(self, real_db):
+            self._real_db = real_db
+
+        async def execute(self, *args, **kwargs):
+            raise RuntimeError("simulated mid-stream DB failure")
+
+        async def close(self):
+            await self._real_db.close()
+
+    async def fake_get_db():
+        return FailingDB(await real_get_db())
+
+    monkeypatch.setattr(dashboard_app_module, "get_db", fake_get_db)
+
+    caplog.set_level(logging.ERROR)
+
+    with pytest.raises(RuntimeError, match="simulated mid-stream DB failure"):
+        await client.get("/api/export?metric=steps&format=json")
+
+    assert any(
+        "export failed mid-stream" in record.message.lower() and record.exc_info is not None
+        for record in caplog.records
+    )

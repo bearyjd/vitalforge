@@ -196,6 +196,13 @@ async def _export_rows(metrics: list[str], days: int):
             for row in rows:
                 if row["value"] is not None:
                     yield metric_name, row["date"], row["value"]
+    except Exception:
+        # The StreamingResponse has already sent a 200 and headers by the time
+        # a failure happens here, so the client just sees a truncated
+        # download with no indication anything went wrong. Log server-side
+        # before re-raising so the failure isn't silently lost.
+        logger.exception("Export failed mid-stream (metrics=%s, days=%s)", metrics, days)
+        raise
     finally:
         await db.close()
 
