@@ -34,6 +34,7 @@ from goals import (
     list_goals,
     update_goal,
 )
+from readiness import compute_readiness
 from recommendations import get_recommendations, get_rules_only
 from sync import run_sync, scheduled_sync
 
@@ -187,6 +188,16 @@ async def get_metrics(metric_name: str, days: int = Query(default=30, ge=1, le=3
         "count": len(data),
         "data": data,
     }
+
+
+@app.get("/api/readiness")
+async def api_readiness():
+    """Get the composite readiness/recovery score (0-100)."""
+    try:
+        return await compute_readiness()
+    except Exception as e:
+        logger.error("Readiness scoring failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to compute readiness score")
 
 
 async def _export_rows(metrics: list[str], days: int):
