@@ -15,6 +15,7 @@ from fastapi.templating import Jinja2Templates
 # `recommendations.py` live next to this file and are imported by bare name.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from readiness import compute_readiness
 from recommendations import get_recommendations, get_rules_only
 from sync import run_sync, scheduled_sync
 
@@ -168,6 +169,16 @@ async def get_metrics(metric_name: str, days: int = Query(default=30, ge=1, le=3
         "count": len(data),
         "data": data,
     }
+
+
+@app.get("/api/readiness")
+async def api_readiness():
+    """Get the composite readiness/recovery score (0-100)."""
+    try:
+        return await compute_readiness()
+    except Exception as e:
+        logger.error("Readiness scoring failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to compute readiness score")
 
 
 @app.get("/api/recommendations")

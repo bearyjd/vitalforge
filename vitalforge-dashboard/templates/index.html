@@ -92,6 +92,25 @@
             cursor: pointer; font-size: 1.1rem; padding: 0 0.3rem;
         }
 
+        /* Readiness */
+        .readiness-tile {
+            background: #16213e; border-radius: 10px;
+            padding: 1.1rem 1.25rem; margin-bottom: 1rem;
+            display: flex; align-items: center; gap: 1.5rem;
+        }
+        .readiness-score-value { font-size: 2.4rem; font-weight: 700; color: #e0e0e0; line-height: 1; }
+        .readiness-score-value.status-good { color: #26a69a; }
+        .readiness-score-value.status-warn { color: #ffa726; }
+        .readiness-score-value.status-low { color: #ef5350; }
+        .readiness-info { flex: 1; min-width: 0; }
+        .readiness-label {
+            font-size: 0.7rem; text-transform: uppercase;
+            letter-spacing: 1px; color: #6060a0; margin-bottom: 0.35rem;
+        }
+        .readiness-status { font-size: 0.7rem; color: #ffa726; margin-bottom: 0.35rem; }
+        .readiness-components { display: flex; gap: 1rem; flex-wrap: wrap; font-size: 0.75rem; color: #8080a0; }
+        .readiness-components span.readiness-component-missing { opacity: 0.4; }
+
         /* Top cards */
         .top-cards {
             display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -182,6 +201,16 @@
 
         <!-- Alerts -->
         <div class="alerts" id="alerts"></div>
+
+        <!-- Readiness -->
+        <div class="readiness-tile" id="readinessTile" style="display:none">
+            <div class="readiness-score-value" id="readinessScoreValue">--</div>
+            <div class="readiness-info">
+                <div class="readiness-label">Readiness</div>
+                <div class="readiness-status" id="readinessStatus"></div>
+                <div class="readiness-components" id="readinessComponents"></div>
+            </div>
+        </div>
 
         <!-- Top Cards -->
         <div class="top-cards">
@@ -484,6 +513,34 @@
 
         function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
 
+        // ── Readiness ──
+        const READINESS_LABELS = { hrv: "HRV", rhr: "RHR", sleep_score: "Sleep" };
+
+        async function loadReadiness() {
+            const tile = document.getElementById("readinessTile");
+            try {
+                const res = await fetch("/api/readiness");
+                if (!res.ok) { tile.style.display = "none"; return; }
+                const data = await res.json();
+                if (data.score == null) { tile.style.display = "none"; return; }
+
+                tile.style.display = "";
+                const scoreEl = document.getElementById("readinessScoreValue");
+                scoreEl.textContent = data.score;
+                scoreEl.classList.remove("status-good", "status-warn", "status-low");
+                scoreEl.classList.add(data.score >= 70 ? "status-good" : data.score >= 40 ? "status-warn" : "status-low");
+
+                document.getElementById("readinessStatus").textContent =
+                    data.status === "partial_data" ? "Based on partial data" : "";
+
+                const comps = data.components || {};
+                document.getElementById("readinessComponents").innerHTML = Object.entries(READINESS_LABELS).map(([key, label]) => {
+                    const v = comps[key];
+                    return `<span class="${v == null ? "readiness-component-missing" : ""}">${label} ${v == null ? "--" : v}</span>`;
+                }).join("");
+            } catch { tile.style.display = "none"; }
+        }
+
         // ── Alerts ──
         function computeAlerts(metricData) {
             const alerts = [];
@@ -631,6 +688,7 @@
             const status = await fetchSyncStatus();
             updateSyncInfo(status);
             await loadDashboard();
+            loadReadiness();
             loadRecommendations(false);
         })();
     </script>
