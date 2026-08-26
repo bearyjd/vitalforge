@@ -376,6 +376,7 @@ the same weigh-in rather than a new one:
 | `GET` | `/api/metrics/{name}?days=30` | Time series data with 7-day moving average |
 | `GET` | `/api/recommendations` | AI-powered health recommendations |
 | `GET` | `/api/recommendations/rules-only` | Rules engine output without LLM |
+| `GET` | `/api/export?metric=all\|{name}&days=30&format=csv\|json` | Download metric data as a CSV or JSON file |
 
 Available metrics: `sleep_duration`, `sleep_score`, `resting_hr`, `hrv`, `body_battery`, `body_battery_low`, `stress`, `vo2max`, `weight`, `body_fat`, `body_water`, `bone_mass`, `muscle_mass`, `training_load`, `steps`, `active_calories`
 
