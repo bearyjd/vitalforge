@@ -3,6 +3,7 @@
 import hashlib
 import json
 import logging
+import math
 import os
 import time
 
@@ -19,7 +20,7 @@ CACHE_TTL = 6 * 3600  # 6 hours
 # Data fetching helpers
 # ---------------------------------------------------------------------------
 
-async def _get_metric(table: str, column: str, days: int = 30) -> list[dict]:
+async def get_metric(table: str, column: str, days: int = 30) -> list[dict]:
     db = await get_db()
     try:
         cursor = await db.execute(
@@ -47,7 +48,7 @@ async def get_all_metrics(days: int = 30) -> dict:
     }
     result = {}
     for name, (table, col) in metrics.items():
-        result[name] = await _get_metric(table, col, days)
+        result[name] = await get_metric(table, col, days)
     return result
 
 
@@ -58,6 +59,17 @@ async def get_all_metrics(days: int = 30) -> dict:
 def avg(values: list) -> float | None:
     valid = [v for v in values if v is not None]
     return sum(valid) / len(valid) if valid else None
+
+
+def stdev(values: list) -> float | None:
+    """Sample standard deviation (n-1), ignoring None values. Needs >=2 points."""
+    valid = [v for v in values if v is not None]
+    n = len(valid)
+    if n < 2:
+        return None
+    mean = sum(valid) / n
+    variance = sum((v - mean) ** 2 for v in valid) / (n - 1)
+    return variance ** 0.5
 
 
 def recent_values(data: list[dict], n: int) -> list:
@@ -347,6 +359,69 @@ def run_rules(data: dict) -> list[dict]:
                 "message": "High training load combined with declining HRV and elevated resting HR suggests overtraining risk",
                 "data": {},
             })
+
+    # --- Notable-change / anomaly alerts (generic, per tracked metric) ---
+    # z-score the trailing 3-day average against a 21-day baseline ending 3 days
+    # back, so the anomaly window itself never leaks into its own baseline.
+    anomaly_metrics = {
+        "sleep_duration": "sleep",
+        "sleep_score": "sleep",
+        "resting_hr": "recovery",
+        "hrv": "recovery",
+        "body_battery": "recovery",
+        "stress": "stress",
+        "vo2max": "activity",
+        "weight": "body_composition",
+        "training_load": "activity",
+        "steps": "activity",
+    }
+    for metric, category in anomaly_metrics.items():
+        series_data = data.get(metric, [])
+        recent_pts = series_data[-3:]
+        baseline_pts = series_data[-24:-3]
+        if len(baseline_pts) < 10:
+            continue  # not enough history yet — guards early-adoption users
+
+        recent_avg = avg([d["value"] for d in recent_pts])
+        baseline_values = [d["value"] for d in baseline_pts]
+        baseline_mean = avg(baseline_values)
+        baseline_sd = stdev(baseline_values)
+        if recent_avg is None or baseline_mean is None or baseline_sd is None:
+            continue
+
+        if baseline_sd == 0:
+            # Zero-variance baseline (metric was perfectly flat for the whole
+            # window) makes a real z-score undefined (division by zero). Any
+            # genuine deviation off that flat baseline is exactly the "sudden
+            # real change" case this rule exists to catch, so treat it as a
+            # maximal/alert-level anomaly instead of skipping. Floats that are
+            # equal only up to rounding still count as "no deviation".
+            if math.isclose(recent_avg, baseline_mean):
+                continue
+            z = 3.0 if recent_avg > baseline_mean else -3.0
+        else:
+            z = (recent_avg - baseline_mean) / baseline_sd
+        if abs(z) >= 3.0:
+            severity = "alert"
+        elif abs(z) >= 2.0:
+            severity = "warning"
+        else:
+            continue
+
+        direction = "above" if z > 0 else "below"
+        findings.append({
+            "category": category,
+            "severity": severity,
+            "rule": f"{metric}_anomaly",
+            "message": f"{metric.replace('_', ' ').title()} is notably {direction} its recent baseline (z={round(z, 2)})",
+            "data": {
+                "z_score": round(z, 2),
+                "recent_avg": round(recent_avg, 2),
+                "baseline_mean": round(baseline_mean, 2),
+                "baseline_sd": round(baseline_sd, 2),
+                "baseline_n": len(baseline_pts),
+            },
+        })
 
     return findings
 

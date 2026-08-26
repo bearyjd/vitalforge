@@ -1,4 +1,7 @@
 import asyncio
+import csv
+import io
+import json
 import logging
 import os
 import sys
@@ -7,6 +10,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.requests import Request
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -15,11 +19,23 @@ from fastapi.templating import Jinja2Templates
 # `recommendations.py` live next to this file and are imported by bare name.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from goals import (
+    GoalCreate,
+    GoalOut,
+    GoalProgress,
+    GoalUpdate,
+    compute_progress,
+    create_goal,
+    delete_goal,
+    get_goal,
+    list_goals,
+    update_goal,
+)
 from readiness import compute_readiness
 from recommendations import get_recommendations, get_rules_only
 from sync import run_sync, scheduled_sync
 
-from shared.auth import add_auth_routes, bootstrap_first_admin, bootstrap_migrated_token
+from shared.auth import add_auth_routes, bootstrap_first_admin, bootstrap_migrated_token, require_account_identity
 from shared.database import get_db, init_db
 from shared.garmin_client import authenticate
 
@@ -181,6 +197,108 @@ async def api_readiness():
         raise HTTPException(status_code=500, detail="Failed to compute readiness score")
 
 
+async def _export_rows(metrics: list[str], days: int):
+    """Yield (metric_name, date, value) tuples for the given metrics.
+
+    Reuses get_metrics()'s exact query pattern (same WHERE/ORDER BY clause,
+    same NULL-value filtering) against one shared DB connection for the
+    whole export, rather than opening/closing a connection per metric.
+    `table`/`column` are always looked up from METRIC_TABLES (never taken
+    from the raw request), so the f-string interpolation into the SQL
+    identifier positions below is safe.
+    """
+    db = await get_db()
+    try:
+        for metric_name in metrics:
+            table, column = METRIC_TABLES[metric_name]
+            cursor = await db.execute(
+                f"SELECT date, [{column}] as value FROM [{table}] WHERE date >= date('now', ?) ORDER BY date ASC",
+                (f"-{days} days",),
+            )
+            rows = await cursor.fetchall()
+            for row in rows:
+                if row["value"] is not None:
+                    yield metric_name, row["date"], row["value"]
+    except Exception:
+        # The StreamingResponse has already sent a 200 and headers by the time
+        # a failure happens here, so the client just sees a truncated
+        # download with no indication anything went wrong. Log server-side
+        # before re-raising so the failure isn't silently lost.
+        logger.exception("Export failed mid-stream (metrics=%s, days=%s)", metrics, days)
+        raise
+    finally:
+        await db.close()
+
+
+async def _export_csv(metrics: list[str], days: int, include_metric_column: bool):
+    """Stream export rows as CSV text chunks."""
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+
+    writer.writerow(["metric", "date", "value"] if include_metric_column else ["date", "value"])
+    yield buf.getvalue()
+    buf.seek(0)
+    buf.truncate(0)
+
+    async for metric_name, date, value in _export_rows(metrics, days):
+        writer.writerow([metric_name, date, value] if include_metric_column else [date, value])
+        yield buf.getvalue()
+        buf.seek(0)
+        buf.truncate(0)
+
+
+async def _export_json(metrics: list[str], days: int, include_metric_column: bool):
+    """Stream export rows as a JSON array, one object per row."""
+    first = True
+    yield "["
+    async for metric_name, date, value in _export_rows(metrics, days):
+        if not first:
+            yield ","
+        first = False
+        record = {"date": date, "value": value}
+        if include_metric_column:
+            record = {"metric": metric_name, **record}
+        yield json.dumps(record)
+    yield "]"
+
+
+@app.get("/api/export")
+async def export_data(
+    metric: str = Query(default="all"),
+    days: int = Query(default=30, ge=1, le=365),
+    format: str = Query(default="csv"),
+):
+    """Stream metric data as a CSV or JSON file download.
+
+    `metric=all` streams long/tidy `metric,date,value` rows across every
+    known metric; a single metric name streams just `date,value`.
+    """
+    if metric != "all" and metric not in METRIC_TABLES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown metric '{metric}'. Valid: all, {', '.join(sorted(METRIC_TABLES))}",
+        )
+    if format not in {"csv", "json"}:
+        raise HTTPException(status_code=400, detail=f"Unknown format '{format}'. Valid: csv, json")
+
+    metrics_to_export = sorted(METRIC_TABLES) if metric == "all" else [metric]
+    include_metric_column = metric == "all"
+    filename = f"vitalforge-export-{metric}-{days}d.{format}"
+
+    if format == "csv":
+        generator = _export_csv(metrics_to_export, days, include_metric_column)
+        media_type = "text/csv"
+    else:
+        generator = _export_json(metrics_to_export, days, include_metric_column)
+        media_type = "application/json"
+
+    return StreamingResponse(
+        generator,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @app.get("/api/recommendations")
 async def api_recommendations(refresh: bool = Query(default=False)):
     """Get AI-powered health recommendations."""
@@ -195,3 +313,88 @@ async def api_recommendations(refresh: bool = Query(default=False)):
 async def api_rules_only():
     """Get rules engine output without LLM."""
     return await get_rules_only()
+
+
+# ---------------------------------------------------------------------------
+# Goal / target tracking
+#
+# Every route below requires an account-bound identity (require_account_identity
+# 401s for both "no session" and the auth-not-configured anonymous identity,
+# since a goal always belongs to a real user_id). In dev mode with an empty
+# users table, this means goal endpoints 401 while every other dashboard
+# endpoint stays open -- expected, not a bug: goals inherently need an
+# owning account.
+# ---------------------------------------------------------------------------
+
+def _validate_goal_metric(metric: str | None):
+    if metric is not None and metric not in METRIC_TABLES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown metric '{metric}'. Valid: {', '.join(sorted(METRIC_TABLES))}",
+        )
+
+
+async def _goal_progress(goal: dict) -> GoalProgress | None:
+    mapping = METRIC_TABLES.get(goal["metric"])
+    if mapping is None:
+        # Only reachable if a row's metric predates a since-removed
+        # METRIC_TABLES entry -- degrade to no progress rather than 500.
+        return None
+    table, column = mapping
+    return await compute_progress(table, column, goal["target_value"], goal["target_date"])
+
+
+async def _goal_out(goal: dict) -> GoalOut:
+    return GoalOut(**goal, progress=await _goal_progress(goal))
+
+
+async def _owned_goal_or_404(request: Request, goal_id: int) -> dict:
+    """404 if the goal doesn't exist, 403 if it exists but belongs to
+    someone else and the caller isn't an admin -- mirrors shared/auth.py's
+    revoke_token ownership check exactly (existence checked, and only then
+    ownership), so a wrong-owner request can never be mistaken for a
+    not-found one."""
+    identity = await require_account_identity(request)
+    goal = await get_goal(goal_id)
+    if goal is None:
+        raise HTTPException(status_code=404, detail="Goal not found")
+    if goal["user_id"] != identity.user_id and identity.role != "admin":
+        raise HTTPException(status_code=403, detail="Not your goal")
+    return goal
+
+
+@app.post("/api/goals", status_code=201)
+async def create_goal_route(data: GoalCreate, request: Request):
+    identity = await require_account_identity(request)
+    _validate_goal_metric(data.metric)
+    goal_id = await create_goal(identity.user_id, data)
+    goal = await get_goal(goal_id)
+    return await _goal_out(goal)
+
+
+@app.get("/api/goals")
+async def list_goals_route(request: Request):
+    identity = await require_account_identity(request)
+    goals = await list_goals(identity.user_id)
+    return [await _goal_out(goal) for goal in goals]
+
+
+@app.get("/api/goals/{goal_id}")
+async def get_goal_route(goal_id: int, request: Request):
+    goal = await _owned_goal_or_404(request, goal_id)
+    return await _goal_out(goal)
+
+
+@app.patch("/api/goals/{goal_id}")
+async def patch_goal_route(goal_id: int, data: GoalUpdate, request: Request):
+    await _owned_goal_or_404(request, goal_id)
+    _validate_goal_metric(data.metric)
+    updated = await update_goal(goal_id, data)
+    return await _goal_out(updated)
+
+
+@app.delete("/api/goals/{goal_id}")
+async def delete_goal_route(goal_id: int, request: Request):
+    await _owned_goal_or_404(request, goal_id)
+    await delete_goal(goal_id)
+    return {"success": True}
