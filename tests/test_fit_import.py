@@ -13,7 +13,10 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from shared.database import get_db
-from tests.fixtures.fit_builder import build_minimal_fit_file
+from tests.fixtures.fit_builder import (
+    build_fit_file_with_non_numeric_calories,
+    build_minimal_fit_file,
+)
 
 
 @pytest.fixture
@@ -185,6 +188,23 @@ async def test_truncated_fit_file_rejected_not_500(client):
     truncated = data[:20]
 
     resp = await client.post("/api/import/activity", files={"file": ("run.fit", truncated)})
+
+    assert resp.status_code == 400
+    assert await activity_count() == 0
+
+
+async def test_malformed_session_field_rejected_not_500(client):
+    """Passes the magic-byte sniff and `fitparse`'s own parse() (structurally
+    valid, correct CRC), but the session message declares `total_calories`
+    with a non-numeric (string) base type. The `int()` conversion in
+    `parse_fit_bytes`'s field-extraction step must be caught and turned into
+    the same 400 as any other malformed upload, not surface as an
+    unhandled 500."""
+    data = build_fit_file_with_non_numeric_calories(
+        start_time=datetime(2026, 8, 20, 7, 30, tzinfo=timezone.utc)
+    )
+
+    resp = await client.post("/api/import/activity", files={"file": ("run.fit", data)})
 
     assert resp.status_code == 400
     assert await activity_count() == 0

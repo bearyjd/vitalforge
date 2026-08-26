@@ -116,3 +116,53 @@ def build_minimal_fit_file(
 
     crc = Crc.calculate(header + records)
     return header + records + struct.pack("<H", crc)
+
+
+_STRING = 0x07
+
+
+def build_fit_file_with_non_numeric_calories(*, start_time: datetime) -> bytes:
+    """Structurally valid FIT file (correct CRC, passes the magic-byte
+    sniff and `fitparse`'s own parse()) whose `session` message declares
+    `total_calories` (field 11) with the `string` base type instead of the
+    real device's `uint16`, carrying the non-numeric value `"bad"`.
+    `fitparse` decodes this without error -- the base type is only ever
+    read off the file's own definition message, not fixed by the FIT spec
+    -- so this exercises `fit_import.parse_fit_bytes`'s session-field
+    extraction step (the `int(fields["total_calories"])` conversion) failing
+    *after* a successful parse, rather than the parse call itself."""
+    fit_ts = _to_fit_timestamp(start_time)
+
+    file_id_def = _definition_message(
+        local_type=0,
+        global_mesg_num=0,
+        fields=[(0, 1, _ENUM), (1, 2, _UINT16), (2, 2, _UINT16), (4, 4, _UINT32)],
+    )
+    file_id_data = _data_message(0, struct.pack("<BHHI", 4, 1, 1, fit_ts))
+
+    session_def = _definition_message(
+        local_type=1,
+        global_mesg_num=18,
+        fields=[
+            (253, 4, _UINT32),  # timestamp
+            (2, 4, _UINT32),  # start_time
+            (5, 1, _ENUM),  # sport
+            (7, 4, _UINT32),  # total_elapsed_time (scale 1000)
+            (9, 4, _UINT32),  # total_distance (scale 100)
+            (11, 4, _STRING),  # total_calories -- non-numeric, malformed
+            (16, 1, _UINT8),  # avg_heart_rate
+            (17, 1, _UINT8),  # max_heart_rate
+            (22, 2, _UINT16),  # total_ascent
+        ],
+    )
+    session_data = _data_message(
+        1,
+        struct.pack("<IIBII", fit_ts, fit_ts, 1, round(1800 * 1000), round(5000 * 100))
+        + b"bad\x00"
+        + struct.pack("<BBH", 140, 175, 50),
+    )
+
+    records = file_id_def + file_id_data + session_def + session_data
+    header = struct.pack("<BBHI4s", 12, 0x10, 2078, len(records), b".FIT")
+    crc = Crc.calculate(header + records)
+    return header + records + struct.pack("<H", crc)
