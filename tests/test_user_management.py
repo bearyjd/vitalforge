@@ -393,6 +393,41 @@ async def test_can_delete_a_non_admin_freely(client):
     assert resp.status_code == 200
 
 
+async def test_deleting_a_user_cascade_deletes_their_goals(client):
+    """Review finding: admin_delete_user removed api_tokens but not goals
+    (added by the goal-tracking feature) inside the same BEGIN IMMEDIATE
+    transaction, leaving orphaned goals rows referencing a dead user_id.
+    """
+    await seed_user("root", role="admin")
+    bob_id = await seed_user("bob", role="user")
+    db = await get_db()
+    try:
+        await db.execute(
+            "INSERT INTO goals (user_id, metric, target_value, target_date, created_at) "
+            "VALUES (?, 'steps', 10000, NULL, ?)",
+            (bob_id, datetime.now(timezone.utc).isoformat()),
+        )
+        await db.commit()
+        goal_count_before = (
+            await (await db.execute("SELECT COUNT(*) FROM goals WHERE user_id = ?", (bob_id,))).fetchone()
+        )[0]
+    finally:
+        await db.close()
+    assert goal_count_before == 1
+
+    resp = await client.delete(f"/auth/admin/users/{bob_id}", cookies=await _cookies_for("root"))
+    assert resp.status_code == 200
+
+    db = await get_db()
+    try:
+        goal_count_after = (
+            await (await db.execute("SELECT COUNT(*) FROM goals WHERE user_id = ?", (bob_id,))).fetchone()
+        )[0]
+    finally:
+        await db.close()
+    assert goal_count_after == 0
+
+
 async def test_delete_nonexistent_user_returns_404(client):
     await seed_user("root", role="admin")
     resp = await client.delete("/auth/admin/users/999999", cookies=await _cookies_for("root"))

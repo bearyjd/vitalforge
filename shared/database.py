@@ -210,6 +210,23 @@ async def init_db():
             )
         """)
 
+        # Per-user goal / target tracking (vitalforge-dashboard/goals.py).
+        # `metric` is validated against METRIC_TABLES.keys() at the API
+        # layer, not with a CHECK constraint here -- a DB-level enum would
+        # be a second place that list can drift out of sync with the one in
+        # vitalforge-dashboard/app.py.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS goals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                metric TEXT NOT NULL,
+                target_value REAL NOT NULL,
+                target_date TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_goals_user_id ON goals(user_id)")
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS training_load (
                 date TEXT PRIMARY KEY,
