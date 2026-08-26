@@ -1,8 +1,11 @@
 # Family / Multi-Person Dashboard — True Multi-Tenancy Design
 
-**Date:** 2026-08-25 (revised 2026-08-25 after adversarial review — see Appendix C)
-**Status:** Design proposal — NOT approved, NOT scheduled. Section (i) lists decisions that
-must be made by a human before implementation planning starts.
+**Date:** 2026-08-25 (revised 2026-08-25 after adversarial review; decisions applied
+2026-08-26 — see Appendix C)
+**Status:** Design proposal — NOT approved, NOT scheduled. The thirteen questions that
+previously blocked implementation planning have all been answered by the deployment's owner;
+section (i) now records those decisions and their rationale. Answering them does not approve
+or schedule the work.
 **Scope:** "Option C" — a real `person_id` dimension on every metric table, enabling
 cross-person queries. Explicitly scoped as a large, multi-week, multi-PR effort.
 
@@ -220,8 +223,9 @@ Additive column on `users` (constant default, metadata-only, safe under the exis
 
 `default_person_id` is which person a user sees when no `person` is specified. Nullable:
 NULL means "resolve to the single person this user can reach, or 400 if ambiguous." It is
-used to build the initial redirect (§f.2) and by the deprecated compatibility aliases (§f.8),
-and **never** as an implicit fallback inside a person-scoped data route.
+used to build the initial redirect (§f.2) and **nowhere else** — never as an implicit fallback
+inside a person-scoped data route. Since §f.8 drops the compatibility-alias layer entirely,
+the redirect is now its only consumer.
 
 ### a.3 Access levels
 
@@ -411,6 +415,12 @@ converge through the existing helper.
 `persons`, `person_grants` (§a.2), `garmin_links` (§d.4), `schema_migrations` (§c.3). All
 plain `CREATE TABLE IF NOT EXISTS` — no rebuild, no risk. Plus the additive
 `api_tokens.person_id` (§f.7), which is a constant-default-free nullable column.
+
+**The schema-version guard (§i Q12, decided: build it in phase 0) adds no table and no
+column.** It reads `schema_migrations`, which already exists for the runner's sake — see the
+guard's definition at the end of §c.3. That is deliberate: a separate `user_version` pragma or
+a `schema_version` row would be a second source of truth that can disagree with the marker
+table, and the marker table is the one the migration itself writes transactionally.
 
 ### b.5 Summary of the rebuild set
 
@@ -633,6 +643,51 @@ Two things reduce the exposure rather than relabel it:
 - **The elapsed-time log above**, which is the only way anyone learns the rebuild is
   approaching the timeout before it crosses it.
 
+**The schema-version guard, in the same module.** §i Q12 is decided — this is built, in
+phase 0, not merely considered. It needs no new storage (§b.4): the set of rows in
+`schema_migrations` *is* the version, and the code already has to know the names it applies.
+
+```python
+# Every marker name this image knows how to apply. These strings MUST match the
+# names passed to run_migration verbatim (§c.4 passes "001-person-id-rebuild") --
+# a typo here makes the guard read this image's own migration as one from the
+# future and boot-loops the container. The snapshot filename in §c.7 is a
+# separate string and is deliberately not derived from this one.
+_KNOWN_MIGRATIONS = ("001-person-id-rebuild",)
+
+
+async def assert_schema_understood() -> None:
+    """Refuse to serve a database that is newer than this image understands.
+
+    Called at the end of init_db(), after run_migration, on its own connection
+    (§c.4 step 5) -- so both services get it without either app.py changing.
+
+    An applied marker whose name is not in _KNOWN_MIGRATIONS means some newer
+    image migrated this file. This image would then read the result WITHOUT
+    erroring and return quietly wrong data (§c.7). Fail the lifespan instead: a
+    documented boot loop beats silently merging several people's metrics into
+    one series.
+
+    A fresh or pre-runner database has zero markers, which is an empty set and
+    therefore passes. The guard only ever fires on names from the future.
+    """
+    db = await get_db()
+    try:
+        rows = await (await db.execute("SELECT name FROM schema_migrations")).fetchall()
+    finally:
+        await db.close()
+    unknown = sorted({r["name"] for r in rows} - set(_KNOWN_MIGRATIONS))
+    if unknown:
+        raise RuntimeError(
+            f"Database has migrations this image does not know: {unknown}. "
+            "Redeploy the newer image, or restore the pre-migration snapshot."
+        )
+```
+
+Its limits are worth stating where the code is, not only in §i: it **cannot** protect the
+001 migration itself, because the image being rolled back to predates the guard. It protects
+every migration after this one, and it costs one table read per boot.
+
 ### c.4 Where the migration fits relative to `init_db()`
 
 The first draft placed `run_migration` as "step 3 inside `init_db()`," which puts a second
@@ -659,6 +714,10 @@ async def init_db():
     #    connection. Nothing from this module holds one across these calls.
     await ensure_pre_migration_snapshot()          # §c.7
     await run_migration("001-person-id-rebuild", _apply_person_id_rebuild)
+
+    # 5. Generic: refuse to serve a DB carrying markers this image does not know
+    #    (§c.3, §i Q12). Own connection, nothing held across it.
+    await assert_schema_understood()
 ```
 
 On a **fresh** DB, step 1 creates the tables already correctly shaped; step 4 observes the
@@ -1002,11 +1061,11 @@ Two design points that stay from the first draft, both still correct:
 Rollback then means: stop both services, replace `fitness.db` with the snapshot (removing WAL
 and SHM sidecars), redeploy the old images.
 
-**2. A schema-version guard for the future.** Store the expected version and have each
-service refuse to serve if the DB is newer than the code understands. Be honest about what
-this buys: **it does not protect this migration**, because the old image predates the
-guard. It protects the *next* one, and it is cheap enough to add now while the surrounding
-code is open.
+**2. A schema-version guard for the future — decided, and built in phase 0** (§i Q12). Each
+service refuses to serve if the DB carries a migration marker the code does not know
+(`assert_schema_understood`, §c.3; no new table or column). Be honest about what this buys:
+**it does not protect this migration**, because the old image predates the guard. It protects
+the *next* one, and it is cheap enough to add now while the surrounding code is open.
 
 **3. Operator procedure.** `docker compose down` before `up`, so no old container is running
 while the new one migrates. This is procedural, not enforced. It must be written into the
@@ -1051,6 +1110,10 @@ The rest:
   counts unchanged).
 - **Fresh DB:** `init_db()` on an empty file → correct shape, marker written, no rebuild work,
   exactly one `persons` row with `is_primary = 1`.
+- **Schema-version guard (§c.3, §i Q12), two cases:** an empty `schema_migrations` and one
+  holding exactly `_KNOWN_MIGRATIONS` both pass; an inserted marker named `"002-from-the-future"`
+  raises. Assert the passing case against a DB that `init_db()` just migrated, which is what
+  catches `_KNOWN_MIGRATIONS` drifting from the name `run_migration` is actually called with.
 - **Interruption:** inject an exception in the middle of `_apply_person_id_rebuild` (e.g. on
   the 6th table) → assert the rebuilt tables' `sqlite_master.sql` is byte-identical to
   pre-migration, assert no marker, assert no `__new` tables survive, **and assert the
@@ -1590,9 +1653,10 @@ other.
 changes. That is real churn, but it is churn in exactly the layer that most needs to become
 person-aware, and it is mechanical.
 
-**Recommendation: F2**, with `default_person_id` used only to build the initial redirect
-(`GET /` → `/p/{slug}/`) and by the time-boxed compatibility aliases in §f.8, never as an
-implicit fallback inside a person-scoped data route.
+**Recommendation: F2** (decided — §i Q7), with `default_person_id` used only to build the
+initial redirect (`GET /` → `/p/{slug}/`), never as an implicit fallback inside a
+person-scoped data route. Because §f.8 drops the alias layer, that rule now has **no
+exception anywhere in this design**.
 
 **URL convention, stated once so the rest of this document is unambiguous:**
 
@@ -1601,7 +1665,7 @@ implicit fallback inside a person-scoped data route.
 | `/p/{slug}/` | The dashboard / weight UI for one person | `require_person("view")` |
 | `/p/{slug}/api/...` | Everything scoped to one person: `metrics/{name}`, `weight`, `weight/recent`, `weight/trend`, `weight/{id}`, `sync`, `sync/status`, `recommendations`, `garmin/link`, `garmin/unlink` | `require_person(level)` — `view` for reads, `manage` for writes and Garmin actions |
 | `/api/persons`, `/api/persons/{id}` | Admin CRUD over the person *collection*, including archived persons and grant management | `_require_admin`, or `own` on that person for grant changes |
-| `/api/metrics/...`, `/api/weight...` | Deprecated compatibility aliases only (§f.8) | `require_person`, after an explicit single-person resolution that 400s when ambiguous |
+| `/api/metrics/...`, `/api/weight...` | **Nothing — unmounted in phase 2, no aliases** (§f.8) | n/a; the router 404s |
 
 Person-scoped routes address the person by **slug** (it is what the browser and the service
 worker cache see). Admin collection routes address it by **id**, because they must be able to
@@ -1770,34 +1834,48 @@ reach the parent's data?" (no). A household with **one shared scale and two peop
 routed automatically by any mechanism this design offers, and that is a genuine product
 limitation, not an oversight: the reading itself carries no identity. The supported answers
 are (a) one linked scale per person, or (b) the person who weighed themself confirms in the
-PWA. **Which of those the deployment expects is §i Q4** — it changes what phase 2 has to
-build.
+PWA. **The deployment has chosen (b)** — one shared scale, human confirmation, no automatic
+guess (§i Q4). That adds nothing to phase 2's list: rule 2 above *is* the confirmation. The
+human picks the person by posting to that person's `/p/{slug}/api/weight` from the PWA, and
+`require_person("manage")` authorizes the choice. No new endpoint, no pending-measurement
+queue, no attribution heuristic.
 
 Because ingest routing depends on it, `api_tokens.person_id` lands in **phase 2** alongside
 the route change, not phase 5.
 
-### f.8 Backward compatibility for existing bearer-token clients
+### f.8 The legacy un-scoped API paths — direct cutover, no alias layer
 
 Phase 2 changes `/api/metrics/{name}` → `/p/{slug}/api/metrics/{name}` and `/api/weight` →
-`/p/{slug}/api/weight`. `bootstrap_migrated_token` (`shared/auth.py:339-386`) exists
-specifically because there are external automation clients holding tokens — phones running
-Tasker/Bascule, which nobody re-flashes on a `docker compose pull`. The first draft said
-phase 1 keeps behavior identical (true) and then said nothing about phase 2 breaking every one
-of those clients.
+`/p/{slug}/api/weight`. **The old paths are unmounted in the same change. There is no
+compatibility alias, no deprecation window, and no alias-removal phase.**
 
-Phase 2 therefore ships **time-boxed compatibility aliases**:
+An earlier revision of this document designed a time-boxed alias layer here, on the inference
+that `bootstrap_migrated_token` (`shared/auth.py:339-386`) exists *because* external automation
+clients hold tokens — phones running Tasker/Bascule, which nobody re-flashes on a
+`docker compose pull`. That code artifact is real and stays; the inference about live traffic
+was wrong. **The deployment's owner confirmed on 2026-08-26 that nothing calls `/api/weight`
+or `/api/metrics/...` today** (§i Q8). Tokens were issued; no client is using those paths. So
+there is no client to preserve, and an alias layer would be a mechanism whose entire
+justification is a population of zero.
 
-- The old un-scoped paths remain mounted and resolve their person as: the token's
-  `person_id` if scoped (§f.7); otherwise the caller's `users.default_person_id`; otherwise,
-  if the caller can reach exactly one person, that person.
-- **If none of those resolves to exactly one person, the alias returns 400** with a message
-  naming the new URL. It must never guess — a guess here writes one person's weight onto
-  another's record, which is precisely §0.2 Correction 1 re-entering through the compatibility
-  door.
-- Every alias hit logs at WARNING with the token label, so an operator can see which clients
-  still need updating.
-- The aliases are an **acknowledged, deliberate exception** to §f.2's "no implicit fallback"
-  rule. They are removed in phase 5, and the README's upgrade section states the window.
+Why that is the better outcome rather than a corner cut:
+
+- **The alias was the design's only exception to §f.2's "no implicit fallback" rule.** It had
+  to resolve a person from the token, then `default_person_id`, then "the caller's only
+  reachable person," and 400 if none of that was unambiguous. Deleting it means every route in
+  this design gets its `person_id` from exactly one place, `Depends(require_person(...))`, with
+  no second path to audit and no ambiguity branch to get wrong. §0.2 Correction 1's failure
+  mode — one person's weight written onto another's record — loses a door it could have come
+  back through.
+- **The failure mode if a forgotten client does exist is loud and harmless.** An un-scoped call
+  hits no route and gets a `404`. It never writes, and it never reads another person's data. A
+  404 on a path nobody calls is the cheapest possible way to be wrong about this.
+- **The fix, should that ever happen, is to point the client at the new URL** — which is what
+  the alias layer's own WARNING log existed to prompt, minus the layer.
+
+This is a decision about *this* deployment's facts, not a general position: if a client is
+ever discovered mid-phase-2, the answer is to reconfigure it, not to reintroduce an alias.
+Nothing in phases 3-5 depends on the legacy paths existing.
 
 ---
 
@@ -1866,8 +1944,10 @@ Deliberate choices:
   anonymous has implicit `own` (§f.3). Correct and requires no special handling.
 - **Non-admin users get nothing.** Any additional accounts created before this migration have
   no grant and see no persons until an admin grants them access. Fail-closed is the right
-  default when the migration cannot know who should see whose health data. This will surprise
-  an operator who had created a second user, so it must be in the release notes (§i Q6).
+  default when the migration cannot know who should see whose health data. **No such account
+  exists in this deployment** (§i Q6), so this cuts nobody off in practice; it remains the rule
+  for any non-admin account created before the upgrade actually runs, and a one-line release
+  note is enough.
 
 ### g.2 Cutover procedure
 
@@ -1975,10 +2055,11 @@ irreversible phase, and it ships with no new features to confound a bisect.
 **Phase 2 — access control and ingest routing.** The `require_person` dependency,
 `/p/{slug}/` routing (§f.2), slug validation and `_RESERVED_SLUGS` (§f.4), person CRUD for
 admins, grant management UI, the `admin_delete_user` cascade fix (§f.5),
-**`api_tokens.person_id` and the ingest resolution order (§f.7)**, and the compatibility
-aliases with their deprecation window (§f.8). Multiple persons can now exist, be viewed, and
-receive ingested measurements — but only one has Garmin data. `api_tokens.person_id` moved
-here from phase 5 because ingest routing depends on it.
+**`api_tokens.person_id` and the ingest resolution order (§f.7)**, and **unmounting the legacy
+un-scoped `/api/weight` and `/api/metrics/...` paths in the same change** (§f.8 — no aliases,
+nothing calls them). Multiple persons can now exist, be viewed, and receive ingested
+measurements — but only one has Garmin data. `api_tokens.person_id` moved here from phase 5
+because ingest routing depends on it.
 
 **Phase 3 — per-person Garmin.** Begins with the garth-token-filename verification task
 (§d.5). Then `garmin_links`, `shared/garmin_registry.py`, per-person token stores with explicit
@@ -1994,9 +2075,14 @@ and lazy auth), 429 backoff written to the `backoff_until` column created in pha
 per-person error isolation, staggered backfill, `SYNC_BACKFILL_DAYS`. Only meaningful once
 phase 3 allows more than one linked person, and best measured against a real second account.
 
-**Phase 5 — cross-person features and alias removal.** The actual payoff: comparison views,
-household aggregates. Plus removing §f.8's compatibility aliases at the end of their window.
-Everything here is additive on a schema that is already correct.
+**Phase 5 — cross-person features.** The actual payoff: comparison views, household
+aggregates. Everything here is additive on a schema that is already correct.
+
+This phase used to also carry "remove the §f.8 compatibility aliases at the end of their
+window." That item is gone with the aliases (§i Q8), but the phase is not: what remains is
+dashboard `templates/`/`static/` work that has nothing to do with phase 4's scheduler, lands
+after it rather than with it, and is the one phase a reviewer can evaluate on whether it is
+*useful* rather than whether it is *safe*. Six phases, not five.
 
 **Do not compress phases 1 and 3.** They fail in unrelated ways (data loss vs. credential
 disclosure), need different reviewers, and combining them means a rollback for either reason
@@ -2004,94 +2090,100 @@ reverts both.
 
 ---
 
-## (i) Open questions requiring a human decision
+## (i) Decisions — the thirteen questions, answered
 
-*This section is written to stand alone — it can be lifted out of the document and answered
-without reading the rest. Each question states the context it needs.*
+*This section is written to stand alone — it can be lifted out of the document and read
+without the rest. Each item states the context it needs.*
 
-Ordered by how much downstream design each one blocks.
+**All thirteen were answered by the deployment's owner on 2026-08-26. Nothing here is open.**
+Twelve confirm what the document already recommended; **Q8 changed the design** and is
+propagated through §a.2, §f.2, §f.8, §(h) and Appendix B.
 
-1. **Is a short maintenance-window cutover acceptable?**
-   The recommended plan stops both containers, runs a one-shot schema migration on the shared
-   SQLite file, and starts them again — total downtime on the order of a container restart.
-   The alternative (expand/contract across three releases, standard zero-downtime playbook)
-   triples the release count, keeps the codebase half-migrated for weeks, and still has to do
-   the risky step at the end. If any zero-downtime requirement exists that this document is
-   unaware of, the whole migration section and the phasing change substantially.
-   *Assumed answer: yes, acceptable — a personal household app.*
+The `Q<n>` labels are kept exactly as they were, because a dozen cross-references elsewhere in
+this document address them by number. Ordering still reflects how much downstream design each
+one blocked.
 
-2. **Garmin credentials: per-person token stores, or encrypted passwords at rest?**
-   The recommendation is **token stores** — one garth token directory per linked person, with
-   the password accepted once over HTTPS during linking and never written anywhere. No new
-   dependency, no new *kind* of secret (a token store already exists on this volume today).
-   The cost: when a token store expires or is invalidated (the person changes their Garmin
-   password, or Garmin forces a logout), that person's sync fails until an operator manually
-   re-links, and re-linking needs a password nobody stored.
-   The alternative stores an encrypted password in SQLite keyed from a new env var, which
-   re-authenticates unattended forever but introduces the first reversible secret this repo
-   has ever held, adds `cryptography` to both services, and puts the key in the same `.env` as
-   everything else (so it is not a real second factor against host compromise).
-   **If unattended operation across token expiry is a hard requirement, this flips.** Decide
-   before the Garmin phase is planned, not during it.
+1. **Is a short maintenance-window cutover acceptable? — YES.**
+   The plan stops both containers, runs a one-shot schema migration on the shared SQLite file,
+   and starts them again: total downtime on the order of a container restart. This is a
+   personal household app; nobody is paged by a 20-second gap. The alternative
+   (expand/contract across three releases, the standard zero-downtime playbook) triples the
+   release count, keeps the codebase half-migrated for weeks, and still has to do the risky
+   step at the end. §c and §g.2 stand as written, and no zero-downtime requirement exists.
 
-3. **How many people, realistically?**
-   Two things hinge on this. At 2–4 people, syncing one person per scheduler tick gives each
-   person a refresh every `SYNC_INTERVAL_HOURS × N` (default: every 8 h at N=4), which is fine
-   for daily health aggregates, and the one-shot migration is trivially fast. At 10+,
-   per-person intervals get long enough to want per-person schedules, and the migration's
-   duration wants measuring against the 30 s lock timeout before the upgrade.
+2. **Garmin credentials: per-person token stores, not encrypted passwords at rest.**
+   One garth token directory per linked person; the password is accepted once over HTTPS
+   during linking and never written anywhere. No new dependency, and no new *kind* of secret —
+   a token store already lives on this volume today. The accepted cost is explicit: when a
+   token store expires or is invalidated (the person changes their Garmin password, or Garmin
+   forces a logout), that person's sync fails until someone manually re-links, and re-linking
+   needs a password nobody stored. Unattended operation across token expiry is **not** a
+   requirement here, which is the condition that would have flipped this.
+   The rejected alternative — an encrypted password in SQLite keyed from a new env var — would
+   introduce the first reversible secret this repo has ever held, add `cryptography` to both
+   services, and put the key in the same `.env` as everything else, so it is not a real second
+   factor against host compromise anyway. §d is built as designed.
 
-4. **How does a scale reading get attributed to a person?**
-   This is the driving use case — a parent managing a child who has no login — and it is a
-   product question, not a schema one. The design supports two answers:
-   **(a) one linked scale/bridge per person**, each configured with its own API token that is
-   scoped to exactly one person (a token scoped to the child cannot write the parent's data,
-   even though it authenticates as the parent); or
-   **(b) a shared scale**, where the measurement carries no identity and a human must confirm
-   whose it is in the PWA before it is attributed.
-   There is deliberately no automatic guess for the shared-scale case — guessing is exactly
-   how one family member's body-composition ends up pushed to another's Garmin account.
-   **Which of these the household expects changes what the access-control phase has to build.**
-   Answer before that phase is planned.
+3. **How many people, realistically? — 4.**
+   Not a range: four. Both things that hinge on it resolve comfortably. Round-robin (§e.2, E2)
+   gives each person a refresh every `SYNC_INTERVAL_HOURS × N` = 2 h × 4 = **every 8 hours**,
+   which is fine for metrics that are daily aggregates, and remains tunable by lowering
+   `SYNC_INTERVAL_HOURS`. The one-shot migration over four people's data is trivially fast and
+   nowhere near the 30 s lock timeout (§c.3).
+   *If this ever grows past ~10 people*, two things want revisiting — per-person schedules
+   instead of one round-robin cursor, and measuring the migration's duration against that
+   timeout before upgrading. Neither is designed for now, and neither should be.
 
-5. **What is the primary person called?**
-   All existing health data is assigned to one person during the migration. That person's name
-   defaults to the first admin account's username (slugified for use in URLs), overridable by
-   setting `VITALFORGE_PRIMARY_PERSON` in `.env`. It is read **once**, during a migration that
-   runs **once**, so it must be set *before* the upgrade. Getting it wrong is recoverable (the
-   display name and the slug can both be renamed afterwards) but confusing, and the old slug
-   is not redirected.
+4. **How does a scale reading get attributed to a person? — Option (b): shared scale, manual
+   confirmation in the PWA, no auto-guessing.**
+   The household has one shared scale. The measurement carries no identity, so a human names
+   the subject: the PWA posts to that person's `/p/{slug}/api/weight`, and
+   `require_person("manage")` authorizes the choice (§f.7). There is deliberately **no
+   automatic guess** — guessing by weight proximity is exactly how one family member's
+   body-composition ends up pushed to another's Garmin account (§0.2 Correction 1).
+   Option (a), one token-scoped bridge per person, remains supported by the same resolution
+   order for anyone who later adds a dedicated scale; it simply is not this deployment's setup.
+   **This adds nothing to phase 2** — the person-scoped route is the confirmation mechanism.
 
-6. **Do pre-existing non-admin users get any access?**
-   The migration grants access **only to the first admin**. Any other account that exists
-   today gets nothing and sees no data until an admin explicitly grants it — fail-closed,
-   because the migration cannot know who should see whose health data.
-   **If a second account already exists (e.g. a spouse who currently sees the dashboard), this
-   migration silently takes that access away until an admin restores it.** Confirm whether
-   such an account exists so it can go in the release notes, or so the migration can be
-   adjusted.
+5. **What is the primary person called? — the default: the first admin's username, slugified.**
+   Overridable by setting `VITALFORGE_PRIMARY_PERSON` in `.env`. No custom name is being
+   chosen up front.
+   **The operational rule survives unchanged: it is read once, during a migration that runs
+   once, so it must be set *before* the upgrade** (§g.2 step 4). Getting it wrong is
+   recoverable — display name and slug can both be renamed afterwards — but the old slug is
+   not redirected.
 
-7. **Person selection in URLs: path-based (`/p/{slug}/api/...`) or query-parameter
-   (`?person=...`)?**
-   Path-based is recommended: it gives the PWA service worker a real cache boundary (one
-   person's cached responses can never be served to another) and it has no "forgot the
-   parameter, silently got the default" failure. The cost is churn in both services'
-   templates, static JS, and service-worker cached-URL lists — mechanical, but real.
-   Confirm that churn is acceptable before the access-control phase.
+6. **Do pre-existing non-admin accounts get access? — NO, and it affects nobody.**
+   The migration grants access only to the first admin; fail-closed, because it cannot know
+   who should see whose health data. The stated risk was that a second existing account
+   (a spouse already seeing the dashboard) would silently lose access. **Confirmed: no second
+   account exists in this deployment**, so the fail-closed default cuts no one off and there is
+   no access to restore. It stays the rule for any non-admin account created before the upgrade
+   actually runs, and a one-line release note covers it (§g.1).
 
-8. **How long do old API URLs keep working?**
-   Existing automation clients (phones running Tasker/Bascule with API tokens) call
-   `/api/weight` and `/api/metrics/...` today. Those paths change. The plan keeps the old
-   paths working as aliases that resolve to the caller's single reachable person — and return
-   a `400` naming the new URL whenever that is ambiguous, rather than guessing — with every
-   alias hit logged so an operator can see which clients still need updating. The aliases are
-   removed in the final phase.
-   **Decide the window** (a release count, or a date). Nobody re-flashes a phone on a
-   `docker compose pull`, so "one release" is probably too short.
+7. **Person selection in URLs: path-based (`/p/{slug}/api/...`). — Confirmed.**
+   As recommended in §f.2: it gives the PWA service worker a real cache boundary (one person's
+   cached responses can never be served to another) and has no "forgot the parameter, silently
+   got the default" failure mode. The churn in both services' templates, static JS, and
+   service-worker cached-URL lists is accepted — it is mechanical, and it lands in exactly the
+   layer that has to become person-aware regardless.
 
-9. **Should `weight_log.person_id` eventually become `NOT NULL`?**
-   Recommendation: **no, and probably not ever.** Two reasons, both of which correct claims an
-   earlier draft of this document got wrong:
+8. **How long do old API URLs keep working? — They don't. Direct cutover, no aliases.**
+   **This is the one answer that changed the design.** The alias layer was designed against an
+   inference — `bootstrap_migrated_token` exists, therefore automation clients are calling the
+   un-scoped paths. Confirmed with the owner: **nothing calls `/api/weight` or
+   `/api/metrics/...` today.** Tokens were issued; no client uses those routes.
+   So phase 2 unmounts them in the same change that mounts `/p/{slug}/api/...`. No aliases, no
+   deprecation window, no alias-removal work in phase 5, and no window to decide the length of.
+   Two things get *better*, not merely cheaper: §f.2's "no implicit fallback" rule now has no
+   exception anywhere in the design, and `Depends(require_person(...))` becomes the sole
+   supplier of `person_id` with no second resolution path to audit. If a forgotten client ever
+   does surface, it gets a loud `404` — it cannot read or write the wrong person's data — and
+   the fix is to point it at the new URL, not to build the layer back. Full reasoning: §f.8.
+
+9. **Should `weight_log.person_id` eventually become `NOT NULL`? — No, and probably not ever.**
+   Confirmed as recommended. Two reasons, both of which correct claims an earlier draft of this
+   document got wrong:
    - *It is not blocked by mechanics.* Adding `person_id INTEGER NOT NULL DEFAULT 0` is a
      fast, metadata-only change in SQLite (the repo already does exactly this for
      `users.session_version`). The objection is **semantic**: person 0 does not exist, so a
@@ -2108,35 +2200,43 @@ Ordered by how much downstream design each one blocks.
      person's row. Any future proposal to do this must state how `sqlite_sequence` is
      preserved.
 
-10. **What happens to a person's data when their Garmin link is removed?**
-    Recommendation: **keep the data, delete the credential.** Unlinking removes the link row
-    and deletes that person's stored Garmin tokens from disk (a link the UI says is gone must
-    not leave a live credential behind), but the historical metrics stay. Archiving a person
-    also unlinks first, for the same reason.
-    Confirm this, because the opposite expectation ("unlink means forget me") is a reasonable
-    reading and the difference is destructive and irreversible.
+10. **What happens to a person's data when their Garmin link is removed? — Keep the data,
+    delete the credential.** Confirmed as recommended. Unlinking removes the link row and
+    deletes that person's stored Garmin tokens from disk — a link the UI says is gone must not
+    leave a live credential behind (threat T9) — but the historical metrics stay. Archiving a
+    person unlinks first, for the same reason.
+    The opposite reading ("unlink means forget me") was the reason to ask: it is a reasonable
+    expectation and the difference is destructive and irreversible. Unlink is not a delete;
+    deleting a person's history stays a separate, explicit action.
 
-11. **Confirm the recommendations cache is fixed in the schema phase, not deferred.**
+11. **Is the recommendations cache fixed in the schema phase, not deferred? — YES, phase 1.**
     `recommendations.py` holds a single-slot module-level cache keyed on a hash of the metric
     data. With several people it does not leak one person's recommendations to another (the
     hash is derived from that person's own data, so a mismatch is a cache miss, and the only
     collision — two people with no data at all — produces identical output anyway). What it
     does do is thrash: person A's read evicts person B's, every time. The fix is one line —
-    key the cache by person — and the file is already being edited in the schema phase.
-    This is flagged only because an earlier draft deferred it to the final phase while listing
-    the same file in the first, which is a contradiction someone would otherwise resolve
-    mid-implementation. *Assumed answer: fix it in phase 1.*
+    key the cache by person — and the file is already being edited in phase 1.
+    This was flagged only because an earlier draft deferred it to the final phase while listing
+    the same file in the first, which is a contradiction someone would otherwise have resolved
+    mid-implementation. It is resolved here: phase 1, in the same change.
 
-12. **Is a schema-version guard worth adding now?**
-    A stored "expected schema version" that makes each service refuse to serve if the database
-    is newer than the code understands. It **cannot** protect this migration — the old image
-    predates the guard, and the specific danger here is that an old image reads the new schema
-    *successfully* and silently merges several people's data into one chart. It protects the
-    *next* non-additive migration. Cheap while the surrounding code is open; pure cost if this
-    turns out to be the last non-additive migration ever.
+12. **Is a schema-version guard worth adding now? — YES. It is being built, in phase 0.**
+    This is a firm decision, not a "cheap enough to consider": `assert_schema_understood`
+    (§c.3) is a phase-0 deliverable alongside the runner, and each service refuses to serve a
+    database carrying a migration marker its code does not know.
+    It needs **no new table and no new column** — `schema_migrations` already exists for the
+    runner, and the set of applied marker names *is* the version (§b.4). A fresh or pre-runner
+    database has zero markers, which passes; the guard only ever fires on a name from the
+    future.
+    Its limit is unchanged and still worth stating: it **cannot** protect the 001 migration,
+    because the image being rolled back to predates the guard — and that is precisely the
+    danger §c.7 describes, an old image reading the new schema *successfully* and silently
+    merging several people's data into one chart. The pre-migration snapshot is what covers
+    that one. The guard covers every non-additive migration after it, for the cost of one table
+    read per boot.
 
-13. **Confirm the accepted operational states.** Three outcomes are deliberate rather than
-    oversights, and each will look like a bug the first time it is hit:
+13. **Are the three deliberate edge states accepted? — YES, all three.** They are deliberate
+    rather than oversights, and each will look like a bug the first time it is hit:
     - A person can end up with **zero** grants (delete the last user who had one, or revoke
       your own last `own` grant). Admins bypass grants, so it is always recoverable.
     - If `VITALFORGE_PASS` is never set, the `users` table stays empty and the app runs in
@@ -2207,12 +2307,12 @@ the `CLAUDE.md` convention updates) with no phase that performs them.
 
 | Phase | Files |
 |---|---|
-| 0 | `shared/migrations.py` (new), `shared/database.py` (`get_db` busy_timeout, `_add_columns` pre-check, comment amendment per Appendix A), `tests/test_migrations.py` (new), **`docs/prp/00-design.md`** (correct `:1596-1598`'s defaulted-column claim) |
+| 0 | `shared/migrations.py` (new — runner **and** the `assert_schema_understood` guard, §i Q12), `shared/database.py` (`init_db` calls the guard as step 5, `get_db` busy_timeout, `_add_columns` pre-check, comment amendment per Appendix A), `tests/test_migrations.py` (new), **`docs/prp/00-design.md`** (correct `:1596-1598`'s defaulted-column claim) |
 | 1 | `shared/database.py`, `shared/migrations.py`, `vitalforge-dashboard/sync.py`, `vitalforge-dashboard/app.py`, `vitalforge-dashboard/recommendations.py`, `vitalforge-weight/app.py`, tests, **`CLAUDE.md`**, **`README.md`** |
 | 2 | `shared/auth.py`, `shared/database.py` (`api_tokens.person_id`), both `app.py`, both `templates/`, both `static/` (incl. service workers), `tests/test_smoke_ui.py` + `tests/live_server.py`, other tests, **`README.md`** |
 | 3 | `shared/garmin_client.py`, `shared/garmin_registry.py` (new), `shared/database.py`, `vitalforge-dashboard/app.py`, `vitalforge-weight/app.py`, `tests/conftest.py`, tests, **`.env.example`**, **`README.md`**, **`CLAUDE.md`** |
 | 4 | `vitalforge-dashboard/sync.py`, `vitalforge-dashboard/app.py`, tests, **`.env.example`** (`SYNC_BACKFILL_DAYS`) |
-| 5 | dashboard `templates/`/`static/` (comparison + household views), both `app.py` (alias removal), tests, **`README.md`** (drop the deprecation notice) |
+| 5 | dashboard `templates/`/`static/` (comparison + household views), `vitalforge-dashboard/app.py`, tests |
 
 **`CLAUDE.md` edits, specifically** — it currently states things this work falsifies:
 
@@ -2270,7 +2370,7 @@ dismissed without a reason grounded in the code.
 | 3.3 | HIGH | Fixed. Identity and grant resolved in one query, so the docstring's claim is now true | §f.1 |
 | 3.4 | HIGH | Fixed. `_SLUG_RE` + `_RESERVED_SLUGS` mirroring `_RESERVED_USERNAMES`; `_ensure_primary_person` slugifies rather than copies | §f.4, §g.1 |
 | 3.5 | MEDIUM | Fixed. Orphaned-person state stated as deliberate and why; `granted_by` added to the cascade as a NULL-out | §f.5, §f.6, §i Q13 |
-| 3.6 | HIGH | Fixed. New §f.8: time-boxed compatibility aliases that 400 rather than guess, with logging and a stated removal phase | §f.8, §(h), §i Q8 |
+| 3.6 | HIGH | Fixed at the time by a new §f.8 (time-boxed compatibility aliases that 400 rather than guess). **Superseded on 2026-08-26** — the finding assumed live legacy clients; there are none, so §f.8 is now a direct cutover with no alias layer. See the decisions entry below | §f.8, §(h), §i Q8 |
 | 3.7 | LOW | Fixed by deciding. Global slug uniqueness including archived persons, plus a rename path; reasoning stated | §f.4, §i Q13 |
 | 3.8 | (restatement) | Adopted. Open-access blast radius stated explicitly and routed to the README | §f.3 |
 | 4.1 | HIGH | Fixed. The false mechanical reason deleted and replaced with the real semantic/auditability one; the upstream `00-design.md:1596-1598` error made a phase-0 deliverable; §i Q9 re-argued | §b.3, §i Q9, Appendix A, Appendix B |
@@ -2283,3 +2383,27 @@ dismissed without a reason grounded in the code.
 | 5.2 | CRITICAL | Fixed. Inventory rebuilt as 13 statements in four groups (reads / writes / safe-by-dependency / signature chain), "complete list" claim removed, `weight_log` INSERT and both `UPDATE`s added, "no default `person_id`" made a rule | §0.2 |
 | 5.3 | HIGH | Fixed. `recommendations.py` cache keyed by person **in phase 1**, matching its Appendix B placement; §i Q11 rewritten to say the defect was the phasing contradiction, not a leak | §(h), §i Q11 |
 | 5.4 | (placeholders) | All resolved: `_rebuild_sync_status` defined; `backoff_until` decided (created in 001, first written in phase 4); round-robin cursor derived from `MIN(last_sync_time)` with no new state; `_REBUILD_TABLES` and `authenticate()` written out in full; the snapshot's placement fixed in `init_db` after the connection closes | §c.5, §b.2, §e.3, §c.4 |
+
+### 2026-08-26 — the thirteen open questions, closed
+
+The deployment's owner answered every question in §(i). That section is no longer a list of
+open questions; it is the decision record, with the `Q<n>` labels preserved so existing
+cross-references still resolve. Eleven answers confirmed the document's own recommendations
+and changed no design text. Two did more:
+
+| Q | Decision | What changed in the document |
+|---|---|---|
+| Q8 | **No compatibility aliases.** Confirmed that nothing calls `/api/weight` or `/api/metrics/...` today, so phase 2 unmounts the legacy paths in the same change that mounts `/p/{slug}/api/...` — no alias layer, no deprecation window, no alias-removal work | §f.8 rewritten as a direct cutover and the reasoning for why it is *safer*, not merely cheaper; §a.2 and §f.2 lose the alias as a consumer of `default_person_id`, so "no implicit fallback" now has zero exceptions; §f.2's URL table row becomes "unmounted, router 404s"; §(h) phase 2 gains the unmount, phase 5 loses the removal (and **stays a phase** — its remaining scope is dashboard comparison/household views, unrelated to phase 4's scheduler); Appendix B phase 5 row drops the alias removal and the README deprecation notice; finding 3.6 above marked superseded |
+| Q12 | **Build the schema-version guard**, in phase 0 — a firm yes, not the earlier "cheap now / pure cost if not needed" framing | `assert_schema_understood` specified at the end of §c.3 and called as `init_db()` step 5 in §c.4; §b.4 states it needs no new table or column (the `schema_migrations` marker set *is* the version); §c.7 mitigation 2 restated as decided; Appendix B phase 0 row names it. §(h) phase 0 already listed it, so this removes a latent contradiction rather than adding scope |
+
+The other eleven, for the record: **Q1** maintenance-window cutover accepted; **Q2** per-person
+garth token stores, no encrypted passwords; **Q3** N = 4 exactly (so round-robin gives each
+person an 8 h refresh at the default `SYNC_INTERVAL_HOURS`, and the >10-person branch becomes
+an if-it-ever-changes note); **Q4** shared scale with manual PWA confirmation, no auto-guessing
+— which adds nothing to phase 2, since the person-scoped route *is* the confirmation; **Q5**
+primary person named from the first admin's username, `VITALFORGE_PRIMARY_PERSON` still must be
+set before the upgrade if that is wrong; **Q6** no access for pre-existing non-admin accounts,
+and no such account exists, so nothing is cut off; **Q7** path-based URLs; **Q9**
+`weight_log.person_id` stays nullable; **Q10** unlink keeps history and deletes the credential;
+**Q11** recommendations cache keyed by person in phase 1; **Q13** all three edge states
+accepted.
