@@ -377,6 +377,7 @@ the same weigh-in rather than a new one:
 | `GET` | `/api/recommendations` | AI-powered health recommendations |
 | `GET` | `/api/recommendations/rules-only` | Rules engine output without LLM |
 | `GET` | `/api/correlations?metrics=a,b,c&days=30&lag=0&min_pairs=5` | Ad-hoc cross-metric correlation matrix |
+| `GET` | `/api/export?metric=all\|{name}&days=30&format=csv\|json` | Download metric data as a CSV or JSON file |
 
 Available metrics: `sleep_duration`, `sleep_score`, `resting_hr`, `hrv`, `body_battery`, `body_battery_low`, `stress`, `vo2max`, `weight`, `body_fat`, `body_water`, `bone_mass`, `muscle_mass`, `training_load`, `steps`, `active_calories`
 

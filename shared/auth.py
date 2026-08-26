@@ -235,11 +235,31 @@ async def _require_admin(request: Request) -> str:
     return identity.username
 
 
-async def _require_account_identity(request: Request) -> _Identity:
+# Public alias for callers outside this module (e.g. dashboard goal
+# ownership checks) that need the full account-bound identity, including
+# live role, without reaching into this module's private names.
+Identity = _Identity
+
+
+async def require_account_identity(request: Request) -> Identity:
+    """Resolve the caller to a full account-bound identity (401 if there
+    isn't one), including live role for authorization decisions that need
+    it (e.g. "owner or admin can act on this resource").
+    get_current_user_role() is explicitly documented as unsafe for that -- a
+    username-reuse race can lend a new account's role to an old account's
+    cookie -- so this reuses _get_current_identity's single cookie/token-bound
+    query instead, the same safe path every other identity-requiring route in
+    this module uses. Also the implementation behind the private
+    `_require_account_identity` name below, kept as an alias for existing
+    internal call sites (one implementation, not two copies of the same
+    four lines -- see _require_admin's docstring for why that matters here)."""
     identity = await _get_current_identity(request)
     if identity is None or identity.user_id is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return identity
+
+
+_require_account_identity = require_account_identity
 
 
 async def _require_step_up(identity: _Identity, current_password: str):
@@ -1236,9 +1256,10 @@ def add_auth_routes(app):
                     await db.rollback()
                     raise HTTPException(status_code=409, detail="Cannot delete the last remaining admin")
             # SQLite foreign keys are not enabled in this project, so the
-            # REFERENCES declaration cannot cascade. Remove credentials in
-            # the same transaction before deleting their owner.
+            # REFERENCES declaration cannot cascade. Remove credentials and
+            # goals in the same transaction before deleting their owner.
             await db.execute("DELETE FROM api_tokens WHERE user_id = ?", (user_id,))
+            await db.execute("DELETE FROM goals WHERE user_id = ?", (user_id,))
             await db.execute("DELETE FROM users WHERE id = ?", (user_id,))
             await db.commit()
         finally:
