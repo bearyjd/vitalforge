@@ -96,8 +96,12 @@
     }
 
     // ── Date-shift alignment (mirrors correlations.py's align_series) ─────
+    // Returns null on a malformed date string instead of throwing, so a bad
+    // row is excluded from alignment rather than crashing the drill-down
+    // (mirrors align_series's ValueError handling on the server).
     function shiftDate(dateStr, days) {
         const d = new Date(`${dateStr}T00:00:00Z`);
+        if (Number.isNaN(d.getTime())) return null;
         d.setUTCDate(d.getUTCDate() + days);
         return d.toISOString().slice(0, 10);
     }
@@ -107,6 +111,7 @@
         const rowMap = new Map();
         for (const d of rowData) {
             const key = lagDays ? shiftDate(d.date, lagDays) : d.date;
+            if (key === null) continue;
             rowMap.set(key, d.value);
         }
         const commonDates = [...rowMap.keys()].filter((d) => colMap.has(d)).sort();
