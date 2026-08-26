@@ -15,10 +15,22 @@ from fastapi.templating import Jinja2Templates
 # `recommendations.py` live next to this file and are imported by bare name.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from goals import (
+    GoalCreate,
+    GoalOut,
+    GoalProgress,
+    GoalUpdate,
+    compute_progress,
+    create_goal,
+    delete_goal,
+    get_goal,
+    list_goals,
+    update_goal,
+)
 from recommendations import get_recommendations, get_rules_only
 from sync import run_sync, scheduled_sync
 
-from shared.auth import add_auth_routes, bootstrap_first_admin, bootstrap_migrated_token
+from shared.auth import add_auth_routes, bootstrap_first_admin, bootstrap_migrated_token, require_account_identity
 from shared.database import get_db, init_db
 from shared.garmin_client import authenticate
 
@@ -184,3 +196,88 @@ async def api_recommendations(refresh: bool = Query(default=False)):
 async def api_rules_only():
     """Get rules engine output without LLM."""
     return await get_rules_only()
+
+
+# ---------------------------------------------------------------------------
+# Goal / target tracking
+#
+# Every route below requires an account-bound identity (require_account_identity
+# 401s for both "no session" and the auth-not-configured anonymous identity,
+# since a goal always belongs to a real user_id). In dev mode with an empty
+# users table, this means goal endpoints 401 while every other dashboard
+# endpoint stays open -- expected, not a bug: goals inherently need an
+# owning account.
+# ---------------------------------------------------------------------------
+
+def _validate_goal_metric(metric: str | None):
+    if metric is not None and metric not in METRIC_TABLES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown metric '{metric}'. Valid: {', '.join(sorted(METRIC_TABLES))}",
+        )
+
+
+async def _goal_progress(goal: dict) -> GoalProgress | None:
+    mapping = METRIC_TABLES.get(goal["metric"])
+    if mapping is None:
+        # Only reachable if a row's metric predates a since-removed
+        # METRIC_TABLES entry -- degrade to no progress rather than 500.
+        return None
+    table, column = mapping
+    return await compute_progress(table, column, goal["target_value"], goal["target_date"])
+
+
+async def _goal_out(goal: dict) -> GoalOut:
+    return GoalOut(**goal, progress=await _goal_progress(goal))
+
+
+async def _owned_goal_or_404(request: Request, goal_id: int) -> dict:
+    """404 if the goal doesn't exist, 403 if it exists but belongs to
+    someone else and the caller isn't an admin -- mirrors shared/auth.py's
+    revoke_token ownership check exactly (existence checked, and only then
+    ownership), so a wrong-owner request can never be mistaken for a
+    not-found one."""
+    identity = await require_account_identity(request)
+    goal = await get_goal(goal_id)
+    if goal is None:
+        raise HTTPException(status_code=404, detail="Goal not found")
+    if goal["user_id"] != identity.user_id and identity.role != "admin":
+        raise HTTPException(status_code=403, detail="Not your goal")
+    return goal
+
+
+@app.post("/api/goals", status_code=201)
+async def create_goal_route(data: GoalCreate, request: Request):
+    identity = await require_account_identity(request)
+    _validate_goal_metric(data.metric)
+    goal_id = await create_goal(identity.user_id, data)
+    goal = await get_goal(goal_id)
+    return await _goal_out(goal)
+
+
+@app.get("/api/goals")
+async def list_goals_route(request: Request):
+    identity = await require_account_identity(request)
+    goals = await list_goals(identity.user_id)
+    return [await _goal_out(goal) for goal in goals]
+
+
+@app.get("/api/goals/{goal_id}")
+async def get_goal_route(goal_id: int, request: Request):
+    goal = await _owned_goal_or_404(request, goal_id)
+    return await _goal_out(goal)
+
+
+@app.patch("/api/goals/{goal_id}")
+async def patch_goal_route(goal_id: int, data: GoalUpdate, request: Request):
+    await _owned_goal_or_404(request, goal_id)
+    _validate_goal_metric(data.metric)
+    updated = await update_goal(goal_id, data)
+    return await _goal_out(updated)
+
+
+@app.delete("/api/goals/{goal_id}")
+async def delete_goal_route(goal_id: int, request: Request):
+    await _owned_goal_or_404(request, goal_id)
+    await delete_goal(goal_id)
+    return {"success": True}

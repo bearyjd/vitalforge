@@ -19,7 +19,7 @@ CACHE_TTL = 6 * 3600  # 6 hours
 # Data fetching helpers
 # ---------------------------------------------------------------------------
 
-async def _get_metric(table: str, column: str, days: int = 30) -> list[dict]:
+async def get_metric(table: str, column: str, days: int = 30) -> list[dict]:
     db = await get_db()
     try:
         cursor = await db.execute(
@@ -47,7 +47,7 @@ async def get_all_metrics(days: int = 30) -> dict:
     }
     result = {}
     for name, (table, col) in metrics.items():
-        result[name] = await _get_metric(table, col, days)
+        result[name] = await get_metric(table, col, days)
     return result
 
 
