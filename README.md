@@ -376,6 +376,7 @@ the same weigh-in rather than a new one:
 | `GET` | `/api/metrics/{name}?days=30` | Time series data with 7-day moving average |
 | `GET` | `/api/recommendations` | AI-powered health recommendations |
 | `GET` | `/api/recommendations/rules-only` | Rules engine output without LLM |
+| `GET` | `/api/correlations?metrics=a,b,c&days=30&lag=0&min_pairs=5` | Ad-hoc cross-metric correlation matrix |
 
 Available metrics: `sleep_duration`, `sleep_score`, `resting_hr`, `hrv`, `body_battery`, `body_battery_low`, `stress`, `vo2max`, `weight`, `body_fat`, `body_water`, `bone_mass`, `muscle_mass`, `training_load`, `steps`, `active_calories`
 
@@ -383,6 +384,17 @@ Available metrics: `sleep_duration`, `sleep_score`, `resting_hr`, `hrv`, `body_b
 request fields' storage convention, confirmed against a real Garmin read-back — see
 `docs/prp/00-design.md` §3.5/§4.3 and `docs/prp/03-live-validation.md`); `body_fat` and
 `body_water` are plain percentages, same as the request fields they come from.
+
+**Correlations.** `/api/correlations` returns a row-major NxN Pearson correlation matrix
+(`cells[i][j] = {"r": float|null, "n": int}`) across any subset of the metrics above —
+`weight_log` (the raw, timestamp-keyed weigh-in log) is deliberately not queryable here since
+every other metric is date-keyed and the alignment is a plain date inner-join. `lag` shifts
+each row metric forward `lag` calendar days before joining against each column metric, so a
+positive lag tests whether a change in the row metric predicts the column metric `lag` days
+later — this makes the matrix asymmetric by design when `lag != 0`. `r` is `null` (never
+`NaN`) whenever fewer than `min_pairs` aligned points exist or either series has zero
+variance; `n` always reports the actual aligned pair count regardless. The dashboard UI's
+Correlations section renders this as a heatmap with a click-to-drill-down scatter plot.
 
 ## License
 
