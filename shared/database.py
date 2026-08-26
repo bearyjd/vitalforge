@@ -249,6 +249,37 @@ async def init_db():
         # the column in julianday() directly is not index-friendly.
         await db.execute("CREATE INDEX IF NOT EXISTS idx_weight_log_timestamp ON weight_log(timestamp)")
 
+        # FIT-file activity import (dashboard-only, first slice: FIT only --
+        # TCX/GPX deferred). Deliberately its own table rather than reusing
+        # any METRIC_TABLES table: sync.py's upsert() does
+        # `INSERT OR REPLACE ... WHERE date = ?` and scheduled_sync() re-pulls
+        # a 90-day Garmin backfill on every boot plus every
+        # SYNC_INTERVAL_HOURS, so anything written into an existing metric
+        # table would be silently overwritten within hours. `file_sha256` is
+        # UNIQUE so the exact-duplicate check in the import route is
+        # enforced by the schema itself, not just application logic.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS activities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                start_time_utc TEXT NOT NULL,
+                sport TEXT,
+                duration_seconds INTEGER,
+                distance_m REAL,
+                calories INTEGER,
+                avg_hr INTEGER,
+                max_hr INTEGER,
+                elevation_gain_m REAL,
+                source_format TEXT NOT NULL CHECK (source_format IN ('fit')),
+                file_sha256 TEXT NOT NULL UNIQUE,
+                imported_at TEXT NOT NULL,
+                raw_summary_json TEXT
+            )
+        """)
+
+        # Supports the near-duplicate (start_time_utc, sport) lookup the
+        # import route runs on every upload after the exact file-hash check.
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_activities_start_time ON activities(start_time_utc)")
+
         await db.commit()
     finally:
         await db.close()
