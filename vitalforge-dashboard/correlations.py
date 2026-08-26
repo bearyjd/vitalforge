@@ -71,9 +71,21 @@ def align_series(
 
     Dates are joined and returned in sorted order for determinism, though
     `pearson_r` itself is order-independent.
+
+    `row_series` keys are not guaranteed to be well-formed `YYYY-MM-DD`
+    strings -- `weight_history` (unlike the Garmin sync tables) isn't as
+    tightly controlled, so a malformed date can reach here. A row whose
+    date can't be shifted is simply excluded from the join rather than
+    raising, degrading the correlation for that row instead of failing
+    the whole request.
     """
     if lag_days:
-        shifted = {_shift_date(d, lag_days): v for d, v in row_series.items()}
+        shifted = {}
+        for d, v in row_series.items():
+            try:
+                shifted[_shift_date(d, lag_days)] = v
+            except ValueError:
+                continue
     else:
         shifted = row_series
 
@@ -89,13 +101,20 @@ def compute_cell(
     lag_days: int,
     min_pairs: int,
 ) -> dict:
-    """Build one `{"r": float|None, "n": int}` matrix cell.
+    """Build one `{"r": float|None, "n": int, "reason": str|None}` matrix cell.
 
     `n` always reflects the actual number of aligned pairs found, even
     when `r` comes back `None` because that count fell below `min_pairs`
-    or the aligned values had zero variance.
+    or the aligned values had zero variance. `reason` disambiguates those
+    two null cases for the frontend tooltip (both are otherwise
+    indistinguishable from `r`/`n` alone): `"insufficient_pairs"` when
+    `n < min_pairs`, `"zero_variance"` when there were enough pairs but
+    one series was constant over them, `None` whenever `r` is not null.
     """
     xs, ys = align_series(row_series, col_series, lag_days)
     n = len(xs)
-    r = pearson_r(xs, ys) if n >= min_pairs else None
-    return {"r": r, "n": n}
+    if n < min_pairs:
+        return {"r": None, "n": n, "reason": "insufficient_pairs"}
+    r = pearson_r(xs, ys)
+    reason = None if r is not None else "zero_variance"
+    return {"r": r, "n": n, "reason": reason}

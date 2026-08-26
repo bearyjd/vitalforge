@@ -99,6 +99,35 @@ def test_compute_cell_below_min_pairs_nulls_r_but_keeps_n():
     cell = compute_cell(a, b, lag_days=0, min_pairs=5)
     assert cell["n"] == 2
     assert cell["r"] is None
+    assert cell["reason"] == "insufficient_pairs"
+
+
+def test_compute_cell_zero_variance_reason():
+    a = {"2026-01-01": 5.0, "2026-01-02": 5.0, "2026-01-03": 5.0}
+    b = {"2026-01-01": 1.0, "2026-01-02": 2.0, "2026-01-03": 3.0}
+    cell = compute_cell(a, b, lag_days=0, min_pairs=2)
+    assert cell["n"] == 3
+    assert cell["r"] is None
+    assert cell["reason"] == "zero_variance"
+
+
+def test_compute_cell_with_r_has_no_reason():
+    a = {"2026-01-01": 1.0, "2026-01-02": 2.0}
+    b = {"2026-01-01": 1.0, "2026-01-02": 2.0}
+    cell = compute_cell(a, b, lag_days=0, min_pairs=2)
+    assert cell["r"] is not None
+    assert cell["reason"] is None
+
+
+def test_align_series_skips_malformed_row_date_instead_of_raising():
+    row = {"2026-01-01": 1.0, "not-a-date": 999.0, "2026-01-02": 2.0}
+    col = {"2026-01-02": 20.0, "2026-01-03": 30.0}
+    xs, ys = align_series(row, col, lag_days=1)
+    # The well-formed dates shift and join normally ("2026-01-01" ->
+    # "2026-01-02", "2026-01-02" -> "2026-01-03"); the malformed date is
+    # silently excluded rather than raising ValueError.
+    assert xs == [1.0, 2.0]
+    assert ys == [20.0, 30.0]
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +244,45 @@ async def test_correlations_lag_zero_matrix_is_symmetric_in_n(client):
     resp = await client.get("/api/correlations?metrics=steps,active_calories&lag=0&min_pairs=2")
     cells = resp.json()["cells"]
     assert cells[0][1]["n"] == cells[1][0]["n"] == 5
+
+
+async def test_correlations_malformed_date_returns_200_and_excludes_row(client):
+    """`weight_history` isn't as tightly controlled as the Garmin sync
+    tables, so a malformed date can reach `align_series`. With `lag != 0`
+    that used to raise an unhandled ValueError (-> 500); it must now
+    degrade to a 200 with that one row simply excluded from the join."""
+    dates = [date_n_days_ago(i) for i in range(5, 0, -1)]
+    values = [1.0, 2.0, 3.0, 4.0, 5.0]
+    await seed_metric("weight_history", "weight_grams", list(zip(dates, values)))
+    # A malformed date sneaks into weight_history alongside the good rows.
+    await seed_metric("weight_history", "weight_grams", [("not-a-date", 999.0)])
+    await seed_metric("steps", "value", list(zip(dates, values)))
+
+    resp = await client.get("/api/correlations?metrics=weight,steps&lag=1&min_pairs=2")
+    assert resp.status_code == 200
+    cell = resp.json()["cells"][0][1]
+    # The malformed row is excluded from alignment, not counted or crashed on.
+    assert cell["n"] == 4
+
+
+async def test_correlations_cell_reason_field_present(client):
+    dates = [date_n_days_ago(i) for i in range(10, 0, -1)]
+    constant = [50.0] * 10
+    varying = list(range(1, 11))
+    await seed_metric("resting_hr", "value", list(zip(dates, constant)))
+    await seed_metric("hrv", "last_night_avg", list(zip(dates, varying)))
+
+    resp = await client.get("/api/correlations?metrics=resting_hr,hrv")
+    assert resp.status_code == 200
+    cell = resp.json()["cells"][0][1]
+    assert cell["r"] is None
+    assert cell["reason"] == "zero_variance"
+
+    # resting_hr's own diagonal is also zero-variance (it's constant), so
+    # check hrv's diagonal instead, which has real variance and self-r == 1.
+    diag_cell = resp.json()["cells"][1][1]
+    assert diag_cell["r"] is not None
+    assert diag_cell["reason"] is None
 
 
 async def test_correlations_unknown_metric_returns_400(client):

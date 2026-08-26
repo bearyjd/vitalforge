@@ -175,6 +175,20 @@
         return field;
     }
 
+    // A null `r` can mean two different things -- too few aligned pairs, or
+    // enough pairs but one metric was constant over them (zero variance) --
+    // and the server disambiguates via `cellData.reason` (see
+    // correlations.py's `compute_cell`).
+    function nullCellReasonText(cellData, matrix) {
+        if (cellData.r !== null) {
+            return `r = ${cellData.r.toFixed(3)}, n = ${cellData.n}`;
+        }
+        if (cellData.reason === "zero_variance") {
+            return `n = ${cellData.n} (zero variance -- one or both metrics were constant over this window)`;
+        }
+        return `n = ${cellData.n} (below min_pairs = ${matrix.min_pairs})`;
+    }
+
     function renderHeatmap(heatmapWrap, matrix) {
         heatmapWrap.innerHTML = "";
 
@@ -213,10 +227,7 @@
                 cell.className = "corr-cell" + (cellData.r === null ? " corr-null" : "");
                 cell.style.background = corrColor(cellData.r);
                 cell.textContent = cellData.r === null ? "–" : cellData.r.toFixed(2);
-                cell.title =
-                    cellData.r === null
-                        ? `${rowKey} × ${colKey}\nn = ${cellData.n} (below min_pairs = ${matrix.min_pairs})`
-                        : `${rowKey} × ${colKey}\nr = ${cellData.r.toFixed(3)}, n = ${cellData.n}`;
+                cell.title = `${rowKey} × ${colKey}\n${nullCellReasonText(cellData, matrix)}`;
                 cell.addEventListener("click", () => showDrilldown(rowKey, colKey, cellData));
                 grid.appendChild(cell);
             });
