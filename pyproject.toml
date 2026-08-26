@@ -48,4 +48,8 @@ dev = [
     "ruff>=0.8.0",
     "playwright>=1.48.0",
     "pytest-playwright>=0.5.2",
+    # Also pinned in vitalforge-dashboard/requirements.txt, where it's an
+    # actual runtime dependency (FIT activity import) -- listed here too so
+    # this group stays a complete picture of what the test suite needs.
+    "fitparse==1.2.0",
 ]
