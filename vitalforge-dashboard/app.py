@@ -40,7 +40,7 @@ from recommendations import get_recommendations, get_rules_only
 from sync import run_sync, scheduled_sync
 
 from shared.auth import add_auth_routes, bootstrap_first_admin, bootstrap_migrated_token, require_account_identity
-from shared.database import get_db, init_db
+from shared.database import get_db, get_primary_person_id, init_db
 from shared.garmin_client import authenticate
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -195,7 +195,8 @@ async def get_metrics(metric_name: str, days: int = Query(default=30, ge=1, le=3
 async def api_readiness():
     """Get the composite readiness/recovery score (0-100)."""
     try:
-        return await compute_readiness()
+        person_id = await get_primary_person_id()
+        return await compute_readiness(person_id)
     except Exception as e:
         logger.error("Readiness scoring failed: %s", e)
         raise HTTPException(status_code=500, detail="Failed to compute readiness score")
@@ -307,7 +308,8 @@ async def export_data(
 async def api_recommendations(refresh: bool = Query(default=False)):
     """Get AI-powered health recommendations."""
     try:
-        return await get_recommendations(force=refresh)
+        person_id = await get_primary_person_id()
+        return await get_recommendations(person_id, force=refresh)
     except Exception as e:
         logger.error("Recommendations failed: %s", e)
         raise HTTPException(status_code=500, detail="Failed to generate recommendations")
@@ -316,7 +318,8 @@ async def api_recommendations(refresh: bool = Query(default=False)):
 @app.get("/api/recommendations/rules-only")
 async def api_rules_only():
     """Get rules engine output without LLM."""
-    return await get_rules_only()
+    person_id = await get_primary_person_id()
+    return await get_rules_only(person_id)
 
 
 @app.get("/api/correlations")

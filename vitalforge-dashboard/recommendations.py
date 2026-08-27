@@ -11,8 +11,8 @@ from shared.database import get_db
 
 logger = logging.getLogger(__name__)
 
-# Cache: { "hash": ..., "timestamp": ..., "recommendations": [...] }
-_cache = {"hash": None, "timestamp": 0, "recommendations": None}
+# Cache: { person_id: {"hash": ..., "timestamp": ..., "recommendations": [...]} }
+_cache: dict[int, dict] = {}
 CACHE_TTL = 6 * 3600  # 6 hours
 
 
@@ -20,12 +20,13 @@ CACHE_TTL = 6 * 3600  # 6 hours
 # Data fetching helpers
 # ---------------------------------------------------------------------------
 
-async def get_metric(table: str, column: str, days: int = 30) -> list[dict]:
+async def get_metric(table: str, column: str, person_id: int, days: int = 30) -> list[dict]:
     db = await get_db()
     try:
         cursor = await db.execute(
-            f"SELECT date, [{column}] as value FROM [{table}] WHERE date >= date('now', ?) ORDER BY date ASC",
-            (f"-{days} days",),
+            f"SELECT date, [{column}] as value FROM [{table}] "
+            f"WHERE person_id = ? AND date >= date('now', ?) ORDER BY date ASC",
+            (person_id, f"-{days} days"),
         )
         rows = await cursor.fetchall()
     finally:
@@ -33,7 +34,7 @@ async def get_metric(table: str, column: str, days: int = 30) -> list[dict]:
     return [{"date": r["date"], "value": r["value"]} for r in rows if r["value"] is not None]
 
 
-async def get_all_metrics(days: int = 30) -> dict:
+async def get_all_metrics(person_id: int, days: int = 30) -> dict:
     metrics = {
         "sleep_duration": ("sleep", "duration_seconds"),
         "sleep_score": ("sleep", "sleep_score"),
@@ -48,7 +49,7 @@ async def get_all_metrics(days: int = 30) -> dict:
     }
     result = {}
     for name, (table, col) in metrics.items():
-        result[name] = await get_metric(table, col, days)
+        result[name] = await get_metric(table, col, person_id, days)
     return result
 
 
@@ -558,27 +559,25 @@ def _findings_to_recommendations(findings: list[dict]) -> list[dict]:
 # Public API
 # ---------------------------------------------------------------------------
 
-async def get_recommendations(force: bool = False) -> dict:
-    """Get recommendations, using cache if available."""
-    global _cache
+async def get_recommendations(person_id: int, force: bool = False) -> dict:
+    """Get recommendations for one person, using that person's cache slot if available."""
+    data = await get_all_metrics(person_id, days=30)
 
-    data = await get_all_metrics(days=30)
-
-    # Compute hash of current data for cache invalidation
     data_hash = hashlib.md5(json.dumps(data, default=str).encode()).hexdigest()
-
     now = time.time()
-    if not force and _cache["hash"] == data_hash and (now - _cache["timestamp"]) < CACHE_TTL and _cache["recommendations"]:
+
+    cached = _cache.get(person_id)
+    if not force and cached and cached["hash"] == data_hash and (now - cached["timestamp"]) < CACHE_TTL and cached["recommendations"]:
         return {
-            "recommendations": _cache["recommendations"],
+            "recommendations": cached["recommendations"],
             "cached": True,
-            "generated_at": _cache["timestamp"],
+            "generated_at": cached["timestamp"],
         }
 
     findings = run_rules(data)
     recommendations = await get_llm_recommendations(findings, data)
 
-    _cache = {
+    _cache[person_id] = {
         "hash": data_hash,
         "timestamp": now,
         "recommendations": recommendations,
@@ -591,9 +590,9 @@ async def get_recommendations(force: bool = False) -> dict:
     }
 
 
-async def get_rules_only() -> dict:
-    """Get just the rules engine output without LLM."""
-    data = await get_all_metrics(days=30)
+async def get_rules_only(person_id: int) -> dict:
+    """Get just the rules engine output without LLM, for one person."""
+    data = await get_all_metrics(person_id, days=30)
     findings = run_rules(data)
     return {
         "findings": findings,
