@@ -6,10 +6,16 @@ import aiosqlite
 DB_PATH = Path(os.getenv("DB_PATH", "/app/data/fitness.db"))
 
 # Additive columns for weight_log's body-composition intake (Track B). Every
-# entry here must stay nullable with no non-constant DEFAULT -- a defaulted
-# column rewrites the table and reintroduces a real interruption window for
-# "container killed during first boot after upgrade" (see
-# docs/prp/00-design.md SS5.4).
+# entry here must stay nullable with no non-constant DEFAULT -- not because a
+# table rewrite is interruption-unsafe (it isn't: SQLite's CREATE/COPY/DROP/
+# RENAME sequence rolls back cleanly inside BEGIN IMMEDIATE, verified in
+# tests/test_migration_gating_assumptions.py), but because a constant-default
+# ADD COLUMN needs no migration runner at all -- it's a fast, metadata-only
+# change -- while a genuine schema change (e.g. a non-constant default, or
+# changing a PRIMARY KEY) does, and belongs in shared/migrations.py instead
+# of here. See docs/prp/00-design.md SS5.4 and
+# docs/superpowers/specs/2026-08-25-family-multitenancy-design.md Appendix A
+# for the full reasoning and the migration that first needed the runner.
 _WEIGHT_LOG_ADDITIVE_COLUMNS = [
     "body_fat_pct REAL",
     "body_water_pct REAL",

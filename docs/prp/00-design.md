@@ -1594,10 +1594,14 @@ rollback verification should confirm this by pointing the previous image at a
 migrated fixture DB.
 
 Residual risk, stated honestly: `ADD COLUMN` here is O(1) because none of the new
-columns has a non-constant `DEFAULT`. Any future migration that adds a defaulted
-column rewrites the table and reintroduces a real interruption window. That
-constraint should be written into `shared/database.py` as a comment at
-implementation time.
+columns has a non-constant `DEFAULT`. Any future migration that adds a column with
+a **non-constant** default (e.g. a value computed at migration time, not a fixed
+literal) rewrites the table and reintroduces a real interruption window; a
+**constant** default (like `session_version INTEGER NOT NULL DEFAULT 1`, already
+in production in `shared/database.py`) is metadata-only and carries none of that
+risk. That distinction is written into `shared/database.py`'s comment, and,
+starting with the multi-tenancy work, into `shared/migrations.py` for the cases
+that genuinely need more than an additive column.
 
 ### 5.5 Two bridges POSTing the same weigh-in seconds apart
 
