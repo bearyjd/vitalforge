@@ -4,8 +4,10 @@ import hashlib
 import hmac
 import logging
 import os
+import re
 import secrets
 import time
+import unicodedata
 from datetime import datetime, timezone
 from typing import Literal, NamedTuple
 
@@ -59,6 +61,29 @@ _LEGACY_TOKEN_MIGRATION = "legacy-api-token-v1"
 # shared-token sentinel; keep both reserved so upgrades cannot create an
 # ambiguous real account with a formerly special identity.
 _RESERVED_USERNAMES = {"anonymous", "api-token"}
+
+_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$")
+
+# Anything that would shadow a real path segment under /p/{slug}/ or collide
+# with the sentinels this module already reserves for usernames.
+_RESERVED_SLUGS = {
+    "api", "auth", "static", "health", "p", "new", "admin", "persons",
+    "anonymous", "api-token",
+}
+
+
+def _slugify(raw: str) -> str:
+    """Derive a URL-safe slug from a display name or username.
+
+    Slugify, do not copy verbatim: _RESERVED_USERNAMES governs "safe as a
+    username", a different and smaller rule than "safe as a path segment
+    under /p/{slug}/". Returns "" when nothing usable survives -- callers
+    must handle that rather than persisting an empty slug into a NOT NULL
+    UNIQUE column (see shared/migrations.py's _ensure_primary_person).
+    """
+    s = unicodedata.normalize("NFKD", raw).encode("ascii", "ignore").decode("ascii")
+    s = re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:32].strip("-")
+    return s if _SLUG_RE.match(s) else ""
 
 # scrypt cost parameters for password hashing. n=2**14 (OWASP's minimum
 # recommendation for interactive/low-throughput logins) rather than a
