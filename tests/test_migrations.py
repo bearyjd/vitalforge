@@ -292,3 +292,74 @@ async def test_snapshot_discards_a_corrupt_partial_and_retries(tmp_path, monkeyp
         assert row[0] == "ok"
     finally:
         await check.close()
+
+
+@pytest.mark.asyncio
+async def test_assert_schema_understood_passes_on_empty_migrations_table(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    db = await database.get_db()
+    try:
+        await db.execute(migrations.SCHEMA_MIGRATIONS_TABLE_SQL)
+        await db.commit()
+    finally:
+        await db.close()
+
+    await migrations.assert_schema_understood()  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_assert_schema_understood_passes_on_known_migrations(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    db = await database.get_db()
+    try:
+        await db.execute(migrations.SCHEMA_MIGRATIONS_TABLE_SQL)
+        for name in migrations._KNOWN_MIGRATIONS:
+            await db.execute(
+                "INSERT INTO schema_migrations (name, completed_at) VALUES (?, 'x')", (name,)
+            )
+        await db.commit()
+    finally:
+        await db.close()
+
+    await migrations.assert_schema_understood()  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_assert_schema_understood_raises_on_unknown_migration(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    db = await database.get_db()
+    try:
+        await db.execute(migrations.SCHEMA_MIGRATIONS_TABLE_SQL)
+        await db.execute(
+            "INSERT INTO schema_migrations (name, completed_at) VALUES ('002-from-the-future', 'x')"
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+    with pytest.raises(RuntimeError, match="002-from-the-future"):
+        await migrations.assert_schema_understood()
+
+
+@pytest.mark.asyncio
+async def test_assert_schema_understood_passes_against_a_just_migrated_db(tmp_path, monkeypatch):
+    """Catches _KNOWN_MIGRATIONS drifting from the literal name run_migration()
+    is called with -- this is the exact bug class caught during spec review:
+    a typo between the guard's known-names tuple and the actual migration
+    name would make an image reject its own migration as unrecognized."""
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    db = await database.get_db()
+    try:
+        await db.execute(migrations.SCHEMA_MIGRATIONS_TABLE_SQL)
+        await db.commit()
+    finally:
+        await db.close()
+
+    for name in migrations._KNOWN_MIGRATIONS:
+
+        async def apply(db):
+            pass
+
+        await migrations.run_migration(name, apply)
+
+    await migrations.assert_schema_understood()  # must not raise

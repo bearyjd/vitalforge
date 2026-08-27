@@ -24,6 +24,46 @@ SCHEMA_MIGRATIONS_TABLE_SQL = """
     )
 """
 
+# Every marker name this image knows how to apply. These strings MUST match
+# the names passed to run_migration() verbatim -- a typo here makes this
+# image's own migration read as one from the future and boot-loops the
+# container. "001-person-id-rebuild" does not exist as a real migration
+# yet (that is Phase 1's job); it is declared here now, in Phase 0, so the
+# guard ships ahead of the migration it will eventually recognize.
+_KNOWN_MIGRATIONS = ("001-person-id-rebuild",)
+
+
+async def assert_schema_understood() -> None:
+    """Refuse to serve a database that is newer than this image understands.
+
+    Called at the end of shared/database.py's init_db(), on its own
+    connection, after any migrations have run -- so both services get it
+    without either app.py changing.
+
+    An applied marker whose name is not in _KNOWN_MIGRATIONS means some
+    newer image migrated this file. This image would then read the result
+    WITHOUT erroring and could return quietly wrong data. Fail the lifespan
+    instead: a documented boot loop beats silently merging data across
+    people (or any other future non-additive change) into the wrong shape.
+
+    A fresh or pre-runner database has zero markers, which is an empty set
+    and therefore passes. The guard only ever fires on names from the
+    future -- it cannot protect against migration 001 itself, because any
+    image that predates this guard predates its check.
+    """
+    db = await get_db()
+    try:
+        cur = await db.execute("SELECT name FROM schema_migrations")
+        rows = await cur.fetchall()
+    finally:
+        await db.close()
+    unknown = sorted({row[0] for row in rows} - set(_KNOWN_MIGRATIONS))
+    if unknown:
+        raise RuntimeError(
+            f"Database has migrations this image does not know: {unknown}. "
+            "Redeploy the newer image, or restore the pre-migration snapshot."
+        )
+
 
 async def run_migration(name: str, apply: Callable[[aiosqlite.Connection], Awaitable[None]]) -> None:
     """Run one migration exactly once, atomically, across both services.
