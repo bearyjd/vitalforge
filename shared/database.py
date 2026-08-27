@@ -59,10 +59,22 @@ async def _add_columns(db, table: str, column_ddls: list[str]):
                 raise
 
 
-async def get_db() -> aiosqlite.Connection:
-    """Open a connection to the SQLite database."""
+async def get_db(isolation_level: str | None = "") -> aiosqlite.Connection:
+    """Open a connection to the SQLite database.
+
+    isolation_level defaults to "" (aiosqlite/sqlite3's own legacy default),
+    so every existing caller's behavior is unchanged. Pass None for
+    autocommit mode with explicit BEGIN/COMMIT/ROLLBACK control -- e.g.
+    shared/migrations.py's run_migration(), which issues DDL inside a
+    transaction it must be able to roll back as a unit. isolation_level is
+    set here, at connect() time -- setting it as a post-connect attribute
+    on the returned connection instead raises a cross-thread
+    ProgrammingError under aiosqlite (verified directly; this is a genuine
+    aiosqlite API constraint, not an artifact of any particular caller's
+    async setup).
+    """
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    db = await aiosqlite.connect(str(DB_PATH))
+    db = await aiosqlite.connect(str(DB_PATH), isolation_level=isolation_level)
     db.row_factory = aiosqlite.Row
     await db.execute("PRAGMA journal_mode=WAL")
     return db
