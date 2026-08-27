@@ -42,15 +42,36 @@ _USERS_ADDITIVE_COLUMNS = [
 
 
 async def _add_columns(db, table: str, column_ddls: list[str]):
-    """Attempt-and-swallow, not PRAGMA-table_info-then-act: both services run
-    init_db() against the same file and docker-compose starts them together,
-    so a pre-check would be TOCTOU-racy -- both could observe "absent" and
-    both then attempt the ADD COLUMN. Only the duplicate-column error is
-    swallowed; `database is locked` must propagate so a container that
-    cannot migrate fails its lifespan and is restarted rather than serving
-    traffic against a half-migrated schema.
+    """Attempt-and-swallow, not PRAGMA-table_info-then-act, for CORRECTNESS:
+    both services run init_db() against the same file and docker-compose
+    starts them together, so a pre-check used to DECIDE whether to add a
+    column would be TOCTOU-racy -- both could observe "absent" and both then
+    attempt the ADD COLUMN. Only the duplicate-column error is swallowed;
+    `database is locked` must propagate so a container that cannot migrate
+    fails its lifespan and is restarted rather than serving traffic against
+    a half-migrated schema.
+
+    The PRAGMA table_info read below is a LATENCY-ONLY pre-check, not a
+    correctness pre-check: it is allowed to be wrong (e.g. under a genuine
+    race, both callers can still see "absent" and both attempt the ALTER,
+    which is exactly the attempt-and-swallow path this docstring's first
+    paragraph describes). What it buys is that the common case -- a second
+    service starting up after the first one already added every column --
+    skips a lock wait on an ALTER TABLE that was only ever going to hit
+    "duplicate column name" and be swallowed anyway.
     """
     for column_ddl in column_ddls:
+        column_name = column_ddl.split()[0]
+        try:
+            cur = await db.execute(f"PRAGMA table_info({table})")
+            existing = {row[1] for row in await cur.fetchall()}
+            if column_name in existing:
+                continue
+        except Exception:
+            # Pre-check failure (e.g., database locked, table doesn't exist,
+            # or any other error) is not fatal -- we fall through to attempt
+            # the ALTER TABLE, which is the source of truth for correctness.
+            pass
         try:
             await db.execute(f"ALTER TABLE {table} ADD COLUMN {column_ddl}")
             await db.commit()

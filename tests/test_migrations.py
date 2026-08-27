@@ -137,3 +137,50 @@ async def test_get_db_sets_a_30_second_busy_timeout(tmp_path, monkeypatch):
         assert row[0] == 30000
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_add_columns_skips_alter_when_column_already_present(tmp_path, monkeypatch):
+    """Latency-only behavior: when the shape pre-check sees the column
+    already exists, _add_columns must not even attempt the ALTER TABLE
+    (which would otherwise hit-and-swallow duplicate_column_name every
+    time, wasting a lock wait under contention)."""
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    db = await database.get_db()
+    try:
+        await db.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY, existing_col TEXT)")
+        await db.commit()
+
+        executed = []
+        original_execute = db.execute
+
+        async def spy_execute(sql, *args, **kwargs):
+            executed.append(sql)
+            return await original_execute(sql, *args, **kwargs)
+
+        db.execute = spy_execute
+        await database._add_columns(db, "probe", ["existing_col TEXT"])
+
+        assert not any("ALTER TABLE" in sql for sql in executed), (
+            "shape pre-check did not prevent a redundant ALTER TABLE attempt"
+        )
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_add_columns_still_adds_missing_column(tmp_path, monkeypatch):
+    """Correctness is unchanged: a genuinely-missing column is still added."""
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    db = await database.get_db()
+    try:
+        await db.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
+        await db.commit()
+
+        await database._add_columns(db, "probe", ["new_col TEXT"])
+
+        cur = await db.execute("PRAGMA table_info(probe)")
+        columns = {row[1] for row in await cur.fetchall()}
+        assert "new_col" in columns
+    finally:
+        await db.close()
