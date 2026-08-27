@@ -128,3 +128,57 @@ async def test_ddl_rebuild_rolls_back_cleanly_with_legacy_isolation_level(tmp_pa
         )
     finally:
         await verify.close()
+
+
+@pytest.mark.asyncio
+async def test_second_connection_can_write_while_first_connection_open_no_transaction(tmp_path):
+    """Connection 1 stays open (unclosed, no active transaction) while
+    connection 2 takes a write lock. Must NOT block or raise -- this is
+    what makes it safe for run_migration() to open its own connection
+    after init_db()'s connection has merely gone out of scope but not
+    necessarily been garbage-collected yet. (init_db() explicitly closes
+    its connection before calling anything from shared/migrations.py --
+    see spec §c.4 -- this test proves why that close() matters.)
+    """
+    db_path = tmp_path / "visibility.db"
+    conn1 = await aiosqlite.connect(str(db_path))
+    await conn1.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY)")
+    await conn1.commit()
+
+    conn2 = await aiosqlite.connect(str(db_path), isolation_level=None)
+    try:
+        # isolation_level is passed to connect() above, not set as a
+        # post-connect attribute -- see Task 1's _run_rebuild_then_rollback
+        # comment for why the latter raises a cross-thread ProgrammingError.
+        await conn2.execute("PRAGMA busy_timeout = 30000")
+        await conn2.execute("BEGIN IMMEDIATE")
+        await conn2.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY)")
+        await conn2.commit()
+    finally:
+        await conn2.close()
+        await conn1.close()
+
+
+@pytest.mark.asyncio
+async def test_second_connection_write_with_uncommitted_seed_insert_on_first(tmp_path):
+    """Same as above, but connection 1 has an uncommitted write pending.
+    Documents (does not assert a specific outcome beyond 'no hang') what
+    actually happens -- this is the scenario that would exist if init_db()
+    ever grew a seed INSERT before closing its connection.
+    """
+    db_path = tmp_path / "visibility_seed.db"
+    conn1 = await aiosqlite.connect(str(db_path))
+    await conn1.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY)")
+    await conn1.execute("INSERT INTO t1 (id) VALUES (1)")
+    # Deliberately NOT committed yet -- conn1 holds an open write transaction.
+
+    conn2 = await aiosqlite.connect(str(db_path), isolation_level=None)
+    await conn2.execute("PRAGMA busy_timeout = 2000")  # short timeout, this should time out fast
+    try:
+        with pytest.raises(aiosqlite.OperationalError, match="database is locked"):
+            await conn2.execute("BEGIN IMMEDIATE")
+            await conn2.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY)")
+    finally:
+        await conn2.close()
+        await conn1.commit()
+        await conn1.close()
