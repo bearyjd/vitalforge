@@ -4,6 +4,7 @@ section (c) for the full design rationale.
 """
 
 import asyncio
+from datetime import datetime, timezone
 
 import aiosqlite
 import pytest
@@ -464,3 +465,254 @@ async def test_init_db_fails_lifespan_if_db_has_an_unknown_migration_marker(tmp_
 
     with pytest.raises(RuntimeError, match="999-from-the-future"):
         await database.init_db()
+
+
+# 001-person-id-rebuild tests appended below the Phase 0 runner tests
+# above. See docs/superpowers/specs/2026-08-25-family-multitenancy-design.md
+# §c.8 for the full required-test list this section implements.
+
+
+@pytest.mark.asyncio
+async def test_fresh_db_gets_new_shape_directly_and_one_primary_person(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    await database.init_db()
+
+    db = await database.get_db()
+    try:
+        cur = await db.execute("PRAGMA table_info(sleep)")
+        cols = {row["name"]: row for row in await cur.fetchall()}
+        assert "person_id" in cols
+        pk_cols = sorted(name for name, row in cols.items() if row["pk"])
+        assert pk_cols == ["date", "person_id"]
+
+        cur = await db.execute("SELECT COUNT(*) FROM persons WHERE is_primary = 1")
+        assert (await cur.fetchone())[0] == 1
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_migration_preserves_row_counts_and_backfills_person_id(production_schema_db, monkeypatch):
+    await database.init_db()
+
+    db = await database.get_db()
+    try:
+        cur = await db.execute("SELECT COUNT(*) FROM weight_log")
+        assert (await cur.fetchone())[0] == 17
+        cur = await db.execute("SELECT COUNT(*) FROM weight_history")
+        assert (await cur.fetchone())[0] == 34
+        cur = await db.execute("SELECT COUNT(*) FROM weight_log WHERE person_id IS NULL")
+        assert (await cur.fetchone())[0] == 0
+        cur = await db.execute("SELECT COUNT(*) FROM weight_history WHERE person_id IS NULL")
+        assert (await cur.fetchone())[0] == 0
+
+        cur = await db.execute("SELECT id FROM persons WHERE is_primary = 1")
+        primary_id = (await cur.fetchone())["id"]
+        cur = await db.execute("SELECT DISTINCT person_id FROM weight_history")
+        assert [row["person_id"] for row in await cur.fetchall()] == [primary_id]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_schema_parity_fresh_vs_migrated(tmp_path, monkeypatch, production_schema_db):
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "fresh.db")
+    await database.init_db()
+    fresh_db = await database.get_db()
+
+    monkeypatch.setattr(database, "DB_PATH", production_schema_db)
+    await database.init_db()
+    migrated_db = await database.get_db()
+
+    try:
+        for table in migrations._REBUILD_TABLES + ["sync_status", "weight_log"]:
+            fresh_info = await (await fresh_db.execute(f"PRAGMA table_info([{table}])")).fetchall()
+            migrated_info = await (await migrated_db.execute(f"PRAGMA table_info([{table}])")).fetchall()
+            fresh_shape = sorted((r["name"], r["type"], r["notnull"], r["dflt_value"], r["pk"]) for r in fresh_info)
+            migrated_shape = sorted((r["name"], r["type"], r["notnull"], r["dflt_value"], r["pk"]) for r in migrated_info)
+            assert fresh_shape == migrated_shape, f"{table} shape diverged between fresh and migrated"
+
+            fresh_idx = sorted(r["name"] for r in await (await fresh_db.execute(f"PRAGMA index_list([{table}])")).fetchall())
+            migrated_idx = sorted(r["name"] for r in await (await migrated_db.execute(f"PRAGMA index_list([{table}])")).fetchall())
+            assert fresh_idx == migrated_idx, f"{table} index set diverged between fresh and migrated"
+    finally:
+        await fresh_db.close()
+        await migrated_db.close()
+
+
+@pytest.mark.asyncio
+async def test_migration_is_idempotent(production_schema_db):
+    await database.init_db()
+    db = await database.get_db()
+    try:
+        cur = await db.execute("SELECT COUNT(*) FROM weight_log")
+        first_count = (await cur.fetchone())[0]
+    finally:
+        await db.close()
+
+    await database.init_db()  # second boot against the already-migrated DB
+    db = await database.get_db()
+    try:
+        cur = await db.execute("SELECT COUNT(*) FROM weight_log")
+        assert (await cur.fetchone())[0] == first_count
+        cur = await db.execute("SELECT COUNT(*) FROM persons")
+        assert (await cur.fetchone())[0] == 1, "a second run created a second primary person"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_interruption_rolls_back_rebuild_but_weight_log_person_id_stays_committed(
+    production_schema_db, monkeypatch
+):
+    """Spec §c.6: the *rebuild* (11 tables + marker) is fully-old-or-fully-new,
+    but weight_log.person_id is added by a separate, already-committed
+    _add_columns step at init_db's step 2. A test that checks only
+    byte-identity on the rebuilt tables would pass in both failure modes and
+    prove nothing -- this test asserts both halves explicitly."""
+    call_count = 0
+    real_apply = migrations._apply_person_id_rebuild
+
+    async def failing_apply(db):
+        nonlocal call_count
+        call_count += 1
+        person_id = await migrations._ensure_primary_person(db)
+        if await migrations._has_column(db, "sleep", "person_id"):
+            return
+        for i, table in enumerate(migrations._REBUILD_TABLES):
+            if i == 5:
+                raise RuntimeError("simulated crash mid-rebuild")
+            columns = await migrations._rebuild_columns(db, table)
+            col_names = ", ".join(f"[{name}]" for name, _ in columns)
+            col_ddl = ", ".join(f"[{name}] {type_}" for name, type_ in columns)
+            await db.execute(
+                f"CREATE TABLE [{table}__new] (person_id INTEGER NOT NULL, date TEXT NOT NULL, "
+                f"{col_ddl}, PRIMARY KEY (person_id, date))"
+            )
+            await db.execute(
+                f"INSERT INTO [{table}__new] (person_id, date, {col_names}) "
+                f"SELECT ?, date, {col_names} FROM [{table}]",
+                (person_id,),
+            )
+            await db.execute(f"DROP TABLE [{table}]")
+            await db.execute(f"ALTER TABLE [{table}__new] RENAME TO [{table}]")
+
+    monkeypatch.setattr(migrations, "_apply_person_id_rebuild", failing_apply)
+
+    pre_shapes = {}
+    db = await database.get_db()
+    try:
+        for table in migrations._REBUILD_TABLES + ["sync_status"]:
+            cur = await db.execute("SELECT sql FROM sqlite_master WHERE name = ?", (table,))
+            pre_shapes[table] = (await cur.fetchone())["sql"]
+    finally:
+        await db.close()
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        # Calling init_db() itself is correct here, not a shortcut: its
+        # local `from shared.migrations import _apply_person_id_rebuild`
+        # resolves the monkeypatched attribute at call time, so this run
+        # uses failing_apply while still exercising the real init_db/
+        # run_migration wiring end to end.
+        await database.init_db()
+
+    db = await database.get_db()
+    try:
+        for table in migrations._REBUILD_TABLES + ["sync_status"]:
+            if table == "weight_history":
+                # weight_history's Track-B additive columns (body_water,
+                # bone_mass_g, muscle_mass_g) are added by a separate,
+                # already-committed _add_columns step at init_db's step 1 --
+                # same mechanism as weight_log.person_id -- so they land
+                # regardless of whether the rebuild itself succeeds. A
+                # byte-exact sql comparison against pre_shapes would fail
+                # here even on a correct rollback; assert on the
+                # rebuild-specific shape instead.
+                cols = await (await db.execute("PRAGMA table_info(weight_history)")).fetchall()
+                assert not any(c["name"] == "person_id" for c in cols), "weight_history rebuild was not rolled back"
+                assert [c["name"] for c in cols if c["pk"]] == ["date"], "weight_history PK was rebuilt"
+                continue
+            cur = await db.execute("SELECT sql FROM sqlite_master WHERE name = ?", (table,))
+            assert (await cur.fetchone())["sql"] == pre_shapes[table], f"{table} was not rolled back"
+        cur = await db.execute("SELECT name FROM schema_migrations WHERE name = '001-person-id-rebuild'")
+        assert await cur.fetchone() is None
+        cur = await db.execute(
+            "SELECT name FROM sqlite_master WHERE name LIKE '%__new'"
+        )
+        assert await cur.fetchall() == [], "a __new table survived the rollback"
+
+        cur = await db.execute("PRAGMA table_info(weight_log)")
+        cols = {row["name"] for row in await cur.fetchall()}
+        assert "person_id" in cols, "weight_log.person_id must survive -- it committed independently"
+        cur = await db.execute("SELECT COUNT(*) FROM weight_log WHERE person_id IS NOT NULL")
+        assert (await cur.fetchone())[0] == 0, "person_id must be all-NULL before the rebuild completes"
+    finally:
+        await db.close()
+
+    monkeypatch.setattr(migrations, "_apply_person_id_rebuild", real_apply)
+    await database.init_db()  # run again cleanly
+    db = await database.get_db()
+    try:
+        cur = await db.execute("SELECT COUNT(*) FROM weight_log WHERE person_id IS NULL")
+        assert (await cur.fetchone())[0] == 0, "did not converge on a clean re-run"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_is_created_before_the_rebuild_runs(production_schema_db):
+    await database.init_db()
+    snapshot = production_schema_db.parent / "fitness.pre-001-person-id.db"
+    assert snapshot.exists()
+
+    check = await aiosqlite.connect(str(snapshot))
+    try:
+        cur = await check.execute("SELECT COUNT(*) FROM weight_log")
+        assert (await cur.fetchone())[0] == 17
+        cur = await check.execute("PRAGMA table_info(sleep)")
+        cols = {row[1] for row in await cur.fetchall()}
+        assert "person_id" not in cols, "snapshot must predate the rebuild (weight_log.person_id may exist, sleep must not)"
+    finally:
+        await check.close()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_not_taken_on_a_fresh_db(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "fresh.db")
+    await database.init_db()
+    assert not (tmp_path / "fitness.pre-001-person-id.db").exists()
+
+
+@pytest.mark.asyncio
+async def test_cross_person_isolation_after_second_person_exists(production_schema_db):
+    """Regression test for the bug this whole design exists to prevent.
+    Phase 1 itself never creates a second person, but the rebuilt PK must
+    already make this safe -- Phase 2 relies on that, not on any code it
+    will add."""
+    await database.init_db()
+
+    db = await database.get_db()
+    try:
+        cur = await db.execute("SELECT id FROM persons WHERE is_primary = 1")
+        person_a = (await cur.fetchone())["id"]
+        cursor = await db.execute(
+            "INSERT INTO persons (slug, display_name, created_at, is_primary) VALUES (?, ?, ?, 0)",
+            ("second", "Second Person", datetime.now(timezone.utc).isoformat()),
+        )
+        person_b = cursor.lastrowid
+        await db.commit()
+
+        await db.execute(
+            "INSERT INTO sleep (person_id, date, duration_seconds) VALUES (?, '2026-01-01', 100)",
+            (person_a,),
+        )
+        await db.execute(
+            "INSERT INTO sleep (person_id, date, duration_seconds) VALUES (?, '2026-01-01', 200)",
+            (person_b,),
+        )
+        await db.commit()
+
+        cur = await db.execute("SELECT COUNT(*) FROM sleep WHERE date = '2026-01-01'")
+        assert (await cur.fetchone())[0] == 2, "same date, different persons must NOT overwrite each other"
+    finally:
+        await db.close()

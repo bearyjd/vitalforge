@@ -13,6 +13,7 @@ from typing import Awaitable, Callable
 
 import aiosqlite
 
+from shared.auth import _RESERVED_SLUGS, _slugify
 from shared.database import get_db
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,171 @@ SCHEMA_MIGRATIONS_TABLE_SQL = """
 # yet (that is Phase 1's job); it is declared here now, in Phase 0, so the
 # guard ships ahead of the migration it will eventually recognize.
 _KNOWN_MIGRATIONS = ("001-person-id-rebuild",)
+
+_PERSON_ID_REBUILD_SNAPSHOT_NAME = "fitness.pre-001-person-id.db"
+
+# Table NAMES only -- no column DDL. _rebuild_columns derives the actual
+# column list from the live schema (PRAGMA table_info) instead, so there is
+# no second copy of any table's shape to drift out of sync with
+# shared/database.py. See CLAUDE.md's METRIC_TABLES convention note: a new
+# metric table created before a future rebuild must be added HERE by name.
+_REBUILD_TABLES = [
+    "sleep", "resting_hr", "hrv", "body_battery", "stress",
+    "vo2max", "weight_history", "training_load", "steps", "active_calories",
+]
+
+
+def now_iso() -> str:
+    # datetime/timezone are already imported at the top of this module.
+    return datetime.now(timezone.utc).isoformat()
+
+
+async def _has_column(db, table: str, column: str) -> bool:
+    cur = await db.execute(f"PRAGMA table_info([{table}])")
+    return any(row["name"] == column for row in await cur.fetchall())
+
+
+async def _needs_person_id_rebuild(db) -> bool:
+    """Cheap, TOCTOU-racy-by-design pre-check (spec §c.7): the only cost of
+    losing this race is a wasted snapshot, because correctness comes
+    entirely from the marker check inside run_migration's transaction."""
+    return not await _has_column(db, "sleep", "person_id")
+
+
+async def _first_admin_username(db) -> str | None:
+    cur = await db.execute("SELECT username FROM users WHERE role = 'admin' ORDER BY id LIMIT 1")
+    row = await cur.fetchone()
+    return row["username"] if row else None
+
+
+async def _ensure_primary_person(db) -> int:
+    """Create (or return) the person that owns all pre-multi-tenancy data.
+
+    Idempotent: called on every migration run, including the fresh-DB path
+    where no rebuild follows. Runs inside the migration transaction, so the
+    check-then-insert is not racy.
+    """
+    # `os` is already imported at the top of this module (used by
+    # ensure_pre_migration_snapshot) -- no new import needed here.
+    existing = await (await db.execute(
+        "SELECT id FROM persons WHERE is_primary = 1"
+    )).fetchone()
+    if existing is not None:
+        return existing["id"]
+
+    any_person = await (await db.execute("SELECT COUNT(*) FROM persons")).fetchone()
+    if any_person[0] != 0:
+        raise RuntimeError("persons rows exist but none is_primary; refusing to guess")
+
+    raw = os.environ.get("VITALFORGE_PRIMARY_PERSON", "").strip() \
+        or await _first_admin_username(db) or "primary"
+    slug = _slugify(raw)
+    if not slug or slug in _RESERVED_SLUGS:
+        logger.warning("Primary person slug %r is unusable; falling back to 'primary'", raw)
+        slug = "primary"
+    cursor = await db.execute(
+        "INSERT INTO persons (slug, display_name, created_at, is_primary) "
+        "VALUES (?, ?, ?, 1)",
+        (slug, raw or slug, now_iso()),
+    )
+    person_id = cursor.lastrowid
+    admin = await (await db.execute(
+        "SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1"
+    )).fetchone()
+    if admin is not None:
+        await db.execute(
+            "INSERT INTO person_grants (person_id, user_id, access, granted_at) "
+            "VALUES (?, ?, 'own', ?)",
+            (person_id, admin["id"], now_iso()),
+        )
+        await db.execute(
+            "UPDATE users SET default_person_id = ? WHERE id = ?",
+            (person_id, admin["id"]),
+        )
+    return person_id
+
+
+async def _rebuild_columns(db, table: str) -> list[tuple[str, str]]:
+    """Return [(name, declared_type)] for every non-`date` column of `table`,
+    read from the live schema. Fails loud on any shape this migration cannot
+    faithfully reproduce."""
+    rows = await (await db.execute(f"PRAGMA table_info([{table}])")).fetchall()
+    columns: list[tuple[str, str]] = []
+    for r in rows:
+        if r["name"] == "date":
+            if r["pk"] != 1:
+                raise RuntimeError(f"{table}.date is not the primary key; refusing to rebuild")
+            continue
+        if r["notnull"] or r["dflt_value"] is not None or r["pk"]:
+            raise RuntimeError(
+                f"{table}.{r['name']} carries NOT NULL/DEFAULT/PK, which this migration "
+                f"does not know how to reproduce -- update _apply_person_id_rebuild"
+            )
+        columns.append((r["name"], r["type"]))
+    if not columns:
+        raise RuntimeError(f"{table} has no non-date columns; refusing to rebuild")
+    return columns
+
+
+async def _rebuild_sync_status(db, person_id: int) -> None:
+    await db.execute("""
+        CREATE TABLE [sync_status__new] (
+            person_id        INTEGER PRIMARY KEY,
+            last_sync_time   TEXT,
+            last_sync_result TEXT,
+            last_sync_days   INTEGER,
+            backoff_until    TEXT
+        )
+    """)
+    await db.execute(
+        "INSERT INTO [sync_status__new] "
+        "(person_id, last_sync_time, last_sync_result, last_sync_days, backoff_until) "
+        "SELECT ?, last_sync_time, last_sync_result, last_sync_days, NULL FROM sync_status",
+        (person_id,),
+    )
+    await db.execute("DROP TABLE sync_status")
+    await db.execute("ALTER TABLE [sync_status__new] RENAME TO sync_status")
+
+
+async def _apply_person_id_rebuild(db) -> None:
+    # Runs inside BEGIN IMMEDIATE (run_migration opens it). Any exception
+    # rolls back the ENTIRE rebuild -- all 11 tables plus the marker --
+    # leaving the original schema untouched. weight_log.person_id was added
+    # and COMMITTED by _add_columns at init_db's step 2, OUTSIDE this
+    # transaction -- see spec §c.6 for why that is correct and safe.
+    person_id = await _ensure_primary_person(db)
+
+    if await _has_column(db, "sleep", "person_id"):
+        return  # fresh DB: tables already correctly shaped by init_db's DDL step.
+
+    for table in _REBUILD_TABLES:
+        columns = await _rebuild_columns(db, table)
+        col_names = ", ".join(f"[{name}]" for name, _ in columns)
+        col_ddl = ", ".join(f"[{name}] {type_}" for name, type_ in columns)
+        await db.execute(f"""
+            CREATE TABLE [{table}__new] (
+                person_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                {col_ddl},
+                PRIMARY KEY (person_id, date)
+            )
+        """)
+        await db.execute(
+            f"INSERT INTO [{table}__new] (person_id, date, {col_names}) "
+            f"SELECT ?, date, {col_names} FROM [{table}]",
+            (person_id,),
+        )
+        await db.execute(f"DROP TABLE [{table}]")
+        await db.execute(f"ALTER TABLE [{table}__new] RENAME TO [{table}]")
+
+    await _rebuild_sync_status(db, person_id)
+
+    await db.execute("UPDATE weight_log SET person_id = ? WHERE person_id IS NULL", (person_id,))
+    await db.execute("DROP INDEX IF EXISTS idx_weight_log_timestamp")
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_weight_log_person_timestamp "
+        "ON weight_log(person_id, timestamp)"
+    )
 
 
 async def assert_schema_understood() -> None:

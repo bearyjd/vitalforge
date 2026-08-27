@@ -22,6 +22,7 @@ _WEIGHT_LOG_ADDITIVE_COLUMNS = [
     "muscle_pct REAL",
     "bone_mass_kg REAL",
     "source TEXT",
+    "person_id INTEGER",
 ]
 
 # Additive columns for weight_history's Garmin-sourced composition read path
@@ -44,6 +45,7 @@ _WEIGHT_HISTORY_ADDITIVE_COLUMNS = [
 # constant default is a fast, metadata-only change, not a table rewrite.
 _USERS_ADDITIVE_COLUMNS = [
     "session_version INTEGER NOT NULL DEFAULT 1",
+    "default_person_id INTEGER",
 ]
 
 
@@ -110,8 +112,17 @@ async def get_db(isolation_level: str | None = "") -> aiosqlite.Connection:
 
 
 async def init_db():
-    """Create all tables if they don't exist."""
-    from shared.migrations import SCHEMA_MIGRATIONS_TABLE_SQL, assert_schema_understood
+    """Create all tables if they don't exist, then run any pending schema
+    migrations."""
+    from shared.migrations import (
+        _PERSON_ID_REBUILD_SNAPSHOT_NAME,
+        SCHEMA_MIGRATIONS_TABLE_SQL,
+        _apply_person_id_rebuild,
+        _needs_person_id_rebuild,
+        assert_schema_understood,
+        ensure_pre_migration_snapshot,
+        run_migration,
+    )
 
     db = await get_db()
     try:
@@ -139,7 +150,8 @@ async def init_db():
         # Phase 2: metric tables — one per metric type, all keyed by date
         await db.execute("""
             CREATE TABLE IF NOT EXISTS sleep (
-                date TEXT PRIMARY KEY,
+                person_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
                 duration_seconds INTEGER,
                 deep_seconds INTEGER,
                 light_seconds INTEGER,
@@ -147,66 +159,79 @@ async def init_db():
                 awake_seconds INTEGER,
                 sleep_score INTEGER,
                 avg_spo2 REAL,
-                avg_respiration REAL
+                avg_respiration REAL,
+                PRIMARY KEY (person_id, date)
             )
         """)
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS resting_hr (
-                date TEXT PRIMARY KEY,
-                value INTEGER
+                person_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                value INTEGER,
+                PRIMARY KEY (person_id, date)
             )
         """)
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS hrv (
-                date TEXT PRIMARY KEY,
+                person_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
                 last_night_avg REAL,
                 last_night_5min_high REAL,
                 weekly_avg REAL,
-                status TEXT
+                status TEXT,
+                PRIMARY KEY (person_id, date)
             )
         """)
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS body_battery (
-                date TEXT PRIMARY KEY,
+                person_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
                 charged INTEGER,
                 drained INTEGER,
                 highest INTEGER,
-                lowest INTEGER
+                lowest INTEGER,
+                PRIMARY KEY (person_id, date)
             )
         """)
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS stress (
-                date TEXT PRIMARY KEY,
+                person_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
                 avg_level INTEGER,
                 max_level INTEGER,
                 rest_duration INTEGER,
                 low_duration INTEGER,
                 medium_duration INTEGER,
-                high_duration INTEGER
+                high_duration INTEGER,
+                PRIMARY KEY (person_id, date)
             )
         """)
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS vo2max (
-                date TEXT PRIMARY KEY,
+                person_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
                 vo2max_value REAL,
-                fitness_age INTEGER
+                fitness_age INTEGER,
+                PRIMARY KEY (person_id, date)
             )
         """)
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS weight_history (
-                date TEXT PRIMARY KEY,
+                person_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
                 weight_grams INTEGER,
                 bmi REAL,
                 body_fat REAL,
                 body_water REAL,
                 bone_mass_g REAL,
-                muscle_mass_g REAL
+                muscle_mass_g REAL,
+                PRIMARY KEY (person_id, date)
             )
         """)
 
@@ -230,6 +255,33 @@ async def init_db():
         # table from an earlier commit of this same branch (a fresh DB
         # already has the column from the CREATE TABLE above).
         await _add_columns(db, "users", _USERS_ADDITIVE_COLUMNS)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS persons (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                slug         TEXT NOT NULL UNIQUE,
+                display_name TEXT NOT NULL,
+                created_at   TEXT NOT NULL,
+                archived_at  TEXT,
+                is_primary   INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_persons_primary "
+            "ON persons(is_primary) WHERE is_primary = 1"
+        )
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS person_grants (
+                person_id  INTEGER NOT NULL REFERENCES persons(id),
+                user_id    INTEGER NOT NULL REFERENCES users(id),
+                access     TEXT NOT NULL CHECK (access IN ('view', 'manage', 'own')),
+                granted_at TEXT NOT NULL,
+                granted_by INTEGER,
+                PRIMARY KEY (person_id, user_id)
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_person_grants_user ON person_grants(user_id)")
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS api_tokens (
@@ -272,33 +324,40 @@ async def init_db():
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS training_load (
-                date TEXT PRIMARY KEY,
+                person_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
                 acute_load REAL,
                 chronic_load REAL,
-                load_ratio REAL
+                load_ratio REAL,
+                PRIMARY KEY (person_id, date)
             )
         """)
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS steps (
-                date TEXT PRIMARY KEY,
-                value INTEGER
+                person_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                value INTEGER,
+                PRIMARY KEY (person_id, date)
             )
         """)
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS active_calories (
-                date TEXT PRIMARY KEY,
-                value INTEGER
+                person_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                value INTEGER,
+                PRIMARY KEY (person_id, date)
             )
         """)
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS sync_status (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
+                person_id      INTEGER PRIMARY KEY,
                 last_sync_time TEXT,
                 last_sync_result TEXT,
-                last_sync_days INTEGER
+                last_sync_days INTEGER,
+                backoff_until  TEXT
             )
         """)
 
@@ -307,7 +366,10 @@ async def init_db():
         # `timestamp >= ?` prefilter alongside the authoritative julianday()
         # bounds specifically so this index can prune the scan -- wrapping
         # the column in julianday() directly is not index-friendly.
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_weight_log_timestamp ON weight_log(timestamp)")
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_weight_log_person_timestamp "
+            "ON weight_log(person_id, timestamp)"
+        )
 
         # FIT-file activity import (dashboard-only, first slice: FIT only --
         # TCX/GPX deferred). Deliberately its own table rather than reusing
@@ -345,12 +407,29 @@ async def init_db():
 
         await db.commit()
     finally:
-        await db.close()
+        await db.close()          # <-- connection closed BEFORE anything below
 
-    # Own connection, opened and closed after init_db()'s connection is
-    # fully closed -- see shared/migrations.py's run_migration() docstring
-    # and tests/test_migration_gating_assumptions.py for why that ordering
-    # matters. No migrations are actually run here yet (that starts in a
-    # later phase); this only refuses to serve a database migrated by a
-    # newer image than this one.
+    await ensure_pre_migration_snapshot(_PERSON_ID_REBUILD_SNAPSHOT_NAME, _needs_person_id_rebuild)
+    await run_migration("001-person-id-rebuild", _apply_person_id_rebuild)
+
     await assert_schema_understood()
+
+
+async def get_primary_person_id() -> int:
+    """Return the id of the durable primary person (persons.is_primary = 1).
+
+    Phase 1 has no per-request identity yet -- every route and background
+    task resolves "the" person through this helper until Phase 2's
+    require_person dependency exists. Each call site is deliberately
+    explicit (see this plan's Global Constraints) so Phase 2 can replace
+    them one at a time.
+    """
+    db = await get_db()
+    try:
+        cur = await db.execute("SELECT id FROM persons WHERE is_primary = 1")
+        row = await cur.fetchone()
+    finally:
+        await db.close()
+    if row is None:
+        raise RuntimeError("No primary person found -- has init_db() run?")
+    return row["id"]
