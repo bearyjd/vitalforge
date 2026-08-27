@@ -363,3 +363,47 @@ async def test_assert_schema_understood_passes_against_a_just_migrated_db(tmp_pa
         await migrations.run_migration(name, apply)
 
     await migrations.assert_schema_understood()  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_init_db_creates_schema_migrations_table(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    await database.init_db()
+
+    db = await database.get_db()
+    try:
+        cur = await db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+        )
+        assert await cur.fetchone() is not None
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_init_db_calls_the_schema_guard_and_passes_on_a_fresh_db(tmp_path, monkeypatch):
+    """A fresh DB has zero migration markers, so the guard must pass --
+    if init_db() raised here, EVERY fresh install would fail to boot."""
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    await database.init_db()  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_init_db_fails_lifespan_if_db_has_an_unknown_migration_marker(tmp_path, monkeypatch):
+    """Proves the guard is actually wired in, not just importable. Seeds an
+    unknown marker directly (bypassing run_migration, which is fine here --
+    this test only cares that init_db() calls assert_schema_understood)."""
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    await database.init_db()  # first boot: creates schema_migrations, passes
+
+    db = await database.get_db()
+    try:
+        await db.execute(
+            "INSERT INTO schema_migrations (name, completed_at) VALUES ('999-from-the-future', 'x')"
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+    with pytest.raises(RuntimeError, match="999-from-the-future"):
+        await database.init_db()

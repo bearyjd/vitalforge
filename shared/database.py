@@ -105,6 +105,8 @@ async def get_db(isolation_level: str | None = "") -> aiosqlite.Connection:
 
 async def init_db():
     """Create all tables if they don't exist."""
+    from shared.migrations import SCHEMA_MIGRATIONS_TABLE_SQL, assert_schema_understood
+
     db = await get_db()
     try:
         # Phase 1: weight log
@@ -332,6 +334,17 @@ async def init_db():
         # import route runs on every upload after the exact file-hash check.
         await db.execute("CREATE INDEX IF NOT EXISTS idx_activities_start_time ON activities(start_time_utc)")
 
+        # Durable one-time markers for shared/migrations.py's run_migration().
+        await db.execute(SCHEMA_MIGRATIONS_TABLE_SQL)
+
         await db.commit()
     finally:
         await db.close()
+
+    # Own connection, opened and closed after init_db()'s connection is
+    # fully closed -- see shared/migrations.py's run_migration() docstring
+    # and tests/test_migration_gating_assumptions.py for why that ordering
+    # matters. No migrations are actually run here yet (that starts in a
+    # later phase); this only refuses to serve a database migrated by a
+    # newer image than this one.
+    await assert_schema_understood()
