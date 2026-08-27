@@ -8,8 +8,6 @@ must be revisited before continuing, per spec Appendix A footnote 1.
 import aiosqlite
 import pytest
 
-import shared.database as database
-
 
 async def _create_scratch_schema(db):
     """A synthetic two-table schema, deliberately unrelated to any real
