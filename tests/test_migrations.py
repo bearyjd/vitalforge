@@ -125,3 +125,15 @@ async def test_run_migration_concurrent_calls_apply_exactly_once(tmp_path, monke
     )
 
     assert call_count == 1, f"apply() ran {call_count} times, expected exactly 1"
+
+
+@pytest.mark.asyncio
+async def test_get_db_sets_a_30_second_busy_timeout(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    db = await database.get_db()
+    try:
+        cur = await db.execute("PRAGMA busy_timeout")
+        row = await cur.fetchone()
+        assert row[0] == 30000
+    finally:
+        await db.close()

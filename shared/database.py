@@ -77,6 +77,14 @@ async def get_db(isolation_level: str | None = "") -> aiosqlite.Connection:
     db = await aiosqlite.connect(str(DB_PATH), isolation_level=isolation_level)
     db.row_factory = aiosqlite.Row
     await db.execute("PRAGMA journal_mode=WAL")
+    # 30s, not aiosqlite's 5s default: a migration (shared/migrations.py's
+    # run_migration) can legitimately hold the write lock longer than 5s on
+    # a database with years of history, and every connection that might
+    # race it -- not just the migration's own -- needs to wait that out
+    # rather than surface "database is locked" as a request-path 500 or a
+    # boot-loop in the other service. See the multi-tenancy design spec's
+    # section (c) for the full reasoning.
+    await db.execute("PRAGMA busy_timeout = 30000")
     return db
 
 
