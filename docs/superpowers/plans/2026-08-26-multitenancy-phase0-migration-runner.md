@@ -80,8 +80,17 @@ async def _sqlite_master_snapshot(db, table_names):
     return rows
 
 
-async def _run_rebuild_then_rollback(db, isolation_level):
-    db.isolation_level = isolation_level
+async def _run_rebuild_then_rollback(db):
+    # isolation_level is NOT set here as a post-connect attribute assignment
+    # (db.isolation_level = ...): aiosqlite proxies the real sqlite3
+    # connection to a background worker thread, and a bare attribute set on
+    # the returned object touches that underlying object from the calling
+    # (wrong) thread, raising `sqlite3.ProgrammingError: SQLite objects
+    # created in a thread can only be used in that same thread` -- verified
+    # directly, this is NOT specific to pytest-asyncio, it reproduces in a
+    # bare asyncio script too. isolation_level must be passed to
+    # aiosqlite.connect(..., isolation_level=...) instead, which is why the
+    # caller passes an already-correctly-opened `db` here.
     await db.execute("PRAGMA busy_timeout = 30000")
     await db.execute("BEGIN IMMEDIATE")
     # The full create/copy/drop/rename sequence, on scratch_a only (scratch_b
@@ -112,9 +121,9 @@ async def test_ddl_rebuild_rolls_back_cleanly_with_isolation_level_none(tmp_path
     finally:
         await setup.close()
 
-    db = await aiosqlite.connect(str(db_path))
+    db = await aiosqlite.connect(str(db_path), isolation_level=None)
     try:
-        await _run_rebuild_then_rollback(db, isolation_level=None)
+        await _run_rebuild_then_rollback(db)
     finally:
         await db.close()
 
@@ -155,9 +164,9 @@ async def test_ddl_rebuild_rolls_back_cleanly_with_legacy_isolation_level(tmp_pa
     finally:
         await setup.close()
 
-    db = await aiosqlite.connect(str(db_path))
+    db = await aiosqlite.connect(str(db_path), isolation_level="")
     try:
-        await _run_rebuild_then_rollback(db, isolation_level="")
+        await _run_rebuild_then_rollback(db)
     finally:
         await db.close()
 
@@ -215,9 +224,11 @@ async def test_second_connection_can_write_while_first_connection_open_no_transa
     await conn1.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY)")
     await conn1.commit()
 
-    conn2 = await aiosqlite.connect(str(db_path))
+    conn2 = await aiosqlite.connect(str(db_path), isolation_level=None)
     try:
-        conn2.isolation_level = None
+        # isolation_level is passed to connect() above, not set as a
+        # post-connect attribute -- see Task 1's _run_rebuild_then_rollback
+        # comment for why the latter raises a cross-thread ProgrammingError.
         await conn2.execute("PRAGMA busy_timeout = 30000")
         await conn2.execute("BEGIN IMMEDIATE")
         await conn2.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY)")
@@ -240,8 +251,7 @@ async def test_second_connection_write_with_uncommitted_seed_insert_on_first(tmp
     await conn1.execute("INSERT INTO t1 (id) VALUES (1)")
     # Deliberately NOT committed yet -- conn1 holds an open write transaction.
 
-    conn2 = await aiosqlite.connect(str(db_path))
-    conn2.isolation_level = None
+    conn2 = await aiosqlite.connect(str(db_path), isolation_level=None)
     await conn2.execute("PRAGMA busy_timeout = 2000")  # short timeout, this should time out fast
     try:
         with pytest.raises(aiosqlite.OperationalError, match="database is locked"):
@@ -272,10 +282,11 @@ git commit -m "test: gate cross-connection DDL visibility assumption"
 **Files:**
 - Create: `shared/migrations.py`
 - Create: `tests/test_migrations.py`
+- Modify: `shared/database.py:62-68` (`get_db()` gains an `isolation_level` parameter — needed by `run_migration()`, discovered while implementing this task: post-connect attribute assignment on an aiosqlite connection raises a cross-thread `ProgrammingError`, so it must be set at `connect()` time instead, which means `get_db()` itself needs to accept it)
 
 **Interfaces:**
-- Consumes: `shared.database.get_db` (existing).
-- Produces: `shared.migrations.SCHEMA_MIGRATIONS_TABLE_SQL: str` (the `CREATE TABLE IF NOT EXISTS` statement, exported so Task 8 doesn't duplicate it), `shared.migrations.run_migration(name: str, apply: Callable[[aiosqlite.Connection], Awaitable[None]]) -> None` (async).
+- Consumes: `shared.database.get_db` (existing, extended in Step 3a of this task to accept `isolation_level: str | None = ""`, default preserves current behavior for every other caller).
+- Produces: `shared.migrations.SCHEMA_MIGRATIONS_TABLE_SQL: str` (the `CREATE TABLE IF NOT EXISTS` statement, exported so Task 8 doesn't duplicate it), `shared.migrations.run_migration(name: str, apply: Callable[[aiosqlite.Connection], Awaitable[None]]) -> None` (async). Also produces the extended `get_db(isolation_level: str | None = "")` signature that Task 4 builds on.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -300,6 +311,32 @@ async def _fresh_db_with_migrations_table(tmp_path, monkeypatch):
     try:
         await db.execute(migrations.SCHEMA_MIGRATIONS_TABLE_SQL)
         await db.commit()
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_get_db_accepts_isolation_level_none(tmp_path, monkeypatch):
+    """get_db() must accept isolation_level as a connect-time parameter, not
+    require the caller to set db.isolation_level after connecting -- see
+    Task 1's _run_rebuild_then_rollback comment for why the latter raises a
+    cross-thread ProgrammingError under aiosqlite."""
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    db = await database.get_db(isolation_level=None)
+    try:
+        assert db.isolation_level is None
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_get_db_default_isolation_level_unchanged(tmp_path, monkeypatch):
+    """Every existing caller across both services calls get_db() with no
+    arguments and must see identical behavior after this change."""
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    db = await database.get_db()
+    try:
+        assert db.isolation_level == ""
     finally:
         await db.close()
 
@@ -387,9 +424,50 @@ async def test_run_migration_concurrent_calls_apply_exactly_once(tmp_path, monke
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/test_migrations.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'shared.migrations'` (or `ImportError`).
+Expected: `test_get_db_accepts_isolation_level_none` FAILs with `TypeError: get_db() got an unexpected keyword argument 'isolation_level'`; `test_get_db_default_isolation_level_unchanged` currently passes (it's asserting today's actual behavior) but is included here so a regression in Step 3a is caught immediately; the four `run_migration` tests FAIL with `ModuleNotFoundError: No module named 'shared.migrations'`.
 
-- [ ] **Step 3: Write `shared/migrations.py`**
+- [ ] **Step 3a: Extend `get_db()` to accept `isolation_level`**
+
+`run_migration()` (Step 3b) needs a connection opened with `isolation_level=None` — and it must be set at `aiosqlite.connect()` time, not as a post-connect attribute assignment (`db.isolation_level = None` after the fact raises `sqlite3.ProgrammingError: SQLite objects created in a thread can only be used in that same thread`, verified directly against aiosqlite — it proxies the real connection to a background worker thread, and a bare attribute set touches that object from the wrong thread). In `shared/database.py`, change:
+
+```python
+async def get_db() -> aiosqlite.Connection:
+    """Open a connection to the SQLite database."""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    db = await aiosqlite.connect(str(DB_PATH))
+    db.row_factory = aiosqlite.Row
+    await db.execute("PRAGMA journal_mode=WAL")
+    return db
+```
+
+to:
+
+```python
+async def get_db(isolation_level: str | None = "") -> aiosqlite.Connection:
+    """Open a connection to the SQLite database.
+
+    isolation_level defaults to "" (aiosqlite/sqlite3's own legacy default),
+    so every existing caller's behavior is unchanged. Pass None for
+    autocommit mode with explicit BEGIN/COMMIT/ROLLBACK control -- e.g.
+    shared/migrations.py's run_migration(), which issues DDL inside a
+    transaction it must be able to roll back as a unit. isolation_level is
+    set here, at connect() time -- setting it as a post-connect attribute
+    on the returned connection instead raises a cross-thread
+    ProgrammingError under aiosqlite (verified directly; this is a genuine
+    aiosqlite API constraint, not an artifact of any particular caller's
+    async setup).
+    """
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    db = await aiosqlite.connect(str(DB_PATH), isolation_level=isolation_level)
+    db.row_factory = aiosqlite.Row
+    await db.execute("PRAGMA journal_mode=WAL")
+    return db
+```
+
+Run: `pytest tests/test_migrations.py -k get_db -v`
+Expected: both `test_get_db_accepts_isolation_level_none` and `test_get_db_default_isolation_level_unchanged` PASS.
+
+- [ ] **Step 3b: Write `shared/migrations.py`**
 
 ```python
 """Migration runner and schema-version guard for VitalForge.
@@ -445,15 +523,14 @@ async def run_migration(name: str, apply: Callable[[aiosqlite.Connection], Await
     a container that cannot migrate must fail its lifespan and be restarted
     rather than serve traffic against a schema it did not verify.
     """
-    db = await get_db()
+    # isolation_level=None (autocommit + explicit BEGIN IMMEDIATE), not
+    # get_db()'s default legacy isolation_level (""), because this is the
+    # mode tests/test_migration_gating_assumptions.py actually verified DDL
+    # rollback under. Do not remove this argument on the grounds that "the
+    # rest of the codebase doesn't set it": the rest of the codebase only
+    # runs DML inside its explicit transactions, never DDL.
+    db = await get_db(isolation_level=None)
     try:
-        # autocommit + an explicit BEGIN IMMEDIATE, rather than get_db()'s
-        # inherited legacy isolation_level (""), because this is the mode
-        # tests/test_migration_gating_assumptions.py actually verified DDL
-        # rollback under. Do not remove this line on the grounds that "the
-        # rest of the codebase doesn't set it": the rest of the codebase
-        # only runs DML inside its explicit transactions, never DDL.
-        db.isolation_level = None
         # 30s, not the sqlite3 default of 5s: the loser of a migration race
         # waits for the winner's entire migration, which can exceed 5s on a
         # database with years of history.
@@ -489,12 +566,17 @@ async def run_migration(name: str, apply: Callable[[aiosqlite.Connection], Await
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/test_migrations.py -v`
-Expected: all 4 tests PASS.
+Expected: all 6 tests PASS (the 2 `get_db` tests from Step 3a plus the 4 `run_migration` tests).
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Run the full existing suite to check for regressions**
+
+Run: `pytest -q`
+Expected: all existing tests pass — `get_db()`'s new parameter is additive with a default that preserves current behavior, but this confirms nothing else in the codebase broke.
+
+- [ ] **Step 6: Commit**
 
 ```bash
-git add shared/migrations.py tests/test_migrations.py
+git add shared/database.py shared/migrations.py tests/test_migrations.py
 git commit -m "feat: add run_migration(), a once-only atomic migration runner"
 ```
 
@@ -534,25 +616,49 @@ Expected: FAIL, `assert 5000 == 30000` (aiosqlite's default) or similar.
 
 - [ ] **Step 3: Update `get_db()`**
 
-In `shared/database.py`, change:
+In `shared/database.py`, `get_db()` was already extended in Task 3 to accept `isolation_level`. Change:
 
 ```python
-async def get_db() -> aiosqlite.Connection:
-    """Open a connection to the SQLite database."""
+async def get_db(isolation_level: str | None = "") -> aiosqlite.Connection:
+    """Open a connection to the SQLite database.
+
+    isolation_level defaults to "" (aiosqlite/sqlite3's own legacy default),
+    so every existing caller's behavior is unchanged. Pass None for
+    autocommit mode with explicit BEGIN/COMMIT/ROLLBACK control -- e.g.
+    shared/migrations.py's run_migration(), which issues DDL inside a
+    transaction it must be able to roll back as a unit. isolation_level is
+    set here, at connect() time -- setting it as a post-connect attribute
+    on the returned connection instead raises a cross-thread
+    ProgrammingError under aiosqlite (verified directly; this is a genuine
+    aiosqlite API constraint, not an artifact of any particular caller's
+    async setup).
+    """
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    db = await aiosqlite.connect(str(DB_PATH))
+    db = await aiosqlite.connect(str(DB_PATH), isolation_level=isolation_level)
     db.row_factory = aiosqlite.Row
     await db.execute("PRAGMA journal_mode=WAL")
     return db
 ```
 
-to:
+to (adding the `busy_timeout` line, docstring unchanged otherwise):
 
 ```python
-async def get_db() -> aiosqlite.Connection:
-    """Open a connection to the SQLite database."""
+async def get_db(isolation_level: str | None = "") -> aiosqlite.Connection:
+    """Open a connection to the SQLite database.
+
+    isolation_level defaults to "" (aiosqlite/sqlite3's own legacy default),
+    so every existing caller's behavior is unchanged. Pass None for
+    autocommit mode with explicit BEGIN/COMMIT/ROLLBACK control -- e.g.
+    shared/migrations.py's run_migration(), which issues DDL inside a
+    transaction it must be able to roll back as a unit. isolation_level is
+    set here, at connect() time -- setting it as a post-connect attribute
+    on the returned connection instead raises a cross-thread
+    ProgrammingError under aiosqlite (verified directly; this is a genuine
+    aiosqlite API constraint, not an artifact of any particular caller's
+    async setup).
+    """
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    db = await aiosqlite.connect(str(DB_PATH))
+    db = await aiosqlite.connect(str(DB_PATH), isolation_level=isolation_level)
     db.row_factory = aiosqlite.Row
     await db.execute("PRAGMA journal_mode=WAL")
     # 30s, not aiosqlite's 5s default: a migration (shared/migrations.py's
@@ -1176,10 +1282,12 @@ Expected: first test fails (`schema_migrations` doesn't exist yet), third test f
 
 - [ ] **Step 3: Update `shared/database.py`**
 
-At the top of the file, add the import:
+**Do NOT add a module-top `from shared.migrations import ...` line.** `shared/migrations.py` (Task 3) already does `from shared.database import get_db` at ITS module top — a module-top import the other direction here would make the two modules import each other at load time (`shared.database` → `shared.migrations` → `shared.database`, which is not yet finished initializing and does not have `get_db` defined yet), raising `ImportError: cannot import name 'get_db' from partially initialized module 'shared.database'`. Import locally, inside `init_db()` itself, exactly as `ensure_pre_migration_snapshot()` already does for its own `shared.database` import (Task 6) — by the time `init_db()` actually runs, both modules have finished loading, so the circularity never triggers.
+
+At the very start of `init_db()`'s function body (before its existing `db = await get_db()` line), add:
 
 ```python
-from shared.migrations import SCHEMA_MIGRATIONS_TABLE_SQL, assert_schema_understood
+    from shared.migrations import SCHEMA_MIGRATIONS_TABLE_SQL, assert_schema_understood
 ```
 
 Inside `init_db()`, before the final `await db.commit()` (i.e. as one more statement alongside the other `CREATE TABLE IF NOT EXISTS` calls, anywhere in that sequence — table creation order doesn't matter since none of these tables reference each other yet), add:

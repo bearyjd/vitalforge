@@ -6,10 +6,16 @@ import aiosqlite
 DB_PATH = Path(os.getenv("DB_PATH", "/app/data/fitness.db"))
 
 # Additive columns for weight_log's body-composition intake (Track B). Every
-# entry here must stay nullable with no non-constant DEFAULT -- a defaulted
-# column rewrites the table and reintroduces a real interruption window for
-# "container killed during first boot after upgrade" (see
-# docs/prp/00-design.md SS5.4).
+# entry here must stay nullable with no non-constant DEFAULT -- not because a
+# table rewrite is interruption-unsafe (it isn't: SQLite's CREATE/COPY/DROP/
+# RENAME sequence rolls back cleanly inside BEGIN IMMEDIATE, verified in
+# tests/test_migration_gating_assumptions.py), but because a constant-default
+# ADD COLUMN needs no migration runner at all -- it's a fast, metadata-only
+# change -- while a genuine schema change (e.g. a non-constant default, or
+# changing a PRIMARY KEY) does, and belongs in shared/migrations.py instead
+# of here. See docs/prp/00-design.md SS5.4 and
+# docs/superpowers/specs/2026-08-25-family-multitenancy-design.md Appendix A
+# for the full reasoning and the migration that first needed the runner.
 _WEIGHT_LOG_ADDITIVE_COLUMNS = [
     "body_fat_pct REAL",
     "body_water_pct REAL",
@@ -42,15 +48,30 @@ _USERS_ADDITIVE_COLUMNS = [
 
 
 async def _add_columns(db, table: str, column_ddls: list[str]):
-    """Attempt-and-swallow, not PRAGMA-table_info-then-act: both services run
-    init_db() against the same file and docker-compose starts them together,
-    so a pre-check would be TOCTOU-racy -- both could observe "absent" and
-    both then attempt the ADD COLUMN. Only the duplicate-column error is
-    swallowed; `database is locked` must propagate so a container that
-    cannot migrate fails its lifespan and is restarted rather than serving
-    traffic against a half-migrated schema.
+    """Attempt-and-swallow, not PRAGMA-table_info-then-act, for CORRECTNESS:
+    both services run init_db() against the same file and docker-compose
+    starts them together, so a pre-check used to DECIDE whether to add a
+    column would be TOCTOU-racy -- both could observe "absent" and both then
+    attempt the ADD COLUMN. Only the duplicate-column error is swallowed;
+    `database is locked` must propagate so a container that cannot migrate
+    fails its lifespan and is restarted rather than serving traffic against
+    a half-migrated schema.
+
+    The PRAGMA table_info read below is a LATENCY-ONLY pre-check, not a
+    correctness pre-check: it is allowed to be wrong (e.g. under a genuine
+    race, both callers can still see "absent" and both attempt the ALTER,
+    which is exactly the attempt-and-swallow path this docstring's first
+    paragraph describes). What it buys is that the common case -- a second
+    service starting up after the first one already added every column --
+    skips a lock wait on an ALTER TABLE that was only ever going to hit
+    "duplicate column name" and be swallowed anyway.
     """
     for column_ddl in column_ddls:
+        column_name = column_ddl.split()[0]
+        cur = await db.execute(f"PRAGMA table_info({table})")
+        existing = {row[1] for row in await cur.fetchall()}
+        if column_name in existing:
+            continue
         try:
             await db.execute(f"ALTER TABLE {table} ADD COLUMN {column_ddl}")
             await db.commit()
@@ -59,17 +80,39 @@ async def _add_columns(db, table: str, column_ddls: list[str]):
                 raise
 
 
-async def get_db() -> aiosqlite.Connection:
-    """Open a connection to the SQLite database."""
+async def get_db(isolation_level: str | None = "") -> aiosqlite.Connection:
+    """Open a connection to the SQLite database.
+
+    isolation_level defaults to "" (aiosqlite/sqlite3's own legacy default),
+    so every existing caller's behavior is unchanged. Pass None for
+    autocommit mode with explicit BEGIN/COMMIT/ROLLBACK control -- e.g.
+    shared/migrations.py's run_migration(), which issues DDL inside a
+    transaction it must be able to roll back as a unit. isolation_level is
+    set here, at connect() time -- setting it as a post-connect attribute
+    on the returned connection instead raises a cross-thread
+    ProgrammingError under aiosqlite (verified directly; this is a genuine
+    aiosqlite API constraint, not an artifact of any particular caller's
+    async setup).
+    """
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    db = await aiosqlite.connect(str(DB_PATH))
+    db = await aiosqlite.connect(str(DB_PATH), isolation_level=isolation_level)
     db.row_factory = aiosqlite.Row
     await db.execute("PRAGMA journal_mode=WAL")
+    # 30s, not aiosqlite's 5s default: a migration (shared/migrations.py's
+    # run_migration) can legitimately hold the write lock longer than 5s on
+    # a database with years of history, and every connection that might
+    # race it -- not just the migration's own -- needs to wait that out
+    # rather than surface "database is locked" as a request-path 500 or a
+    # boot-loop in the other service. See the multi-tenancy design spec's
+    # section (c) for the full reasoning.
+    await db.execute("PRAGMA busy_timeout = 30000")
     return db
 
 
 async def init_db():
     """Create all tables if they don't exist."""
+    from shared.migrations import SCHEMA_MIGRATIONS_TABLE_SQL, assert_schema_understood
+
     db = await get_db()
     try:
         # Phase 1: weight log
@@ -297,6 +340,17 @@ async def init_db():
         # import route runs on every upload after the exact file-hash check.
         await db.execute("CREATE INDEX IF NOT EXISTS idx_activities_start_time ON activities(start_time_utc)")
 
+        # Durable one-time markers for shared/migrations.py's run_migration().
+        await db.execute(SCHEMA_MIGRATIONS_TABLE_SQL)
+
         await db.commit()
     finally:
         await db.close()
+
+    # Own connection, opened and closed after init_db()'s connection is
+    # fully closed -- see shared/migrations.py's run_migration() docstring
+    # and tests/test_migration_gating_assumptions.py for why that ordering
+    # matters. No migrations are actually run here yet (that starts in a
+    # later phase); this only refuses to serve a database migrated by a
+    # newer image than this one.
+    await assert_schema_understood()
