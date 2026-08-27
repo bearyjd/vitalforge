@@ -71,23 +71,32 @@ async def test_init_db_converges_after_partial_migration(production_schema_db):
 
 
 async def test_duplicate_column_error_swallowed_but_others_propagate():
+    class MockCursor:
+        async def fetchall(self):
+            return []  # empty result: no columns exist yet
+
     class DuplicateDB:
         async def execute(self, sql):
+            if "PRAGMA" in sql:
+                return MockCursor()
             raise aiosqlite.OperationalError("duplicate column name: body_fat_pct")
 
         async def commit(self):
             pass
 
-    # no exception -- swallowed
+    # no exception -- swallowed (duplicate_column_name is caught and ignored)
     await database._add_columns(DuplicateDB(), "weight_log", database._WEIGHT_LOG_ADDITIVE_COLUMNS)
 
     class OtherErrorDB:
         async def execute(self, sql):
+            if "PRAGMA" in sql:
+                return MockCursor()
             raise aiosqlite.OperationalError("database is locked")
 
         async def commit(self):
             pass
 
+    # database is locked must propagate (not swallowed)
     with pytest.raises(aiosqlite.OperationalError, match="database is locked"):
         await database._add_columns(OtherErrorDB(), "weight_log", database._WEIGHT_LOG_ADDITIVE_COLUMNS)
 

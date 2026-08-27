@@ -62,16 +62,10 @@ async def _add_columns(db, table: str, column_ddls: list[str]):
     """
     for column_ddl in column_ddls:
         column_name = column_ddl.split()[0]
-        try:
-            cur = await db.execute(f"PRAGMA table_info({table})")
-            existing = {row[1] for row in await cur.fetchall()}
-            if column_name in existing:
-                continue
-        except Exception:
-            # Pre-check failure (e.g., database locked, table doesn't exist,
-            # or any other error) is not fatal -- we fall through to attempt
-            # the ALTER TABLE, which is the source of truth for correctness.
-            pass
+        cur = await db.execute(f"PRAGMA table_info({table})")
+        existing = {row[1] for row in await cur.fetchall()}
+        if column_name in existing:
+            continue
         try:
             await db.execute(f"ALTER TABLE {table} ADD COLUMN {column_ddl}")
             await db.commit()
