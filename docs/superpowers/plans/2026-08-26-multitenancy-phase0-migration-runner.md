@@ -1176,10 +1176,12 @@ Expected: first test fails (`schema_migrations` doesn't exist yet), third test f
 
 - [ ] **Step 3: Update `shared/database.py`**
 
-At the top of the file, add the import:
+**Do NOT add a module-top `from shared.migrations import ...` line.** `shared/migrations.py` (Task 3) already does `from shared.database import get_db` at ITS module top — a module-top import the other direction here would make the two modules import each other at load time (`shared.database` → `shared.migrations` → `shared.database`, which is not yet finished initializing and does not have `get_db` defined yet), raising `ImportError: cannot import name 'get_db' from partially initialized module 'shared.database'`. Import locally, inside `init_db()` itself, exactly as `ensure_pre_migration_snapshot()` already does for its own `shared.database` import (Task 6) — by the time `init_db()` actually runs, both modules have finished loading, so the circularity never triggers.
+
+At the very start of `init_db()`'s function body (before its existing `db = await get_db()` line), add:
 
 ```python
-from shared.migrations import SCHEMA_MIGRATIONS_TABLE_SQL, assert_schema_understood
+    from shared.migrations import SCHEMA_MIGRATIONS_TABLE_SQL, assert_schema_understood
 ```
 
 Inside `init_db()`, before the final `await db.commit()` (i.e. as one more statement alongside the other `CREATE TABLE IF NOT EXISTS` calls, anywhere in that sequence — table creation order doesn't matter since none of these tables reference each other yet), add:
