@@ -5,6 +5,7 @@ section (c) for the full design rationale.
 
 import asyncio
 
+import aiosqlite
 import pytest
 
 import shared.database as database
@@ -184,3 +185,110 @@ async def test_add_columns_still_adds_missing_column(tmp_path, monkeypatch):
         assert "new_col" in columns
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_created_and_verified_when_needed(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "fitness.db")
+    db = await database.get_db()
+    try:
+        await db.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
+        await db.execute("INSERT INTO probe (id) VALUES (1)")
+        await db.commit()
+    finally:
+        await db.close()
+
+    async def needs_snapshot(db):
+        return True
+
+    await migrations.ensure_pre_migration_snapshot("test.pre-migration.db", needs_snapshot)
+
+    final = tmp_path / "test.pre-migration.db"
+    assert final.exists()
+    check = await aiosqlite.connect(str(final))
+    try:
+        cur = await check.execute("SELECT id FROM probe")
+        assert await cur.fetchone() == (1,)
+    finally:
+        await check.close()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_skipped_when_not_needed(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "fitness.db")
+    db = await database.get_db()
+    await db.close()
+
+    async def needs_snapshot(db):
+        return False
+
+    await migrations.ensure_pre_migration_snapshot("test.pre-migration.db", needs_snapshot)
+
+    assert not (tmp_path / "test.pre-migration.db").exists()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_skipped_when_final_already_exists(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "fitness.db")
+    tmp_path.mkdir(exist_ok=True)
+    final = tmp_path / "test.pre-migration.db"
+    final.write_bytes(b"already here")
+    call_count = 0
+
+    async def needs_snapshot(db):
+        nonlocal call_count
+        call_count += 1
+        return True
+
+    await migrations.ensure_pre_migration_snapshot("test.pre-migration.db", needs_snapshot)
+
+    assert call_count == 0, "needs_snapshot() was called even though the final snapshot already exists"
+    assert final.read_bytes() == b"already here", "an existing snapshot was overwritten"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_respects_skip_env_var(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "fitness.db")
+    monkeypatch.setenv("VITALFORGE_SKIP_MIGRATION_SNAPSHOT", "1")
+    db = await database.get_db()
+    await db.close()
+
+    async def needs_snapshot(db):
+        return True
+
+    await migrations.ensure_pre_migration_snapshot("test.pre-migration.db", needs_snapshot)
+
+    assert not (tmp_path / "test.pre-migration.db").exists()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_discards_a_corrupt_partial_and_retries(tmp_path, monkeypatch):
+    """Simulates a container killed mid-VACUUM INTO: a .partial file exists
+    from a prior interrupted attempt. A fresh call must discard it (not
+    trust it) and produce a genuinely verified snapshot."""
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "fitness.db")
+    db = await database.get_db()
+    try:
+        await db.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
+        await db.commit()
+    finally:
+        await db.close()
+
+    partial = tmp_path / "test.pre-migration.db.partial"
+    partial.write_bytes(b"not a valid sqlite file, simulates a kill mid-VACUUM")
+
+    async def needs_snapshot(db):
+        return True
+
+    await migrations.ensure_pre_migration_snapshot("test.pre-migration.db", needs_snapshot)
+
+    final = tmp_path / "test.pre-migration.db"
+    assert final.exists()
+    assert not partial.exists()
+    check = await aiosqlite.connect(str(final))
+    try:
+        cur = await check.execute("PRAGMA integrity_check")
+        row = await cur.fetchone()
+        assert row[0] == "ok"
+    finally:
+        await check.close()
