@@ -11,23 +11,23 @@ logger = logging.getLogger(__name__)
 SYNC_INTERVAL_HOURS = int(os.getenv("SYNC_INTERVAL_HOURS", "2"))
 
 
-async def get_synced_dates(table: str) -> set[str]:
+async def get_synced_dates(table: str, person_id: int) -> set[str]:
     """Return the set of dates already stored for a given metric table."""
     db = await get_db()
     try:
-        cursor = await db.execute(f"SELECT date FROM [{table}]")
+        cursor = await db.execute(f"SELECT date FROM [{table}] WHERE person_id = ?", (person_id,))
         rows = await cursor.fetchall()
         return {row["date"] for row in rows}
     finally:
         await db.close()
 
 
-async def upsert(table: str, date: str, **columns):
-    """Insert or replace a row in a metric table."""
-    cols = ["date"] + list(columns.keys())
+async def upsert(table: str, date: str, person_id: int, **columns):
+    """Insert or replace a row in a metric table, scoped to person_id."""
+    cols = ["person_id", "date"] + list(columns.keys())
     placeholders = ", ".join(["?"] * len(cols))
     col_names = ", ".join(cols)
-    values = [date] + list(columns.values())
+    values = [person_id, date] + list(columns.values())
 
     db = await get_db()
     try:
@@ -52,7 +52,7 @@ def _extract_sleep_score(dto: dict, sleep: dict) -> int | None:
     return dto.get("overallSleepScoreValue") or sleep.get("overallSleepScoreValue")
 
 
-async def sync_date(date_str: str):
+async def sync_date(date_str: str, person_id: int):
     """Pull all metrics from Garmin for a single date and store them."""
 
     # --- Sleep ---
@@ -62,7 +62,7 @@ async def sync_date(date_str: str):
         dto = sleep.get("dailySleepDTO", sleep)
         if isinstance(dto, dict) and dto.get("sleepTimeSeconds"):
             await upsert(
-                "sleep", date_str,
+                "sleep", date_str, person_id,
                 duration_seconds=dto.get("sleepTimeSeconds"),
                 deep_seconds=dto.get("deepSleepSeconds"),
                 light_seconds=dto.get("lightSleepSeconds"),
@@ -78,15 +78,15 @@ async def sync_date(date_str: str):
     if summary and isinstance(summary, dict):
         rhr = summary.get("restingHeartRate")
         if rhr:
-            await upsert("resting_hr", date_str, value=rhr)
+            await upsert("resting_hr", date_str, person_id, value=rhr)
 
         total_steps = summary.get("totalSteps")
         if total_steps is not None:
-            await upsert("steps", date_str, value=total_steps)
+            await upsert("steps", date_str, person_id, value=total_steps)
 
         active_cal = summary.get("activeKilocalories")
         if active_cal is not None:
-            await upsert("active_calories", date_str, value=active_cal)
+            await upsert("active_calories", date_str, person_id, value=active_cal)
 
     # --- HRV ---
     hrv = garmin_client.get_hrv_data(date_str)
@@ -96,7 +96,7 @@ async def sync_date(date_str: str):
             last_night = hrv_summary.get("lastNightAvg")
             if last_night:
                 await upsert(
-                    "hrv", date_str,
+                    "hrv", date_str, person_id,
                     last_night_avg=last_night,
                     last_night_5min_high=hrv_summary.get("lastNight5MinHigh"),
                     weekly_avg=hrv_summary.get("weeklyAvg"),
@@ -126,7 +126,7 @@ async def sync_date(date_str: str):
 
             if highest is not None:
                 await upsert(
-                    "body_battery", date_str,
+                    "body_battery", date_str, person_id,
                     charged=entry.get("charged") or entry.get("bodyBatteryChargedValue"),
                     drained=entry.get("drained") or entry.get("bodyBatteryDrainedValue"),
                     highest=highest,
@@ -140,7 +140,7 @@ async def sync_date(date_str: str):
         avg_stress = stress.get("avgStressLevel") or stress.get("overallStressLevel")
         if avg_stress is not None:
             await upsert(
-                "stress", date_str,
+                "stress", date_str, person_id,
                 avg_level=avg_stress,
                 max_level=stress.get("maxStressLevel"),
                 rest_duration=stress.get("restStressDuration"),
@@ -160,7 +160,7 @@ async def sync_date(date_str: str):
                 vo2 = generic.get("vo2MaxValue")
                 if vo2:
                     await upsert(
-                        "vo2max", date_str,
+                        "vo2max", date_str, person_id,
                         vo2max_value=vo2,
                         fitness_age=generic.get("fitnessAge"),
                     )
@@ -179,7 +179,7 @@ async def sync_date(date_str: str):
                         total = round(aero_low + aero_high + anaerobic, 1)
                         if total > 0:
                             await upsert(
-                                "training_load", date_str,
+                                "training_load", date_str, person_id,
                                 acute_load=total,
                                 chronic_load=None,
                                 load_ratio=None,
@@ -192,14 +192,14 @@ async def sync_date(date_str: str):
             acute = training.get("acuteLoad") or (agg.get("acuteLoad") if isinstance(agg, dict) else None)
             if acute is not None:
                 await upsert(
-                    "training_load", date_str,
+                    "training_load", date_str, person_id,
                     acute_load=acute,
                     chronic_load=training.get("chronicLoad") or (agg.get("chronicLoad") if isinstance(agg, dict) else None),
                     load_ratio=training.get("loadRatio") or (agg.get("loadRatio") if isinstance(agg, dict) else None),
                 )
 
 
-async def sync_weight_history(start_date: str, end_date: str):
+async def sync_weight_history(start_date: str, end_date: str, person_id: int):
     """Pull weight data from Garmin and store in weight_history table."""
     data = garmin_client.get_weight_range(start_date, end_date)
     if not data:
@@ -223,7 +223,7 @@ async def sync_weight_history(start_date: str, end_date: str):
                 date_val = datetime.fromtimestamp(date_val / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
             if date_val and weight_g:
                 await upsert(
-                    "weight_history", date_val,
+                    "weight_history", date_val, person_id,
                     weight_grams=weight_g,
                     bmi=latest.get("bmi"),
                     body_fat=latest.get("bodyFat"),
@@ -233,9 +233,9 @@ async def sync_weight_history(start_date: str, end_date: str):
                 )
 
 
-async def run_sync(days: int = 7):
+async def run_sync(days: int = 7, *, person_id: int):
     """Run a full sync for the given number of days back from today."""
-    logger.info("Starting sync for last %d days", days)
+    logger.info("Starting sync for person %s, last %d days", person_id, days)
     start_time = datetime.now(timezone.utc)
     result = "success"
     errors = 0
@@ -253,7 +253,7 @@ async def run_sync(days: int = 7):
     ]
     existing = {}
     for table in tables:
-        existing[table] = await get_synced_dates(table)
+        existing[table] = await get_synced_dates(table, person_id)
 
     today_str = today.isoformat()
 
@@ -265,7 +265,7 @@ async def run_sync(days: int = 7):
                 continue
 
         try:
-            await sync_date(date_str)
+            await sync_date(date_str, person_id)
         except Exception:
             logger.exception("Error syncing date %s", date_str)
             errors += 1
@@ -273,7 +273,7 @@ async def run_sync(days: int = 7):
     # Weight history — fetch as a range
     try:
         start_date = (today - timedelta(days=days)).isoformat()
-        await sync_weight_history(start_date, today_str)
+        await sync_weight_history(start_date, today_str, person_id)
     except Exception as e:
         logger.error("Error syncing weight history: %s", e)
         errors += 1
@@ -288,8 +288,9 @@ async def run_sync(days: int = 7):
     db = await get_db()
     try:
         await db.execute(
-            "INSERT OR REPLACE INTO sync_status (id, last_sync_time, last_sync_result, last_sync_days) VALUES (1, ?, ?, ?)",
-            (start_time.isoformat(), result, days),
+            "INSERT OR REPLACE INTO sync_status (person_id, last_sync_time, last_sync_result, last_sync_days) "
+            "VALUES (?, ?, ?, ?)",
+            (person_id, start_time.isoformat(), result, days),
         )
         await db.commit()
     finally:
@@ -307,19 +308,23 @@ async def scheduled_sync(lock: asyncio.Lock):
     shared serialization a manual sync and this backfill/scheduled loop can
     interleave and let an older pull silently overwrite a newer one.
     """
+    from shared.database import get_primary_person_id
+
     # Initial backfill of 90 days
     logger.info("Running initial 90-day backfill...")
     try:
+        person_id = await get_primary_person_id()
         async with lock:
-            await run_sync(days=90)
+            await run_sync(days=90, person_id=person_id)
     except Exception as e:
         logger.error("Initial backfill failed: %s", e)
 
     while True:
         await asyncio.sleep(SYNC_INTERVAL_HOURS * 3600)
         try:
+            person_id = await get_primary_person_id()
             logger.info("Running scheduled sync...")
             async with lock:
-                await run_sync(days=3)
+                await run_sync(days=3, person_id=person_id)
         except Exception as e:
             logger.error("Scheduled sync failed: %s", e)
