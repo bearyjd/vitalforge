@@ -295,6 +295,63 @@ async def test_snapshot_discards_a_corrupt_partial_and_retries(tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_snapshot_raises_actionable_error_when_integrity_check_itself_raises(tmp_path, monkeypatch):
+    """Simulates the realistic corruption shape: VACUUM INTO "succeeds" (the
+    .partial file exists) but its contents are not a valid SQLite database
+    at all, so PRAGMA integrity_check raises sqlite3.DatabaseError ("file is
+    not a database") from *inside* the connection rather than returning a
+    not-ok row. Without the except clause this exercises,
+    ensure_pre_migration_snapshot would let that exception propagate raw
+    instead of the actionable RuntimeError, and the `if not ok` /
+    cleanup-and-raise path below it would never run.
+
+    Reaching this naturally would require VACUUM INTO itself to write a
+    corrupt file, which it does not do on a healthy filesystem. Instead we
+    monkeypatch aiosqlite.connect so that only the connection for the
+    verification step (connecting to the tmp `.partial` path) first
+    overwrites that file with garbage bytes -- every other aiosqlite.connect
+    call (the main db connections used for the CREATE TABLE setup and
+    inside ensure_pre_migration_snapshot itself) is passed through
+    unchanged. The subsequent real `PRAGMA integrity_check` call then raises
+    the genuine sqlite3.DatabaseError on its own, so this test exercises the
+    actual production code path, not a hand-thrown substitute.
+    """
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "fitness.db")
+    db = await database.get_db()
+    try:
+        await db.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
+        await db.commit()
+    finally:
+        await db.close()
+
+    tmp = tmp_path / "test.pre-migration.db.partial"
+    final = tmp_path / "test.pre-migration.db"
+
+    real_connect = aiosqlite.connect
+
+    def fake_connect(path, *args, **kwargs):
+        if str(path) == str(tmp):
+            # Overwrite VACUUM INTO's real output with garbage right before
+            # the verification connection opens it, so the real
+            # PRAGMA integrity_check call below raises DatabaseError itself.
+            tmp.write_bytes(b"not a valid sqlite database at all, simulates corrupted VACUUM output")
+        return real_connect(path, *args, **kwargs)
+
+    monkeypatch.setattr(migrations.aiosqlite, "connect", fake_connect)
+
+    async def needs_snapshot(db):
+        return True
+
+    with pytest.raises(
+        RuntimeError, match="^Pre-migration snapshot failed integrity_check; refusing to migrate$"
+    ):
+        await migrations.ensure_pre_migration_snapshot("test.pre-migration.db", needs_snapshot)
+
+    assert not tmp.exists(), "the unverifiable .partial file must still be cleaned up"
+    assert not final.exists(), "an unverified snapshot must never be promoted to the fixed name"
+
+
+@pytest.mark.asyncio
 async def test_assert_schema_understood_passes_on_empty_migrations_table(tmp_path, monkeypatch):
     monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
     db = await database.get_db()

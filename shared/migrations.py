@@ -119,12 +119,16 @@ async def run_migration(name: str, apply: Callable[[aiosqlite.Connection], Await
             )
             await db.commit()
         except BaseException:
-            # Explicit, matching shared/auth.py's rollback pattern around its
-            # own BEGIN IMMEDIATE blocks. Closing the connection in `finally`
-            # would also discard the transaction, but relying on that is the
-            # kind of implicit behavior this module exists to avoid.
-            # BaseException, not Exception, so a cancelled lifespan also
-            # rolls back rather than leaving a held lock.
+            # shared/auth.py's bootstrap_migrated_token() is the closest
+            # structural model this generalizes: it does an explicit
+            # `await db.rollback()` on each known early-return branch inside
+            # its own BEGIN IMMEDIATE block, then relies on `finally: await
+            # db.close()` to discard the transaction on anything unexpected
+            # -- it has no except clause at all. This function adds one:
+            # BaseException (not just Exception), so that a cancelled
+            # lifespan (asyncio.CancelledError) also gets an explicit
+            # rollback here rather than relying on the implicit discard from
+            # closing the connection in `finally` below.
             await db.rollback()
             raise
         logger.warning("Applied schema migration %s in %.2fs", name, time.monotonic() - started)
@@ -155,7 +159,9 @@ async def ensure_pre_migration_snapshot(
     snapshot exists." os.rename is atomic within a filesystem, and both
     paths are on the same data volume by construction (DB_PATH.parent).
     """
-    from shared.database import DB_PATH, get_db
+    # local, so DB_PATH is resolved per-call -- a module-top binding would
+    # freeze the value at import and defeat DB_PATH overrides in tests.
+    from shared.database import DB_PATH
 
     final = DB_PATH.parent / snapshot_name
     if final.exists():
@@ -204,13 +210,28 @@ async def ensure_pre_migration_snapshot(
     finally:
         await db.close()
 
-    check = await aiosqlite.connect(str(tmp))
     try:
-        cur = await check.execute("PRAGMA integrity_check")
-        row = await cur.fetchone()
-    finally:
-        await check.close()
-    if row is None or row[0] != "ok":
+        check = await aiosqlite.connect(str(tmp))
+        try:
+            cur = await check.execute("PRAGMA integrity_check")
+            row = await cur.fetchone()
+        finally:
+            await check.close()
+        ok = row is not None and row[0] == "ok"
+    except aiosqlite.DatabaseError as exc:
+        # The tmp file cannot be read or verified as a SQLite database at
+        # all (e.g. "file is not a database") -- PRAGMA integrity_check
+        # raises from inside the connection rather than returning a not-ok
+        # row, so without this the `if not ok` branch below would never run
+        # and the operator would see a raw DatabaseError instead of the
+        # actionable message. Same failure mode as an explicit
+        # integrity_check failure, so route it into the same
+        # cleanup-and-raise path -- but log the original exception first,
+        # since its message (e.g. "file is not a database" vs "database
+        # disk image is malformed") is the actual diagnostic detail.
+        logger.error("Pre-migration snapshot at %s is not a readable SQLite database", tmp, exc_info=exc)
+        ok = False
+    if not ok:
         tmp.unlink(missing_ok=True)
         raise RuntimeError("Pre-migration snapshot failed integrity_check; refusing to migrate")
 
