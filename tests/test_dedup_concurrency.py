@@ -23,7 +23,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from shared import database
-from shared.database import get_db
+from shared.database import get_db, get_primary_person_id
 
 
 @pytest.fixture
@@ -36,12 +36,13 @@ async def client(weight_app_module):
 async def seed_row(weight_grams: int, seconds_ago: float = 0) -> int:
     ts = (datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)).isoformat()
     weight_kg = weight_grams / 1000.0
+    person_id = await get_primary_person_id()
     db = await get_db()
     try:
         cursor = await db.execute(
-            "INSERT INTO weight_log (weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin) "
-            "VALUES (?, ?, ?, ?, 1)",
-            (round(weight_kg * 2.20462, 2), round(weight_kg, 2), weight_grams, ts),
+            "INSERT INTO weight_log (person_id, weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin) "
+            "VALUES (?, ?, ?, ?, ?, 1)",
+            (person_id, round(weight_kg * 2.20462, 2), round(weight_kg, 2), weight_grams, ts),
         )
         await db.commit()
         return cursor.lastrowid

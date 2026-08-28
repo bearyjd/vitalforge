@@ -16,7 +16,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from shared.auth import add_auth_routes, bootstrap_first_admin, bootstrap_migrated_token
-from shared.database import get_db, init_db
+from shared.database import get_db, get_primary_person_id, init_db
 from shared.garmin_client import authenticate, push_weight
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -184,6 +184,7 @@ async def post_weight(data: WeightIn):
     weight_grams = round(weight_kg * GRAMS_PER_KG)
     now = datetime.now(timezone.utc)
     timestamp = now.isoformat()
+    person_id = await get_primary_person_id()
 
     # Atomic: read for a duplicate and (if any) write inside one transaction,
     # so two concurrent requests can never both observe "no duplicate". The
@@ -244,12 +245,14 @@ async def post_weight(data: WeightIn):
             "SELECT id, weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin, "
             "body_fat_pct, body_water_pct, muscle_pct, bone_mass_kg, source "
             "FROM weight_log "
-            "WHERE timestamp >= ? "
+            "WHERE person_id = ? "
+            "AND timestamp >= ? "
             "AND ABS(weight_grams - ?) <= ? "
             "AND julianday(timestamp) >= julianday(?, ?) "
             "AND julianday(timestamp) <= julianday(?, ?) "
             "ORDER BY timestamp DESC LIMIT 1",
             (
+                person_id,
                 sargable_cutoff,
                 weight_grams,
                 DEDUP_WEIGHT_TOLERANCE_GRAMS,
@@ -276,10 +279,11 @@ async def post_weight(data: WeightIn):
 
         if existing is None:
             cursor = await db.execute(
-                "INSERT INTO weight_log (weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin, "
+                "INSERT INTO weight_log (person_id, weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin, "
                 "body_fat_pct, body_water_pct, muscle_pct, bone_mass_kg, source) "
-                "VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)",
                 (
+                    person_id,
                     round(weight_lbs, 2),
                     round(weight_kg, 2),
                     weight_grams,
@@ -413,10 +417,13 @@ async def post_weight(data: WeightIn):
 
 @app.get("/api/weight/recent")
 async def get_recent_weights():
+    person_id = await get_primary_person_id()
     db = await get_db()
     try:
         cursor = await db.execute(
-            "SELECT id, weight_lbs, weight_kg, timestamp, synced_to_garmin FROM weight_log ORDER BY timestamp DESC LIMIT 10"
+            "SELECT id, weight_lbs, weight_kg, timestamp, synced_to_garmin FROM weight_log "
+            "WHERE person_id = ? ORDER BY timestamp DESC LIMIT 10",
+            (person_id,),
         )
         rows = await cursor.fetchall()
     finally:
@@ -437,10 +444,13 @@ async def get_recent_weights():
 @app.get("/api/weight/trend")
 async def get_weight_trend():
     """Return last 30 days of weights for the trend chart."""
+    person_id = await get_primary_person_id()
     db = await get_db()
     try:
         cursor = await db.execute(
-            "SELECT weight_lbs, weight_kg, timestamp FROM weight_log WHERE timestamp >= datetime('now', '-30 days') ORDER BY timestamp ASC"
+            "SELECT weight_lbs, weight_kg, timestamp FROM weight_log "
+            "WHERE person_id = ? AND timestamp >= datetime('now', '-30 days') ORDER BY timestamp ASC",
+            (person_id,),
         )
         rows = await cursor.fetchall()
     finally:
@@ -454,9 +464,12 @@ async def get_weight_trend():
 
 @app.delete("/api/weight/{weight_id}")
 async def delete_weight(weight_id: int):
+    person_id = await get_primary_person_id()
     db = await get_db()
     try:
-        cursor = await db.execute("DELETE FROM weight_log WHERE id = ?", (weight_id,))
+        cursor = await db.execute(
+            "DELETE FROM weight_log WHERE id = ? AND person_id = ?", (weight_id, person_id)
+        )
         await db.commit()
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="Weight entry not found")

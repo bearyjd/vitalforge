@@ -297,3 +297,21 @@ async def test_composition_persisted_to_weight_log(client):
     assert row["muscle_pct"] == 40.1
     assert row["bone_mass_kg"] == 3.2
     assert row["source"] == "bascule"
+
+
+@pytest.mark.asyncio
+async def test_posted_weight_always_carries_a_person_id(weight_app_module):
+    from httpx import ASGITransport, AsyncClient
+
+    from shared.database import get_db
+
+    async with AsyncClient(transport=ASGITransport(app=weight_app_module.app), base_url="http://test") as client:
+        response = await client.post("/api/weight", json={"weight": 180.0, "unit": "lbs"})
+        assert response.status_code == 200
+
+    db = await get_db()
+    try:
+        cursor = await db.execute("SELECT COUNT(*) FROM weight_log WHERE person_id IS NULL")
+        assert (await cursor.fetchone())[0] == 0
+    finally:
+        await db.close()
