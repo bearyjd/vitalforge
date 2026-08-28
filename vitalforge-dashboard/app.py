@@ -455,6 +455,7 @@ async def import_activity(file: UploadFile = File(...)):
     raw_summary_json = json.dumps(record.raw_summary, default=str)
 
     columns_sql = ", ".join(_ACTIVITY_COLUMNS)
+    person_id = await get_primary_person_id()
 
     db = await get_db()
     try:
@@ -465,8 +466,8 @@ async def import_activity(file: UploadFile = File(...)):
         await db.execute("BEGIN IMMEDIATE")
 
         cursor = await db.execute(
-            f"SELECT {columns_sql} FROM activities WHERE file_sha256 = ?",
-            (file_hash,),
+            f"SELECT {columns_sql} FROM activities WHERE person_id = ? AND file_sha256 = ?",
+            (person_id, file_hash),
         )
         existing = await cursor.fetchone()
         duplicate_reason = "exact_duplicate" if existing is not None else None
@@ -474,11 +475,13 @@ async def import_activity(file: UploadFile = File(...)):
         if existing is None:
             cursor = await db.execute(
                 f"SELECT {columns_sql} FROM activities "
-                "WHERE sport IS ? "
+                "WHERE person_id = ? "
+                "AND sport IS ? "
                 "AND julianday(start_time_utc) >= julianday(?, ?) "
                 "AND julianday(start_time_utc) <= julianday(?, ?) "
                 "ORDER BY start_time_utc DESC LIMIT 1",
                 (
+                    person_id,
                     record.sport,
                     record.start_time_utc,
                     f"-{ACTIVITY_NEAR_DUPLICATE_WINDOW_SECONDS} seconds",
@@ -500,10 +503,11 @@ async def import_activity(file: UploadFile = File(...)):
             row = existing
         else:
             insert_cursor = await db.execute(
-                "INSERT INTO activities (start_time_utc, sport, duration_seconds, distance_m, calories, "
+                "INSERT INTO activities (person_id, start_time_utc, sport, duration_seconds, distance_m, calories, "
                 "avg_hr, max_hr, elevation_gain_m, source_format, file_sha256, imported_at, raw_summary_json) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
+                    person_id,
                     record.start_time_utc,
                     record.sport,
                     record.duration_seconds,
@@ -520,7 +524,10 @@ async def import_activity(file: UploadFile = File(...)):
             )
             row_id = insert_cursor.lastrowid
             await db.commit()
-            cursor = await db.execute(f"SELECT {columns_sql} FROM activities WHERE id = ?", (row_id,))
+            cursor = await db.execute(
+                f"SELECT {columns_sql} FROM activities WHERE id = ? AND person_id = ?",
+                (row_id, person_id),
+            )
             row = await cursor.fetchone()
     finally:
         await db.close()
@@ -536,11 +543,13 @@ async def import_activity(file: UploadFile = File(...)):
 async def list_activities(limit: int = Query(default=50, ge=1, le=200)):
     """List imported activities, most recent first."""
     columns_sql = ", ".join(_ACTIVITY_COLUMNS)
+    person_id = await get_primary_person_id()
     db = await get_db()
     try:
         cursor = await db.execute(
-            f"SELECT {columns_sql} FROM activities ORDER BY start_time_utc DESC LIMIT ?",
-            (limit,),
+            f"SELECT {columns_sql} FROM activities "
+            "WHERE person_id = ? ORDER BY start_time_utc DESC LIMIT ?",
+            (person_id, limit),
         )
         rows = await cursor.fetchall()
     finally:
@@ -554,11 +563,13 @@ async def get_activity(activity_id: int):
     """A single imported activity, including its full raw FIT session
     summary."""
     columns_sql = ", ".join(_ACTIVITY_COLUMNS)
+    person_id = await get_primary_person_id()
     db = await get_db()
     try:
         cursor = await db.execute(
-            f"SELECT {columns_sql}, raw_summary_json FROM activities WHERE id = ?",
-            (activity_id,),
+            f"SELECT {columns_sql}, raw_summary_json FROM activities "
+            "WHERE id = ? AND person_id = ?",
+            (activity_id, person_id),
         )
         row = await cursor.fetchone()
     finally:

@@ -870,3 +870,267 @@ async def test_upgrade_with_an_existing_admin_grants_inside_the_migration(tmp_pa
         assert (await cur.fetchone())["default_person_id"] == person_id
     finally:
         await db.close()
+
+
+# --- activities re-key (M1) ----------------------------------------------------
+# activities is not in _REBUILD_TABLES: it keeps its AUTOINCREMENT id and only
+# moves its UNIQUE from file_sha256 to (person_id, file_sha256), so
+# _rebuild_columns cannot generate it and _rebuild_activities writes it out
+# longhand. That means the generic parity test above does not cover it.
+
+_LEGACY_ACTIVITIES_DDL = """
+    CREATE TABLE activities (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        start_time_utc TEXT NOT NULL,
+        sport TEXT,
+        duration_seconds INTEGER,
+        distance_m REAL,
+        calories INTEGER,
+        avg_hr INTEGER,
+        max_hr INTEGER,
+        elevation_gain_m REAL,
+        source_format TEXT NOT NULL CHECK (source_format IN ('fit')),
+        file_sha256 TEXT NOT NULL UNIQUE,
+        imported_at TEXT NOT NULL,
+        raw_summary_json TEXT
+    )
+"""
+
+
+async def _seed_legacy_activities(db_path, rows: int = 2) -> None:
+    """Add a PRE-rebuild activities table to a legacy database.
+
+    tests/fixtures/production_schema.sql predates FIT import, so without this
+    the migrated database would get its activities table fresh from init_db's
+    DDL and the rebuild would never actually run.
+    """
+    conn = await aiosqlite.connect(str(db_path))
+    try:
+        await conn.execute(_LEGACY_ACTIVITIES_DDL)
+        await conn.execute("CREATE INDEX idx_activities_start_time ON activities(start_time_utc)")
+        for i in range(rows):
+            await conn.execute(
+                "INSERT INTO activities (start_time_utc, sport, source_format, file_sha256, imported_at) "
+                "VALUES (?, 'running', 'fit', ?, ?)",
+                (f"2026-01-0{i + 1}T00:00:00Z", f"hash-{i}", "2026-01-01T00:00:00Z"),
+            )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_activities_rebuild_preserves_rows_and_ids(production_schema_db):
+    await _seed_legacy_activities(production_schema_db, rows=2)
+    await database.init_db()
+
+    db = await database.get_db()
+    try:
+        person_id = await database.get_primary_person_id()
+        cur = await db.execute("SELECT id, person_id, file_sha256 FROM activities ORDER BY id")
+        rows = [(r["id"], r["person_id"], r["file_sha256"]) for r in await cur.fetchall()]
+        assert rows == [(1, person_id, "hash-0"), (2, person_id, "hash-1")], (
+            "activities rows, their AUTOINCREMENT ids, or the person_id backfill did not survive"
+        )
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_activities_schema_parity_fresh_vs_migrated(tmp_path, monkeypatch, production_schema_db):
+    await _seed_legacy_activities(production_schema_db)
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "fresh.db")
+    await database.init_db()
+    fresh_db = await database.get_db()
+
+    monkeypatch.setattr(database, "DB_PATH", production_schema_db)
+    await database.init_db()
+    migrated_db = await database.get_db()
+
+    try:
+        for conn_pair in ("table_info", "index_list"):
+            fresh = await (await fresh_db.execute(f"PRAGMA {conn_pair}(activities)")).fetchall()
+            migrated = await (await migrated_db.execute(f"PRAGMA {conn_pair}(activities)")).fetchall()
+            if conn_pair == "table_info":
+                fresh_shape = sorted((r["name"], r["type"], r["notnull"], r["dflt_value"], r["pk"]) for r in fresh)
+                migrated_shape = sorted((r["name"], r["type"], r["notnull"], r["dflt_value"], r["pk"]) for r in migrated)
+            else:
+                # Includes sqlite_autoindex_activities_1 -- the UNIQUE's own
+                # index, which must survive the __new table's RENAME under the
+                # same name it has on a fresh database.
+                fresh_shape = sorted(r["name"] for r in fresh)
+                migrated_shape = sorted(r["name"] for r in migrated)
+            assert fresh_shape == migrated_shape, f"activities {conn_pair} diverged"
+    finally:
+        await fresh_db.close()
+        await migrated_db.close()
+
+
+@pytest.mark.asyncio
+async def test_two_persons_can_import_the_same_file_after_the_rebuild(production_schema_db):
+    """The reason activities is a rebuild and not an additive column: the old
+    global UNIQUE(file_sha256) made one person's import silently reject
+    another person's identical FIT file."""
+    await _seed_legacy_activities(production_schema_db, rows=1)
+    await database.init_db()
+
+    db = await database.get_db()
+    try:
+        person_a = await database.get_primary_person_id()
+        cursor = await db.execute(
+            "INSERT INTO persons (slug, display_name, created_at, is_primary) VALUES (?, ?, ?, 0)",
+            ("second", "Second Person", datetime.now(timezone.utc).isoformat()),
+        )
+        person_b = cursor.lastrowid
+        await db.execute(
+            "INSERT INTO activities (person_id, start_time_utc, sport, source_format, file_sha256, imported_at) "
+            "VALUES (?, '2026-01-01T00:00:00Z', 'running', 'fit', 'hash-0', '2026-01-01T00:00:00Z')",
+            (person_b,),
+        )
+        await db.commit()
+
+        cur = await db.execute("SELECT COUNT(*) FROM activities WHERE file_sha256 = 'hash-0'")
+        assert (await cur.fetchone())[0] == 2, "same file must be importable by two different persons"
+
+        with pytest.raises(aiosqlite.IntegrityError):
+            await db.execute(
+                "INSERT INTO activities (person_id, start_time_utc, sport, source_format, file_sha256, imported_at) "
+                "VALUES (?, '2026-01-01T00:00:00Z', 'running', 'fit', 'hash-0', '2026-01-01T00:00:00Z')",
+                (person_a,),
+            )
+        await db.rollback()
+    finally:
+        await db.close()
+
+
+# --- rebuild pre-flight (L3) ---------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_migration_refuses_a_null_date_instead_of_failing_mid_rebuild(production_schema_db):
+    """SQLite lets `date TEXT PRIMARY KEY` hold NULL; the rebuilt
+    `date TEXT NOT NULL` does not. Without the pre-flight this surfaces as an
+    opaque IntegrityError partway through a one-way upgrade."""
+    conn = await aiosqlite.connect(str(production_schema_db))
+    try:
+        await conn.execute("INSERT INTO steps (date, value) VALUES (NULL, 123)")
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    with pytest.raises(RuntimeError, match="steps has 1 row\\(s\\) with a NULL date"):
+        await database.init_db()
+
+    db = await database.get_db()
+    try:
+        cur = await db.execute("SELECT name FROM schema_migrations WHERE name = '001-person-id-rebuild'")
+        assert await cur.fetchone() is None, "marker committed despite the pre-flight raising"
+        cur = await db.execute("PRAGMA table_info(sleep)")
+        assert not any(r["name"] == "person_id" for r in await cur.fetchall()), (
+            "rebuild was not rolled back"
+        )
+    finally:
+        await db.close()
+
+
+# --- schema guard ordering (M3) ------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_unknown_marker_is_refused_before_any_snapshot_is_written(production_schema_db):
+    """assert_schema_understood() runs BEFORE the migrations, so a database
+    from a newer image is refused while this image has still changed nothing
+    -- no snapshot file, no write transaction."""
+    conn = await aiosqlite.connect(str(production_schema_db))
+    try:
+        await conn.execute(migrations.SCHEMA_MIGRATIONS_TABLE_SQL)
+        await conn.execute(
+            "INSERT INTO schema_migrations (name, completed_at) VALUES ('999-from-the-future', ?)",
+            (datetime.now(timezone.utc).isoformat(),),
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    with pytest.raises(RuntimeError, match="999-from-the-future"):
+        await database.init_db()
+
+    snapshot = production_schema_db.parent / migrations._PERSON_ID_REBUILD_SNAPSHOT_NAME
+    assert not snapshot.exists(), "a downgrade-boot wrote a snapshot before refusing to serve"
+
+
+@pytest.mark.asyncio
+async def test_002_rekeys_activities_on_a_db_that_already_applied_001(tmp_path, monkeypatch):
+    """The state no other test in this file occupies: 001's marker already
+    committed, activities still on its pre-rebuild shape.
+
+    This is what a development database created from an earlier commit of
+    this branch looks like. Folding the activities re-key into 001 instead of
+    giving it its own marker would leave exactly these databases un-migrated
+    -- run_migration skips 001 wholesale once its marker exists -- while every
+    /api/activities route queried a person_id column that was never added.
+    """
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "mid.db")
+    await database.init_db()
+
+    db = await database.get_db()
+    try:
+        await db.execute("DROP TABLE activities")
+        await db.execute(_LEGACY_ACTIVITIES_DDL)
+        await db.execute(
+            "INSERT INTO activities (start_time_utc, sport, source_format, file_sha256, imported_at) "
+            "VALUES ('2026-01-01T00:00:00Z', 'running', 'fit', 'hash-0', '2026-01-01T00:00:00Z')"
+        )
+        await db.execute("DELETE FROM schema_migrations WHERE name = '002-activities-person-id'")
+        await db.commit()
+
+        cur = await db.execute("SELECT name FROM schema_migrations WHERE name = '001-person-id-rebuild'")
+        assert await cur.fetchone() is not None, "fixture must keep 001 applied"
+    finally:
+        await db.close()
+
+    await database.init_db()  # reboot on the new code
+
+    db = await database.get_db()
+    try:
+        cols = {r["name"] for r in await (await db.execute("PRAGMA table_info(activities)")).fetchall()}
+        assert "person_id" in cols, "002 did not re-key activities on a database that already ran 001"
+        cur = await db.execute("SELECT person_id FROM activities")
+        assert (await cur.fetchone())["person_id"] == await database.get_primary_person_id()
+        idx = {r["name"] for r in await (await db.execute("PRAGMA index_list(activities)")).fetchall()}
+        assert "idx_activities_person_start_time" in idx
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_activities_rebuild_preserves_the_autoincrement_high_water_mark(production_schema_db):
+    """DROP TABLE deletes the table's sqlite_sequence row. If the rebuild let
+    the counter reset, a deleted activity's id could be handed to a new row --
+    and "AUTOINCREMENT never reuses rowids" is load-bearing elsewhere in this
+    design (it is the stated reason person_grants' decorative REFERENCES carry
+    no privilege-inheritance path)."""
+    await _seed_legacy_activities(production_schema_db, rows=3)
+    await database.init_db()
+
+    db = await database.get_db()
+    try:
+        person_id = await database.get_primary_person_id()
+        cur = await db.execute("SELECT MAX(id) FROM activities")
+        highest = (await cur.fetchone())[0]
+        assert highest == 3
+
+        await db.execute("DELETE FROM activities WHERE id = ?", (highest,))
+        await db.commit()
+
+        cursor = await db.execute(
+            "INSERT INTO activities (person_id, start_time_utc, sport, source_format, file_sha256, imported_at) "
+            "VALUES (?, '2026-02-01T00:00:00Z', 'running', 'fit', 'fresh-hash', '2026-02-01T00:00:00Z')",
+            (person_id,),
+        )
+        await db.commit()
+        assert cursor.lastrowid > highest, (
+            f"rowid {cursor.lastrowid} reused a deleted id -- the rebuild reset sqlite_sequence"
+        )
+    finally:
+        await db.close()

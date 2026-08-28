@@ -238,7 +238,12 @@ Some releases (starting with the `001-person-id-rebuild` schema migration) chang
 database schema in a way that is not safely readable by an older image. For these:
 
 1. **Stop both services before upgrading**: `docker compose down`, not a rolling restart —
-   an old container must never run against the new schema mid-upgrade.
+   an old container must never run against the new schema mid-upgrade. This step is the only
+   thing protecting you here, and it is not optional. The boot-time schema guard cannot catch
+   this particular case: the image that shipped the guard already lists `001-person-id-rebuild`
+   as a migration it knows, so it will start happily against the rebuilt schema and read the
+   metric tables *without* a `person_id` filter — quietly merging every person's data together.
+   The guard only refuses migrations newer than itself. Take both services down.
 2. Pull/build the new images, then `docker compose up`.
 3. The new image takes an automatic pre-migration snapshot (`fitness.pre-001-person-id.db`,
    next to `fitness.db` in the `vitalforge-data` volume) before it changes anything, verified

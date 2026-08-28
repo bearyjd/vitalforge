@@ -428,10 +428,31 @@ table, and the marker table is the one the migration itself writes transactional
 |---|---|
 | `sleep`, `resting_hr`, `hrv`, `body_battery`, `stress`, `vo2max`, `weight_history`, `training_load`, `steps`, `active_calories` | **Rebuild** → PK `(person_id, date)` |
 | `sync_status` | **Rebuild** → PK `person_id`, plus `backoff_until` |
+| `activities` | **Rebuild**, in migration **002** → adds `person_id`, `UNIQUE(file_sha256)` → `UNIQUE(person_id, file_sha256)`, index swap |
 | `weight_log` | Additive column + index swap (both DDL sites) + dedup predicate |
 | `users` | Additive `default_person_id` |
 | `api_tokens` | Additive `person_id` (phase 2, §f.7) |
 | `persons`, `person_grants`, `garmin_links`, `schema_migrations` | New |
+
+`activities` was added by the FIT-import feature after this spec's original audit and was
+missed by it. It is a **rebuild**, not an additive column like `weight_log`, for one reason:
+`file_sha256` carried a global `UNIQUE`, and SQLite cannot alter a constraint in place. Left
+global, one person importing a FIT file would make that file permanently un-importable for
+everyone else, and scoping only the dedup `SELECT` would convert that into an `IntegrityError`
+instead of the clean duplicate response `/api/import/activity` returns. `id INTEGER PRIMARY KEY
+AUTOINCREMENT` is preserved, so existing activity URLs keep working.
+
+It ships as migration **002**, not as extra work inside 001, because 001 had already been
+applied to development databases by the time the gap was found. Those carry the 001 marker, so
+the runner skips 001 entirely on their next boot — anything folded into 001 after the fact
+would silently never run there while the routes assumed it had. Migrations are immutable once
+written, even before release.
+
+`goals` stays `user_id`-scoped and is deliberately NOT in the rebuild set: a goal belongs to
+the account that set it, not to the person whose metrics it measures. Its progress is computed
+against person-scoped metric tables, so the person resolution happens at the call site
+(`_goal_progress`) rather than in the row. Revisit in phase 2 if one account needs separate
+goals per person.
 | `auth_migrations` | Unchanged |
 
 ---

@@ -149,3 +149,22 @@ the original test-suite rationale (marked DONE).
   added by name to `shared/migrations.py`'s `_REBUILD_TABLES` list — that list derives its
   column shapes from the live schema rather than duplicating them, so it only ever needs the
   table's name, not its columns.
+- **`_REBUILD_TABLES` only covers `(person_id, date)`-keyed metric tables.** A table that keeps
+  its own `id` primary key, or carries `NOT NULL`/`DEFAULT`/`CHECK`/`UNIQUE` columns, cannot go
+  in that list — `_rebuild_columns` refuses exactly those shapes rather than silently dropping
+  the constraint. Such tables get a hand-written rebuild instead (`_rebuild_sync_status`,
+  `_rebuild_activities`). If you add one, also add it to
+  `tests/test_migrations.py`'s parity checks: the generic
+  `test_schema_parity_fresh_vs_migrated` only iterates `_REBUILD_TABLES`, so a bespoke rebuild
+  whose DDL drifts from `shared/database.py`'s is invisible to it.
+- **Migrations are immutable once written — never add work to an existing marker.** A database
+  that already committed a marker skips that migration wholesale forever, so anything appended
+  to it silently never runs there while the app code assumes it did. Add a new marker instead
+  (`002-activities-person-id` exists because the `activities` gap was found after 001 had
+  already run on dev databases), and list it in `shared/migrations.py`'s `_KNOWN_MIGRATIONS` in
+  the same commit — an applied marker missing from that tuple boot-loops the container.
+- **A `CREATE INDEX` in `init_db` cannot reference a column that only a migration adds.**
+  The whole DDL block runs before any migration, so `activities`'s person-scoped index is
+  guarded by a `PRAGMA table_info` check and re-created inside `_rebuild_activities` for the
+  upgrade path. `weight_log` avoids this only because `_add_columns` gives it `person_id`
+  earlier in the same block.

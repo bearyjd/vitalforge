@@ -79,3 +79,41 @@ async def test_scheduled_sync_serializes_against_shared_lock(initialized_db, mon
 
     assert seen == [(90, True), (3, True)]
     assert not lock.locked()
+
+
+async def test_run_sync_preserves_backoff_until(initialized_db, fake_garmin_client):
+    """run_sync must not clear sync_status.backoff_until (spec §e, the Garmin
+    429 backoff). INSERT OR REPLACE deletes and reinserts the row, so every
+    column the statement omits silently reverts to its default -- which would
+    drop an active backoff on every sync and turn a rate limit into a ban."""
+    from shared.database import get_primary_person_id
+
+    sync = import_service_module("vitalforge-dashboard.sync")
+    person_id = await get_primary_person_id()
+
+    db = await get_db()
+    try:
+        await db.execute(
+            "INSERT INTO sync_status (person_id, backoff_until) VALUES (?, ?) "
+            "ON CONFLICT (person_id) DO UPDATE SET backoff_until = excluded.backoff_until",
+            (person_id, "2099-01-01T00:00:00+00:00"),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+    await sync.run_sync(days=1, person_id=person_id)
+
+    db = await get_db()
+    try:
+        cur = await db.execute(
+            "SELECT backoff_until, last_sync_result FROM sync_status WHERE person_id = ?",
+            (person_id,),
+        )
+        row = await cur.fetchone()
+        assert row["backoff_until"] == "2099-01-01T00:00:00+00:00", (
+            "run_sync cleared an active backoff"
+        )
+        assert row["last_sync_result"] is not None, "run_sync did not record its own result"
+    finally:
+        await db.close()

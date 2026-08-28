@@ -287,9 +287,19 @@ async def run_sync(days: int = 7, *, person_id: int):
 
     db = await get_db()
     try:
+        # ON CONFLICT DO UPDATE, not INSERT OR REPLACE: REPLACE deletes the
+        # row and reinserts it, so every column absent from the statement
+        # silently reverts to its default. backoff_until (spec §e, the
+        # Garmin 429 backoff) is exactly such a column -- a plain REPLACE
+        # here would clear an active backoff on every single sync, which is
+        # how a rate limit turns into a ban.
         await db.execute(
-            "INSERT OR REPLACE INTO sync_status (person_id, last_sync_time, last_sync_result, last_sync_days) "
-            "VALUES (?, ?, ?, ?)",
+            "INSERT INTO sync_status (person_id, last_sync_time, last_sync_result, last_sync_days) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT (person_id) DO UPDATE SET "
+            "last_sync_time = excluded.last_sync_time, "
+            "last_sync_result = excluded.last_sync_result, "
+            "last_sync_days = excluded.last_sync_days",
             (person_id, start_time.isoformat(), result, days),
         )
         await db.commit()

@@ -118,6 +118,7 @@ async def init_db():
     from shared.migrations import (
         _PERSON_ID_REBUILD_SNAPSHOT_NAME,
         SCHEMA_MIGRATIONS_TABLE_SQL,
+        _apply_activities_person_id,
         _apply_person_id_rebuild,
         _needs_person_id_rebuild,
         assert_schema_understood,
@@ -384,6 +385,7 @@ async def init_db():
         await db.execute("""
             CREATE TABLE IF NOT EXISTS activities (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_id INTEGER NOT NULL,
                 start_time_utc TEXT NOT NULL,
                 sport TEXT,
                 duration_seconds INTEGER,
@@ -393,15 +395,34 @@ async def init_db():
                 max_hr INTEGER,
                 elevation_gain_m REAL,
                 source_format TEXT NOT NULL CHECK (source_format IN ('fit')),
-                file_sha256 TEXT NOT NULL UNIQUE,
+                file_sha256 TEXT NOT NULL,
                 imported_at TEXT NOT NULL,
-                raw_summary_json TEXT
+                raw_summary_json TEXT,
+                -- Scoped, not global: two people may legitimately import the
+                -- same FIT file (same ride, same device). A global UNIQUE
+                -- here would reject the second one with an IntegrityError
+                -- instead of the clean duplicate response the route returns.
+                UNIQUE (person_id, file_sha256)
             )
         """)
 
         # Supports the near-duplicate (start_time_utc, sport) lookup the
         # import route runs on every upload after the exact file-hash check.
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_activities_start_time ON activities(start_time_utc)")
+        # Guarded, unlike every other CREATE INDEX here, because
+        # activities.person_id does not exist yet on an UPGRADE at this
+        # point: activities is re-keyed by migration 001, which runs after
+        # this whole DDL block, so an unguarded CREATE INDEX would fail with
+        # "no such column: person_id" and break the lifespan. On a fresh
+        # database the column comes from the CREATE TABLE above and this is
+        # what creates the index; on an upgrade _rebuild_activities creates
+        # it as part of the rebuild. The read is a latency/ordering check,
+        # not a correctness one -- IF NOT EXISTS still carries the race.
+        cur = await db.execute("PRAGMA table_info(activities)")
+        if any(row[1] == "person_id" for row in await cur.fetchall()):
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_activities_person_start_time "
+                "ON activities(person_id, start_time_utc)"
+            )
 
         # Durable one-time markers for shared/migrations.py's run_migration().
         await db.execute(SCHEMA_MIGRATIONS_TABLE_SQL)
@@ -410,10 +431,16 @@ async def init_db():
     finally:
         await db.close()          # <-- connection closed BEFORE anything below
 
+    # BEFORE the migrations, not after: a database carrying a marker from a
+    # newer image must be refused while this image has still changed nothing.
+    # Running the guard afterwards would let a downgrade-boot write a
+    # snapshot file and open a write transaction against a schema it has
+    # already admitted it does not understand.
+    await assert_schema_understood()
+
     await ensure_pre_migration_snapshot(_PERSON_ID_REBUILD_SNAPSHOT_NAME, _needs_person_id_rebuild)
     await run_migration("001-person-id-rebuild", _apply_person_id_rebuild)
-
-    await assert_schema_understood()
+    await run_migration("002-activities-person-id", _apply_activities_person_id)
 
 
 async def get_primary_person_id() -> int:

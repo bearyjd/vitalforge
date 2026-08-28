@@ -13,8 +13,8 @@ from typing import Awaitable, Callable
 
 import aiosqlite
 
-from shared.auth import _RESERVED_SLUGS, _slugify
 from shared.database import _grant_primary_person_to_first_admin, get_db
+from shared.slugs import RESERVED_SLUGS, slugify
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +28,20 @@ SCHEMA_MIGRATIONS_TABLE_SQL = """
 # Every marker name this image knows how to apply. These strings MUST match
 # the names passed to run_migration() verbatim -- a typo here makes this
 # image's own migration read as one from the future and boot-loops the
-# container. "001-person-id-rebuild" does not exist as a real migration
-# yet (that is Phase 1's job); it is declared here now, in Phase 0, so the
-# guard ships ahead of the migration it will eventually recognize.
-_KNOWN_MIGRATIONS = ("001-person-id-rebuild",)
+# container. "001-person-id-rebuild" was declared here in Phase 0, one
+# release ahead of the Phase 1 migration that now implements it, so the
+# guard shipped before the schema change it has to tolerate. The cost of
+# that ordering is documented in README's Upgrading section: a Phase 0
+# image already accepts this marker, so it will happily read Phase 1 tables
+# without a person_id predicate. Stopping both services during the upgrade
+# is what actually prevents that, not this list.
+#
+# Migrations are IMMUTABLE once written. "002-activities-person-id" exists as
+# its own marker rather than as extra work inside 001 for exactly that reason:
+# a database that already committed the 001 marker skips 001 entirely on the
+# next boot, so anything added to 001 after the fact silently never runs and
+# leaves the schema half-changed while the app code assumes otherwise.
+_KNOWN_MIGRATIONS = ("001-person-id-rebuild", "002-activities-person-id")
 
 _PERSON_ID_REBUILD_SNAPSHOT_NAME = "fitness.pre-001-person-id.db"
 
@@ -90,8 +100,8 @@ async def _ensure_primary_person(db) -> int:
 
     raw = os.environ.get("VITALFORGE_PRIMARY_PERSON", "").strip() \
         or await _first_admin_username(db) or "primary"
-    slug = _slugify(raw)
-    if not slug or slug in _RESERVED_SLUGS:
+    slug = slugify(raw)
+    if not slug or slug in RESERVED_SLUGS:
         logger.warning("Primary person slug %r is unusable; falling back to 'primary'", raw)
         slug = "primary"
     cursor = await db.execute(
@@ -152,6 +162,98 @@ async def _rebuild_sync_status(db, person_id: int) -> None:
     await db.execute("ALTER TABLE [sync_status__new] RENAME TO sync_status")
 
 
+async def _rebuild_activities(db, person_id: int) -> None:
+    """Re-key activities on (person_id, file_sha256).
+
+    Not expressible through _rebuild_columns: activities keeps its
+    `id INTEGER PRIMARY KEY AUTOINCREMENT` and carries NOT NULL/CHECK/UNIQUE
+    columns, all three of which _rebuild_columns refuses by design. Written
+    out longhand for the same reason _rebuild_sync_status is.
+
+    The UNIQUE must move from file_sha256 to (person_id, file_sha256), and
+    that is the whole reason this is a rebuild rather than an additive
+    person_id column: a global UNIQUE would let one person's import silently
+    reject another person's identical FIT file, and scoping only the SELECT
+    would turn that into an IntegrityError instead of a clean duplicate
+    response.
+    """
+    await db.execute("""
+        CREATE TABLE [activities__new] (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            person_id INTEGER NOT NULL,
+            start_time_utc TEXT NOT NULL,
+            sport TEXT,
+            duration_seconds INTEGER,
+            distance_m REAL,
+            calories INTEGER,
+            avg_hr INTEGER,
+            max_hr INTEGER,
+            elevation_gain_m REAL,
+            source_format TEXT NOT NULL CHECK (source_format IN ('fit')),
+            file_sha256 TEXT NOT NULL,
+            imported_at TEXT NOT NULL,
+            raw_summary_json TEXT,
+            UNIQUE (person_id, file_sha256)
+        )
+    """)
+    await db.execute(
+        "INSERT INTO [activities__new] "
+        "(id, person_id, start_time_utc, sport, duration_seconds, distance_m, calories, "
+        "avg_hr, max_hr, elevation_gain_m, source_format, file_sha256, imported_at, raw_summary_json) "
+        "SELECT id, ?, start_time_utc, sport, duration_seconds, distance_m, calories, "
+        "avg_hr, max_hr, elevation_gain_m, source_format, file_sha256, imported_at, raw_summary_json "
+        "FROM activities",
+        (person_id,),
+    )
+    await db.execute("DROP TABLE activities")
+    await db.execute("ALTER TABLE [activities__new] RENAME TO activities")
+    await db.execute("DROP INDEX IF EXISTS idx_activities_start_time")
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_activities_person_start_time "
+        "ON activities(person_id, start_time_utc)"
+    )
+
+
+async def _assert_no_null_dates(db) -> None:
+    """Refuse to rebuild a table holding a NULL date.
+
+    SQLite's legacy quirk: `date TEXT PRIMARY KEY` permits NULL, but the
+    rebuilt `date TEXT NOT NULL` does not. One such row would fail the
+    INSERT ... SELECT halfway through an irreversible upgrade and leave the
+    container boot-looping on a rolled-back transaction with no explanation.
+    Check first and name the table, so the operator can delete the row from
+    the pre-migration snapshot's source and retry.
+    """
+    for table in _REBUILD_TABLES:
+        cur = await db.execute(f"SELECT COUNT(*) FROM [{table}] WHERE date IS NULL")
+        count = (await cur.fetchone())[0]
+        if count:
+            raise RuntimeError(
+                f"{table} has {count} row(s) with a NULL date, which cannot be migrated to "
+                f"the (person_id, date) primary key. Delete or repair them "
+                f"(DELETE FROM {table} WHERE date IS NULL), then restart."
+            )
+
+
+async def _apply_activities_person_id(db) -> None:
+    """Migration 002: re-key activities on (person_id, file_sha256).
+
+    Separate from 001 because 001 has already been applied to databases
+    created from earlier commits of this branch. Those have the 001 marker
+    committed, so run_migration skips 001 wholesale on their next boot --
+    folding this work into 001 would leave activities un-migrated there while
+    every route queried a person_id column that does not exist.
+
+    Runs inside its own BEGIN IMMEDIATE. No pre-migration snapshot of its
+    own: on an upgrade from a pre-001 database 001's snapshot already
+    captured the pre-state in the same boot, and the only databases that
+    reach 002 alone are development ones from this unmerged branch.
+    """
+    if await _has_column(db, "activities", "person_id"):
+        return  # fresh DB: init_db's DDL already created the new shape.
+    await _rebuild_activities(db, await _ensure_primary_person(db))
+
+
 async def _apply_person_id_rebuild(db) -> None:
     # Runs inside BEGIN IMMEDIATE (run_migration opens it). Any exception
     # rolls back the ENTIRE rebuild -- all 11 tables plus the marker --
@@ -162,6 +264,8 @@ async def _apply_person_id_rebuild(db) -> None:
 
     if await _has_column(db, "sleep", "person_id"):
         return  # fresh DB: tables already correctly shaped by init_db's DDL step.
+
+    await _assert_no_null_dates(db)
 
     for table in _REBUILD_TABLES:
         columns = await _rebuild_columns(db, table)
