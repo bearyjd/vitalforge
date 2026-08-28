@@ -163,6 +163,14 @@ the original test-suite rationale (marked DONE).
   (`002-activities-person-id` exists because the `activities` gap was found after 001 had
   already run on dev databases), and list it in `shared/migrations.py`'s `_KNOWN_MIGRATIONS` in
   the same commit — an applied marker missing from that tuple boot-loops the container.
+- **A table rebuild resets `AUTOINCREMENT` unless you carry `sqlite_sequence` across by hand.**
+  `DROP TABLE` deletes that table's `sqlite_sequence` row, and the `INSERT ... SELECT` leaves the
+  new counter at `MAX(id)` of the rows that survived — so any id above it, belonging to a row
+  deleted before the migration, gets issued a second time. `_rebuild_activities` reads the old
+  `seq` before the `DROP` and restores it after the `RENAME`. Note `sqlite_sequence` has no
+  `PRIMARY KEY`/`UNIQUE`, so `ON CONFLICT` cannot be used — it is `UPDATE`, then `INSERT` if the
+  `UPDATE` matched nothing (which is what happens when every row was deleted and the copy was
+  empty). Any future rebuild of an `AUTOINCREMENT` table needs the same treatment.
 - **A `CREATE INDEX` in `init_db` cannot reference a column that only a migration adds.**
   The whole DDL block runs before any migration, so `activities`'s person-scoped index is
   guarded by a `PRAGMA table_info` check and re-created inside `_rebuild_activities` for the

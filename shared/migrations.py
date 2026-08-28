@@ -176,6 +176,9 @@ async def _rebuild_activities(db, person_id: int) -> None:
     reject another person's identical FIT file, and scoping only the SELECT
     would turn that into an IntegrityError instead of a clean duplicate
     response.
+
+    The AUTOINCREMENT high-water mark is carried across by hand -- see the
+    sqlite_sequence block at the end.
     """
     await db.execute("""
         CREATE TABLE [activities__new] (
@@ -196,6 +199,14 @@ async def _rebuild_activities(db, person_id: int) -> None:
             UNIQUE (person_id, file_sha256)
         )
     """)
+    # Read AFTER the CREATE above, which guarantees sqlite_sequence exists
+    # (SQLite creates that table with the first AUTOINCREMENT table), and
+    # BEFORE the DROP below, which deletes this table's row from it.
+    seq_row = await (await db.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name = 'activities'"
+    )).fetchone()
+    old_seq = seq_row["seq"] if seq_row is not None else None
+
     await db.execute(
         "INSERT INTO [activities__new] "
         "(id, person_id, start_time_utc, sport, duration_seconds, distance_m, calories, "
@@ -207,6 +218,31 @@ async def _rebuild_activities(db, person_id: int) -> None:
     )
     await db.execute("DROP TABLE activities")
     await db.execute("ALTER TABLE [activities__new] RENAME TO activities")
+
+    # Carry the AUTOINCREMENT high-water mark across the rebuild. Without
+    # this the copy leaves the counter at MAX(id) of the rows that survived,
+    # so any id above that -- belonging to a row deleted BEFORE the migration
+    # -- gets handed out a second time. "AUTOINCREMENT never reuses rowids"
+    # is load-bearing in this design: it is the stated reason person_grants'
+    # decorative REFERENCES carry no privilege-inheritance path.
+    #
+    # UPDATE-then-INSERT rather than upsert: sqlite_sequence is an internal
+    # table declared as `CREATE TABLE sqlite_sequence(name,seq)` with no
+    # PRIMARY KEY or UNIQUE, so ON CONFLICT has no constraint to target. The
+    # INSERT branch is not defensive padding -- it is the only path when
+    # every row was deleted before migrating, since a zero-row copy leaves
+    # activities__new with no sqlite_sequence row for the UPDATE to hit.
+    if old_seq is not None:
+        cursor = await db.execute(
+            "UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = 'activities'",
+            (old_seq,),
+        )
+        if cursor.rowcount == 0:
+            await db.execute(
+                "INSERT INTO sqlite_sequence (name, seq) VALUES ('activities', ?)",
+                (old_seq,),
+            )
+
     await db.execute("DROP INDEX IF EXISTS idx_activities_start_time")
     await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_activities_person_start_time "
@@ -300,9 +336,14 @@ async def _apply_person_id_rebuild(db) -> None:
 async def assert_schema_understood() -> None:
     """Refuse to serve a database that is newer than this image understands.
 
-    Called at the end of shared/database.py's init_db(), on its own
-    connection, after any migrations have run -- so both services get it
-    without either app.py changing.
+    Called from shared/database.py's init_db(), on its own connection, and
+    BEFORE any migration runs -- so both services get it without either
+    app.py changing. The ordering is deliberate and load-bearing: a database
+    carrying a marker from a newer image must be refused while this image
+    has still changed nothing on disk. Running this after the migrations
+    would let a downgrade-boot write a snapshot file and open a write
+    transaction against a schema it has already admitted it cannot read.
+    Do not move this call back below run_migration().
 
     An applied marker whose name is not in _KNOWN_MIGRATIONS means some
     newer image migrated this file. This image would then read the result

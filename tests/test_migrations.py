@@ -1103,25 +1103,40 @@ async def test_002_rekeys_activities_on_a_db_that_already_applied_001(tmp_path, 
         await db.close()
 
 
+async def _delete_legacy_activity(db_path, activity_id: int) -> None:
+    """Delete a row from the PRE-rebuild activities table, leaving
+    sqlite_sequence.seq above MAX(id) exactly as a real deletion would."""
+    conn = await aiosqlite.connect(str(db_path))
+    try:
+        await conn.execute("DELETE FROM activities WHERE id = ?", (activity_id,))
+        await conn.commit()
+    finally:
+        await conn.close()
+
+
 @pytest.mark.asyncio
 async def test_activities_rebuild_preserves_the_autoincrement_high_water_mark(production_schema_db):
-    """DROP TABLE deletes the table's sqlite_sequence row. If the rebuild let
-    the counter reset, a deleted activity's id could be handed to a new row --
-    and "AUTOINCREMENT never reuses rowids" is load-bearing elsewhere in this
-    design (it is the stated reason person_grants' decorative REFERENCES carry
-    no privilege-inheritance path)."""
+    """DROP TABLE deletes the table's sqlite_sequence row, and the copy leaves
+    the new counter at MAX(id) of the rows that SURVIVED. Any id above that --
+    belonging to a row deleted before the migration -- would be handed out a
+    second time, and "AUTOINCREMENT never reuses rowids" is load-bearing here
+    (it is the stated reason person_grants' decorative REFERENCES carry no
+    privilege-inheritance path).
+
+    The deletion must happen BEFORE init_db(): deleting afterwards only
+    exercises ordinary post-migration AUTOINCREMENT behavior, which passes
+    whether or not the rebuild preserves anything.
+    """
     await _seed_legacy_activities(production_schema_db, rows=3)
+    await _delete_legacy_activity(production_schema_db, 3)
+
     await database.init_db()
 
     db = await database.get_db()
     try:
         person_id = await database.get_primary_person_id()
         cur = await db.execute("SELECT MAX(id) FROM activities")
-        highest = (await cur.fetchone())[0]
-        assert highest == 3
-
-        await db.execute("DELETE FROM activities WHERE id = ?", (highest,))
-        await db.commit()
+        assert (await cur.fetchone())[0] == 2, "the pre-migration delete did not take"
 
         cursor = await db.execute(
             "INSERT INTO activities (person_id, start_time_utc, sport, source_format, file_sha256, imported_at) "
@@ -1129,8 +1144,127 @@ async def test_activities_rebuild_preserves_the_autoincrement_high_water_mark(pr
             (person_id,),
         )
         await db.commit()
-        assert cursor.lastrowid > highest, (
-            f"rowid {cursor.lastrowid} reused a deleted id -- the rebuild reset sqlite_sequence"
+        assert cursor.lastrowid == 4, (
+            f"rowid {cursor.lastrowid} reused id 3, deleted before the migration -- "
+            "the rebuild reset sqlite_sequence instead of carrying it across"
+        )
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_activities_rebuild_carries_the_high_water_mark_when_every_row_was_deleted(
+    production_schema_db,
+):
+    """The zero-row copy leaves activities__new with no sqlite_sequence row at
+    all, so the UPDATE that carries the counter across matches nothing. This is
+    the case the INSERT fallback exists for -- without it the counter restarts
+    at 1 and re-issues every id the table ever had."""
+    await _seed_legacy_activities(production_schema_db, rows=2)
+    await _delete_legacy_activity(production_schema_db, 1)
+    await _delete_legacy_activity(production_schema_db, 2)
+
+    await database.init_db()
+
+    db = await database.get_db()
+    try:
+        person_id = await database.get_primary_person_id()
+        cur = await db.execute("SELECT COUNT(*) FROM activities")
+        assert (await cur.fetchone())[0] == 0
+
+        cursor = await db.execute(
+            "INSERT INTO activities (person_id, start_time_utc, sport, source_format, file_sha256, imported_at) "
+            "VALUES (?, '2026-02-01T00:00:00Z', 'running', 'fit', 'fresh-hash', '2026-02-01T00:00:00Z')",
+            (person_id,),
+        )
+        await db.commit()
+        assert cursor.lastrowid == 3, (
+            f"rowid {cursor.lastrowid} restarted the sequence over ids 1-2, both of which "
+            "existed before the migration"
+        )
+    finally:
+        await db.close()
+
+
+# --- weight_log orphan self-heal (L5) -------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_boot_reattributes_a_weight_log_row_left_unattributed_after_001(
+    production_schema_db,
+):
+    """A weight_log row written with a NULL person_id AFTER 001 has committed
+    is never repaired by the migration -- 001 skips itself forever once its
+    marker is in. weight_log.person_id cannot be NOT NULL, so the schema will
+    not refuse the row either, and every read path filters `person_id = ?`,
+    which makes it invisible rather than mis-attributed.
+
+    Reachable by leaving an old weight-service container running against the
+    rebuilt schema, which README's Upgrading step 1 forbids. The next boot
+    must repair it.
+    """
+    await database.init_db()
+    person_id = await database.get_primary_person_id()
+
+    # Exactly what a pre-multi-tenancy weight service INSERT looks like: no
+    # person_id column at all.
+    db = await database.get_db()
+    try:
+        await db.execute(
+            "INSERT INTO weight_log (weight_lbs, weight_kg, weight_grams, timestamp) "
+            "VALUES (180.0, 81.65, 81650, '2026-03-01T12:00:00+00:00')"
+        )
+        await db.commit()
+        cur = await db.execute("SELECT COUNT(*) FROM weight_log WHERE person_id IS NULL")
+        assert (await cur.fetchone())[0] == 1, "test setup failed to create an orphan row"
+    finally:
+        await db.close()
+
+    await database.init_db()  # the next container boot
+
+    db = await database.get_db()
+    try:
+        cur = await db.execute("SELECT COUNT(*) FROM weight_log WHERE person_id IS NULL")
+        assert (await cur.fetchone())[0] == 0, (
+            "an unattributed weight_log row survived a boot -- it stays invisible to "
+            "/recent, /trend and DELETE forever"
+        )
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM weight_log WHERE person_id = ? AND weight_grams = 81650",
+            (person_id,),
+        )
+        assert (await cur.fetchone())[0] == 1, "the repaired row went to the wrong person"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_reattribution_leaves_correctly_attributed_rows_alone(production_schema_db):
+    """The self-heal must be a no-op on a healthy database -- it runs on every
+    boot, so it must never touch a row that already has an owner."""
+    await database.init_db()
+    person_id = await database.get_primary_person_id()
+
+    db = await database.get_db()
+    try:
+        await db.execute(
+            "INSERT INTO weight_log (person_id, weight_lbs, weight_kg, weight_grams, timestamp) "
+            "VALUES (?, 200.0, 90.72, 90720, '2026-03-02T12:00:00+00:00')",
+            (person_id + 1,),  # some other person, not the primary
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+    await database.init_db()
+
+    db = await database.get_db()
+    try:
+        cur = await db.execute(
+            "SELECT person_id FROM weight_log WHERE weight_grams = 90720"
+        )
+        assert (await cur.fetchone())["person_id"] == person_id + 1, (
+            "the self-heal reassigned a row that already had an owner"
         )
     finally:
         await db.close()

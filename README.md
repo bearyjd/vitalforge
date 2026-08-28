@@ -244,6 +244,13 @@ database schema in a way that is not safely readable by an older image. For thes
    as a migration it knows, so it will start happily against the rebuilt schema and read the
    metric tables *without* a `person_id` filter — quietly merging every person's data together.
    The guard only refuses migrations newer than itself. Take both services down.
+
+   An old **weight** service does something different and worse: its `INSERT` predates
+   `person_id` entirely, so anything you log through it lands unattributed and is invisible
+   to `/recent`, `/trend` and delete — not merged, missing. The next boot of a current image
+   repairs those rows automatically by assigning them to the primary person (logged as a
+   warning), but the timestamps will be whatever the old container recorded. Still: take both
+   services down.
 2. Pull/build the new images, then `docker compose up`.
 3. The new image takes an automatic pre-migration snapshot (`fitness.pre-001-person-id.db`,
    next to `fitness.db` in the `vitalforge-data` volume) before it changes anything, verified
