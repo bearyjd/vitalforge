@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from shared.database import get_db
+from shared.database import get_db, get_primary_person_id
 
 
 @pytest.fixture
@@ -37,12 +37,14 @@ async def seed_row(
     ts = (datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)).isoformat()
     weight_kg = weight_grams / 1000.0
     weight_lbs = weight_kg * 2.20462
+    person_id = await get_primary_person_id()
     db = await get_db()
     try:
         cursor = await db.execute(
-            "INSERT INTO weight_log (weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin, "
-            "body_fat_pct, body_water_pct, muscle_pct, bone_mass_kg, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO weight_log (person_id, weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin, "
+            "body_fat_pct, body_water_pct, muscle_pct, bone_mass_kg, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
+                person_id,
                 round(weight_lbs, 2),
                 round(weight_kg, 2),
                 weight_grams,
@@ -76,12 +78,13 @@ async def seed_row_raw_timestamp(weight_grams: int, timestamp: str) -> int:
     pre-existing/legacy row, per the open item in docs/prp/01-plan.md SS4.1)."""
     weight_kg = weight_grams / 1000.0
     weight_lbs = weight_kg * 2.20462
+    person_id = await get_primary_person_id()
     db = await get_db()
     try:
         cursor = await db.execute(
-            "INSERT INTO weight_log (weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin) "
-            "VALUES (?, ?, ?, ?, 1)",
-            (round(weight_lbs, 2), round(weight_kg, 2), weight_grams, timestamp),
+            "INSERT INTO weight_log (person_id, weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin) "
+            "VALUES (?, ?, ?, ?, ?, 1)",
+            (person_id, round(weight_lbs, 2), round(weight_kg, 2), weight_grams, timestamp),
         )
         await db.commit()
         return cursor.lastrowid
@@ -456,3 +459,40 @@ async def test_unparseable_stored_timestamp_still_persists_sync_failure(client, 
     finally:
         await db.close()
     assert row["synced_to_garmin"] == 0
+
+
+@pytest.mark.asyncio
+async def test_two_persons_same_second_similar_weight_produce_two_rows(initialized_db):
+    """Regression test for spec §0.2 Correction 1: without a person predicate
+    on the dedup SELECT, two family members weighing in within the dedup
+    window at similar weights would silently merge into one row."""
+    from datetime import datetime, timezone
+
+    from shared.database import get_db, get_primary_person_id
+
+    person_a = await get_primary_person_id()
+    now = datetime.now(timezone.utc)
+
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "INSERT INTO persons (slug, display_name, created_at, is_primary) VALUES (?, ?, ?, 0)",
+            ("second", "Second Person", now.isoformat()),
+        )
+        person_b = cursor.lastrowid
+        await db.commit()
+
+        for pid in (person_a, person_b):
+            await db.execute(
+                "INSERT INTO weight_log (person_id, weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin) "
+                "VALUES (?, 180.0, 81.6, 81600, ?, 0)",
+                (pid, now.isoformat()),
+            )
+        await db.commit()
+
+        cursor = await db.execute(
+            "SELECT COUNT(DISTINCT person_id) FROM weight_log WHERE timestamp = ?", (now.isoformat(),)
+        )
+        assert (await cursor.fetchone())[0] == 2
+    finally:
+        await db.close()

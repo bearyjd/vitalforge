@@ -120,7 +120,7 @@ async def delete_goal(goal_id: int) -> None:
 
 
 async def compute_progress(
-    table: str, column: str, target_value: float, target_date: str | None, days: int = 90
+    table: str, column: str, person_id: int, target_value: float, target_date: str | None, days: int = 90
 ) -> GoalProgress:
     """ETA-to-goal from the metric's own recent trend.
 
@@ -134,7 +134,7 @@ async def compute_progress(
     in whatever unit the metric column itself stores (e.g. weight_grams for
     "weight", not lbs/kg) -- callers are responsible for that agreement.
     """
-    data = await get_metric(table, column, days=days)
+    data = await get_metric(table, column, person_id, days=days)
     latest_value = data[-1]["value"] if data else None
     slope = trend_slope(data) if data else None
 

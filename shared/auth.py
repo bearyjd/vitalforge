@@ -60,6 +60,11 @@ _LEGACY_TOKEN_MIGRATION = "legacy-api-token-v1"
 # ambiguous real account with a formerly special identity.
 _RESERVED_USERNAMES = {"anonymous", "api-token"}
 
+# Person slugs live in shared/slugs.py: "safe as a path segment under
+# /p/{slug}/" is a different and larger rule than _RESERVED_USERNAMES' "safe
+# as a username", and keeping it out of here lets shared/migrations.py avoid
+# importing this module at all.
+
 # scrypt cost parameters for password hashing. n=2**14 (OWASP's minimum
 # recommendation for interactive/low-throughput logins) rather than a
 # stronger setting: this is a personal app with infrequent logins, not a

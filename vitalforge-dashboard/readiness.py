@@ -135,7 +135,7 @@ def score_readiness(data: dict) -> dict:
     return {"score": round(_clamp(weighted)), "components": rounded_components, "status": status}
 
 
-async def compute_readiness() -> dict:
+async def compute_readiness(person_id: int) -> dict:
     """Fetch trailing metrics and compute the composite readiness score."""
-    data = await get_all_metrics(days=30)
+    data = await get_all_metrics(person_id, days=30)
     return score_readiness(data)

@@ -232,6 +232,43 @@ docker compose -f docker-compose.prod.yml pull
 docker compose -f docker-compose.prod.yml up -d
 ```
 
+## Upgrading
+
+Some releases (starting with the `001-person-id-rebuild` schema migration) change the
+database schema in a way that is not safely readable by an older image. For these:
+
+1. **Stop both services before upgrading**: `docker compose down`, not a rolling restart —
+   an old container must never run against the new schema mid-upgrade. This step is the only
+   thing protecting you here, and it is not optional. The boot-time schema guard cannot catch
+   this particular case: the image that shipped the guard already lists `001-person-id-rebuild`
+   as a migration it knows, so it will start happily against the rebuilt schema and read the
+   metric tables *without* a `person_id` filter — quietly merging every person's data together.
+   The guard only refuses migrations newer than itself. Take both services down.
+
+   An old **weight** service does something different and worse: its `INSERT` predates
+   `person_id` entirely, so anything you log through it lands unattributed and is invisible
+   to `/recent`, `/trend` and delete — not merged, missing. The next boot of a current image
+   repairs those rows automatically by assigning them to the primary person (logged as a
+   warning), but the timestamps will be whatever the old container recorded. Still: take both
+   services down.
+2. Pull/build the new images, then `docker compose up`.
+3. The new image takes an automatic pre-migration snapshot (`fitness.pre-001-person-id.db`,
+   next to `fitness.db` in the `vitalforge-data` volume) before it changes anything, verified
+   with a SQLite integrity check. To name the primary person yourself, set
+   `VITALFORGE_PRIMARY_PERSON` in `.env` **before** this upgrade — it is read once, during the
+   one-shot migration. Without it the name defaults to the first admin's username, slugified,
+   on an upgrade of an existing deployment, and to `primary` on a brand-new install (where no
+   admin account exists yet at the moment the migration runs).
+4. If the migration fails (most commonly: insufficient free space for the snapshot), the
+   container will restart-loop with an error naming the cause and the fix. Free up space and
+   restart, or — after taking your own volume-level backup — set
+   `VITALFORGE_SKIP_MIGRATION_SNAPSHOT=1` to proceed without the automatic snapshot.
+5. **Rollback**: stop both services, replace `fitness.db` with the pre-migration snapshot
+   (removing any `-wal`/`-shm` sidecar files), redeploy the previous images.
+6. Once the upgrade is verified good and at least 7 days have passed, delete
+   `fitness.pre-001-person-id.db` — it is a full second copy of your health data and is not
+   cleaned up automatically.
+
 ## Nginx (optional)
 
 Copy `nginx/nginx.conf` to your nginx configuration and update the `server_name` values:

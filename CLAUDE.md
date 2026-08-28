@@ -27,7 +27,8 @@ and out of scope for inspection beyond schema.
 ```
 shared/                   # imported by BOTH services via sys.path.insert hack (no pyproject.toml)
   auth.py                 # cookie/HMAC session auth + login page HTML + FastAPI middleware
-  database.py             # aiosqlite connection + schema (CREATE TABLE IF NOT EXISTS, no migrations)
+  database.py             # aiosqlite connection + schema; migrations.py runs one-shot schema
+                          # migrations on top of it (001-person-id-rebuild, Phase 1)
   garmin_client.py        # thin wrapper over garminconnect.Garmin, module-level singleton `_client`
 vitalforge-weight/        # port 8085 — weight entry PWA, writes to Garmin + weight_log table
 vitalforge-dashboard/     # port 8086 — reads synced metrics, runs sync.py + recommendations.py
@@ -144,3 +145,34 @@ the original test-suite rationale (marked DONE).
   `vitalforge-dashboard/app.py:30-44` — when adding a new synced metric, you must update
   `shared/database.py` (schema), `sync.py` (populate), and this `METRIC_TABLES` dict
   (expose via `/api/metrics/{name}`) together, or the metric silently won't be queryable.
+  If the new metric table is created before a future schema rebuild ships, it must also be
+  added by name to `shared/migrations.py`'s `_REBUILD_TABLES` list — that list derives its
+  column shapes from the live schema rather than duplicating them, so it only ever needs the
+  table's name, not its columns.
+- **`_REBUILD_TABLES` only covers `(person_id, date)`-keyed metric tables.** A table that keeps
+  its own `id` primary key, or carries `NOT NULL`/`DEFAULT`/`CHECK`/`UNIQUE` columns, cannot go
+  in that list — `_rebuild_columns` refuses exactly those shapes rather than silently dropping
+  the constraint. Such tables get a hand-written rebuild instead (`_rebuild_sync_status`,
+  `_rebuild_activities`). If you add one, also add it to
+  `tests/test_migrations.py`'s parity checks: the generic
+  `test_schema_parity_fresh_vs_migrated` only iterates `_REBUILD_TABLES`, so a bespoke rebuild
+  whose DDL drifts from `shared/database.py`'s is invisible to it.
+- **Migrations are immutable once written — never add work to an existing marker.** A database
+  that already committed a marker skips that migration wholesale forever, so anything appended
+  to it silently never runs there while the app code assumes it did. Add a new marker instead
+  (`002-activities-person-id` exists because the `activities` gap was found after 001 had
+  already run on dev databases), and list it in `shared/migrations.py`'s `_KNOWN_MIGRATIONS` in
+  the same commit — an applied marker missing from that tuple boot-loops the container.
+- **A table rebuild resets `AUTOINCREMENT` unless you carry `sqlite_sequence` across by hand.**
+  `DROP TABLE` deletes that table's `sqlite_sequence` row, and the `INSERT ... SELECT` leaves the
+  new counter at `MAX(id)` of the rows that survived — so any id above it, belonging to a row
+  deleted before the migration, gets issued a second time. `_rebuild_activities` reads the old
+  `seq` before the `DROP` and restores it after the `RENAME`. Note `sqlite_sequence` has no
+  `PRIMARY KEY`/`UNIQUE`, so `ON CONFLICT` cannot be used — it is `UPDATE`, then `INSERT` if the
+  `UPDATE` matched nothing (which is what happens when every row was deleted and the copy was
+  empty). Any future rebuild of an `AUTOINCREMENT` table needs the same treatment.
+- **A `CREATE INDEX` in `init_db` cannot reference a column that only a migration adds.**
+  The whole DDL block runs before any migration, so `activities`'s person-scoped index is
+  guarded by a `PRAGMA table_info` check and re-created inside `_rebuild_activities` for the
+  upgrade path. `weight_log` avoids this only because `_add_columns` gives it `person_id`
+  earlier in the same block.

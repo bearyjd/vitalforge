@@ -237,3 +237,86 @@ async def test_list_and_get_activities(client):
 
     missing = await client.get("/api/activities/999999")
     assert missing.status_code == 404
+
+
+async def test_activity_routes_exclude_other_persons_rows(client):
+    """Cross-person read isolation for the FIT-import routes -- the /api/metrics
+    counterpart of tests/test_dashboard_api.py's
+    test_get_metric_excludes_other_persons_rows. Verified to fail without the
+    `person_id = ?` predicates on /api/activities and /api/activities/{id}."""
+    from shared.database import get_primary_person_id
+
+    data = make_fit_bytes()
+    mine = await client.post("/api/import/activity", files={"file": ("mine.fit", data)})
+    assert mine.status_code == 200
+    my_id = mine.json()["id"]
+
+    db = await get_db()
+    try:
+        mine_person = await get_primary_person_id()
+        cursor = await db.execute(
+            "INSERT INTO persons (slug, display_name, created_at, is_primary) VALUES (?, ?, ?, 0)",
+            ("second", "Second Person", datetime.now(timezone.utc).isoformat()),
+        )
+        other_person = cursor.lastrowid
+        assert other_person != mine_person
+        await db.execute(
+            "INSERT INTO activities (person_id, start_time_utc, sport, source_format, file_sha256, imported_at) "
+            "VALUES (?, '2026-08-21T07:30:00+00:00', 'running', 'fit', 'someone-elses-hash', ?)",
+            (other_person, datetime.now(timezone.utc).isoformat()),
+        )
+        await db.commit()
+        cur = await db.execute("SELECT id FROM activities WHERE person_id = ?", (other_person,))
+        other_id = (await cur.fetchone())["id"]
+    finally:
+        await db.close()
+
+    assert await activity_count() == 2, "fixture did not actually seed a second person's activity"
+
+    listed = await client.get("/api/activities")
+    assert listed.status_code == 200
+    ids = [a["id"] for a in listed.json()["activities"]]
+    assert ids == [my_id], "/api/activities leaked another person's rows"
+    assert listed.json()["count"] == 1
+
+    detail = await client.get(f"/api/activities/{other_id}")
+    assert detail.status_code == 404, "/api/activities/{id} is an IDOR onto another person's activity"
+
+
+async def test_same_file_imported_by_two_persons_is_not_a_duplicate(client):
+    """The route dedups within a person. A second person's identical file is a
+    genuinely new row, which the old global UNIQUE(file_sha256) made
+    impossible to store at all."""
+    from shared.database import get_primary_person_id
+
+    data = make_fit_bytes()
+    first = await client.post("/api/import/activity", files={"file": ("run.fit", data)})
+    assert first.status_code == 200
+    assert "duplicate" not in first.json()
+
+    second = await client.post("/api/import/activity", files={"file": ("run.fit", data)})
+    assert second.json().get("duplicate_reason") == "exact_duplicate"
+    assert await activity_count() == 1
+
+    db = await get_db()
+    try:
+        mine = await get_primary_person_id()
+        cursor = await db.execute(
+            "INSERT INTO persons (slug, display_name, created_at, is_primary) VALUES (?, ?, ?, 0)",
+            ("second", "Second Person", datetime.now(timezone.utc).isoformat()),
+        )
+        other = cursor.lastrowid
+        cur = await db.execute("SELECT file_sha256 FROM activities WHERE person_id = ?", (mine,))
+        shared_hash = (await cur.fetchone())["file_sha256"]
+        await db.execute(
+            "INSERT INTO activities (person_id, start_time_utc, sport, source_format, file_sha256, imported_at) "
+            "VALUES (?, '2026-08-20T07:30:00+00:00', 'running', 'fit', ?, ?)",
+            (other, shared_hash, datetime.now(timezone.utc).isoformat()),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+    assert await activity_count() == 2, (
+        "two persons could not both hold the same file_sha256 -- UNIQUE is still global"
+    )

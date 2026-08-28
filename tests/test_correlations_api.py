@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from shared.database import get_db
+from shared.database import get_db, get_primary_person_id
 
 # `vitalforge-dashboard` is a hyphenated directory name, so `correlations.py`
 # is loaded via `importlib.import_module` (same mechanism `conftest.py`'s
@@ -38,12 +38,13 @@ async def client(dashboard_app_module):
 
 async def seed_metric(table: str, column: str, rows: list[tuple[str, float]]):
     """Insert (date, value) rows into a metric table for testing."""
+    person_id = await get_primary_person_id()
     db = await get_db()
     try:
         for date, value in rows:
             await db.execute(
-                f"INSERT OR REPLACE INTO [{table}] (date, [{column}]) VALUES (?, ?)",
-                (date, value),
+                f"INSERT OR REPLACE INTO [{table}] (person_id, date, [{column}]) VALUES (?, ?, ?)",
+                (person_id, date, value),
             )
         await db.commit()
     finally:

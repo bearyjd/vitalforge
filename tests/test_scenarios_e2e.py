@@ -14,6 +14,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from shared.auth import create_session_cookie
+from shared.database import get_primary_person_id
 from tests.conftest import import_service_module, seed_token, seed_user
 
 FULL_PAYLOAD = {
@@ -200,7 +201,8 @@ async def test_full_composition_chain_and_duplicate_collapse(
     monkeypatch.setattr(
         fake_garmin_client, "get_weigh_ins", lambda start, end: _weigh_ins_echoing_push(pushed)
     )
-    await sync.sync_weight_history(sync_date, sync_date)
+    person_id = await get_primary_person_id()
+    await sync.sync_weight_history(sync_date, sync_date, person_id)
 
     dashboard_transport = ASGITransport(app=dashboard_app_module.app)
     async with AsyncClient(transport=dashboard_transport, base_url="http://test") as dc:

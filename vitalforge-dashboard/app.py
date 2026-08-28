@@ -40,7 +40,7 @@ from recommendations import get_recommendations, get_rules_only
 from sync import run_sync, scheduled_sync
 
 from shared.auth import add_auth_routes, bootstrap_first_admin, bootstrap_migrated_token, require_account_identity
-from shared.database import get_db, init_db
+from shared.database import ensure_primary_person_grant, get_db, get_primary_person_id, init_db
 from shared.garmin_client import authenticate
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -78,6 +78,10 @@ async def lifespan(app: FastAPI):
     # under that race itself (see its own docstring), so no coordination
     # is needed here.
     await bootstrap_first_admin()
+    # Must follow bootstrap_first_admin(): on a fresh database the migration
+    # that creates the primary person runs inside init_db(), before any admin
+    # exists to own it. See ensure_primary_person_grant()'s docstring.
+    await ensure_primary_person_grant()
     await bootstrap_migrated_token()
     logger.info("Authenticating with Garmin Connect...")
     try:
@@ -122,8 +126,9 @@ async def trigger_sync(days: int = Query(default=7, ge=1, le=90)):
         return {"status": "already_running", "message": "A sync is already in progress"}
 
     async def _do_sync():
+        person_id = await get_primary_person_id()
         async with _sync_lock:
-            await run_sync(days=days)
+            await run_sync(days=days, person_id=person_id)
 
     asyncio.create_task(_do_sync())
     return {"status": "started", "days": days}
@@ -132,9 +137,13 @@ async def trigger_sync(days: int = Query(default=7, ge=1, le=90)):
 @app.get("/api/sync/status")
 async def sync_status():
     """Return last sync time and result."""
+    person_id = await get_primary_person_id()
     db = await get_db()
     try:
-        cursor = await db.execute("SELECT last_sync_time, last_sync_result, last_sync_days FROM sync_status WHERE id = 1")
+        cursor = await db.execute(
+            "SELECT last_sync_time, last_sync_result, last_sync_days FROM sync_status WHERE person_id = ?",
+            (person_id,),
+        )
         row = await cursor.fetchone()
     finally:
         await db.close()
@@ -160,12 +169,14 @@ async def get_metrics(metric_name: str, days: int = Query(default=30, ge=1, le=3
         )
 
     table, column = METRIC_TABLES[metric_name]
+    person_id = await get_primary_person_id()
 
     db = await get_db()
     try:
         cursor = await db.execute(
-            f"SELECT date, [{column}] as value FROM [{table}] WHERE date >= date('now', ?) ORDER BY date ASC",
-            (f"-{days} days",),
+            f"SELECT date, [{column}] as value FROM [{table}] "
+            f"WHERE person_id = ? AND date >= date('now', ?) ORDER BY date ASC",
+            (person_id, f"-{days} days"),
         )
         rows = await cursor.fetchall()
     finally:
@@ -195,7 +206,8 @@ async def get_metrics(metric_name: str, days: int = Query(default=30, ge=1, le=3
 async def api_readiness():
     """Get the composite readiness/recovery score (0-100)."""
     try:
-        return await compute_readiness()
+        person_id = await get_primary_person_id()
+        return await compute_readiness(person_id)
     except Exception as e:
         logger.error("Readiness scoring failed: %s", e)
         raise HTTPException(status_code=500, detail="Failed to compute readiness score")
@@ -205,19 +217,21 @@ async def _export_rows(metrics: list[str], days: int):
     """Yield (metric_name, date, value) tuples for the given metrics.
 
     Reuses get_metrics()'s exact query pattern (same WHERE/ORDER BY clause,
-    same NULL-value filtering) against one shared DB connection for the
-    whole export, rather than opening/closing a connection per metric.
-    `table`/`column` are always looked up from METRIC_TABLES (never taken
-    from the raw request), so the f-string interpolation into the SQL
-    identifier positions below is safe.
+    same NULL-value filtering, same person_id scoping) against one shared DB
+    connection for the whole export, rather than opening/closing a
+    connection per metric. `table`/`column` are always looked up from
+    METRIC_TABLES (never taken from the raw request), so the f-string
+    interpolation into the SQL identifier positions below is safe.
     """
+    person_id = await get_primary_person_id()
     db = await get_db()
     try:
         for metric_name in metrics:
             table, column = METRIC_TABLES[metric_name]
             cursor = await db.execute(
-                f"SELECT date, [{column}] as value FROM [{table}] WHERE date >= date('now', ?) ORDER BY date ASC",
-                (f"-{days} days",),
+                f"SELECT date, [{column}] as value FROM [{table}] "
+                f"WHERE person_id = ? AND date >= date('now', ?) ORDER BY date ASC",
+                (person_id, f"-{days} days"),
             )
             rows = await cursor.fetchall()
             for row in rows:
@@ -307,7 +321,8 @@ async def export_data(
 async def api_recommendations(refresh: bool = Query(default=False)):
     """Get AI-powered health recommendations."""
     try:
-        return await get_recommendations(force=refresh)
+        person_id = await get_primary_person_id()
+        return await get_recommendations(person_id, force=refresh)
     except Exception as e:
         logger.error("Recommendations failed: %s", e)
         raise HTTPException(status_code=500, detail="Failed to generate recommendations")
@@ -316,7 +331,8 @@ async def api_recommendations(refresh: bool = Query(default=False)):
 @app.get("/api/recommendations/rules-only")
 async def api_rules_only():
     """Get rules engine output without LLM."""
-    return await get_rules_only()
+    person_id = await get_primary_person_id()
+    return await get_rules_only(person_id)
 
 
 @app.get("/api/correlations")
@@ -350,14 +366,17 @@ async def api_correlations(
             detail=f"Unknown metric(s): {', '.join(unknown)}. Valid: {', '.join(sorted(METRIC_TABLES))}",
         )
 
+    person_id = await get_primary_person_id()
+
     db = await get_db()
     try:
         series: dict[str, dict[str, float]] = {}
         for name in set(metric_names):
             table, column = METRIC_TABLES[name]
             cursor = await db.execute(
-                f"SELECT date, [{column}] as value FROM [{table}] WHERE date >= date('now', ?) ORDER BY date ASC",
-                (f"-{days} days",),
+                f"SELECT date, [{column}] as value FROM [{table}] "
+                f"WHERE person_id = ? AND date >= date('now', ?) ORDER BY date ASC",
+                (person_id, f"-{days} days"),
             )
             rows = await cursor.fetchall()
             series[name] = {row["date"]: row["value"] for row in rows if row["value"] is not None}
@@ -436,6 +455,7 @@ async def import_activity(file: UploadFile = File(...)):
     raw_summary_json = json.dumps(record.raw_summary, default=str)
 
     columns_sql = ", ".join(_ACTIVITY_COLUMNS)
+    person_id = await get_primary_person_id()
 
     db = await get_db()
     try:
@@ -446,8 +466,8 @@ async def import_activity(file: UploadFile = File(...)):
         await db.execute("BEGIN IMMEDIATE")
 
         cursor = await db.execute(
-            f"SELECT {columns_sql} FROM activities WHERE file_sha256 = ?",
-            (file_hash,),
+            f"SELECT {columns_sql} FROM activities WHERE person_id = ? AND file_sha256 = ?",
+            (person_id, file_hash),
         )
         existing = await cursor.fetchone()
         duplicate_reason = "exact_duplicate" if existing is not None else None
@@ -455,11 +475,13 @@ async def import_activity(file: UploadFile = File(...)):
         if existing is None:
             cursor = await db.execute(
                 f"SELECT {columns_sql} FROM activities "
-                "WHERE sport IS ? "
+                "WHERE person_id = ? "
+                "AND sport IS ? "
                 "AND julianday(start_time_utc) >= julianday(?, ?) "
                 "AND julianday(start_time_utc) <= julianday(?, ?) "
                 "ORDER BY start_time_utc DESC LIMIT 1",
                 (
+                    person_id,
                     record.sport,
                     record.start_time_utc,
                     f"-{ACTIVITY_NEAR_DUPLICATE_WINDOW_SECONDS} seconds",
@@ -481,10 +503,11 @@ async def import_activity(file: UploadFile = File(...)):
             row = existing
         else:
             insert_cursor = await db.execute(
-                "INSERT INTO activities (start_time_utc, sport, duration_seconds, distance_m, calories, "
+                "INSERT INTO activities (person_id, start_time_utc, sport, duration_seconds, distance_m, calories, "
                 "avg_hr, max_hr, elevation_gain_m, source_format, file_sha256, imported_at, raw_summary_json) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
+                    person_id,
                     record.start_time_utc,
                     record.sport,
                     record.duration_seconds,
@@ -501,7 +524,10 @@ async def import_activity(file: UploadFile = File(...)):
             )
             row_id = insert_cursor.lastrowid
             await db.commit()
-            cursor = await db.execute(f"SELECT {columns_sql} FROM activities WHERE id = ?", (row_id,))
+            cursor = await db.execute(
+                f"SELECT {columns_sql} FROM activities WHERE id = ? AND person_id = ?",
+                (row_id, person_id),
+            )
             row = await cursor.fetchone()
     finally:
         await db.close()
@@ -517,11 +543,13 @@ async def import_activity(file: UploadFile = File(...)):
 async def list_activities(limit: int = Query(default=50, ge=1, le=200)):
     """List imported activities, most recent first."""
     columns_sql = ", ".join(_ACTIVITY_COLUMNS)
+    person_id = await get_primary_person_id()
     db = await get_db()
     try:
         cursor = await db.execute(
-            f"SELECT {columns_sql} FROM activities ORDER BY start_time_utc DESC LIMIT ?",
-            (limit,),
+            f"SELECT {columns_sql} FROM activities "
+            "WHERE person_id = ? ORDER BY start_time_utc DESC LIMIT ?",
+            (person_id, limit),
         )
         rows = await cursor.fetchall()
     finally:
@@ -535,11 +563,13 @@ async def get_activity(activity_id: int):
     """A single imported activity, including its full raw FIT session
     summary."""
     columns_sql = ", ".join(_ACTIVITY_COLUMNS)
+    person_id = await get_primary_person_id()
     db = await get_db()
     try:
         cursor = await db.execute(
-            f"SELECT {columns_sql}, raw_summary_json FROM activities WHERE id = ?",
-            (activity_id,),
+            f"SELECT {columns_sql}, raw_summary_json FROM activities "
+            "WHERE id = ? AND person_id = ?",
+            (activity_id, person_id),
         )
         row = await cursor.fetchone()
     finally:
@@ -572,18 +602,18 @@ def _validate_goal_metric(metric: str | None):
         )
 
 
-async def _goal_progress(goal: dict) -> GoalProgress | None:
+async def _goal_progress(goal: dict, person_id: int) -> GoalProgress | None:
     mapping = METRIC_TABLES.get(goal["metric"])
     if mapping is None:
         # Only reachable if a row's metric predates a since-removed
         # METRIC_TABLES entry -- degrade to no progress rather than 500.
         return None
     table, column = mapping
-    return await compute_progress(table, column, goal["target_value"], goal["target_date"])
+    return await compute_progress(table, column, person_id, goal["target_value"], goal["target_date"])
 
 
-async def _goal_out(goal: dict) -> GoalOut:
-    return GoalOut(**goal, progress=await _goal_progress(goal))
+async def _goal_out(goal: dict, person_id: int) -> GoalOut:
+    return GoalOut(**goal, progress=await _goal_progress(goal, person_id))
 
 
 async def _owned_goal_or_404(request: Request, goal_id: int) -> dict:
@@ -607,20 +637,23 @@ async def create_goal_route(data: GoalCreate, request: Request):
     _validate_goal_metric(data.metric)
     goal_id = await create_goal(identity.user_id, data)
     goal = await get_goal(goal_id)
-    return await _goal_out(goal)
+    person_id = await get_primary_person_id()
+    return await _goal_out(goal, person_id)
 
 
 @app.get("/api/goals")
 async def list_goals_route(request: Request):
     identity = await require_account_identity(request)
     goals = await list_goals(identity.user_id)
-    return [await _goal_out(goal) for goal in goals]
+    person_id = await get_primary_person_id()
+    return [await _goal_out(goal, person_id) for goal in goals]
 
 
 @app.get("/api/goals/{goal_id}")
 async def get_goal_route(goal_id: int, request: Request):
     goal = await _owned_goal_or_404(request, goal_id)
-    return await _goal_out(goal)
+    person_id = await get_primary_person_id()
+    return await _goal_out(goal, person_id)
 
 
 @app.patch("/api/goals/{goal_id}")
@@ -628,7 +661,8 @@ async def patch_goal_route(goal_id: int, data: GoalUpdate, request: Request):
     await _owned_goal_or_404(request, goal_id)
     _validate_goal_metric(data.metric)
     updated = await update_goal(goal_id, data)
-    return await _goal_out(updated)
+    person_id = await get_primary_person_id()
+    return await _goal_out(updated, person_id)
 
 
 @app.delete("/api/goals/{goal_id}")
