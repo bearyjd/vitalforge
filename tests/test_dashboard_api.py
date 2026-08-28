@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from shared.database import get_db
+from shared.database import get_db, get_primary_person_id
 
 
 def days_ago(n: int) -> str:
@@ -30,12 +30,13 @@ async def client(dashboard_app_module):
 
 async def seed_metric(table: str, column: str, rows: list[tuple[str, float]]):
     """Insert (date, value) rows into a metric table for testing."""
+    person_id = await get_primary_person_id()
     db = await get_db()
     try:
         for date, value in rows:
             await db.execute(
-                f"INSERT OR REPLACE INTO [{table}] (date, [{column}]) VALUES (?, ?)",
-                (date, value),
+                f"INSERT OR REPLACE INTO [{table}] (person_id, date, [{column}]) VALUES (?, ?, ?)",
+                (person_id, date, value),
             )
         await db.commit()
     finally:
@@ -110,12 +111,13 @@ async def test_composition_metrics_return_empty_series_when_garmin_values_null(c
     null until the first Track B push round-trips through Garmin. The
     endpoint must return an empty series, not error or crash the moving-
     average loop."""
+    person_id = await get_primary_person_id()
     db = await get_db()
     try:
         await db.execute(
-            "INSERT INTO weight_history (date, weight_grams, bmi, body_fat, body_water, bone_mass_g, muscle_mass_g) "
-            "VALUES (?, 81200, 24.1, 18.4, NULL, NULL, NULL)",
-            (days_ago(1),),
+            "INSERT INTO weight_history (person_id, date, weight_grams, bmi, body_fat, body_water, bone_mass_g, muscle_mass_g) "
+            "VALUES (?, ?, 81200, 24.1, 18.4, NULL, NULL, NULL)",
+            (person_id, days_ago(1)),
         )
         await db.commit()
     finally:
@@ -153,3 +155,40 @@ async def test_recommendations_rules_only_does_not_call_garmin(client, fake_garm
     resp = await client.get("/api/recommendations/rules-only")
     assert resp.status_code == 200
     assert fake_garmin_client.pushed_weights == []
+
+
+async def test_get_metric_excludes_other_persons_rows(client):
+    """The phase's whole point: a second person's rows for the same date
+    range must never leak into the primary person's read. Every existing
+    test in this module has exactly one person seeded, so a scoped and an
+    unscoped SELECT would both pass them -- this is the one test that would
+    actually fail if the `WHERE person_id = ?` predicate were dropped from
+    `get_metrics`."""
+    primary_id = await get_primary_person_id()
+
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "INSERT INTO persons (slug, display_name, created_at, is_primary) VALUES (?, ?, ?, 0)",
+            ("second", "Second Person", datetime.now(timezone.utc).isoformat()),
+        )
+        second_id = cursor.lastrowid
+        await db.commit()
+
+        await db.execute(
+            "INSERT OR REPLACE INTO [steps] (person_id, date, value) VALUES (?, ?, ?)",
+            (primary_id, days_ago(1), 1000.0),
+        )
+        await db.execute(
+            "INSERT OR REPLACE INTO [steps] (person_id, date, value) VALUES (?, ?, ?)",
+            (second_id, days_ago(1), 9999.0),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+    resp = await client.get("/api/metrics/steps")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["count"] == 1
+    assert body["data"][0]["value"] == 1000.0

@@ -122,8 +122,9 @@ async def trigger_sync(days: int = Query(default=7, ge=1, le=90)):
         return {"status": "already_running", "message": "A sync is already in progress"}
 
     async def _do_sync():
+        person_id = await get_primary_person_id()
         async with _sync_lock:
-            await run_sync(days=days)
+            await run_sync(days=days, person_id=person_id)
 
     asyncio.create_task(_do_sync())
     return {"status": "started", "days": days}
@@ -132,9 +133,13 @@ async def trigger_sync(days: int = Query(default=7, ge=1, le=90)):
 @app.get("/api/sync/status")
 async def sync_status():
     """Return last sync time and result."""
+    person_id = await get_primary_person_id()
     db = await get_db()
     try:
-        cursor = await db.execute("SELECT last_sync_time, last_sync_result, last_sync_days FROM sync_status WHERE id = 1")
+        cursor = await db.execute(
+            "SELECT last_sync_time, last_sync_result, last_sync_days FROM sync_status WHERE person_id = ?",
+            (person_id,),
+        )
         row = await cursor.fetchone()
     finally:
         await db.close()
@@ -160,12 +165,14 @@ async def get_metrics(metric_name: str, days: int = Query(default=30, ge=1, le=3
         )
 
     table, column = METRIC_TABLES[metric_name]
+    person_id = await get_primary_person_id()
 
     db = await get_db()
     try:
         cursor = await db.execute(
-            f"SELECT date, [{column}] as value FROM [{table}] WHERE date >= date('now', ?) ORDER BY date ASC",
-            (f"-{days} days",),
+            f"SELECT date, [{column}] as value FROM [{table}] "
+            f"WHERE person_id = ? AND date >= date('now', ?) ORDER BY date ASC",
+            (person_id, f"-{days} days"),
         )
         rows = await cursor.fetchall()
     finally:
@@ -206,19 +213,21 @@ async def _export_rows(metrics: list[str], days: int):
     """Yield (metric_name, date, value) tuples for the given metrics.
 
     Reuses get_metrics()'s exact query pattern (same WHERE/ORDER BY clause,
-    same NULL-value filtering) against one shared DB connection for the
-    whole export, rather than opening/closing a connection per metric.
-    `table`/`column` are always looked up from METRIC_TABLES (never taken
-    from the raw request), so the f-string interpolation into the SQL
-    identifier positions below is safe.
+    same NULL-value filtering, same person_id scoping) against one shared DB
+    connection for the whole export, rather than opening/closing a
+    connection per metric. `table`/`column` are always looked up from
+    METRIC_TABLES (never taken from the raw request), so the f-string
+    interpolation into the SQL identifier positions below is safe.
     """
+    person_id = await get_primary_person_id()
     db = await get_db()
     try:
         for metric_name in metrics:
             table, column = METRIC_TABLES[metric_name]
             cursor = await db.execute(
-                f"SELECT date, [{column}] as value FROM [{table}] WHERE date >= date('now', ?) ORDER BY date ASC",
-                (f"-{days} days",),
+                f"SELECT date, [{column}] as value FROM [{table}] "
+                f"WHERE person_id = ? AND date >= date('now', ?) ORDER BY date ASC",
+                (person_id, f"-{days} days"),
             )
             rows = await cursor.fetchall()
             for row in rows:
@@ -353,14 +362,17 @@ async def api_correlations(
             detail=f"Unknown metric(s): {', '.join(unknown)}. Valid: {', '.join(sorted(METRIC_TABLES))}",
         )
 
+    person_id = await get_primary_person_id()
+
     db = await get_db()
     try:
         series: dict[str, dict[str, float]] = {}
         for name in set(metric_names):
             table, column = METRIC_TABLES[name]
             cursor = await db.execute(
-                f"SELECT date, [{column}] as value FROM [{table}] WHERE date >= date('now', ?) ORDER BY date ASC",
-                (f"-{days} days",),
+                f"SELECT date, [{column}] as value FROM [{table}] "
+                f"WHERE person_id = ? AND date >= date('now', ?) ORDER BY date ASC",
+                (person_id, f"-{days} days"),
             )
             rows = await cursor.fetchall()
             series[name] = {row["date"]: row["value"] for row in rows if row["value"] is not None}
@@ -575,18 +587,18 @@ def _validate_goal_metric(metric: str | None):
         )
 
 
-async def _goal_progress(goal: dict) -> GoalProgress | None:
+async def _goal_progress(goal: dict, person_id: int) -> GoalProgress | None:
     mapping = METRIC_TABLES.get(goal["metric"])
     if mapping is None:
         # Only reachable if a row's metric predates a since-removed
         # METRIC_TABLES entry -- degrade to no progress rather than 500.
         return None
     table, column = mapping
-    return await compute_progress(table, column, goal["target_value"], goal["target_date"])
+    return await compute_progress(table, column, person_id, goal["target_value"], goal["target_date"])
 
 
-async def _goal_out(goal: dict) -> GoalOut:
-    return GoalOut(**goal, progress=await _goal_progress(goal))
+async def _goal_out(goal: dict, person_id: int) -> GoalOut:
+    return GoalOut(**goal, progress=await _goal_progress(goal, person_id))
 
 
 async def _owned_goal_or_404(request: Request, goal_id: int) -> dict:
@@ -610,20 +622,23 @@ async def create_goal_route(data: GoalCreate, request: Request):
     _validate_goal_metric(data.metric)
     goal_id = await create_goal(identity.user_id, data)
     goal = await get_goal(goal_id)
-    return await _goal_out(goal)
+    person_id = await get_primary_person_id()
+    return await _goal_out(goal, person_id)
 
 
 @app.get("/api/goals")
 async def list_goals_route(request: Request):
     identity = await require_account_identity(request)
     goals = await list_goals(identity.user_id)
-    return [await _goal_out(goal) for goal in goals]
+    person_id = await get_primary_person_id()
+    return [await _goal_out(goal, person_id) for goal in goals]
 
 
 @app.get("/api/goals/{goal_id}")
 async def get_goal_route(goal_id: int, request: Request):
     goal = await _owned_goal_or_404(request, goal_id)
-    return await _goal_out(goal)
+    person_id = await get_primary_person_id()
+    return await _goal_out(goal, person_id)
 
 
 @app.patch("/api/goals/{goal_id}")
@@ -631,7 +646,8 @@ async def patch_goal_route(goal_id: int, data: GoalUpdate, request: Request):
     await _owned_goal_or_404(request, goal_id)
     _validate_goal_metric(data.metric)
     updated = await update_goal(goal_id, data)
-    return await _goal_out(updated)
+    person_id = await get_primary_person_id()
+    return await _goal_out(updated, person_id)
 
 
 @app.delete("/api/goals/{goal_id}")

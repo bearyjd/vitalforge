@@ -21,7 +21,7 @@ from httpx import ASGITransport, AsyncClient
 
 from shared import auth as shared_auth
 from shared.auth import create_session_cookie
-from shared.database import get_db
+from shared.database import get_db, get_primary_person_id
 from tests.conftest import seed_user
 
 
@@ -46,12 +46,13 @@ async def _goal_count() -> int:
 
 
 async def seed_metric(table: str, column: str, rows: list[tuple[str, float]]):
+    person_id = await get_primary_person_id()
     db = await get_db()
     try:
         for date, value in rows:
             await db.execute(
-                f"INSERT OR REPLACE INTO [{table}] (date, [{column}]) VALUES (?, ?)",
-                (date, value),
+                f"INSERT OR REPLACE INTO [{table}] (person_id, date, [{column}]) VALUES (?, ?, ?)",
+                (person_id, date, value),
             )
         await db.commit()
     finally:
@@ -226,7 +227,8 @@ async def test_compute_progress_projects_eta_when_trending_toward_target(dashboa
     rows = [(days_ago(4 - i), 100.0 * (i + 1)) for i in range(5)]  # 100, 200, ..., 500 ascending
     await seed_metric("steps", "value", rows)
 
-    progress = await goals.compute_progress("steps", "value", target_value=1000, target_date=None)
+    person_id = await get_primary_person_id()
+    progress = await goals.compute_progress("steps", "value", person_id, target_value=1000, target_date=None)
     assert progress.latest_value == 500.0
     assert progress.trend_slope is not None
     assert progress.trend_slope > 0
@@ -240,7 +242,8 @@ async def test_compute_progress_no_eta_when_trending_away_from_target(dashboard_
     rows = [(days_ago(4 - i), 500.0 - 100.0 * i) for i in range(5)]  # 500, 400, ..., 100 descending
     await seed_metric("steps", "value", rows)
 
-    progress = await goals.compute_progress("steps", "value", target_value=1000, target_date=None)
+    person_id = await get_primary_person_id()
+    progress = await goals.compute_progress("steps", "value", person_id, target_value=1000, target_date=None)
     assert progress.trend_slope is not None
     assert progress.trend_slope < 0
     assert progress.eta_date is None
@@ -251,7 +254,8 @@ async def test_compute_progress_insufficient_data_returns_none_slope(dashboard_a
     import goals
 
     await seed_metric("steps", "value", [(days_ago(0), 100.0)])
-    progress = await goals.compute_progress("steps", "value", target_value=1000, target_date=None)
+    person_id = await get_primary_person_id()
+    progress = await goals.compute_progress("steps", "value", person_id, target_value=1000, target_date=None)
     assert progress.latest_value == 100.0
     assert progress.trend_slope is None
     assert progress.eta_date is None
@@ -264,7 +268,8 @@ async def test_compute_progress_already_at_target(dashboard_app_module):
     rows = [(days_ago(4 - i), 1000.0) for i in range(5)]
     await seed_metric("steps", "value", rows)
 
-    progress = await goals.compute_progress("steps", "value", target_value=1000, target_date=None)
+    person_id = await get_primary_person_id()
+    progress = await goals.compute_progress("steps", "value", person_id, target_value=1000, target_date=None)
     assert progress.eta_date == days_ago(0)
     assert progress.on_track is True
 
@@ -275,15 +280,19 @@ async def test_compute_progress_on_track_relative_to_target_date(dashboard_app_m
     rows = [(days_ago(4 - i), 100.0 * (i + 1)) for i in range(5)]  # +100/day
     await seed_metric("steps", "value", rows)
 
+    person_id = await get_primary_person_id()
+
     # A generous target_date far in the future should be "on track"; an
     # impossibly close one should not.
     generous = await goals.compute_progress(
-        "steps", "value", target_value=1000, target_date=days_ago(-365)
+        "steps", "value", person_id, target_value=1000, target_date=days_ago(-365)
     )
     assert generous.eta_date is not None
     assert generous.on_track is True
 
-    impossible = await goals.compute_progress("steps", "value", target_value=1000, target_date=days_ago(1))
+    impossible = await goals.compute_progress(
+        "steps", "value", person_id, target_value=1000, target_date=days_ago(1)
+    )
     assert impossible.eta_date is not None
     assert impossible.on_track is False
 
@@ -291,7 +300,8 @@ async def test_compute_progress_on_track_relative_to_target_date(dashboard_app_m
 async def test_compute_progress_no_data_returns_all_none(dashboard_app_module):
     import goals
 
-    progress = await goals.compute_progress("steps", "value", target_value=1000, target_date=None)
+    person_id = await get_primary_person_id()
+    progress = await goals.compute_progress("steps", "value", person_id, target_value=1000, target_date=None)
     assert progress.latest_value is None
     assert progress.trend_slope is None
     assert progress.eta_date is None
