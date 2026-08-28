@@ -232,6 +232,29 @@ docker compose -f docker-compose.prod.yml pull
 docker compose -f docker-compose.prod.yml up -d
 ```
 
+## Upgrading
+
+Some releases (starting with the `001-person-id-rebuild` schema migration) change the
+database schema in a way that is not safely readable by an older image. For these:
+
+1. **Stop both services before upgrading**: `docker compose down`, not a rolling restart —
+   an old container must never run against the new schema mid-upgrade.
+2. Pull/build the new images, then `docker compose up`.
+3. The new image takes an automatic pre-migration snapshot (`fitness.pre-001-person-id.db`,
+   next to `fitness.db` in the `vitalforge-data` volume) before it changes anything, verified
+   with a SQLite integrity check. If you also want to rename the primary person away from the
+   default (the first admin's username, slugified), set `VITALFORGE_PRIMARY_PERSON` in `.env`
+   **before** this upgrade — it is read once, during the one-shot migration.
+4. If the migration fails (most commonly: insufficient free space for the snapshot), the
+   container will restart-loop with an error naming the cause and the fix. Free up space and
+   restart, or — after taking your own volume-level backup — set
+   `VITALFORGE_SKIP_MIGRATION_SNAPSHOT=1` to proceed without the automatic snapshot.
+5. **Rollback**: stop both services, replace `fitness.db` with the pre-migration snapshot
+   (removing any `-wal`/`-shm` sidecar files), redeploy the previous images.
+6. Once the upgrade is verified good and at least 7 days have passed, delete
+   `fitness.pre-001-person-id.db` — it is a full second copy of your health data and is not
+   cleaned up automatically.
+
 ## Nginx (optional)
 
 Copy `nginx/nginx.conf` to your nginx configuration and update the `server_name` values:

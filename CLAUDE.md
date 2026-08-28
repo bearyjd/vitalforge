@@ -27,7 +27,8 @@ and out of scope for inspection beyond schema.
 ```
 shared/                   # imported by BOTH services via sys.path.insert hack (no pyproject.toml)
   auth.py                 # cookie/HMAC session auth + login page HTML + FastAPI middleware
-  database.py             # aiosqlite connection + schema (CREATE TABLE IF NOT EXISTS, no migrations)
+  database.py             # aiosqlite connection + schema; migrations.py runs one-shot schema
+                          # migrations on top of it (001-person-id-rebuild, Phase 1)
   garmin_client.py        # thin wrapper over garminconnect.Garmin, module-level singleton `_client`
 vitalforge-weight/        # port 8085 — weight entry PWA, writes to Garmin + weight_log table
 vitalforge-dashboard/     # port 8086 — reads synced metrics, runs sync.py + recommendations.py
@@ -144,3 +145,7 @@ the original test-suite rationale (marked DONE).
   `vitalforge-dashboard/app.py:30-44` — when adding a new synced metric, you must update
   `shared/database.py` (schema), `sync.py` (populate), and this `METRIC_TABLES` dict
   (expose via `/api/metrics/{name}`) together, or the metric silently won't be queryable.
+  If the new metric table is created before a future schema rebuild ships, it must also be
+  added by name to `shared/migrations.py`'s `_REBUILD_TABLES` list — that list derives its
+  column shapes from the live schema rather than duplicating them, so it only ever needs the
+  table's name, not its columns.
