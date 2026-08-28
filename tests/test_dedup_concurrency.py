@@ -120,6 +120,7 @@ async def test_concurrent_writer_not_blocked_by_garmin_push(client, weight_app_m
     monkeypatch.setattr(weight_app_module, "push_weight", slow_push)
 
     db_path = str(database.DB_PATH)
+    person_id = await get_primary_person_id()
     writer_succeeded = threading.Event()
     write_duration = {}
 
@@ -128,7 +129,10 @@ async def test_concurrent_writer_not_blocked_by_garmin_push(client, weight_app_m
         start = time.monotonic()
         conn = sqlite3.connect(db_path, timeout=2)
         try:
-            conn.execute("INSERT OR REPLACE INTO steps (date, value) VALUES (?, ?)", ("2026-01-01", 9000))
+            conn.execute(
+                "INSERT OR REPLACE INTO steps (person_id, date, value) VALUES (?, ?, ?)",
+                (person_id, "2026-01-01", 9000),
+            )
             conn.commit()
         finally:
             conn.close()
@@ -164,6 +168,7 @@ async def test_concurrent_writer_not_blocked_by_enrichment_push(client, weight_a
     monkeypatch.setattr(weight_app_module, "push_weight", slow_push)
 
     db_path = str(database.DB_PATH)
+    person_id = await get_primary_person_id()
     writer_succeeded = threading.Event()
     write_duration = {}
 
@@ -172,7 +177,10 @@ async def test_concurrent_writer_not_blocked_by_enrichment_push(client, weight_a
         start = time.monotonic()
         conn = sqlite3.connect(db_path, timeout=2)
         try:
-            conn.execute("INSERT OR REPLACE INTO steps (date, value) VALUES (?, ?)", ("2026-01-01", 9000))
+            conn.execute(
+                "INSERT OR REPLACE INTO steps (person_id, date, value) VALUES (?, ?, ?)",
+                (person_id, "2026-01-01", 9000),
+            )
             conn.commit()
         finally:
             conn.close()
