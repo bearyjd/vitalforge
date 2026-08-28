@@ -72,16 +72,26 @@ def _seed_resting_hr_and_steps_with_a_malformed_date():
     Plain sqlite3 rather than the app's async get_db(): by the time this
     runs, dashboard_live_server's uvicorn thread already owns the async
     event loop, so asyncio.run() here would raise "cannot be called from a
-    running event loop" -- a synchronous connection sidesteps that.
+    running event loop" -- a synchronous connection sidesteps that. The
+    primary person's id is looked up on this same synchronous connection
+    for the same reason -- shared.database.get_primary_person_id() is async
+    and would hit the identical event-loop conflict.
     """
     conn = sqlite3.connect(str(shared.database.DB_PATH))
     try:
+        person_id = conn.execute("SELECT id FROM persons WHERE is_primary = 1").fetchone()[0]
         today = datetime.now(timezone.utc)
         for n in range(5):
             date = (today - timedelta(days=n)).strftime("%Y-%m-%d")
-            conn.execute("INSERT INTO resting_hr (date, value) VALUES (?, ?)", (date, 55 + n))
-            conn.execute("INSERT INTO steps (date, value) VALUES (?, ?)", (date, 8000 + n * 100))
-        conn.execute("INSERT INTO resting_hr (date, value) VALUES (?, ?)", ("not-a-date", 999))
+            conn.execute(
+                "INSERT INTO resting_hr (person_id, date, value) VALUES (?, ?, ?)", (person_id, date, 55 + n)
+            )
+            conn.execute(
+                "INSERT INTO steps (person_id, date, value) VALUES (?, ?, ?)", (person_id, date, 8000 + n * 100)
+            )
+        conn.execute(
+            "INSERT INTO resting_hr (person_id, date, value) VALUES (?, ?, ?)", (person_id, "not-a-date", 999)
+        )
         conn.commit()
     finally:
         conn.close()
