@@ -716,3 +716,157 @@ async def test_cross_person_isolation_after_second_person_exists(production_sche
         assert (await cur.fetchone())[0] == 2, "same date, different persons must NOT overwrite each other"
     finally:
         await db.close()
+
+
+# --- primary-person ownership --------------------------------------------------
+# init_db() runs migration 001 before either service's lifespan reaches
+# bootstrap_first_admin(), so on a fresh database _ensure_primary_person()
+# finds no admin to grant the person to and the committed marker stops it
+# ever running again. shared/database.py's ensure_primary_person_grant() is
+# the lifespan-side repair for that; these tests pin both halves.
+
+
+async def _seed_admin(username: str = "the-admin") -> int:
+    from tests.conftest import seed_user
+
+    return await seed_user(username, role="admin")
+
+
+async def _grant_rows(db) -> list[tuple]:
+    """As plain tuples -- sqlite3.Row never compares equal to a tuple."""
+    cur = await db.execute("SELECT person_id, user_id, access FROM person_grants")
+    return [(r["person_id"], r["user_id"], r["access"]) for r in await cur.fetchall()]
+
+
+@pytest.mark.asyncio
+async def test_migration_alone_leaves_a_fresh_db_primary_person_unowned(tmp_path, monkeypatch):
+    """Characterization test for the gap ensure_primary_person_grant() closes.
+    If this ever starts failing because the grant appears here, the lifespan
+    call below is redundant and should be reconsidered -- not deleted
+    silently."""
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    await database.init_db()
+
+    db = await database.get_db()
+    try:
+        assert await _grant_rows(db) == []
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_fresh_install_lifespan_order_gives_the_admin_an_own_grant(tmp_path, monkeypatch):
+    """The real lifespan sequence: init_db() -> bootstrap_first_admin() ->
+    ensure_primary_person_grant() (see both services' app.py)."""
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    await database.init_db()
+    admin_id = await _seed_admin()
+    await database.ensure_primary_person_grant()
+
+    db = await database.get_db()
+    try:
+        person_id = await database.get_primary_person_id()
+        assert await _grant_rows(db) == [(person_id, admin_id, "own")]
+        cur = await db.execute("SELECT default_person_id FROM users WHERE id = ?", (admin_id,))
+        assert (await cur.fetchone())["default_person_id"] == person_id
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_ensure_primary_person_grant_is_idempotent(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    await database.init_db()
+    await _seed_admin()
+    await database.ensure_primary_person_grant()
+    await database.ensure_primary_person_grant()
+    await database.ensure_primary_person_grant()
+
+    db = await database.get_db()
+    try:
+        assert len(await _grant_rows(db)) == 1, "repeated boots duplicated the grant"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_ensure_primary_person_grant_noops_without_an_admin(tmp_path, monkeypatch):
+    """A fresh install with VITALFORGE_PASS unset has an empty users table;
+    the grant must simply wait for the boot after an admin is seeded rather
+    than crash the lifespan."""
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    await database.init_db()
+    await database.ensure_primary_person_grant()  # must not raise
+
+    db = await database.get_db()
+    try:
+        assert await _grant_rows(db) == []
+    finally:
+        await db.close()
+
+    admin_id = await _seed_admin()
+    await database.ensure_primary_person_grant()
+    db = await database.get_db()
+    try:
+        assert [row[1] for row in await _grant_rows(db)] == [admin_id]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_ensure_primary_person_grant_never_overwrites_a_chosen_default(tmp_path, monkeypatch):
+    """Phase 2 lets an account pick its own default person. A later boot must
+    not silently drag it back to the primary."""
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    await database.init_db()
+    admin_id = await _seed_admin()
+    await database.ensure_primary_person_grant()
+
+    db = await database.get_db()
+    try:
+        cursor = await db.execute(
+            "INSERT INTO persons (slug, display_name, created_at, is_primary) VALUES (?, ?, ?, 0)",
+            ("someone-else", "Someone Else", datetime.now(timezone.utc).isoformat()),
+        )
+        other_person = cursor.lastrowid
+        await db.execute(
+            "UPDATE users SET default_person_id = ? WHERE id = ?", (other_person, admin_id)
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+    await database.ensure_primary_person_grant()
+
+    db = await database.get_db()
+    try:
+        cur = await db.execute("SELECT default_person_id FROM users WHERE id = ?", (admin_id,))
+        assert (await cur.fetchone())["default_person_id"] == other_person
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_upgrade_with_an_existing_admin_grants_inside_the_migration(tmp_path, monkeypatch):
+    """The other half: when an admin DOES already exist, the grant is created
+    by _ensure_primary_person() during the migration itself, with no lifespan
+    help. Exercised directly on a connection because run_migration() has
+    already recorded its marker by the time a test could observe it."""
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    await database.init_db()
+    admin_id = await _seed_admin()
+
+    db = await database.get_db()
+    try:
+        await db.execute("DELETE FROM person_grants")
+        await db.execute("DELETE FROM persons")
+        await db.commit()
+
+        person_id = await migrations._ensure_primary_person(db)
+        await db.commit()
+
+        assert await _grant_rows(db) == [(person_id, admin_id, "own")]
+        cur = await db.execute("SELECT default_person_id FROM users WHERE id = ?", (admin_id,))
+        assert (await cur.fetchone())["default_person_id"] == person_id
+    finally:
+        await db.close()

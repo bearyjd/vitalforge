@@ -16,7 +16,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from shared.auth import add_auth_routes, bootstrap_first_admin, bootstrap_migrated_token
-from shared.database import get_db, get_primary_person_id, init_db
+from shared.database import ensure_primary_person_grant, get_db, get_primary_person_id, init_db
 from shared.garmin_client import authenticate, push_weight
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -36,6 +36,10 @@ async def lifespan(app: FastAPI):
     # under that race itself (see its own docstring), so no coordination
     # is needed here.
     await bootstrap_first_admin()
+    # Must follow bootstrap_first_admin(): on a fresh database the migration
+    # that creates the primary person runs inside init_db(), before any admin
+    # exists to own it. See ensure_primary_person_grant()'s docstring.
+    await ensure_primary_person_grant()
     await bootstrap_migrated_token()
     logger.info("Authenticating with Garmin Connect...")
     try:

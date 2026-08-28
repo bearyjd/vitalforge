@@ -14,7 +14,7 @@ from typing import Awaitable, Callable
 import aiosqlite
 
 from shared.auth import _RESERVED_SLUGS, _slugify
-from shared.database import get_db
+from shared.database import _grant_primary_person_to_first_admin, get_db
 
 logger = logging.getLogger(__name__)
 
@@ -100,19 +100,13 @@ async def _ensure_primary_person(db) -> int:
         (slug, raw or slug, now_iso()),
     )
     person_id = cursor.lastrowid
-    admin = await (await db.execute(
-        "SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1"
-    )).fetchone()
-    if admin is not None:
-        await db.execute(
-            "INSERT INTO person_grants (person_id, user_id, access, granted_at) "
-            "VALUES (?, ?, 'own', ?)",
-            (person_id, admin["id"], now_iso()),
-        )
-        await db.execute(
-            "UPDATE users SET default_person_id = ? WHERE id = ?",
-            (person_id, admin["id"]),
-        )
+    # Shared with shared/database.py's ensure_primary_person_grant(), which
+    # both services call from their lifespans after bootstrap_first_admin().
+    # On an UPGRADE the admin already exists and the grant lands here; on a
+    # FRESH install the users table is still empty at this point, this call
+    # no-ops, and that later lifespan call is what creates the grant. One
+    # implementation, so the two paths cannot drift.
+    await _grant_primary_person_to_first_admin(db, person_id)
     return person_id
 
 

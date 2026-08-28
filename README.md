@@ -242,9 +242,11 @@ database schema in a way that is not safely readable by an older image. For thes
 2. Pull/build the new images, then `docker compose up`.
 3. The new image takes an automatic pre-migration snapshot (`fitness.pre-001-person-id.db`,
    next to `fitness.db` in the `vitalforge-data` volume) before it changes anything, verified
-   with a SQLite integrity check. If you also want to rename the primary person away from the
-   default (the first admin's username, slugified), set `VITALFORGE_PRIMARY_PERSON` in `.env`
-   **before** this upgrade — it is read once, during the one-shot migration.
+   with a SQLite integrity check. To name the primary person yourself, set
+   `VITALFORGE_PRIMARY_PERSON` in `.env` **before** this upgrade — it is read once, during the
+   one-shot migration. Without it the name defaults to the first admin's username, slugified,
+   on an upgrade of an existing deployment, and to `primary` on a brand-new install (where no
+   admin account exists yet at the moment the migration runs).
 4. If the migration fails (most commonly: insufficient free space for the snapshot), the
    container will restart-loop with an error naming the cause and the fix. Free up space and
    restart, or — after taking your own volume-level backup — set
