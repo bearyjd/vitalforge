@@ -57,6 +57,15 @@ Verified against the code at `cf07748`. **Read these before implementing from th
    leaks household membership. "No such slug" and "no grant" return the *same* 404, deliberately.
    The one exception is ingest rule 1's token/slug mismatch, which **is** 403 (§f.7:1846) —
    the caller demonstrably holds a valid token, so nothing leaks. Keep these straight.
+   **The rule is "person existence is never confirmed", not "every response under
+   `/p/{slug}/` is a 404".** Account-scoped resources keep an ownership check:
+   `_owned_goal_or_404` returns 404 for a missing goal and 403 for someone else's, matching
+   `revoke_token`'s existing shape. That confirms a goal id exists inside the account; it says
+   nothing about which persons exist or who can reach them, and `require_person` still gates
+   the person first. The discriminator is **what kind of resource**, not which route family, so
+   it does not generalise into an argument for a person-scoped 403. Stated here because a
+   security review read constraint 2 as absolute and flagged the goals 403 as a violation — the
+   next reader will do the same otherwise.
 3. **One query, not two** (§f.1:1566). Identity and grant resolve in a single statement bound
    to the just-established identity; two queries leave a revoked-grant-still-usable window.
 4. **The anonymous check precedes the admin check** (§f.1:1639). `shared/auth.py:181` returns

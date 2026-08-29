@@ -197,7 +197,15 @@ async def test_sync_refuses_a_person_the_garmin_account_does_not_describe(
 async def test_sync_still_works_for_the_person_the_credentials_describe(
     dashboard_app_module, dashboard_client, two_persons, monkeypatch
 ):
-    """The refusal above is worthless if it also blocks the legitimate case."""
+    """The refusal above is worthless if it also blocks the legitimate case.
+
+    Asserts run_sync actually RAN and ran for the right person, not just that
+    the route returned 200. An earlier version of this test collected `ran`
+    and never looked at it, so it would have passed against a guard placed
+    wrongly enough to return 200 without syncing at all -- precisely the
+    regression it exists to catch. Nothing else pins which person the sync
+    runs for.
+    """
     mine, _theirs = two_persons
     cookies = await _authorized_as("realowner", mine, access="manage")
 
@@ -210,3 +218,7 @@ async def test_sync_still_works_for_the_person_the_credentials_describe(
 
     resp = await dashboard_client.post(f"{PERSON_PREFIX}/api/sync?days=1", cookies=cookies)
     assert resp.status_code == 200, f"sync refused for the credential owner: {resp.text}"
+    assert ran == [mine], (
+        f"run_sync ran for {ran}, expected the credential owner {mine}. A 200 alone does "
+        "not prove the sync happened, or happened for the right person."
+    )

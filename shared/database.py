@@ -526,9 +526,13 @@ async def garmin_credential_person_id() -> int:
     Every SQL statement involved was correctly person-scoped; the source was
     not. Callers that pull from Garmin must compare their target against this.
 
-    PHASE 3 REPLACES THIS. When garmin_links exists, the question stops being
-    "is this the primary person" and becomes "does this person have their own
-    linked account", and this function is the single place that changes.
+    PHASE 3 REPLACES THIS, and the RETURN TYPE changes with it. Today this
+    delegates to get_primary_person_id(), which RAISES when no primary row
+    exists -- acceptable because that state means init_db() has not completed,
+    so it is noise rather than a case. Once garmin_links exists, "this person
+    has no linked account" becomes a normal, expected answer, and the
+    signature should become `int | None` with callers handling None rather
+    than an exception escaping onto the request path as a 500.
     """
     return await get_primary_person_id()
 
