@@ -13,6 +13,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from shared.database import get_db, get_primary_person_id
+from tests.conftest import PERSON_PREFIX
 
 
 def days_ago(n: int) -> str:
@@ -50,7 +51,7 @@ async def test_health(client):
 
 
 async def test_sync_status_never_synced(client):
-    resp = await client.get("/api/sync/status")
+    resp = await client.get(f"{PERSON_PREFIX}/api/sync/status")
     assert resp.status_code == 200
     body = resp.json()
     assert body["last_sync_time"] is None
@@ -82,7 +83,7 @@ async def test_get_metric_returns_seeded_data(client, metric_name, table, column
     # Synthetic values only — never data from a real fitness.db.
     await seed_metric(table, column, [(days_ago(2), 10.0), (days_ago(1), 20.0)])
 
-    resp = await client.get(f"/api/metrics/{metric_name}")
+    resp = await client.get(f"{PERSON_PREFIX}/api/metrics/{metric_name}")
     assert resp.status_code == 200
     body = resp.json()
 
@@ -95,7 +96,7 @@ async def test_get_metric_returns_seeded_data(client, metric_name, table, column
 
 
 async def test_get_metric_unknown_name_returns_400(client):
-    resp = await client.get("/api/metrics/not_a_real_metric")
+    resp = await client.get(f"{PERSON_PREFIX}/api/metrics/not_a_real_metric")
     assert resp.status_code == 400
 
 
@@ -123,7 +124,7 @@ async def test_composition_metrics_return_empty_series_when_garmin_values_null(c
     finally:
         await db.close()
 
-    resp = await client.get(f"/api/metrics/{metric_name}")
+    resp = await client.get(f"{PERSON_PREFIX}/api/metrics/{metric_name}")
     assert resp.status_code == 200
     body = resp.json()
     assert body["count"] == 0
@@ -134,13 +135,13 @@ async def test_get_metric_respects_days_window(client):
     # Seed one point far outside the default 30-day window.
     await seed_metric("steps", "value", [(days_ago(365 * 5), 999.0)])
 
-    resp = await client.get("/api/metrics/steps?days=30")
+    resp = await client.get(f"{PERSON_PREFIX}/api/metrics/steps?days=30")
     assert resp.status_code == 200
     assert resp.json()["count"] == 0
 
 
 async def test_recommendations_rules_only_empty_db(client):
-    resp = await client.get("/api/recommendations/rules-only")
+    resp = await client.get(f"{PERSON_PREFIX}/api/recommendations/rules-only")
     assert resp.status_code == 200
     body = resp.json()
     assert "findings" in body
@@ -152,7 +153,7 @@ async def test_recommendations_rules_only_does_not_call_garmin(client, fake_garm
     """Confirms the roadmap's key insight: no Garmin call for a read endpoint."""
     await seed_metric("resting_hr", "value", [(days_ago(1), 55.0)])
 
-    resp = await client.get("/api/recommendations/rules-only")
+    resp = await client.get(f"{PERSON_PREFIX}/api/recommendations/rules-only")
     assert resp.status_code == 200
     assert fake_garmin_client.pushed_weights == []
 
@@ -187,7 +188,7 @@ async def test_get_metric_excludes_other_persons_rows(client):
     finally:
         await db.close()
 
-    resp = await client.get("/api/metrics/steps")
+    resp = await client.get(f"{PERSON_PREFIX}/api/metrics/steps")
     assert resp.status_code == 200
     body = resp.json()
     assert body["count"] == 1

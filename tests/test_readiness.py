@@ -18,6 +18,8 @@ from datetime import datetime, timedelta
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from tests.conftest import PERSON_PREFIX
+
 readiness = importlib.import_module("vitalforge-dashboard.readiness")
 
 score_readiness = readiness.score_readiness
@@ -255,7 +257,7 @@ async def client(dashboard_app_module):
 
 
 async def test_readiness_endpoint_insufficient_data_on_empty_db(client):
-    resp = await client.get("/api/readiness")
+    resp = await client.get(f"{PERSON_PREFIX}/api/readiness")
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "insufficient_data"
@@ -264,6 +266,6 @@ async def test_readiness_endpoint_insufficient_data_on_empty_db(client):
 
 
 async def test_readiness_endpoint_does_not_call_garmin(client, fake_garmin_client):
-    resp = await client.get("/api/readiness")
+    resp = await client.get(f"{PERSON_PREFIX}/api/readiness")
     assert resp.status_code == 200
     assert fake_garmin_client.pushed_weights == []

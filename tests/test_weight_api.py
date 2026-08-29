@@ -9,6 +9,8 @@ import json
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from tests.conftest import PERSON_PREFIX
+
 
 @pytest.fixture
 async def client(weight_app_module):
@@ -24,7 +26,7 @@ async def test_health(client):
 
 
 async def test_post_weight_lbs_converts_and_syncs(client, fake_garmin_client):
-    resp = await client.post("/api/weight", json={"weight": 180.0, "unit": "lbs"})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 180.0, "unit": "lbs"})
     assert resp.status_code == 200
     body = resp.json()
 
@@ -39,7 +41,7 @@ async def test_post_weight_lbs_converts_and_syncs(client, fake_garmin_client):
 
 
 async def test_post_weight_kg_converts(client):
-    resp = await client.post("/api/weight", json={"weight": 81.5, "unit": "kg"})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 81.5, "unit": "kg"})
     assert resp.status_code == 200
     body = resp.json()
 
@@ -51,7 +53,7 @@ async def test_invalid_unit_still_returns_400_not_422(client):
     """Pins the one legacy 400 (a retained quirk, not a compatibility
     requirement -- see docs/prp/00-design.md SS3.1) against the 422 migration
     B2 applies to everything else this endpoint validates."""
-    resp = await client.post("/api/weight", json={"weight": 150.0, "unit": "stone"})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 150.0, "unit": "stone"})
     assert resp.status_code == 400
 
 
@@ -61,14 +63,14 @@ async def test_post_weight_garmin_failure_still_saves_locally(client, weight_app
 
     monkeypatch.setattr(weight_app_module, "push_weight", failing_push)
 
-    resp = await client.post("/api/weight", json={"weight": 170.0, "unit": "lbs"})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 170.0, "unit": "lbs"})
     assert resp.status_code == 200
     body = resp.json()
     assert body["synced_to_garmin"] is False
     assert "garmin_error" in body
 
     # The entry should still show up locally even though Garmin sync failed.
-    recent = await client.get("/api/weight/recent")
+    recent = await client.get(f"{PERSON_PREFIX}/api/weight/recent")
     assert recent.status_code == 200
     assert len(recent.json()) == 1
     assert recent.json()[0]["synced_to_garmin"] is False
@@ -76,17 +78,17 @@ async def test_post_weight_garmin_failure_still_saves_locally(client, weight_app
 
 async def test_get_recent_weights_orders_newest_first(client):
     for w in (150.0, 151.0, 152.0):
-        await client.post("/api/weight", json={"weight": w, "unit": "lbs"})
+        await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": w, "unit": "lbs"})
 
-    resp = await client.get("/api/weight/recent")
+    resp = await client.get(f"{PERSON_PREFIX}/api/weight/recent")
     assert resp.status_code == 200
     weights = [row["weight_lbs"] for row in resp.json()]
     assert weights == [152.0, 151.0, 150.0]
 
 
 async def test_get_weight_trend_returns_entries(client):
-    await client.post("/api/weight", json={"weight": 160.0, "unit": "lbs"})
-    resp = await client.get("/api/weight/trend")
+    await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 160.0, "unit": "lbs"})
+    resp = await client.get(f"{PERSON_PREFIX}/api/weight/trend")
     assert resp.status_code == 200
     data = resp.json()
     assert len(data) == 1
@@ -94,20 +96,20 @@ async def test_get_weight_trend_returns_entries(client):
 
 
 async def test_delete_weight_success(client):
-    await client.post("/api/weight", json={"weight": 140.0, "unit": "lbs"})
-    recent = await client.get("/api/weight/recent")
+    await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 140.0, "unit": "lbs"})
+    recent = await client.get(f"{PERSON_PREFIX}/api/weight/recent")
     entry_id = recent.json()[0]["id"]
 
-    del_resp = await client.delete(f"/api/weight/{entry_id}")
+    del_resp = await client.delete(f"{PERSON_PREFIX}/api/weight/{entry_id}")
     assert del_resp.status_code == 200
     assert del_resp.json() == {"success": True, "deleted_id": entry_id}
 
-    recent_after = await client.get("/api/weight/recent")
+    recent_after = await client.get(f"{PERSON_PREFIX}/api/weight/recent")
     assert recent_after.json() == []
 
 
 async def test_delete_weight_missing_returns_404(client):
-    resp = await client.delete("/api/weight/999999")
+    resp = await client.delete(f"{PERSON_PREFIX}/api/weight/999999")
     assert resp.status_code == 404
 
 
@@ -127,7 +129,7 @@ COMPOSITION_PAYLOAD = {
 
 
 async def test_composition_fields_accepted_and_echoed(client):
-    resp = await client.post("/api/weight", json=COMPOSITION_PAYLOAD)
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json=COMPOSITION_PAYLOAD)
     assert resp.status_code == 200
     body = resp.json()
     assert body["body_fat_pct"] == 18.4
@@ -138,7 +140,7 @@ async def test_composition_fields_accepted_and_echoed(client):
 
 
 async def test_weight_only_payload_still_succeeds(client):
-    resp = await client.post("/api/weight", json={"weight": 180.0, "unit": "lbs"})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 180.0, "unit": "lbs"})
     assert resp.status_code == 200
     body = resp.json()
     assert body["success"] is True
@@ -147,7 +149,7 @@ async def test_weight_only_payload_still_succeeds(client):
 
 
 async def test_unknown_field_rejected_422(client):
-    resp = await client.post("/api/weight", json={"weight": 180.0, "unit": "lbs", "bodyFat": 20})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 180.0, "unit": "lbs", "bodyFat": 20})
     assert resp.status_code == 422
     detail = resp.json()["detail"]
     assert detail[0]["type"] == "extra_forbidden"
@@ -156,36 +158,36 @@ async def test_unknown_field_rejected_422(client):
 
 @pytest.mark.parametrize("value", [2.9, 75.1])
 async def test_body_fat_below_floor_or_above_ceiling_rejected_422(client, value):
-    resp = await client.post("/api/weight", json={"weight": 180.0, "unit": "lbs", "body_fat_pct": value})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 180.0, "unit": "lbs", "body_fat_pct": value})
     assert resp.status_code == 422
 
 
 async def test_body_fat_fraction_rejected_422(client):
-    resp = await client.post("/api/weight", json={"weight": 180.0, "unit": "lbs", "body_fat_pct": 0.20})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 180.0, "unit": "lbs", "body_fat_pct": 0.20})
     assert resp.status_code == 422
 
 
 @pytest.mark.parametrize("value", [29.9, 80.1])
 async def test_body_water_bounds_rejected_422(client, value):
-    resp = await client.post("/api/weight", json={"weight": 180.0, "unit": "lbs", "body_water_pct": value})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 180.0, "unit": "lbs", "body_water_pct": value})
     assert resp.status_code == 422
 
 
 @pytest.mark.parametrize("value", [9.9, 90.1])
 async def test_muscle_pct_bounds_rejected_422(client, value):
-    resp = await client.post("/api/weight", json={"weight": 180.0, "unit": "lbs", "muscle_pct": value})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 180.0, "unit": "lbs", "muscle_pct": value})
     assert resp.status_code == 422
 
 
 @pytest.mark.parametrize("value", [0.4, 10.1])
 async def test_bone_mass_kg_bounds_rejected_422(client, value):
-    resp = await client.post("/api/weight", json={"weight": 180.0, "unit": "lbs", "bone_mass_kg": value})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 180.0, "unit": "lbs", "bone_mass_kg": value})
     assert resp.status_code == 422
 
 
 async def test_bone_mass_in_grams_rejected_422(client):
     """3200 (grams) is the unit-error case the 0.5-10.0 kg bound exists for."""
-    resp = await client.post("/api/weight", json={"weight": 180.0, "unit": "lbs", "bone_mass_kg": 3200})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 180.0, "unit": "lbs", "bone_mass_kg": 3200})
     assert resp.status_code == 422
 
 
@@ -199,7 +201,7 @@ async def test_boolean_value_rejected_not_silently_coerced(client, field):
     review finding). Asserts on the specific error, not just the status
     code, so this can't pass by coincidence via a field's own range bound."""
     payload = {"weight": 180.0, "unit": "lbs", field: True}
-    resp = await client.post("/api/weight", json=payload)
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json=payload)
     assert resp.status_code == 422
     assert "boolean" in resp.text
 
@@ -225,14 +227,14 @@ async def test_non_finite_float_rejected_422_not_500(client, field, bad_value):
     so this is what actually reaches the server over the wire."""
     payload = {"weight": 180.0, "unit": "lbs", field: bad_value}
     body = json.dumps(payload)
-    resp = await client.post("/api/weight", content=body, headers={"Content-Type": "application/json"})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", content=body, headers={"Content-Type": "application/json"})
     assert resp.status_code == 422
     assert resp.headers["content-type"].startswith("application/json")
 
 
 @pytest.mark.parametrize("weight,unit", [(1200.0, "kg"), (1.0, "kg")])
 async def test_weight_above_500kg_or_below_2kg_rejected_422(client, weight, unit):
-    resp = await client.post("/api/weight", json={"weight": weight, "unit": unit})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": weight, "unit": unit})
     assert resp.status_code == 422
     detail = resp.json()["detail"]
     assert detail[0]["loc"] == ["body"]
@@ -241,7 +243,7 @@ async def test_weight_above_500kg_or_below_2kg_rejected_422(client, weight, unit
 
 async def test_weight_bound_applies_after_unit_conversion(client):
     """1200 lbs is ~544 kg -- the bound is on derived kg, not the raw field."""
-    resp = await client.post("/api/weight", json={"weight": 1200.0, "unit": "lbs"})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 1200.0, "unit": "lbs"})
     assert resp.status_code == 422
 
 
@@ -257,12 +259,12 @@ async def test_pwa_toast_flattens_array_detail():
 
 
 async def test_source_literal_rejects_unknown_value_422(client):
-    resp = await client.post("/api/weight", json={"weight": 180.0, "unit": "lbs", "source": "basucle"})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 180.0, "unit": "lbs", "source": "basucle"})
     assert resp.status_code == 422
 
 
 async def test_source_optional_defaults_to_null(client):
-    resp = await client.post("/api/weight", json={"weight": 180.0, "unit": "lbs"})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 180.0, "unit": "lbs"})
     assert resp.status_code == 200
     assert "source" not in resp.json()
 
@@ -277,7 +279,7 @@ async def test_source_optional_defaults_to_null(client):
 
 
 async def test_composition_persisted_to_weight_log(client):
-    resp = await client.post("/api/weight", json=COMPOSITION_PAYLOAD)
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json=COMPOSITION_PAYLOAD)
     assert resp.status_code == 200
 
     from shared.database import get_db
@@ -306,7 +308,7 @@ async def test_posted_weight_always_carries_a_person_id(weight_app_module):
     from shared.database import get_db
 
     async with AsyncClient(transport=ASGITransport(app=weight_app_module.app), base_url="http://test") as client:
-        response = await client.post("/api/weight", json={"weight": 180.0, "unit": "lbs"})
+        response = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 180.0, "unit": "lbs"})
         assert response.status_code == 200
 
     db = await get_db()

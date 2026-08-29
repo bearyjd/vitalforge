@@ -14,6 +14,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from shared.database import get_db, get_primary_person_id
+from tests.conftest import PERSON_PREFIX
 
 
 def days_ago(n: int) -> str:
@@ -47,7 +48,7 @@ async def seed_metric(table: str, column: str, rows: list[tuple[str, float]]):
 async def test_export_single_metric_csv_happy_path(client):
     await seed_metric("steps", "value", [(days_ago(2), 1000.0), (days_ago(1), 2000.0)])
 
-    resp = await client.get("/api/export?metric=steps&format=csv")
+    resp = await client.get(f"{PERSON_PREFIX}/api/export?metric=steps&format=csv")
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/csv")
     assert 'filename="vitalforge-export-steps-30d.csv"' in resp.headers["content-disposition"]
@@ -62,7 +63,7 @@ async def test_export_single_metric_csv_happy_path(client):
 async def test_export_single_metric_json_happy_path(client):
     await seed_metric("resting_hr", "value", [(days_ago(1), 55.0)])
 
-    resp = await client.get("/api/export?metric=resting_hr&format=json")
+    resp = await client.get(f"{PERSON_PREFIX}/api/export?metric=resting_hr&format=json")
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("application/json")
     assert 'filename="vitalforge-export-resting_hr-30d.json"' in resp.headers["content-disposition"]
@@ -75,7 +76,7 @@ async def test_export_all_metrics_long_format(client):
     await seed_metric("steps", "value", [(days_ago(1), 1000.0)])
     await seed_metric("resting_hr", "value", [(days_ago(1), 55.0)])
 
-    resp = await client.get("/api/export?metric=all&format=json")
+    resp = await client.get(f"{PERSON_PREFIX}/api/export?metric=all&format=json")
     assert resp.status_code == 200
     body = resp.json()
 
@@ -89,7 +90,7 @@ async def test_export_all_metrics_csv_has_metric_column(client):
     await seed_metric("steps", "value", [(days_ago(1), 1000.0)])
     await seed_metric("resting_hr", "value", [(days_ago(1), 55.0)])
 
-    resp = await client.get("/api/export?metric=all&format=csv")
+    resp = await client.get(f"{PERSON_PREFIX}/api/export?metric=all&format=csv")
     assert resp.status_code == 200
 
     rows = list(csv.reader(io.StringIO(resp.text)))
@@ -102,12 +103,12 @@ async def test_export_all_metrics_csv_has_metric_column(client):
 
 
 async def test_export_unknown_metric_returns_400(client):
-    resp = await client.get("/api/export?metric=not_a_real_metric&format=csv")
+    resp = await client.get(f"{PERSON_PREFIX}/api/export?metric=not_a_real_metric&format=csv")
     assert resp.status_code == 400
 
 
 async def test_export_bad_format_returns_400(client):
-    resp = await client.get("/api/export?metric=steps&format=xml")
+    resp = await client.get(f"{PERSON_PREFIX}/api/export?metric=steps&format=xml")
     assert resp.status_code == 400
 
 
@@ -116,14 +117,14 @@ async def test_export_respects_days_window(client):
     await seed_metric("steps", "value", [(days_ago(365 * 5), 999.0)])
     await seed_metric("steps", "value", [(days_ago(1), 42.0)])
 
-    resp = await client.get("/api/export?metric=steps&format=json&days=30")
+    resp = await client.get(f"{PERSON_PREFIX}/api/export?metric=steps&format=json&days=30")
     assert resp.status_code == 200
     body = resp.json()
     assert body == [{"date": days_ago(1), "value": 42.0}]
 
 
 async def test_export_empty_table_returns_empty_csv_without_crashing(client):
-    resp = await client.get("/api/export?metric=steps&format=csv")
+    resp = await client.get(f"{PERSON_PREFIX}/api/export?metric=steps&format=csv")
     assert resp.status_code == 200
 
     rows = list(csv.reader(io.StringIO(resp.text)))
@@ -131,7 +132,7 @@ async def test_export_empty_table_returns_empty_csv_without_crashing(client):
 
 
 async def test_export_empty_table_returns_empty_json_array_without_crashing(client):
-    resp = await client.get("/api/export?metric=steps&format=json")
+    resp = await client.get(f"{PERSON_PREFIX}/api/export?metric=steps&format=json")
     assert resp.status_code == 200
     assert resp.json() == []
 
@@ -169,7 +170,7 @@ async def test_export_mid_stream_db_failure_is_logged(client, dashboard_app_modu
     caplog.set_level(logging.ERROR)
 
     with pytest.raises(RuntimeError, match="simulated mid-stream DB failure"):
-        await client.get("/api/export?metric=steps&format=json")
+        await client.get(f"{PERSON_PREFIX}/api/export?metric=steps&format=json")
 
     assert any(
         "export failed mid-stream" in record.message.lower() and record.exc_info is not None

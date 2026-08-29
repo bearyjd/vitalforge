@@ -15,7 +15,14 @@ from httpx import ASGITransport, AsyncClient
 
 from shared.auth import create_session_cookie
 from shared.database import get_primary_person_id
-from tests.conftest import import_service_module, seed_token, seed_user
+from tests.conftest import (
+    PERSON_PREFIX,
+    grant_person,
+    import_service_module,
+    primary_person_id,
+    seed_token,
+    seed_user,
+)
 
 FULL_PAYLOAD = {
     "weight": 180.0,
@@ -33,6 +40,9 @@ TOKEN = "secret-token"
 async def _configure_auth() -> int:
     user_id = await seed_user("testuser")
     await seed_token(user_id, raw_token=TOKEN)
+    # `manage`, not `view`: every flow below POSTs a weight, which
+    # require_person("manage") gates. A `view` grant would 404 those posts.
+    await grant_person(await primary_person_id(), user_id, access="manage")
     return user_id
 
 
@@ -41,14 +51,14 @@ async def test_token_client_full_flow(weight_app_module):
     headers = {"Authorization": f"Bearer {TOKEN}"}
     transport = ASGITransport(app=weight_app_module.app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
-        post_resp = await ac.post("/api/weight", json=FULL_PAYLOAD, headers=headers)
+        post_resp = await ac.post(f"{PERSON_PREFIX}/api/weight", json=FULL_PAYLOAD, headers=headers)
         assert post_resp.status_code == 200
         post_body = post_resp.json()
         assert post_body["success"] is True
         assert post_body["body_fat_pct"] == 18.4
         assert post_body["source"] == "bascule"
 
-        recent_resp = await ac.get("/api/weight/recent", headers=headers)
+        recent_resp = await ac.get(f"{PERSON_PREFIX}/api/weight/recent", headers=headers)
     assert recent_resp.status_code == 200
     recent = recent_resp.json()
     assert len(recent) == 1
@@ -66,11 +76,11 @@ async def test_cookie_client_regression_flow(weight_app_module):
     cookies = {"vf_session": create_session_cookie("testuser", user_id, 1)}
     transport = ASGITransport(app=weight_app_module.app)
     async with AsyncClient(transport=transport, base_url="http://test", cookies=cookies) as ac:
-        post_resp = await ac.post("/api/weight", json=FULL_PAYLOAD)
+        post_resp = await ac.post(f"{PERSON_PREFIX}/api/weight", json=FULL_PAYLOAD)
         assert post_resp.status_code == 200
         assert post_resp.json()["success"] is True
 
-        recent_resp = await ac.get("/api/weight/recent")
+        recent_resp = await ac.get(f"{PERSON_PREFIX}/api/weight/recent")
     assert recent_resp.status_code == 200
     recent = recent_resp.json()
     assert len(recent) == 1
@@ -96,24 +106,24 @@ async def test_mixed_clients_interleaved_no_auth_leakage(weight_app_module):
         AsyncClient(transport=transport, base_url="http://test", cookies=cookies) as cookie_client,
         AsyncClient(transport=transport, base_url="http://test") as anon_client,
     ):
-        token_post = await token_client.post("/api/weight", json={"weight": 170.0, "unit": "lbs"})
+        token_post = await token_client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 170.0, "unit": "lbs"})
         assert token_post.status_code == 200
 
-        cookie_get = await cookie_client.get("/api/weight/recent")
+        cookie_get = await cookie_client.get(f"{PERSON_PREFIX}/api/weight/recent")
         assert cookie_get.status_code == 200
         assert len(cookie_get.json()) == 1
 
-        anon_get = await anon_client.get("/api/weight/recent")
+        anon_get = await anon_client.get(f"{PERSON_PREFIX}/api/weight/recent")
         assert anon_get.status_code == 401
 
-        token_get = await token_client.get("/api/weight/recent")
+        token_get = await token_client.get(f"{PERSON_PREFIX}/api/weight/recent")
         assert token_get.status_code == 200
         assert len(token_get.json()) == 1  # unaffected by the intervening 401 on a distinct client
 
-        cookie_post = await cookie_client.post("/api/weight", json={"weight": 171.0, "unit": "lbs"})
+        cookie_post = await cookie_client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 171.0, "unit": "lbs"})
         assert cookie_post.status_code == 200
 
-        final_get = await token_client.get("/api/weight/recent")
+        final_get = await token_client.get(f"{PERSON_PREFIX}/api/weight/recent")
     assert final_get.status_code == 200
     assert len(final_get.json()) == 2
 
@@ -167,7 +177,7 @@ async def test_full_composition_chain_and_duplicate_collapse(
     }
     weight_transport = ASGITransport(app=weight_app_module.app)
     async with AsyncClient(transport=weight_transport, base_url="http://test") as wc:
-        first = await wc.post("/api/weight", json=payload)
+        first = await wc.post(f"{PERSON_PREFIX}/api/weight", json=payload)
         assert first.status_code == 200
         assert first.json()["synced_to_garmin"] is True
 
@@ -177,19 +187,19 @@ async def test_full_composition_chain_and_duplicate_collapse(
         assert pushed["muscle_mass_kg"] == pytest.approx(32.0)  # 80kg * 40% -- distinguishable from a raw 40.0
         assert pushed["bone_mass_kg"] == 3.2
 
-        first_id = (await wc.get("/api/weight/recent")).json()[0]["id"]
+        first_id = (await wc.get(f"{PERSON_PREFIX}/api/weight/recent")).json()[0]["id"]
 
         # B4 dedup, folded in here rather than re-testing test_dedup.py's
         # suite: an identical POST inside the window must collapse, not
         # double-push.
-        second = await wc.post("/api/weight", json=payload)
+        second = await wc.post(f"{PERSON_PREFIX}/api/weight", json=payload)
         assert second.status_code == 200
         second_body = second.json()
         assert second_body["deduplicated"] is True
         assert second_body["id"] == first_id
         assert len(fake_garmin_client.pushed_weights) == 1
 
-        recent = await wc.get("/api/weight/recent")
+        recent = await wc.get(f"{PERSON_PREFIX}/api/weight/recent")
     assert len(recent.json()) == 1
 
     # Dashboard sync pulls from the same fake Garmin client. Echo back what
@@ -206,8 +216,8 @@ async def test_full_composition_chain_and_duplicate_collapse(
 
     dashboard_transport = ASGITransport(app=dashboard_app_module.app)
     async with AsyncClient(transport=dashboard_transport, base_url="http://test") as dc:
-        bone_resp = await dc.get("/api/metrics/bone_mass")
-        muscle_resp = await dc.get("/api/metrics/muscle_mass")
+        bone_resp = await dc.get(f"{PERSON_PREFIX}/api/metrics/bone_mass")
+        muscle_resp = await dc.get(f"{PERSON_PREFIX}/api/metrics/muscle_mass")
 
     assert bone_resp.status_code == 200
     bone_body = bone_resp.json()
