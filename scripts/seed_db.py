@@ -126,13 +126,83 @@ def build_day(i: int, days: int, pattern: str, rng: random.Random) -> dict:
     }
 
 
-async def seed(db_path: Path, days: int, pattern: str, seed_value: int):
+async def _resolve_person(database, slug: str | None) -> tuple[int, str, bool]:
+    """Return (person_id, slug, created) for the person to seed.
+
+    With no --person, this is the primary person the migration created, which
+    keeps the pre-multi-tenancy behavior of this script intact. With --person,
+    a missing person is CREATED rather than erroring: seeding a second person
+    is the whole point of the flag, and requiring the operator to first create
+    one through an admin route that does not exist until Phase 2's PR 3 would
+    make the flag unusable in exactly the phase that needs it.
+
+    A created person gets NO person_grants row, deliberately. Once Phase 2's
+    require_person lands, that person's data will 404 for every user until
+    someone grants access -- which is exactly the state a cross-person
+    isolation test wants, and the reason this script does not guess at one.
+    The caller is told so on stdout rather than discovering it as a bug.
+
+    `created` is returned rather than inferred from `slug is not None` so that
+    note is only printed when it is TRUE. `--person <an existing slug>` (e.g.
+    the primary person on a database that already has an admin and a grant)
+    resolves to that row and creates nothing, and claiming it has no grant
+    would be a plain falsehood.
+    """
+    from shared.slugs import RESERVED_SLUGS, slugify
+
+    if slug is None:
+        person_id = await database.get_primary_person_id()
+        db = await database.get_db()
+        try:
+            row = await (
+                await db.execute("SELECT slug FROM persons WHERE id = ?", (person_id,))
+            ).fetchone()
+        finally:
+            await db.close()
+        return person_id, row["slug"], False
+
+    normalized = slugify(slug)
+    if not normalized or normalized in RESERVED_SLUGS:
+        raise SystemExit(
+            f"--person '{slug}' is not a usable slug "
+            f"(normalizes to '{normalized}'; reserved: {sorted(RESERVED_SLUGS)})"
+        )
+
+    db = await database.get_db()
+    try:
+        # Idempotent by constraint, not by pre-check -- the convention this
+        # codebase states in shared/database.py's _grant_primary_person_to_
+        # first_admin and _add_columns. A check-then-insert here would let two
+        # concurrent runs both miss the SELECT and one die on persons.slug
+        # UNIQUE with a raw traceback.
+        cursor = await db.execute(
+            "INSERT INTO persons (slug, display_name, created_at, is_primary) "
+            "VALUES (?, ?, ?, 0) ON CONFLICT (slug) DO NOTHING",
+            (normalized, normalized, datetime.now(timezone.utc).isoformat()),
+        )
+        # rowcount distinguishes insert from conflict without a second read,
+        # and without the check-then-insert race the pre-check version had.
+        created = cursor.rowcount == 1
+        await db.commit()
+        row = await (
+            await db.execute("SELECT id FROM persons WHERE slug = ?", (normalized,))
+        ).fetchone()
+        if created:
+            print(f"Created person '{normalized}' (id={row['id']})")
+        return row["id"], normalized, created
+    finally:
+        await db.close()
+
+
+async def seed(db_path: Path, days: int, pattern: str, seed_value: int, person: str | None = None):
     os.environ["DB_PATH"] = str(db_path)
 
     from shared import database
 
     database.DB_PATH = db_path  # module-level override, mirrors tests/conftest.py
     await database.init_db()
+
+    person_id, person_slug, person_created = await _resolve_person(database, person)
 
     rng = random.Random(seed_value)
     today = datetime.now(timezone.utc).date()
@@ -145,10 +215,14 @@ async def seed(db_path: Path, days: int, pattern: str, seed_value: int):
             day = build_day(i, days, pattern, rng)
 
             for table, columns in day.items():
-                cols = ["date"] + list(columns.keys())
+                # person_id is not optional: every metric table is keyed
+                # (person_id, date) NOT NULL since migration 001, so omitting
+                # it does not write rows nobody can read -- it raises
+                # IntegrityError on the first insert and seeds nothing.
+                cols = ["person_id", "date"] + list(columns.keys())
                 placeholders = ", ".join(["?"] * len(cols))
                 col_names = ", ".join(cols)
-                values = [date_str] + list(columns.values())
+                values = [person_id, date_str] + list(columns.values())
                 await db.execute(
                     f"INSERT OR REPLACE INTO [{table}] ({col_names}) VALUES ({placeholders})",
                     values,
@@ -157,7 +231,17 @@ async def seed(db_path: Path, days: int, pattern: str, seed_value: int):
     finally:
         await db.close()
 
-    print(f"Seeded {days} days of synthetic '{pattern}' data into {db_path}")
+    print(
+        f"Seeded {days} days of synthetic '{pattern}' data for person "
+        f"'{person_slug}' (id={person_id}) into {db_path}"
+    )
+    if person_created:
+        print(
+            f"Note: '{person_slug}' has no person_grants row. Once access control "
+            "lands, this person's data is reachable only by an admin or by a user "
+            "you grant explicitly -- which is the intended starting state for a "
+            "cross-person isolation test."
+        )
 
 
 def main():
@@ -166,6 +250,11 @@ def main():
     parser.add_argument("--db-path", type=Path, required=True, help="Path to the SQLite DB to seed (never the real fitness.db)")
     parser.add_argument("--pattern", choices=PATTERNS, default="normal", help="Synthetic trend pattern to generate")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument(
+        "--person",
+        default=None,
+        help="Slug of the person to seed. Created if absent. Defaults to the primary person.",
+    )
     args = parser.parse_args()
 
     resolved = args.db_path.resolve()
@@ -175,7 +264,7 @@ def main():
             "Use a scratch path (e.g. /tmp/vf.db)."
         )
 
-    asyncio.run(seed(args.db_path, args.days, args.pattern, args.seed))
+    asyncio.run(seed(args.db_path, args.days, args.pattern, args.seed, args.person))
 
 
 if __name__ == "__main__":

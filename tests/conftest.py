@@ -214,6 +214,70 @@ async def seed_token(user_id: int, label: str = "test-token", raw_token: str | N
         await db.close()
 
 
+async def seed_person(slug: str, display_name: str | None = None, is_primary: bool = False) -> int:
+    """Insert a person row directly and return its id.
+
+    `init_db()` already creates the primary person, so this is for the SECOND
+    person onward -- the one that makes cross-person isolation testable at all.
+    Pass is_primary=True only on a database that has none; the partial unique
+    index idx_persons_primary allows exactly one.
+
+    Deliberately does NOT create a person_grants row. Grant it explicitly with
+    grant_person() so each test states the access level it is exercising --
+    Phase 2's require_person returns 404, not 403, for a missing grant, so an
+    implicit grant here would quietly turn every negative test positive.
+    """
+    from shared.database import get_db
+
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "INSERT INTO persons (slug, display_name, created_at, is_primary) VALUES (?, ?, ?, ?)",
+            (
+                slug,
+                display_name or slug,
+                datetime.now(timezone.utc).isoformat(),
+                1 if is_primary else 0,
+            ),
+        )
+        await db.commit()
+        return cursor.lastrowid
+    finally:
+        await db.close()
+
+
+async def grant_person(
+    person_id: int, user_id: int, access: str = "own", granted_by: int | None = None
+) -> None:
+    """Give `user_id` `access` on `person_id`.
+
+    access is one of 'view' | 'manage' | 'own' -- the CHECK constraint on
+    person_grants rejects anything else, which is intentional: a typo'd level
+    should fail loudly in the fixture rather than silently under-granting and
+    producing a confusing 404 in the test body.
+    """
+    from shared.database import get_db
+
+    db = await get_db()
+    try:
+        await db.execute(
+            "INSERT OR REPLACE INTO person_grants "
+            "(person_id, user_id, access, granted_at, granted_by) VALUES (?, ?, ?, ?, ?)",
+            (person_id, user_id, access, datetime.now(timezone.utc).isoformat(), granted_by),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def primary_person_id() -> int:
+    """The person init_db() created. Thin wrapper so tests that only need the
+    id do not each import from shared.database."""
+    from shared.database import get_primary_person_id
+
+    return await get_primary_person_id()
+
+
 @pytest.fixture
 def weight_app_module(initialized_db, fake_garmin_client, monkeypatch):
     """The `vitalforge-weight` FastAPI app module, Garmin/DB fully faked."""
