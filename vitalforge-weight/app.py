@@ -15,17 +15,15 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-# _get_current_identity is private, but it is the only accessor that returns
-# the open-access `anonymous` sentinel instead of raising: its public sibling
-# require_account_identity() 401s whenever `user_id is None`, and GET /
-# below must keep working in the empty-users-table mode CLAUDE.md documents.
-# A public identity-or-None accessor in shared/auth.py would retire this
-# import.
+# get_current_identity, not require_account_identity: the latter 401s
+# whenever `user_id is None`, which includes the open-access `anonymous`
+# sentinel, and GET / below must keep working in the empty-users-table mode
+# CLAUDE.md documents.
 from shared.auth import (
-    _get_current_identity,
     add_auth_routes,
     bootstrap_first_admin,
     bootstrap_migrated_token,
+    get_current_identity,
     require_person,
 )
 from shared.database import ensure_primary_person_grant, get_db, init_db
@@ -153,20 +151,33 @@ log to open. An administrator needs to grant you access to a person.</p>
 """
 
 
-async def _reachable_persons(user_id: int | None, is_admin: bool) -> list[tuple[int, str]]:
+async def _reachable_persons(user_id: int | None) -> list[tuple[int, str]]:
     """Active persons this caller may reach, as (id, slug) in stable id order.
 
-    Deliberately mirrors shared.auth._identity_and_grant's predicate --
-    `archived_at IS NULL`, plus the anonymous and admin bypasses
-    require_person() applies. A slug this returns must be one
-    require_person("view") accepts on the very next request, or the redirect
-    below would hand the browser a 404.
+    Mirrors shared.auth._identity_and_grant's `archived_at IS NULL` predicate:
+    a slug this returns must be one require_person("view") accepts on the very
+    next request, or the redirect below would hand the browser a 404.
+
+    Account-bound callers are grant-scoped, ADMINS INCLUDED, and this must
+    stay identical to vitalforge-dashboard's `_reachable_persons`. The two
+    services share one login, so a landing rule that differs between them
+    sends the same person to different places depending on which port they
+    opened.
+
+    require_person does let an admin bypass grants, but that bypass is about
+    reaching a person they addressed EXPLICITLY. Landing is about preference,
+    not capability: applying it here would make the home page 400 (ambiguous)
+    for an admin who holds exactly one grant in a three-person household,
+    which is the common case rather than an edge one. Spec f.2 also gives
+    default_person_id this redirect "and nothing else" -- expanding the
+    fallback set by capability is not in it. An admin can still open any
+    /p/{slug}/ directly.
     """
     db = await get_db()
     try:
-        if user_id is None or is_admin:
-            # Open-access mode holds implicit `own` on everyone, and the admin
-            # bypass is the same one every /auth/admin/* route already uses.
+        if user_id is None:
+            # Open-access mode (empty users table) holds implicit `own` on
+            # everyone, because there are no grants to consult.
             cursor = await db.execute(
                 "SELECT id, slug FROM persons WHERE archived_at IS NULL ORDER BY id"
             )
@@ -210,13 +221,13 @@ async def index(request: Request):
     waiting on a grant lands here -- so it renders an explanatory 200 page
     rather than a bare 400.
     """
-    identity = await _get_current_identity(request)
+    identity = await get_current_identity(request)
     if identity is None:
         # auth_middleware normally redirects an unauthenticated browser to the
         # login page before routing gets here; this is the belt-and-braces arm.
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    reachable = await _reachable_persons(identity.user_id, identity.role == "admin")
+    reachable = await _reachable_persons(identity.user_id)
     if not reachable:
         return HTMLResponse(_NO_PERSONS_PAGE)
 

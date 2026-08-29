@@ -40,10 +40,10 @@ from recommendations import get_recommendations, get_rules_only
 from sync import run_sync, scheduled_sync
 
 from shared.auth import (
-    _get_current_identity,
     add_auth_routes,
     bootstrap_first_admin,
     bootstrap_migrated_token,
+    get_current_identity,
     require_account_identity,
     require_person,
 )
@@ -161,13 +161,13 @@ async def _reachable_persons(request: Request) -> tuple[list[tuple[int, str]], i
     400 (ambiguous) for an admin in a multi-person household who holds
     exactly one grant. They can still open /p/{slug}/ directly.
 
-    `_get_current_identity` is private to shared/auth.py, and is used here
+    `get_current_identity` is the identity-or-None accessor, used here
     because it is the only identity resolver that returns the anonymous
     sentinel instead of 401ing on it (require_account_identity, used by the
     goals routes below, deliberately rejects it). Worth promoting to a public
     alias if a second caller ever needs it.
     """
-    identity = await _get_current_identity(request)
+    identity = await get_current_identity(request)
     if identity is None:
         # Unreachable behind auth_middleware, which redirects an unauthenticated
         # browser to the login page before routing. Fail closed anyway.

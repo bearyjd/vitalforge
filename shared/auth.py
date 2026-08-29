@@ -290,6 +290,23 @@ async def require_account_identity(request: Request) -> Identity:
 _require_account_identity = require_account_identity
 
 
+# Public alias for _get_current_identity, for callers that must handle "no
+# identity" themselves rather than have it raised at them.
+#
+# require_account_identity is the wrong tool for a landing page: it 401s the
+# open-access anonymous sentinel (user_id is None), and open access on a fresh
+# volume is this project's primary development path. Both services' GET /
+# routes need the sentinel, and during the Phase 2 sweep both independently
+# imported the private name to get it -- two private imports for the same
+# reason is a missing public accessor, not two mistakes.
+#
+# Returns None when auth is configured and the caller presented nothing
+# valid; returns _Identity("anonymous", None, None, None) when the users
+# table is empty. Callers must distinguish those two cases themselves, which
+# is precisely why this is separate from require_account_identity.
+get_current_identity = _get_current_identity
+
+
 # --- person-scoped access control (multi-tenancy Phase 2) ---------------------
 
 # view < manage < own. Compared by rank, so a route asking for "view" is
