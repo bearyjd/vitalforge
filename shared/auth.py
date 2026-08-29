@@ -316,6 +316,22 @@ async def _identity_and_grant(
     grant" are distinguishable here -- both collapse to the same 404 in
     require_person, but only after the anonymous and admin branches have had a
     chance to look at them.
+
+    `slug` is NOT validated against SLUG_RE first, deliberately. It is
+    parameterized so there is no injection surface, and rejecting a malformed
+    slug with a 422 would create a THIRD observable -- malformed vs
+    exists-but-not-yours vs yours -- reintroducing a smaller version of the
+    leak the 404-not-403 rule exists to close. An unvalidated slug simply
+    matches no row and 404s like everything else. SLUG_RE governs creation,
+    which is where the check belongs.
+
+    This opens its own connection, so a person-scoped request costs three in
+    total (this, _get_current_identity's, and the route's own). That is the
+    documented per-operation convention this codebase uses everywhere rather
+    than an oversight -- see CLAUDE.md. SQLite connections are process-local
+    and cheap; if it ever matters, the fix is threading one connection through
+    the request, which is a change to the whole codebase's pattern and not to
+    this function.
     """
     identity = await _get_current_identity(request)
     if identity is None:
@@ -376,6 +392,21 @@ def require_person(level: str):
         raise ValueError(f"unknown access level {level!r}; expected one of {sorted(_ACCESS_ORDER)}")
 
     async def dependency(request: Request, slug: str) -> int:
+        # FastAPI binds `slug` from the QUERY STRING when the route's path has
+        # no {slug} placeholder -- silently, and it documents it as
+        # `in: query`. Verified: GET /api/x?slug=primary returns 200 through a
+        # dependency that was meant to be reachable only under /p/{slug}/.
+        # That would make ?slug= a second way to address a person, which is
+        # precisely the implicit-fallback path this phase exists to delete.
+        # Path params are the only accepted source; anything else is a wiring
+        # mistake in this repo, not a client error, so it raises rather than
+        # returning a status code.
+        if "slug" not in request.scope.get("path_params", {}):
+            raise RuntimeError(
+                "require_person() is mounted on a route whose path has no {slug} parameter; "
+                f"FastAPI bound slug={slug!r} from the query string instead. Person "
+                "addressing is by path segment only -- mount the route under /p/{slug}/."
+            )
         identity, granted, person_id = await _identity_and_grant(request, slug)
         if identity is None:
             raise HTTPException(status_code=401, detail="Not authenticated")
@@ -390,7 +421,15 @@ def require_person(level: str):
             # Matches the admin bypass every /auth/admin/* route already uses.
             # One superuser story, not two.
             return person_id
-        if granted is None or _ACCESS_ORDER[granted] < _ACCESS_ORDER[level]:
+        # .get(granted, -1), not [granted]: an access value outside the three
+        # would otherwise KeyError into a 500, and a 500 is a DIFFERENT
+        # observable from a 404 -- it confirms the person exists, which is the
+        # exact leak the 404 convention is here to prevent. -1 sorts below
+        # every real level, so an unrecognised grant denies. The CHECK
+        # constraint on person_grants.access makes this unreachable today;
+        # constraints get relaxed by future table rebuilds, and this costs
+        # nothing.
+        if granted is None or _ACCESS_ORDER.get(granted, -1) < _ACCESS_ORDER[level]:
             raise HTTPException(status_code=404, detail="Person not found")
         return person_id
 

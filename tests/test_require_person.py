@@ -293,6 +293,59 @@ async def test_returns_the_right_person_id_when_several_exist(client):
 # --- misuse -------------------------------------------------------------------
 
 
+async def test_slug_from_the_query_string_is_refused(initialized_db):
+    """FastAPI binds `slug` from the QUERY STRING when a route's path has no
+    {slug} placeholder -- silently, and documents it as `in: query`. Verified
+    before this guard existed: GET /api/x?slug=primary returned 200 through a
+    dependency meant to be reachable only under /p/{slug}/.
+
+    That would make ?slug= a second way to address a person, which is exactly
+    the implicit-fallback path this phase exists to delete. It is a wiring
+    mistake in this repo rather than a client error, so it raises rather than
+    returning a status code.
+    """
+    app = FastAPI()
+    add_auth_routes(app)
+
+    @app.get("/api/misconfigured")
+    async def misconfigured(person_id: int = Depends(require_person("view"))):
+        return {"person_id": person_id}
+
+    await seed_person("bryn")
+    transport = ASGITransport(app=app, raise_app_exceptions=True)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        with pytest.raises(RuntimeError, match=r"no \{slug\} parameter"):
+            await ac.get("/api/misconfigured?slug=bryn")
+
+
+async def test_an_unrecognised_grant_level_denies_rather_than_500s(client, monkeypatch):
+    """A 500 is a different observable from a 404 -- it confirms the person
+    exists, which is the leak the 404 convention closes.
+
+    The CHECK constraint on person_grants.access makes an out-of-range value
+    unreachable today, and an earlier version of this test tried to write one
+    directly and simply SKIPPED when the constraint refused -- proving nothing.
+    Instead this shrinks _ACCESS_ORDER so a perfectly valid stored grant
+    becomes unrecognised, which is the same state the code would face if a
+    future table rebuild dropped the constraint, and exercises the real
+    `.get(granted, -1)` branch rather than a hand-thrown substitute.
+    """
+    user_id, cookies = await _as("weird")
+    person_id = await seed_person("bryn")
+    await grant_person(person_id, user_id, access="own")
+
+    import shared.auth as shared_auth
+
+    # 'own' is now a value the code has no rank for.
+    monkeypatch.setattr(shared_auth, "_ACCESS_ORDER", {"view": 0, "manage": 1})
+
+    resp = await client.get("/p/bryn/api/read", cookies=cookies)
+    assert resp.status_code == 404, (
+        f"an unrecognised access level gave {resp.status_code}; it must deny with the same "
+        "404 as any other refusal, not 500 and thereby confirm the person exists"
+    )
+
+
 def test_require_person_rejects_an_unknown_level():
     """Fails at import/wiring time, not on the first request. A typo'd level
     would otherwise raise KeyError inside the dependency -- a 500 on a live
