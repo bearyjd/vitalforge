@@ -131,6 +131,32 @@ def test_seed_script_refuses_a_reserved_slug(tmp_path, reserved):
         conn.close()
 
 
+def test_no_grant_note_is_only_printed_for_a_person_actually_created(tmp_path):
+    """The note asserts a fact, so it must not be printed when that fact was
+    never checked. --person naming an EXISTING slug creates nothing and may
+    well resolve to a person who already has a grant; saying otherwise is
+    simply false. Keyed off whether the INSERT took, not off `--person` being
+    present."""
+    db_path = tmp_path / "seeded.db"
+    assert _run_seed("--db-path", str(db_path), "--days", "1").returncode == 0
+
+    created = _run_seed("--db-path", str(db_path), "--days", "1", "--person", "bryn")
+    assert "Created person 'bryn'" in created.stdout
+    assert "has no person_grants row" in created.stdout, "the note is missing on creation"
+
+    existing = _run_seed("--db-path", str(db_path), "--days", "1", "--person", "bryn")
+    assert "Created person" not in existing.stdout, "re-run claimed to create an existing person"
+    assert "has no person_grants row" not in existing.stdout, (
+        "claimed a pre-existing person has no grant without ever checking"
+    )
+
+    primary = _run_seed("--db-path", str(db_path), "--days", "1", "--person", "primary")
+    assert primary.returncode == 0
+    assert "has no person_grants row" not in primary.stdout, (
+        "--person primary resolves to the existing primary person and creates nothing"
+    )
+
+
 def test_seed_script_still_refuses_a_real_looking_data_path(tmp_path):
     """Pre-existing guard, pinned here because this file now has the only
     coverage of the script's CLI."""

@@ -126,8 +126,8 @@ def build_day(i: int, days: int, pattern: str, rng: random.Random) -> dict:
     }
 
 
-async def _resolve_person(database, slug: str | None) -> tuple[int, str]:
-    """Return (person_id, slug) for the person to seed, creating them if needed.
+async def _resolve_person(database, slug: str | None) -> tuple[int, str, bool]:
+    """Return (person_id, slug, created) for the person to seed.
 
     With no --person, this is the primary person the migration created, which
     keeps the pre-multi-tenancy behavior of this script intact. With --person,
@@ -141,6 +141,12 @@ async def _resolve_person(database, slug: str | None) -> tuple[int, str]:
     someone grants access -- which is exactly the state a cross-person
     isolation test wants, and the reason this script does not guess at one.
     The caller is told so on stdout rather than discovering it as a bug.
+
+    `created` is returned rather than inferred from `slug is not None` so that
+    note is only printed when it is TRUE. `--person <an existing slug>` (e.g.
+    the primary person on a database that already has an admin and a grant)
+    resolves to that row and creates nothing, and claiming it has no grant
+    would be a plain falsehood.
     """
     from shared.slugs import RESERVED_SLUGS, slugify
 
@@ -153,7 +159,7 @@ async def _resolve_person(database, slug: str | None) -> tuple[int, str]:
             ).fetchone()
         finally:
             await db.close()
-        return person_id, row["slug"]
+        return person_id, row["slug"], False
 
     normalized = slugify(slug)
     if not normalized or normalized in RESERVED_SLUGS:
@@ -169,16 +175,21 @@ async def _resolve_person(database, slug: str | None) -> tuple[int, str]:
         # first_admin and _add_columns. A check-then-insert here would let two
         # concurrent runs both miss the SELECT and one die on persons.slug
         # UNIQUE with a raw traceback.
-        await db.execute(
+        cursor = await db.execute(
             "INSERT INTO persons (slug, display_name, created_at, is_primary) "
             "VALUES (?, ?, ?, 0) ON CONFLICT (slug) DO NOTHING",
             (normalized, normalized, datetime.now(timezone.utc).isoformat()),
         )
+        # rowcount distinguishes insert from conflict without a second read,
+        # and without the check-then-insert race the pre-check version had.
+        created = cursor.rowcount == 1
         await db.commit()
         row = await (
             await db.execute("SELECT id FROM persons WHERE slug = ?", (normalized,))
         ).fetchone()
-        return row["id"], normalized
+        if created:
+            print(f"Created person '{normalized}' (id={row['id']})")
+        return row["id"], normalized, created
     finally:
         await db.close()
 
@@ -191,7 +202,7 @@ async def seed(db_path: Path, days: int, pattern: str, seed_value: int, person: 
     database.DB_PATH = db_path  # module-level override, mirrors tests/conftest.py
     await database.init_db()
 
-    person_id, person_slug = await _resolve_person(database, person)
+    person_id, person_slug, person_created = await _resolve_person(database, person)
 
     rng = random.Random(seed_value)
     today = datetime.now(timezone.utc).date()
@@ -224,7 +235,7 @@ async def seed(db_path: Path, days: int, pattern: str, seed_value: int, person: 
         f"Seeded {days} days of synthetic '{pattern}' data for person "
         f"'{person_slug}' (id={person_id}) into {db_path}"
     )
-    if person is not None:
+    if person_created:
         print(
             f"Note: '{person_slug}' has no person_grants row. Once access control "
             "lands, this person's data is reachable only by an admin or by a user "
