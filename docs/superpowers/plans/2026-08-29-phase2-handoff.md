@@ -1,124 +1,158 @@
-# Phase 2 handoff — 2026-08-29
+# Phase 2 handoff — 2026-08-29 (after PR 3)
 
-State of the multi-tenancy work at the end of this session. Written so a fresh
-session can pick up cold.
+State of the multi-tenancy work. Written so a fresh session can pick up cold.
 
 ## Where things stand
 
 | | |
 |---|---|
-| `main` | `24f6acb` — Phase 1 + Phase 2 PRs 1/4 and 2/4, CI green |
+| `main` | `10fcdc4` — Phase 1 + Phase 2 PRs 1/4, 2/4 and 3/4, CI green |
 | Open PRs | **none** |
+| Open issues | **#37** — starlette PYSEC-2026-1942 (pre-existing, needs its own PR) |
 | Branches | all merged branches deleted local and remote; tree clean |
 | Production | `knowledge` (100.74.76.39), both services healthy, running **Phase 1** |
-| Suite | 561 passed, 4 deselected, ruff clean, on `main` |
+| Suite | 649 passed, 4 deselected, ruff clean, on `main` |
 
-**Phase 2 is half done.** PRs 1/4 and 2/4 are merged; 3/4 and 4/4 remain.
+**Only PR 4/4 remains.**
 
-### Prod is now THREE merges behind `main`
+### Prod is now FOUR merges behind `main`
 
-It lacks #33 (snapshot race), #34 (PR 1) and #35 (PR 2). Nothing is urgent —
-migrations 001/002 are already applied there, and #33 protects the *next*
-migration rather than one already run.
+It lacks #33 (snapshot race), #34 (PR 1), #35 (PR 2) and #36 (PR 3). Nothing is
+urgent — migrations 001/002 are already applied there, and #33 protects the
+*next* migration rather than one already run.
 
-**But a redeploy is no longer routine.** PR 2 moved every person-scoped route
-to `/p/{slug}/` and unmounts nothing yet, so the deployed PWAs' hardcoded
-`/api/...` calls would 404 against new images. Treat a redeploy the way the
-Phase 1 upgrade was treated: stop BOTH services, then bring them up together.
-The service-worker `CACHE_NAME` bump to `-v2` is already in, so installed
-clients will pick up the new shell.
+**A redeploy is still not routine.** PR 2 moved every person-scoped route to
+`/p/{slug}/` and unmounts nothing yet, so the deployed PWAs' hardcoded `/api/...`
+calls would 404 against new images. Treat a redeploy the way the Phase 1 upgrade
+was treated: stop BOTH services, then bring them up together. The service-worker
+`CACHE_NAME` bump to `-v2` is already in, so installed clients pick up the new
+shell.
 
-## What Phase 2 still needs (PRs 3 and 4)
+## What Phase 2 still needs (PR 4)
 
-Per `2026-08-29-multitenancy-phase2-access-control.md`:
+Per `2026-08-29-multitenancy-phase2-access-control.md` §PR 4:
 
-- **PR 3** — persons/grants CRUD, admin page mirroring `/auth/admin/users`,
-  and the `admin_delete_user` cascade fix (`DELETE FROM person_grants` plus
-  nulling `granted_by`).
-- **PR 4** — `api_tokens.person_id`, the ingest resolution order (§f.7), the
-  legacy unmount, and README/docs.
+- `api_tokens.person_id` (deltas A2, A3) — additive nullable column via
+  `_add_columns`, **not** a migration-runner entry. Add `person_id` to
+  `_Identity` and to `_resolve_bearer_token`'s SELECT; **audit every positional
+  `_Identity(...)` construction**, since it is built positionally. Extend
+  `tests/conftest.py`'s `seed_token()` to take an optional person here — it was
+  deliberately left alone in PR 1 because the column did not exist yet.
+- Ingest resolution order (§f.7): scoped token wins and a `{slug}` mismatch is
+  **403**, not 404 (the caller demonstrably holds a valid token, so nothing
+  leaks); otherwise `{slug}` is the subject via `require_person("manage")`.
+  There is no third rule.
+- The legacy unmount (§f.8) — remove root `/api/weight` and `/api/metrics/...`
+  in the same change. No alias, no deprecation window.
+- README/docs — Tasker/bearer URLs gain `/p/{slug}/`;
+  `tests/test_docs_drift.py` will need extending; `CLAUDE.md`'s
+  dashboard-read-endpoints bullet keeps its meaning but its URLs change.
 
-## Start here for PR 3
+## Start here for PR 4
 
-1. Read `2026-08-29-multitenancy-phase2-access-control.md` §PR 3 for scope, and
-   the spec deltas at the top of it — the design spec is stale in six places
-   against what shipped, and A2 (token identity "works unchanged") is simply
-   wrong.
-2. Read "Carried forward" below before writing anything. Item 1 is a
-   requirement of PR 3 itself, not a nicety.
-3. Branch from `main` at `24f6acb`.
+1. Read the plan's **"Decisions taken before writing this plan"** (D2, D3, D6–D8)
+   and **"Decisions taken while implementing PR 3"** (D9–D15) — the latter is
+   new and includes two deviations from the plan text itself.
+2. Read the **spec deltas** at the top of the plan. The design spec is stale in
+   six places, and A2 (token identity "works unchanged") is simply wrong — which
+   matters directly for PR 4, since §4.1 is the fix for it.
+3. Read "Carried forward" below.
+4. Branch from `main` at `10fcdc4`.
 
-## Carried forward — read before starting PR 3
+## Carried forward — read before starting PR 4
 
-These are findings from this session that PR 3 must handle. Each is a real
-defect or a live requirement, not a nicety.
+1. **An admin's API token is a whole-household read key.** Admins bypass grants
+   for every non-archived person, and `_resolve_bearer_token` returns the
+   owner's live role. `api_tokens.person_id` is what bounds the blast radius —
+   this is PR 4's own §4.1, not a side note.
 
-1. **`SLUG_RE` is enforced only in `shared/migrations.py` and
-   `scripts/seed_db.py`.** PR 3 adds the first *route* that creates a person,
-   which is exactly where an unvalidated slug enters. Jinja autoescape catches
-   it at render time (verified: a forced payload renders as `&#34;` with no
-   breakout), but validation belongs at creation.
-
-2. **`_reachable_persons` and `require_person` disagree on an unrecognised
-   grant value.** Both apps' `_reachable_persons` join `person_grants` without
-   inspecting `access`; `require_person` denies it via `.get(granted, -1)`.
-   Such a grant makes `GET /` redirect to a `/p/{slug}/` that 404s — a dead
-   end. Unreachable without `PRAGMA ignore_check_constraints`, but both
-   docstrings claim they mirror `require_person`.
-
-3. **`sync_status.syncing` leaks across persons.** `app.py` returns
-   `_sync_lock.locked()` — one module-level lock — on an otherwise
-   person-scoped response, so one person's sync is visible from another
-   person's status endpoint. The lock's *serialization* is Phase 4; the leaked
-   flag is not.
-
-4. **An admin's API token is a whole-household read key.** Admins bypass
-   grants for every non-archived person, and `_resolve_bearer_token` returns
-   the owner's live role. `api_tokens.person_id` (PR 4) bounds the blast
-   radius.
-
-5. **`garmin_credential_person_id()` will need `int | None` in Phase 3.** It
+2. **`garmin_credential_person_id()` will need `int | None` in Phase 3.** It
    currently delegates to `get_primary_person_id()`, which raises. Once
    `garmin_links` exists, "this person has no linked account" is a normal
    answer, not an exception. Its docstring says so.
 
+3. **`is_primary` is overloaded, and Phase 3 must unpick it.** It means both
+   "the durable primary person" *and* "whose Garmin account this deployment
+   holds", because `garmin_credential_person_id()` **is**
+   `get_primary_person_id()`. PR 3 added the first request-path way to move that
+   pointer and had to gate it behind `acknowledge_garmin_reassignment` as a
+   result (D10). When `garmin_links` lands, the coupling — and that flag —
+   should go away together. Do not add a second writer to `is_primary` before
+   then.
+
+4. **The `own`-holder grant API has no UI** (D14). The authorization path exists
+   and is tested, but `/auth/admin/persons` is admin-gated and its user dropdown
+   reads the admin-only `/auth/admin/users/list`. Phase 5's UI work, recorded so
+   it is a decision rather than an oversight.
+
+5. **The `users.id` existence oracle on grant writes is accepted, not closed**
+   (D15). Revisit if grants ever gain a non-admin UI; addressing the target by
+   username rather than id would make it a guess rather than a count.
+
+## Closed since the last handoff
+
+All three of the previous handoff's carried-forward defects landed in #36:
+
+- `SLUG_RE` is now enforced at the creation route, which is the first route that
+  mints a slug from external input.
+- `_reachable_persons` in **both** services now denies the same grant values
+  `require_person` denies, so `GET /` cannot redirect to a `/p/{slug}/` that
+  then 404s.
+- `sync_status.syncing` and `POST /api/sync` are per-person via `SyncRegistry`
+  rather than answering from the module-level `_sync_lock`. The lock's
+  *serialization* is still shared — that is Phase 4, deliberately untouched.
+
 ## Known issues, out of Phase 2 scope
 
+- **#37 — `starlette 0.41.3` / PYSEC-2026-1942.** A `Range`-header DoS reachable
+  **unauthenticated**, because `auth_middleware` skips `/static/` and both
+  services mount `StaticFiles` there. Pre-existing. The issue carries the other
+  15 `pip-audit` advisories triaged, the suggested pins, and a note to add
+  `pip-audit` to CI — there is currently no dependency check at all.
 - **Both service workers have the wrong scope.** They register as
   `/static/sw.js` with no `scope` option, so they control `/static/` and never
-  navigations. Both PWAs therefore do not do what they appear to. Pre-existing,
-  unrelated to this phase. Fixing it needs `sw.js` served from root or a
-  `Service-Worker-Allowed` header — a route change.
-- **Playwright cannot run on the Fedora dev box.** `TargetClosedError` in
-  pytest-playwright teardown, reproduces with all changes stashed. CI is the
-  authority for that lane and is green.
+  navigations. Both PWAs therefore do not do what they appear to. Pre-existing.
+  Fixing it needs `sw.js` served from root or a `Service-Worker-Allowed`
+  header — a route change.
+- **Playwright cannot run on the Fedora dev box.** Root cause is now known:
+  `Not implemented` from Skia's fontconfig backend — missing system font libs,
+  exactly the case `CLAUDE.md` warns about for non-apt systems. Confirmed
+  identical on `main` with all changes stashed. CI is the authority for that
+  lane and is green.
 
 ## Conventions this session established
 
-- **Structural guards over behavioural tests for scoping.**
-  `tests/test_no_unscoped_person_access.py` asserts over source (AST, not
-  substring) because this phase's failure mode is silent: a route on the old
-  shim behaves perfectly with one person. All nine guards were confirmed to
-  fail against the pre-sweep tree, so none can pass vacuously.
-- **Mutation-test every new guard.** Three defects this session were found by
-  mutation against a fully green suite, not by review. A guard that cannot be
-  made to fail is decorative.
-- **Assert the positive control.** Two vacuous positive controls shipped this
-  session before being caught — one in a fixture test, one in the sync test.
-  A negative test without a working positive control passes when the route is
-  entirely broken.
-- **404 hides person existence; account-scoped resources keep 403.** The
-  discriminator is what kind of resource, not which route family. Written into
-  the plan next to constraint 2.
+- **Review the fix commit.** A commit written in response to a review is, by
+  construction, the one nobody has checked — and it is where regressions land.
+  The second review round of #36 found fragility that the *fix* commit had
+  introduced (a release paired positionally rather than structurally), which no
+  amount of re-reviewing the original would have surfaced.
+- **A guard that a comment can satisfy is not a guard.**
+  `ast.get_source_segment` returns source *including comments*, so a
+  substring-over-source test passed against a fix that had been deleted and
+  left only in the comment above it. Structural guards must assert over the AST
+  or over behaviour, never over raw source text.
+- **Parametrize authorization tests over every verb on the route family.** The
+  grant routes' authorization could be deleted from both write routes with the
+  full suite green, because only the read was exercised.
+- **Mutation-test every new guard, and re-run after the review round.** 29
+  mutations, all killed. Two of them exist because a reviewer proved the
+  corresponding guards were decorative; two more because a later reviewer proved
+  they were unbacked.
+- **A positive control asserts state, not just status.** A route that 200s while
+  writing nothing satisfies a status-only control.
 
 ## Things I got wrong, recorded so they are not re-derived
 
-- I claimed the service-worker `CACHE_NAME` bump guarded a stale-shell failure
-  mode. It doesn't — scope is `/static/`, so no install ever served a
-  navigation from that cache. The bump is still correct hygiene.
-- I claimed `require_person`'s anonymous-before-admin ordering was
-  load-bearing. Mutation proved it isn't: the sentinel's role is `None`, so
-  both orders behave identically. It is defensive, and the real invariant is
-  pinned by `test_anonymous_sentinel_has_no_role`.
-- I relayed one agent's prediction that ~35 validation tests would need grants.
-  They didn't — those tests seed no users and run in open-access mode.
+- I shipped a promote endpoint whose only warning was "scheduled syncs follow
+  the primary person" — a scheduling-flavoured sentence for what is actually
+  data contamination. The coupling to `garmin_credential_person_id()` was found
+  by review, not by me, against a green suite and a passing mutation run.
+- My first fix for the leaked `syncing` flag used a plain `set`, which a
+  reviewer correctly showed did not close the regression: `scheduled_sync` never
+  registered in it, so the boot backfill reported idle.
+- I claimed "27 mutations, all killed" in a commit that also changed the
+  re-archive cleanup — true of the list it enumerated, but that list did not
+  cover the change. Enumerated-mutation claims must name what they cover.
+- `monkeypatch.undo()` reverts **every** patch a test's fixtures made, including
+  `conftest.py`'s temp `DB_PATH`. Restore a single patch by hand in a `finally`.
