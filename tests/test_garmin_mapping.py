@@ -10,6 +10,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from shared import garmin_client
+from tests.conftest import PERSON_PREFIX
 
 
 @pytest.fixture
@@ -85,13 +86,13 @@ async def test_muscle_pct_derives_muscle_mass_kg(client, weight_app_module, fake
     # the conversion (weight_kg * pct/100) is numerically the identity map on
     # the percent value, so a 100kg fixture can't distinguish "converted to a
     # mass" from "passed through as a raw percent" -- see Phase 4 review.
-    resp = await client.post("/api/weight", json={"weight": 80.0, "unit": "kg", "muscle_pct": 40.0})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 80.0, "unit": "kg", "muscle_pct": 40.0})
     assert resp.status_code == 200
     assert fake_garmin_client.pushed_weights[-1]["muscle_mass"] == pytest.approx(32.0)
 
 
 async def test_weight_only_push_sends_no_composition_values(client, fake_garmin_client):
-    resp = await client.post("/api/weight", json={"weight": 180.0, "unit": "lbs"})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 180.0, "unit": "lbs"})
     assert resp.status_code == 200
     pushed = fake_garmin_client.pushed_weights[-1]
     assert pushed.get("percent_fat") is None
@@ -107,7 +108,7 @@ async def test_garmin_failure_still_stores_composition_locally(client, weight_ap
     monkeypatch.setattr(weight_app_module, "push_weight", failing_push)
 
     resp = await client.post(
-        "/api/weight",
+        f"{PERSON_PREFIX}/api/weight",
         json={"weight": 180.0, "unit": "lbs", "body_fat_pct": 18.4, "bone_mass_kg": 3.2},
     )
     assert resp.status_code == 200

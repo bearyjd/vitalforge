@@ -22,7 +22,7 @@ from httpx import ASGITransport, AsyncClient
 from shared import auth as shared_auth
 from shared.auth import create_session_cookie
 from shared.database import get_db, get_primary_person_id
-from tests.conftest import seed_user
+from tests.conftest import PERSON_PREFIX, grant_person, primary_person_id, seed_user
 
 
 @pytest.fixture
@@ -35,6 +35,21 @@ async def client(dashboard_app_module):
 async def _cookies_for(username: str) -> dict[str, str]:
     user_id, session_version = await shared_auth._get_user_id_and_session_version(username)
     return {"vf_session": create_session_cookie(username, user_id, session_version)}
+
+
+async def _seed_user_with_grant(username: str, password: str, role: str = "user") -> int:
+    """`seed_user` plus the `view` grant every scoped goals route asks for
+    (`vitalforge-dashboard/app.py`, create/list/get/patch all take
+    `require_person("view")`).
+
+    `view`, not `manage`: that is the level the routes actually require, and
+    over-granting would stop this file from noticing if one of them tightened.
+    Without any grant, require_person returns 404 before the route's own
+    ownership check runs -- which would quietly turn the 403 and 404 cases
+    below into passes that prove nothing."""
+    user_id = await seed_user(username, password=password, role=role)
+    await grant_person(await primary_person_id(), user_id, access="view")
+    return user_id
 
 
 async def _goal_count() -> int:
@@ -69,11 +84,11 @@ def days_ago(n: int) -> str:
 
 
 async def test_owner_can_crud_own_goal(client):
-    await seed_user("alice", password="alice-pw")
+    await _seed_user_with_grant("alice", password="alice-pw")
     cookies = await _cookies_for("alice")
 
     create_resp = await client.post(
-        "/api/goals",
+        f"{PERSON_PREFIX}/api/goals",
         json={"metric": "steps", "target_value": 10000, "target_date": "2026-12-31"},
         cookies=cookies,
     )
@@ -85,15 +100,15 @@ async def test_owner_can_crud_own_goal(client):
     assert body["progress"]["latest_value"] is None  # no synced data yet
     goal_id = body["id"]
 
-    list_resp = await client.get("/api/goals", cookies=cookies)
+    list_resp = await client.get(f"{PERSON_PREFIX}/api/goals", cookies=cookies)
     assert list_resp.status_code == 200
     assert [g["id"] for g in list_resp.json()] == [goal_id]
 
-    get_resp = await client.get(f"/api/goals/{goal_id}", cookies=cookies)
+    get_resp = await client.get(f"{PERSON_PREFIX}/api/goals/{goal_id}", cookies=cookies)
     assert get_resp.status_code == 200
     assert get_resp.json()["id"] == goal_id
 
-    patch_resp = await client.patch(f"/api/goals/{goal_id}", json={"target_value": 12000}, cookies=cookies)
+    patch_resp = await client.patch(f"{PERSON_PREFIX}/api/goals/{goal_id}", json={"target_value": 12000}, cookies=cookies)
     assert patch_resp.status_code == 200
     assert patch_resp.json()["target_value"] == 12000
     # target_date left untouched by the partial update.
@@ -105,38 +120,38 @@ async def test_owner_can_crud_own_goal(client):
 
 
 async def test_non_owner_gets_403(client):
-    await seed_user("alice", password="alice-pw")
-    await seed_user("bob", password="bob-pw")
+    await _seed_user_with_grant("alice", password="alice-pw")
+    await _seed_user_with_grant("bob", password="bob-pw")
     create_resp = await client.post(
-        "/api/goals",
+        f"{PERSON_PREFIX}/api/goals",
         json={"metric": "resting_hr", "target_value": 55},
         cookies=await _cookies_for("alice"),
     )
     goal_id = create_resp.json()["id"]
 
     bob_cookies = await _cookies_for("bob")
-    assert (await client.get(f"/api/goals/{goal_id}", cookies=bob_cookies)).status_code == 403
+    assert (await client.get(f"{PERSON_PREFIX}/api/goals/{goal_id}", cookies=bob_cookies)).status_code == 403
     assert (
-        await client.patch(f"/api/goals/{goal_id}", json={"target_value": 50}, cookies=bob_cookies)
+        await client.patch(f"{PERSON_PREFIX}/api/goals/{goal_id}", json={"target_value": 50}, cookies=bob_cookies)
     ).status_code == 403
     assert (await client.delete(f"/api/goals/{goal_id}", cookies=bob_cookies)).status_code == 403
     assert await _goal_count() == 1
 
 
 async def test_admin_can_override(client):
-    await seed_user("root", password="root-pw", role="admin")
-    await seed_user("bob", password="bob-pw")
+    await _seed_user_with_grant("root", password="root-pw", role="admin")
+    await _seed_user_with_grant("bob", password="bob-pw")
     create_resp = await client.post(
-        "/api/goals",
+        f"{PERSON_PREFIX}/api/goals",
         json={"metric": "resting_hr", "target_value": 55},
         cookies=await _cookies_for("bob"),
     )
     goal_id = create_resp.json()["id"]
 
     admin_cookies = await _cookies_for("root")
-    assert (await client.get(f"/api/goals/{goal_id}", cookies=admin_cookies)).status_code == 200
+    assert (await client.get(f"{PERSON_PREFIX}/api/goals/{goal_id}", cookies=admin_cookies)).status_code == 200
 
-    patch_resp = await client.patch(f"/api/goals/{goal_id}", json={"target_value": 50}, cookies=admin_cookies)
+    patch_resp = await client.patch(f"{PERSON_PREFIX}/api/goals/{goal_id}", json={"target_value": 50}, cookies=admin_cookies)
     assert patch_resp.status_code == 200
     assert patch_resp.json()["target_value"] == 50
 
@@ -150,20 +165,20 @@ async def test_unauthenticated_gets_401(client):
     # makes every request anonymous instead, which would also 401 but for
     # the wrong reason (see test_dev_mode_no_users_returns_401 below for
     # that separate, expected case).
-    await seed_user("alice", password="alice-pw")
-    assert (await client.get("/api/goals")).status_code == 401
-    assert (await client.post("/api/goals", json={"metric": "steps", "target_value": 1})).status_code == 401
-    assert (await client.get("/api/goals/1")).status_code == 401
-    assert (await client.patch("/api/goals/1", json={"target_value": 1})).status_code == 401
+    await _seed_user_with_grant("alice", password="alice-pw")
+    assert (await client.get(f"{PERSON_PREFIX}/api/goals")).status_code == 401
+    assert (await client.post(f"{PERSON_PREFIX}/api/goals", json={"metric": "steps", "target_value": 1})).status_code == 401
+    assert (await client.get(f"{PERSON_PREFIX}/api/goals/1")).status_code == 401
+    assert (await client.patch(f"{PERSON_PREFIX}/api/goals/1", json={"target_value": 1})).status_code == 401
     assert (await client.delete("/api/goals/1")).status_code == 401
 
 
 async def test_unknown_id_returns_404(client):
-    await seed_user("alice", password="alice-pw")
-    resp = await client.get("/api/goals/999999", cookies=await _cookies_for("alice"))
+    await _seed_user_with_grant("alice", password="alice-pw")
+    resp = await client.get(f"{PERSON_PREFIX}/api/goals/999999", cookies=await _cookies_for("alice"))
     assert resp.status_code == 404
     assert (
-        await client.patch("/api/goals/999999", json={"target_value": 1}, cookies=await _cookies_for("alice"))
+        await client.patch(f"{PERSON_PREFIX}/api/goals/999999", json={"target_value": 1}, cookies=await _cookies_for("alice"))
     ).status_code == 404
     assert (await client.delete("/api/goals/999999", cookies=await _cookies_for("alice"))).status_code == 404
 
@@ -174,13 +189,13 @@ async def test_dev_mode_no_users_returns_401_for_goals(client):
     # goal endpoints still 401 in this mode. Expected, documented in the PR
     # description, and pinned here so it can't silently regress.
     assert (await client.get("/health")).status_code == 200
-    assert (await client.get("/api/goals")).status_code == 401
+    assert (await client.get(f"{PERSON_PREFIX}/api/goals")).status_code == 401
 
 
 async def test_create_goal_rejects_unknown_metric(client):
-    await seed_user("alice", password="alice-pw")
+    await _seed_user_with_grant("alice", password="alice-pw")
     resp = await client.post(
-        "/api/goals",
+        f"{PERSON_PREFIX}/api/goals",
         json={"metric": "not-a-real-metric", "target_value": 1},
         cookies=await _cookies_for("alice"),
     )
@@ -189,29 +204,29 @@ async def test_create_goal_rejects_unknown_metric(client):
 
 
 async def test_patch_rejects_unknown_metric(client):
-    await seed_user("alice", password="alice-pw")
+    await _seed_user_with_grant("alice", password="alice-pw")
     cookies = await _cookies_for("alice")
-    create_resp = await client.post("/api/goals", json={"metric": "steps", "target_value": 1000}, cookies=cookies)
+    create_resp = await client.post(f"{PERSON_PREFIX}/api/goals", json={"metric": "steps", "target_value": 1000}, cookies=cookies)
     goal_id = create_resp.json()["id"]
 
-    resp = await client.patch(f"/api/goals/{goal_id}", json={"metric": "not-a-real-metric"}, cookies=cookies)
+    resp = await client.patch(f"{PERSON_PREFIX}/api/goals/{goal_id}", json={"metric": "not-a-real-metric"}, cookies=cookies)
     assert resp.status_code == 422
     # Rejected metric never landed.
-    unchanged = await client.get(f"/api/goals/{goal_id}", cookies=cookies)
+    unchanged = await client.get(f"{PERSON_PREFIX}/api/goals/{goal_id}", cookies=cookies)
     assert unchanged.json()["metric"] == "steps"
 
 
 async def test_users_only_list_their_own_goals(client):
-    await seed_user("alice", password="alice-pw")
-    await seed_user("bob", password="bob-pw")
+    await _seed_user_with_grant("alice", password="alice-pw")
+    await _seed_user_with_grant("bob", password="bob-pw")
     await client.post(
-        "/api/goals", json={"metric": "steps", "target_value": 1}, cookies=await _cookies_for("alice")
+        f"{PERSON_PREFIX}/api/goals", json={"metric": "steps", "target_value": 1}, cookies=await _cookies_for("alice")
     )
     await client.post(
-        "/api/goals", json={"metric": "resting_hr", "target_value": 2}, cookies=await _cookies_for("bob")
+        f"{PERSON_PREFIX}/api/goals", json={"metric": "resting_hr", "target_value": 2}, cookies=await _cookies_for("bob")
     )
 
-    resp = await client.get("/api/goals", cookies=await _cookies_for("alice"))
+    resp = await client.get(f"{PERSON_PREFIX}/api/goals", cookies=await _cookies_for("alice"))
     assert resp.status_code == 200
     assert [g["metric"] for g in resp.json()] == ["steps"]
 

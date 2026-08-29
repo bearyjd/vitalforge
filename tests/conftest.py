@@ -26,6 +26,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "garmin"
 PRODUCTION_SCHEMA_SQL = Path(__file__).resolve().parent / "fixtures" / "production_schema.sql"
 
+# The slug `init_db()` gives the primary person on a fresh database. It derives
+# from VITALFORGE_PRIMARY_PERSON, then the first admin's username, then this
+# literal (shared/migrations.py) -- and every test DB is created empty, before
+# any user is seeded, so it is always this one.
+PRIMARY_SLUG = "primary"
+# Prefix for every person-scoped route: Phase 2 moved /api/... to
+# /p/{slug}/api/.... Named rather than inlined so a slug change is one edit,
+# and so a test that means "the primary person" says so.
+PERSON_PREFIX = f"/p/{PRIMARY_SLUG}"
+
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 

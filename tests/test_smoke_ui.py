@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 import shared.database
+from tests.conftest import PERSON_PREFIX
 
 
 def _collect_console_errors(page):
@@ -26,7 +27,7 @@ def _collect_console_errors(page):
 def test_weight_page_loads_without_console_errors(page, weight_live_server):
     errors = _collect_console_errors(page)
 
-    page.goto(weight_live_server)
+    page.goto(f"{weight_live_server}{PERSON_PREFIX}/")
     page.wait_for_selector("#recentList li")
 
     assert "VitalForge" in page.title()
@@ -38,7 +39,7 @@ def test_weight_page_loads_without_console_errors(page, weight_live_server):
 
 @pytest.mark.playwright
 def test_weight_page_logs_an_entry(page, weight_live_server):
-    page.goto(weight_live_server)
+    page.goto(f"{weight_live_server}{PERSON_PREFIX}/")
     page.wait_for_selector("#recentList li")
 
     page.locator("#weightInput").fill("175.5")
@@ -53,7 +54,7 @@ def test_weight_page_logs_an_entry(page, weight_live_server):
 def test_dashboard_page_loads_without_console_errors(page, dashboard_live_server):
     errors = _collect_console_errors(page)
 
-    page.goto(dashboard_live_server)
+    page.goto(f"{dashboard_live_server}{PERSON_PREFIX}/")
     page.wait_for_function("document.getElementById('syncInfo').textContent !== 'Loading...'")
 
     assert "VitalForge" in page.title()
@@ -108,7 +109,7 @@ def test_correlations_drilldown_survives_a_malformed_date_with_nonzero_lag(page,
     _seed_resting_hr_and_steps_with_a_malformed_date()
 
     errors = _collect_console_errors(page)
-    page.goto(dashboard_live_server)
+    page.goto(f"{dashboard_live_server}{PERSON_PREFIX}/")
     page.wait_for_selector(".corr-cell")
 
     lag_input = page.locator(".corr-field", has_text="Lag (days)").locator("input")

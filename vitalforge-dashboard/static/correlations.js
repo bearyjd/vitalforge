@@ -1,6 +1,6 @@
 /**
  * Ad-hoc cross-metric correlation view: metric picker + hand-rolled CSS-grid
- * heatmap, backed by GET /api/correlations, plus a Chart.js scatter
+ * heatmap, backed by GET /p/<slug>/api/correlations, plus a Chart.js scatter
  * drill-down on cell click.
  *
  * Self-contained on purpose: index.html's own inline <script> already owns
@@ -12,12 +12,19 @@
  * rest of the page has loaded any data yet.
  *
  * `weight_log` is intentionally absent from this list: it's timestamp-keyed
- * (one row per log entry), not date-keyed like every table `/api/correlations`
- * can reach, and the server-side METRIC_TABLES dict this list mirrors never
- * contains it either.
+ * (one row per log entry), not date-keyed like every table the correlations
+ * endpoint can reach, and the server-side METRIC_TABLES dict this list
+ * mirrors never contains it either.
  */
 (function () {
     "use strict";
+
+    // Person-scoped API base (`/p/<slug>/api`), set by index.html's inline
+    // script -- this file is served as a static asset and never sees Jinja, so
+    // it cannot build the base itself. There is no unscoped `/api/...` route to
+    // fall back to any more, so a missing base disables the section with a
+    // visible message instead of firing requests that would 404.
+    const API_BASE = window.VF_API_BASE;
 
     const METRICS = [
         { key: "sleep_duration", label: "Sleep Duration", short: "Sleep Dur", unit: "sec" },
@@ -79,14 +86,14 @@
             lag: String(lag),
             min_pairs: String(minPairs),
         });
-        const res = await fetch(`/api/correlations?${params.toString()}`);
+        const res = await fetch(`${API_BASE}/correlations?${params.toString()}`);
         if (!res.ok) throw new Error(`correlations request failed: ${res.status}`);
         return res.json();
     }
 
     async function fetchMetricSeries(name, days) {
         try {
-            const res = await fetch(`/api/metrics/${name}?days=${days}`);
+            const res = await fetch(`${API_BASE}/metrics/${name}?days=${days}`);
             if (!res.ok) return [];
             const json = await res.json();
             return json.data || [];
@@ -342,6 +349,18 @@
     function init() {
         const section = document.getElementById("correlationsSection");
         if (!section) return;
+
+        if (!API_BASE) {
+            console.error(
+                "correlations.js: window.VF_API_BASE is not set. The page template must " +
+                "define it (e.g. \"/p/<slug>/api\") before loading this script."
+            );
+            const failed = document.createElement("div");
+            failed.className = "corr-empty";
+            failed.textContent = "Correlations unavailable: the API base URL is not configured.";
+            section.appendChild(failed);
+            return;
+        }
 
         const heading = document.createElement("h2");
         heading.textContent = "Correlations";

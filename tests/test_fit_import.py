@@ -13,6 +13,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from shared.database import get_db
+from tests.conftest import PERSON_PREFIX
 from tests.fixtures.fit_builder import (
     build_fit_file_with_non_numeric_calories,
     build_minimal_fit_file,
@@ -53,7 +54,7 @@ async def test_valid_fit_upload_happy_path(client):
     data = make_fit_bytes()
 
     resp = await client.post(
-        "/api/import/activity",
+        f"{PERSON_PREFIX}/api/import/activity",
         files={"file": ("morning_run.fit", data, "application/octet-stream")},
     )
 
@@ -71,7 +72,7 @@ async def test_valid_fit_upload_happy_path(client):
     assert "duplicate" not in body
     assert await activity_count() == 1
 
-    detail = await client.get(f"/api/activities/{body['id']}")
+    detail = await client.get(f"{PERSON_PREFIX}/api/activities/{body['id']}")
     assert detail.status_code == 200
     assert detail.json()["raw_summary"]["total_calories"] == 400
 
@@ -79,10 +80,10 @@ async def test_valid_fit_upload_happy_path(client):
 async def test_duplicate_file_hash_rejected_gracefully(client):
     data = make_fit_bytes()
 
-    first = await client.post("/api/import/activity", files={"file": ("run.fit", data)})
+    first = await client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("run.fit", data)})
     assert first.status_code == 200
 
-    second = await client.post("/api/import/activity", files={"file": ("run-copy.fit", data)})
+    second = await client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("run-copy.fit", data)})
 
     assert second.status_code == 200
     body = second.json()
@@ -100,10 +101,10 @@ async def test_near_duplicate_different_bytes_same_activity_rejected(client):
     second_data = make_fit_bytes(calories=401)  # 1 byte different -> different hash
     assert first_data != second_data
 
-    first = await client.post("/api/import/activity", files={"file": ("a.fit", first_data)})
+    first = await client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("a.fit", first_data)})
     assert first.status_code == 200
 
-    second = await client.post("/api/import/activity", files={"file": ("b.fit", second_data)})
+    second = await client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("b.fit", second_data)})
 
     assert second.status_code == 200
     body = second.json()
@@ -116,8 +117,8 @@ async def test_distinct_activities_both_stored(client):
     first_data = make_fit_bytes(start_time=datetime(2026, 8, 20, 7, 30, tzinfo=timezone.utc))
     second_data = make_fit_bytes(start_time=datetime(2026, 8, 21, 7, 30, tzinfo=timezone.utc))
 
-    first = await client.post("/api/import/activity", files={"file": ("a.fit", first_data)})
-    second = await client.post("/api/import/activity", files={"file": ("b.fit", second_data)})
+    first = await client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("a.fit", first_data)})
+    second = await client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("b.fit", second_data)})
 
     assert first.status_code == 200
     assert second.status_code == 200
@@ -132,8 +133,8 @@ async def test_two_concurrent_identical_uploads_store_one_row(client):
     data = make_fit_bytes()
 
     results = await asyncio.gather(
-        client.post("/api/import/activity", files={"file": ("run.fit", data)}),
-        client.post("/api/import/activity", files={"file": ("run.fit", data)}),
+        client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("run.fit", data)}),
+        client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("run.fit", data)}),
     )
 
     assert all(r.status_code == 200 for r in results)
@@ -151,8 +152,8 @@ async def test_two_concurrent_distinct_uploads_both_stored(client):
     second_data = make_fit_bytes(start_time=datetime(2026, 8, 22, 7, 30, tzinfo=timezone.utc))
 
     results = await asyncio.gather(
-        client.post("/api/import/activity", files={"file": ("a.fit", first_data)}),
-        client.post("/api/import/activity", files={"file": ("b.fit", second_data)}),
+        client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("a.fit", first_data)}),
+        client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("b.fit", second_data)}),
     )
 
     assert all(r.status_code == 200 for r in results)
@@ -161,7 +162,7 @@ async def test_two_concurrent_distinct_uploads_both_stored(client):
 
 async def test_non_fit_file_rejected(client):
     resp = await client.post(
-        "/api/import/activity",
+        f"{PERSON_PREFIX}/api/import/activity",
         files={"file": ("not_a_fit_file.fit", b"this is definitely not a FIT file" * 10)},
     )
 
@@ -173,7 +174,7 @@ async def test_non_fit_file_with_fit_extension_and_content_type_still_rejected(c
     """Extension and Content-Type are attacker-controlled -- only the actual
     magic bytes are trusted."""
     resp = await client.post(
-        "/api/import/activity",
+        f"{PERSON_PREFIX}/api/import/activity",
         files={"file": ("totally_legit.fit", b"\x00" * 200, "application/vnd.ant.fit")},
     )
 
@@ -187,7 +188,7 @@ async def test_truncated_fit_file_rejected_not_500(client):
     data = make_fit_bytes()
     truncated = data[:20]
 
-    resp = await client.post("/api/import/activity", files={"file": ("run.fit", truncated)})
+    resp = await client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("run.fit", truncated)})
 
     assert resp.status_code == 400
     assert await activity_count() == 0
@@ -204,7 +205,7 @@ async def test_malformed_session_field_rejected_not_500(client):
         start_time=datetime(2026, 8, 20, 7, 30, tzinfo=timezone.utc)
     )
 
-    resp = await client.post("/api/import/activity", files={"file": ("run.fit", data)})
+    resp = await client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("run.fit", data)})
 
     assert resp.status_code == 400
     assert await activity_count() == 0
@@ -214,7 +215,7 @@ async def test_oversized_file_rejected(client, dashboard_app_module, monkeypatch
     monkeypatch.setattr(dashboard_app_module.fit_import, "MAX_UPLOAD_BYTES", 100)
     oversized = make_fit_bytes() + b"\x00" * 500
 
-    resp = await client.post("/api/import/activity", files={"file": ("run.fit", oversized)})
+    resp = await client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("run.fit", oversized)})
 
     assert resp.status_code == 413
     assert await activity_count() == 0
@@ -222,20 +223,20 @@ async def test_oversized_file_rejected(client, dashboard_app_module, monkeypatch
 
 async def test_list_and_get_activities(client):
     data = make_fit_bytes()
-    created = (await client.post("/api/import/activity", files={"file": ("run.fit", data)})).json()
+    created = (await client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("run.fit", data)})).json()
 
-    listing = await client.get("/api/activities")
+    listing = await client.get(f"{PERSON_PREFIX}/api/activities")
     assert listing.status_code == 200
     body = listing.json()
     assert body["count"] == 1
     assert body["activities"][0]["id"] == created["id"]
     assert "raw_summary" not in body["activities"][0]
 
-    detail = await client.get(f"/api/activities/{created['id']}")
+    detail = await client.get(f"{PERSON_PREFIX}/api/activities/{created['id']}")
     assert detail.status_code == 200
     assert detail.json()["file_sha256"] == created["file_sha256"]
 
-    missing = await client.get("/api/activities/999999")
+    missing = await client.get(f"{PERSON_PREFIX}/api/activities/999999")
     assert missing.status_code == 404
 
 
@@ -247,7 +248,7 @@ async def test_activity_routes_exclude_other_persons_rows(client):
     from shared.database import get_primary_person_id
 
     data = make_fit_bytes()
-    mine = await client.post("/api/import/activity", files={"file": ("mine.fit", data)})
+    mine = await client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("mine.fit", data)})
     assert mine.status_code == 200
     my_id = mine.json()["id"]
 
@@ -273,13 +274,13 @@ async def test_activity_routes_exclude_other_persons_rows(client):
 
     assert await activity_count() == 2, "fixture did not actually seed a second person's activity"
 
-    listed = await client.get("/api/activities")
+    listed = await client.get(f"{PERSON_PREFIX}/api/activities")
     assert listed.status_code == 200
     ids = [a["id"] for a in listed.json()["activities"]]
     assert ids == [my_id], "/api/activities leaked another person's rows"
     assert listed.json()["count"] == 1
 
-    detail = await client.get(f"/api/activities/{other_id}")
+    detail = await client.get(f"{PERSON_PREFIX}/api/activities/{other_id}")
     assert detail.status_code == 404, "/api/activities/{id} is an IDOR onto another person's activity"
 
 
@@ -290,11 +291,11 @@ async def test_same_file_imported_by_two_persons_is_not_a_duplicate(client):
     from shared.database import get_primary_person_id
 
     data = make_fit_bytes()
-    first = await client.post("/api/import/activity", files={"file": ("run.fit", data)})
+    first = await client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("run.fit", data)})
     assert first.status_code == 200
     assert "duplicate" not in first.json()
 
-    second = await client.post("/api/import/activity", files={"file": ("run.fit", data)})
+    second = await client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("run.fit", data)})
     assert second.json().get("duplicate_reason") == "exact_duplicate"
     assert await activity_count() == 1
 

@@ -24,6 +24,7 @@ from httpx import ASGITransport, AsyncClient
 
 from shared import database
 from shared.database import get_db, get_primary_person_id
+from tests.conftest import PERSON_PREFIX
 
 
 @pytest.fixture
@@ -60,8 +61,8 @@ async def row_count() -> int:
 
 async def test_two_concurrent_identical_posts_store_one_row(client):
     results = await asyncio.gather(
-        client.post("/api/weight", json={"weight": 185.4, "unit": "lbs"}),
-        client.post("/api/weight", json={"weight": 185.4, "unit": "lbs"}),
+        client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 185.4, "unit": "lbs"}),
+        client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 185.4, "unit": "lbs"}),
     )
     assert all(r.status_code == 200 for r in results)
     assert await row_count() == 1
@@ -69,16 +70,16 @@ async def test_two_concurrent_identical_posts_store_one_row(client):
 
 async def test_two_concurrent_identical_posts_push_to_garmin_once(client, fake_garmin_client):
     await asyncio.gather(
-        client.post("/api/weight", json={"weight": 185.4, "unit": "lbs"}),
-        client.post("/api/weight", json={"weight": 185.4, "unit": "lbs"}),
+        client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 185.4, "unit": "lbs"}),
+        client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 185.4, "unit": "lbs"}),
     )
     assert len(fake_garmin_client.pushed_weights) == 1
 
 
 async def test_two_concurrent_distinct_posts_both_stored(client):
     results = await asyncio.gather(
-        client.post("/api/weight", json={"weight": 150.0, "unit": "lbs"}),
-        client.post("/api/weight", json={"weight": 200.0, "unit": "lbs"}),
+        client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 150.0, "unit": "lbs"}),
+        client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 200.0, "unit": "lbs"}),
     )
     assert all(r.status_code == 200 for r in results)
     assert await row_count() == 2
@@ -92,8 +93,8 @@ async def test_two_concurrent_enrichment_posts_update_once_and_push_once(client,
     await seed_row(84096, seconds_ago=5)
 
     results = await asyncio.gather(
-        client.post("/api/weight", json={"weight": 185.4, "unit": "lbs", "body_fat_pct": 18.4}),
-        client.post("/api/weight", json={"weight": 185.4, "unit": "lbs", "body_fat_pct": 18.4}),
+        client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 185.4, "unit": "lbs", "body_fat_pct": 18.4}),
+        client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 185.4, "unit": "lbs", "body_fat_pct": 18.4}),
     )
     assert all(r.status_code == 200 for r in results)
     assert len(fake_garmin_client.pushed_weights) == 1
@@ -142,7 +143,7 @@ async def test_concurrent_writer_not_blocked_by_garmin_push(client, weight_app_m
     writer_thread = threading.Thread(target=concurrent_writer)
     writer_thread.start()
 
-    resp = await client.post("/api/weight", json={"weight": 180.0, "unit": "lbs"})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 180.0, "unit": "lbs"})
     assert resp.status_code == 200
 
     writer_thread.join(timeout=5)
@@ -190,7 +191,7 @@ async def test_concurrent_writer_not_blocked_by_enrichment_push(client, weight_a
     writer_thread = threading.Thread(target=concurrent_writer)
     writer_thread.start()
 
-    resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs", "body_fat_pct": 18.4})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 185.4, "unit": "lbs", "body_fat_pct": 18.4})
     assert resp.status_code == 200
     assert resp.json()["enriched"] is True
 

@@ -290,6 +290,169 @@ async def require_account_identity(request: Request) -> Identity:
 _require_account_identity = require_account_identity
 
 
+# Public alias for _get_current_identity, for callers that must handle "no
+# identity" themselves rather than have it raised at them.
+#
+# require_account_identity is the wrong tool for a landing page: it 401s the
+# open-access anonymous sentinel (user_id is None), and open access on a fresh
+# volume is this project's primary development path. Both services' GET /
+# routes need the sentinel, and during the Phase 2 sweep both independently
+# imported the private name to get it -- two private imports for the same
+# reason is a missing public accessor, not two mistakes.
+#
+# Returns None when auth is configured and the caller presented nothing
+# valid; returns _Identity("anonymous", None, None, None) when the users
+# table is empty. Callers must distinguish those two cases themselves, which
+# is precisely why this is separate from require_account_identity.
+get_current_identity = _get_current_identity
+
+
+# --- person-scoped access control (multi-tenancy Phase 2) ---------------------
+
+# view < manage < own. Compared by rank, so a route asking for "view" is
+# satisfied by any higher level.
+_ACCESS_ORDER = {"view": 0, "manage": 1, "own": 2}
+
+
+async def _identity_and_grant(
+    request: Request, slug: str
+) -> tuple[_Identity | None, str | None, int | None]:
+    """Resolve the caller AND their grant on `slug` in ONE query.
+
+    One statement, not two, and bound to the identity that was just
+    established: a two-query version (resolve person, then look up the grant)
+    leaves a window in which a grant revoked between the two still authorizes
+    the request.
+
+    `archived_at IS NULL` is in the query, not in the caller: an archived
+    person is unreachable through this dependency by construction. Admin
+    routes that must reach archived persons use _require_admin and address by
+    id instead.
+
+    LEFT JOIN, so "the slug exists but you have no grant" and "you have a
+    grant" are distinguishable here -- both collapse to the same 404 in
+    require_person, but only after the anonymous and admin branches have had a
+    chance to look at them.
+
+    `slug` is NOT validated against SLUG_RE first, deliberately. It is
+    parameterized so there is no injection surface, and rejecting a malformed
+    slug with a 422 would create a THIRD observable -- malformed vs
+    exists-but-not-yours vs yours -- reintroducing a smaller version of the
+    leak the 404-not-403 rule exists to close. An unvalidated slug simply
+    matches no row and 404s like everything else. SLUG_RE governs creation,
+    which is where the check belongs.
+
+    This opens its own connection, so a person-scoped request costs three in
+    total (this, _get_current_identity's, and the route's own). That is the
+    documented per-operation convention this codebase uses everywhere rather
+    than an oversight -- see CLAUDE.md. SQLite connections are process-local
+    and cheap; if it ever matters, the fix is threading one connection through
+    the request, which is a change to the whole codebase's pattern and not to
+    this function.
+    """
+    identity = await _get_current_identity(request)
+    if identity is None:
+        return None, None, None
+    db = await get_db()
+    try:
+        row = await (
+            await db.execute(
+                "SELECT p.id AS person_id, g.access AS access "
+                "FROM persons p "
+                "LEFT JOIN person_grants g "
+                "  ON g.person_id = p.id AND g.user_id = ? "
+                "WHERE p.slug = ? AND p.archived_at IS NULL",
+                (identity.user_id, slug),
+            )
+        ).fetchone()
+    finally:
+        await db.close()
+    if row is None:
+        return identity, None, None
+    return identity, row["access"], row["person_id"]
+
+
+def require_person(level: str):
+    """FastAPI dependency factory: authorize the caller for `slug` at `level`
+    and return that person's id.
+
+    This is the ONLY way a request path may obtain a person_id. There is
+    deliberately no module-level helper that returns one without authorizing,
+    because such a helper is the thing that gets called by mistake --
+    get_primary_person_id() was exactly that during Phase 1 and is retired
+    from request paths here. It survives only in startup bootstrap
+    (ensure_primary_person_grant) and in scheduled_sync, which has no request
+    to authorize; Phase 4's round-robin replaces the latter.
+
+    404, NEVER 403, for a missing grant. A 403 would confirm the person
+    exists, which leaks household membership to anyone who can guess a name.
+    "No such slug" and "no grant" return the same 404 on purpose. The one
+    deliberate exception in this design is the ingest token/slug mismatch,
+    which IS a 403 -- there the caller demonstrably holds a valid token, so
+    saying no leaks nothing.
+
+    The anonymous check precedes the admin check DEFENSIVELY, not because the
+    two orders differ today. Verified by mutation: swapping them changes no
+    test, because _get_current_identity returns
+    _Identity("anonymous", None, None, None) in open-access mode and
+    `None == "admin"` is False, so the admin branch falls through either way.
+
+    The ordering becomes load-bearing the moment that stops being true -- if
+    the anonymous sentinel ever gains a role, or the admin branch widens to
+    something like `role != "user"`. Since no behavioural test can tell the
+    two orders apart while role is None, the invariant is pinned directly
+    instead: see test_anonymous_sentinel_has_no_role in
+    tests/test_require_person.py, which fails if the sentinel gains one and
+    points the reader back here.
+    """
+    if level not in _ACCESS_ORDER:
+        raise ValueError(f"unknown access level {level!r}; expected one of {sorted(_ACCESS_ORDER)}")
+
+    async def dependency(request: Request, slug: str) -> int:
+        # FastAPI binds `slug` from the QUERY STRING when the route's path has
+        # no {slug} placeholder -- silently, and it documents it as
+        # `in: query`. Verified: GET /api/x?slug=primary returns 200 through a
+        # dependency that was meant to be reachable only under /p/{slug}/.
+        # That would make ?slug= a second way to address a person, which is
+        # precisely the implicit-fallback path this phase exists to delete.
+        # Path params are the only accepted source; anything else is a wiring
+        # mistake in this repo, not a client error, so it raises rather than
+        # returning a status code.
+        if "slug" not in request.scope.get("path_params", {}):
+            raise RuntimeError(
+                "require_person() is mounted on a route whose path has no {slug} parameter; "
+                f"FastAPI bound slug={slug!r} from the query string instead. Person "
+                "addressing is by path segment only -- mount the route under /p/{slug}/."
+            )
+        identity, granted, person_id = await _identity_and_grant(request, slug)
+        if identity is None:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        if person_id is None:
+            # No such active slug. Same answer as "no grant", deliberately.
+            raise HTTPException(status_code=404, detail="Person not found")
+        if identity.user_id is None:
+            # Open-access mode: anonymous holds implicit `own` on everyone.
+            # `granted` is always None here and is not consulted.
+            return person_id
+        if identity.role == "admin":
+            # Matches the admin bypass every /auth/admin/* route already uses.
+            # One superuser story, not two.
+            return person_id
+        # .get(granted, -1), not [granted]: an access value outside the three
+        # would otherwise KeyError into a 500, and a 500 is a DIFFERENT
+        # observable from a 404 -- it confirms the person exists, which is the
+        # exact leak the 404 convention is here to prevent. -1 sorts below
+        # every real level, so an unrecognised grant denies. The CHECK
+        # constraint on person_grants.access makes this unreachable today;
+        # constraints get relaxed by future table rebuilds, and this costs
+        # nothing.
+        if granted is None or _ACCESS_ORDER.get(granted, -1) < _ACCESS_ORDER[level]:
+            raise HTTPException(status_code=404, detail="Person not found")
+        return person_id
+
+    return dependency
+
+
 async def _require_step_up(identity: _Identity, current_password: str):
     verified = await _authenticate_credentials(identity.username, current_password)
     if verified is None or verified[0] != identity.user_id:

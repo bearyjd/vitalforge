@@ -12,6 +12,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from shared.database import get_db, get_primary_person_id
+from tests.conftest import PERSON_PREFIX
 
 # `vitalforge-dashboard` is a hyphenated directory name, so `correlations.py`
 # is loaded via `importlib.import_module` (same mechanism `conftest.py`'s
@@ -142,7 +143,7 @@ async def test_correlations_perfect_positive(client):
     await seed_metric("steps", "value", list(zip(dates, values)))
     await seed_metric("active_calories", "value", list(zip(dates, values)))
 
-    resp = await client.get("/api/correlations?metrics=steps,active_calories")
+    resp = await client.get(f"{PERSON_PREFIX}/api/correlations?metrics=steps,active_calories")
     assert resp.status_code == 200
     body = resp.json()
 
@@ -165,7 +166,7 @@ async def test_correlations_perfect_negative(client):
     await seed_metric("resting_hr", "value", list(zip(dates, values_a)))
     await seed_metric("stress", "avg_level", list(zip(dates, values_b)))
 
-    resp = await client.get("/api/correlations?metrics=resting_hr,stress")
+    resp = await client.get(f"{PERSON_PREFIX}/api/correlations?metrics=resting_hr,stress")
     assert resp.status_code == 200
     cell = resp.json()["cells"][0][1]
     assert cell["n"] == 10
@@ -179,7 +180,7 @@ async def test_correlations_insufficient_pairs_returns_null(client):
     await seed_metric("resting_hr", "value", list(zip(dates, values_a)))
     await seed_metric("hrv", "last_night_avg", list(zip(dates, values_b)))
 
-    resp = await client.get("/api/correlations?metrics=resting_hr,hrv&min_pairs=5")
+    resp = await client.get(f"{PERSON_PREFIX}/api/correlations?metrics=resting_hr,hrv&min_pairs=5")
     assert resp.status_code == 200
     cell = resp.json()["cells"][0][1]
     # Real (anti-correlated) variance in the data -- nulled purely for
@@ -195,7 +196,7 @@ async def test_correlations_zero_variance_returns_null(client):
     await seed_metric("resting_hr", "value", list(zip(dates, constant)))
     await seed_metric("hrv", "last_night_avg", list(zip(dates, varying)))
 
-    resp = await client.get("/api/correlations?metrics=resting_hr,hrv")
+    resp = await client.get(f"{PERSON_PREFIX}/api/correlations?metrics=resting_hr,hrv")
     assert resp.status_code == 200
     cell = resp.json()["cells"][0][1]
     assert cell["n"] == 10
@@ -218,7 +219,7 @@ async def test_correlations_lag_produces_asymmetric_matrix(client):
     await seed_metric("steps", "value", list(zip(dates_a, values)))
     await seed_metric("active_calories", "value", list(zip(dates_b, values)))
 
-    resp = await client.get("/api/correlations?metrics=steps,active_calories&lag=1&min_pairs=2")
+    resp = await client.get(f"{PERSON_PREFIX}/api/correlations?metrics=steps,active_calories&lag=1&min_pairs=2")
     assert resp.status_code == 200
     cells = resp.json()["cells"]
 
@@ -242,7 +243,7 @@ async def test_correlations_lag_zero_matrix_is_symmetric_in_n(client):
     await seed_metric("steps", "value", list(zip(dates_a, values)))
     await seed_metric("active_calories", "value", list(zip(dates_b, values)))
 
-    resp = await client.get("/api/correlations?metrics=steps,active_calories&lag=0&min_pairs=2")
+    resp = await client.get(f"{PERSON_PREFIX}/api/correlations?metrics=steps,active_calories&lag=0&min_pairs=2")
     cells = resp.json()["cells"]
     assert cells[0][1]["n"] == cells[1][0]["n"] == 5
 
@@ -259,7 +260,7 @@ async def test_correlations_malformed_date_returns_200_and_excludes_row(client):
     await seed_metric("weight_history", "weight_grams", [("not-a-date", 999.0)])
     await seed_metric("steps", "value", list(zip(dates, values)))
 
-    resp = await client.get("/api/correlations?metrics=weight,steps&lag=1&min_pairs=2")
+    resp = await client.get(f"{PERSON_PREFIX}/api/correlations?metrics=weight,steps&lag=1&min_pairs=2")
     assert resp.status_code == 200
     cell = resp.json()["cells"][0][1]
     # The malformed row is excluded from alignment, not counted or crashed on.
@@ -273,7 +274,7 @@ async def test_correlations_cell_reason_field_present(client):
     await seed_metric("resting_hr", "value", list(zip(dates, constant)))
     await seed_metric("hrv", "last_night_avg", list(zip(dates, varying)))
 
-    resp = await client.get("/api/correlations?metrics=resting_hr,hrv")
+    resp = await client.get(f"{PERSON_PREFIX}/api/correlations?metrics=resting_hr,hrv")
     assert resp.status_code == 200
     cell = resp.json()["cells"][0][1]
     assert cell["r"] is None
@@ -287,7 +288,7 @@ async def test_correlations_cell_reason_field_present(client):
 
 
 async def test_correlations_unknown_metric_returns_400(client):
-    resp = await client.get("/api/correlations?metrics=not_a_real_metric,steps")
+    resp = await client.get(f"{PERSON_PREFIX}/api/correlations?metrics=not_a_real_metric,steps")
     assert resp.status_code == 400
 
 
@@ -295,12 +296,12 @@ async def test_correlations_weight_log_not_reachable(client):
     """weight_log is timestamp-keyed and deliberately excluded from v1 by
     never being in METRIC_TABLES -- it must be rejected exactly like any
     other unknown metric name, not silently accepted."""
-    resp = await client.get("/api/correlations?metrics=weight_log")
+    resp = await client.get(f"{PERSON_PREFIX}/api/correlations?metrics=weight_log")
     assert resp.status_code == 400
 
 
 async def test_correlations_missing_metrics_param_returns_422(client):
-    resp = await client.get("/api/correlations")
+    resp = await client.get(f"{PERSON_PREFIX}/api/correlations")
     assert resp.status_code == 422
 
 
@@ -320,6 +321,6 @@ async def test_correlations_single_db_connection_per_request(client, dashboard_a
 
     monkeypatch.setattr(dashboard_app_module, "get_db", counting_get_db)
 
-    resp = await client.get("/api/correlations?metrics=steps,active_calories,resting_hr")
+    resp = await client.get(f"{PERSON_PREFIX}/api/correlations?metrics=steps,active_calories,resting_hr")
     assert resp.status_code == 200
     assert call_count == 1

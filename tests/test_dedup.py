@@ -14,6 +14,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from shared.database import get_db, get_primary_person_id
+from tests.conftest import PERSON_PREFIX
 
 
 @pytest.fixture
@@ -94,7 +95,7 @@ async def seed_row_raw_timestamp(weight_grams: int, timestamp: str) -> int:
 
 async def test_duplicate_within_window_returns_deduplicated_true(client):
     row_id, ts = await seed_row(84096, seconds_ago=5)
-    resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs"})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 185.4, "unit": "lbs"})
     assert resp.status_code == 200
     body = resp.json()
     assert body["deduplicated"] is True
@@ -103,14 +104,14 @@ async def test_duplicate_within_window_returns_deduplicated_true(client):
 
 async def test_duplicate_not_pushed_to_garmin_twice(client, fake_garmin_client):
     await seed_row(84096, seconds_ago=5)
-    resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs"})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 185.4, "unit": "lbs"})
     assert resp.status_code == 200
     assert len(fake_garmin_client.pushed_weights) == 0
 
 
 async def test_dedup_response_returns_original_row_id_and_timestamp(client):
     row_id, ts = await seed_row(84096, seconds_ago=5)
-    resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs"})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 185.4, "unit": "lbs"})
     body = resp.json()
     assert body["id"] == row_id
     assert body["timestamp"] == ts
@@ -118,19 +119,19 @@ async def test_dedup_response_returns_original_row_id_and_timestamp(client):
 
 async def test_dedup_tolerance_49g_collapses(client):
     await seed_row(84096, seconds_ago=5)
-    resp = await client.post("/api/weight", json={"weight": (84096 + 49) / 1000, "unit": "kg"})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": (84096 + 49) / 1000, "unit": "kg"})
     assert resp.json()["deduplicated"] is True
 
 
 async def test_dedup_tolerance_exactly_50g_collapses(client):
     await seed_row(84096, seconds_ago=5)
-    resp = await client.post("/api/weight", json={"weight": (84096 + 50) / 1000, "unit": "kg"})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": (84096 + 50) / 1000, "unit": "kg"})
     assert resp.json()["deduplicated"] is True
 
 
 async def test_dedup_tolerance_51g_creates_second_row(client):
     await seed_row(84096, seconds_ago=5)
-    resp = await client.post("/api/weight", json={"weight": (84096 + 51) / 1000, "unit": "kg"})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": (84096 + 51) / 1000, "unit": "kg"})
     body = resp.json()
     assert "deduplicated" not in body or body["deduplicated"] is not True
     assert await row_count() == 2
@@ -138,7 +139,7 @@ async def test_dedup_tolerance_51g_creates_second_row(client):
 
 async def test_dedup_ignores_source(client):
     row_id, _ = await seed_row(84096, seconds_ago=5, source="tasker")
-    resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs", "source": "bascule"})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 185.4, "unit": "lbs", "source": "bascule"})
     body = resp.json()
     assert body["deduplicated"] is True
     assert body["id"] == row_id
@@ -146,7 +147,7 @@ async def test_dedup_ignores_source(client):
 
 async def test_weighins_600s_apart_both_stored(client):
     await seed_row(84096, seconds_ago=600)
-    resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs"})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 185.4, "unit": "lbs"})
     body = resp.json()
     assert "deduplicated" not in body or body["deduplicated"] is not True
     assert body["success"] is True
@@ -157,13 +158,13 @@ async def test_dedup_window_58s_collapses(client):
     """A few seconds of margin inside the 60s edge, since real wall-clock
     time elapses between seeding and the POST landing."""
     await seed_row(84096, seconds_ago=58)
-    resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs"})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 185.4, "unit": "lbs"})
     assert resp.json()["deduplicated"] is True
 
 
 async def test_dedup_window_62s_does_not_collapse(client):
     await seed_row(84096, seconds_ago=62)
-    resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs"})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 185.4, "unit": "lbs"})
     body = resp.json()
     assert "deduplicated" not in body or body["deduplicated"] is not True
     assert await row_count() == 2
@@ -174,7 +175,7 @@ async def test_future_dated_row_does_not_swallow_real_weighin(client):
     future (e.g. from clock skew) must not match every later request and
     silently discard real weigh-ins forever."""
     await seed_row(84096, seconds_ago=-3600)  # one hour in the future
-    resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs"})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 185.4, "unit": "lbs"})
     assert resp.status_code == 200
     body = resp.json()
     assert "deduplicated" not in body or body["deduplicated"] is not True
@@ -188,7 +189,7 @@ async def test_malformed_timestamp_row_does_not_error_the_dedup_query(client):
     an unparseable string returns NULL, and NULL comparisons are false in
     SQL, so the row is silently excluded from matching -- not a crash."""
     await seed_row_raw_timestamp(84096, "not-a-real-timestamp")
-    resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs"})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 185.4, "unit": "lbs"})
     assert resp.status_code == 200
     body = resp.json()
     assert "deduplicated" not in body or body["deduplicated"] is not True
@@ -198,7 +199,7 @@ async def test_malformed_timestamp_row_does_not_error_the_dedup_query(client):
 async def test_enrichment_updates_null_columns_and_repushes(client, fake_garmin_client):
     row_id, ts = await seed_row(84096, seconds_ago=5, synced_to_garmin=1)
     resp = await client.post(
-        "/api/weight",
+        f"{PERSON_PREFIX}/api/weight",
         json={"weight": 185.4, "unit": "lbs", "body_fat_pct": 18.4, "bone_mass_kg": 3.2},
     )
     assert resp.status_code == 200
@@ -215,7 +216,7 @@ async def test_enrichment_uses_original_timestamp(client, fake_garmin_client):
     string -- that string-formatting is push_weight's own job, already
     covered by test_garmin_mapping.py."""
     row_id, ts = await seed_row(84096, seconds_ago=5)
-    await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs", "body_fat_pct": 18.4})
+    await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 185.4, "unit": "lbs", "body_fat_pct": 18.4})
     pushed_ts = fake_garmin_client.pushed_weights[-1]["timestamp"]
     assert pushed_ts == datetime.fromisoformat(ts)
 
@@ -228,7 +229,7 @@ async def test_enrichment_push_failure_sets_synced_to_garmin_zero(client, weight
 
     monkeypatch.setattr(weight_app_module, "push_weight", failing_push)
 
-    resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs", "body_fat_pct": 18.4})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 185.4, "unit": "lbs", "body_fat_pct": 18.4})
     body = resp.json()
     assert body["enriched"] is True
     assert body["synced_to_garmin"] is False
@@ -248,7 +249,7 @@ async def test_source_only_enrichment_does_not_repush_to_garmin(client, fake_gar
     change should trigger a re-push or touch the flag; `source` alone must
     not."""
     row_id, ts = await seed_row(84096, seconds_ago=5, body_fat_pct=18.4, bone_mass_kg=3.2, synced_to_garmin=1)
-    resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs", "source": "bascule"})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 185.4, "unit": "lbs", "source": "bascule"})
     body = resp.json()
     assert body["enriched"] is True  # source itself is still recorded
     assert body["synced_to_garmin"] is True  # untouched, not silently flipped
@@ -271,7 +272,7 @@ async def test_source_only_enrichment_does_not_fabricate_synced_true(client, fak
     fabricate a `true` flag in the other direction either -- it stays
     whatever it already was."""
     row_id, ts = await seed_row(84096, seconds_ago=5, body_fat_pct=18.4, synced_to_garmin=0)
-    resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs", "source": "bascule"})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 185.4, "unit": "lbs", "source": "bascule"})
     body = resp.json()
     assert body["enriched"] is True
     assert body["synced_to_garmin"] is False
@@ -297,7 +298,7 @@ async def test_pure_source_conflict_with_no_composition_change_does_not_repush(c
     must not touch synced_to_garmin -- there is nothing here for the
     composition_changed gate to even see."""
     row_id, ts = await seed_row(84096, seconds_ago=5, source="tasker", synced_to_garmin=1)
-    resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs", "source": "bascule"})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 185.4, "unit": "lbs", "source": "bascule"})
     body = resp.json()
     assert body["conflict"] is True
     assert body["conflict_fields"] == ["source"]
@@ -319,7 +320,7 @@ async def test_pure_source_conflict_with_no_composition_change_does_not_repush(c
 async def test_conflicting_value_does_not_overwrite_and_flags_conflict(client, fake_garmin_client, caplog):
     row_id, ts = await seed_row(84096, seconds_ago=5, body_fat_pct=18.4)
     with caplog.at_level(logging.WARNING):
-        resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs", "body_fat_pct": 20.0})
+        resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 185.4, "unit": "lbs", "body_fat_pct": 20.0})
     assert resp.status_code == 200
     body = resp.json()
     assert body["deduplicated"] is True
@@ -342,7 +343,7 @@ async def test_enrichment_with_partial_conflict_updates_only_null_columns(client
     gets enriched; the re-push carries the final (post-merge) row."""
     row_id, ts = await seed_row(84096, seconds_ago=5, body_fat_pct=18.4, bone_mass_kg=None)
     resp = await client.post(
-        "/api/weight",
+        f"{PERSON_PREFIX}/api/weight",
         json={"weight": 185.4, "unit": "lbs", "body_fat_pct": 20.0, "bone_mass_kg": 3.2},
     )
     assert resp.status_code == 200
@@ -373,7 +374,7 @@ async def test_conflict_response_names_the_conflicting_fields(client, fake_garmi
     without grepping server logs it likely can't see."""
     await seed_row(84096, seconds_ago=5, body_fat_pct=18.4, muscle_pct=40.0)
     resp = await client.post(
-        "/api/weight",
+        f"{PERSON_PREFIX}/api/weight",
         json={"weight": 185.4, "unit": "lbs", "body_fat_pct": 20.0, "muscle_pct": 41.0, "bone_mass_kg": 3.2},
     )
     body = resp.json()
@@ -386,7 +387,7 @@ async def test_dedup_enrichment_fills_in_missing_source(client):
     `source` used to stay `source: NULL` forever, even once a later request
     on the same weigh-in supplied one."""
     row_id, ts = await seed_row(84096, seconds_ago=5)
-    resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs", "source": "bascule"})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 185.4, "unit": "lbs", "source": "bascule"})
     assert resp.status_code == 200
     assert resp.json()["enriched"] is True
 
@@ -408,7 +409,7 @@ async def test_dedup_enrichment_conflicting_source_kept_not_overwritten(client):
     visible conflict, not a silent overwrite in either direction."""
     row_id, ts = await seed_row(84096, seconds_ago=5, source="tasker")
     resp = await client.post(
-        "/api/weight",
+        f"{PERSON_PREFIX}/api/weight",
         json={"weight": 185.4, "unit": "lbs", "source": "bascule", "body_fat_pct": 18.4},
     )
     body = resp.json()
@@ -445,7 +446,7 @@ async def test_unparseable_stored_timestamp_still_persists_sync_failure(client, 
     finally:
         await db.close()
     row_id = await seed_row_raw_timestamp(84096, str(julian_now))
-    resp = await client.post("/api/weight", json={"weight": 185.4, "unit": "lbs", "body_fat_pct": 18.4})
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 185.4, "unit": "lbs", "body_fat_pct": 18.4})
     assert resp.status_code == 200
     body = resp.json()
     assert body["synced_to_garmin"] is False

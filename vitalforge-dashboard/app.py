@@ -9,9 +9,9 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.requests import Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -39,8 +39,20 @@ from readiness import compute_readiness
 from recommendations import get_recommendations, get_rules_only
 from sync import run_sync, scheduled_sync
 
-from shared.auth import add_auth_routes, bootstrap_first_admin, bootstrap_migrated_token, require_account_identity
-from shared.database import ensure_primary_person_grant, get_db, get_primary_person_id, init_db
+from shared.auth import (
+    add_auth_routes,
+    bootstrap_first_admin,
+    bootstrap_migrated_token,
+    get_current_identity,
+    require_account_identity,
+    require_person,
+)
+from shared.database import (
+    ensure_primary_person_grant,
+    garmin_credential_person_id,
+    get_db,
+    init_db,
+)
 from shared.garmin_client import authenticate
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -109,24 +121,177 @@ async def health():
     return {"status": "ok", "service": "vitalforge-dashboard"}
 
 
+# Shown by GET / when the caller can reach no person at all. Static text on
+# purpose -- nothing from the request or the database is interpolated into it,
+# so this page can never echo a username or a display name back into HTML.
+_NO_REACHABLE_PERSON_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VitalForge — no person available</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 3rem auto; max-width: 34rem; padding: 0 1rem;
+         background: #111; color: #eee; line-height: 1.5; }
+  a { color: #6cf; }
+</style>
+</head>
+<body>
+<h1>Nothing to show yet</h1>
+<p>Your account does not have access to anyone's health data, so there is no dashboard to open.</p>
+<p>An administrator can grant you access to a person from the admin pages. Once that grant
+exists, this page will take you straight to that person's dashboard.</p>
+<p><a href="/auth/logout">Sign out</a></p>
+</body>
+</html>
+"""
+
+
+async def _reachable_persons(request: Request) -> tuple[list[tuple[int, str]], int | None]:
+    """Every active person the caller may open, as (id, slug) lowest id first,
+    plus their `users.default_person_id` (None for the anonymous sentinel, or
+    when the column was never set).
+
+    Mirrors require_person's own reachability rules rather than inventing a
+    second answer: archived persons are excluded by construction (an archived
+    person is unreachable through the dependency, so redirecting to one would
+    be a permanent dead end), and the anonymous sentinel of open-access mode
+    -- an empty `users` table, which CLAUDE.md documents as intentional local
+    development behaviour -- reaches every active person because there are no
+    grants to consult.
+
+    Account-bound callers are grant-scoped, admins included. require_person
+    does let an admin bypass grants, but that bypass is about reaching a
+    person they addressed explicitly; using it here would make the home page
+    400 (ambiguous) for an admin in a multi-person household who holds
+    exactly one grant. They can still open /p/{slug}/ directly.
+
+    `get_current_identity` is the identity-or-None accessor, used here
+    because it is the only identity resolver that returns the anonymous
+    sentinel instead of 401ing on it (require_account_identity, used by the
+    goals routes below, deliberately rejects it). Worth promoting to a public
+    alias if a second caller ever needs it.
+    """
+    identity = await get_current_identity(request)
+    if identity is None:
+        # Unreachable behind auth_middleware, which redirects an unauthenticated
+        # browser to the login page before routing. Fail closed anyway.
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    db = await get_db()
+    try:
+        if identity.user_id is None:
+            cursor = await db.execute(
+                "SELECT id, slug FROM persons WHERE archived_at IS NULL ORDER BY id"
+            )
+        else:
+            cursor = await db.execute(
+                "SELECT p.id AS id, p.slug AS slug FROM persons p "
+                "JOIN person_grants g ON g.person_id = p.id AND g.user_id = ? "
+                "WHERE p.archived_at IS NULL ORDER BY p.id",
+                (identity.user_id,),
+            )
+        rows = await cursor.fetchall()
+
+        default_person_id = None
+        if identity.user_id is not None:
+            cursor = await db.execute(
+                "SELECT default_person_id FROM users WHERE id = ?", (identity.user_id,)
+            )
+            row = await cursor.fetchone()
+            default_person_id = row["default_person_id"] if row is not None else None
+    finally:
+        await db.close()
+
+    return [(row["id"], row["slug"]) for row in rows], default_person_id
+
+
 @app.get("/")
 async def index(request: Request):
+    """Send the caller to their own person's dashboard.
+
+    `users.default_person_id` builds this redirect and nothing else (design
+    spec §f.2) -- it is never an implicit fallback inside a person-scoped data
+    route. NULL means "the single person this caller can reach, or 400 if
+    ambiguous" (§a.2). Reaching *zero* persons isn't covered by the spec; a
+    bare 400 is a dead end for a real user, so that case gets an explanatory
+    page instead.
+
+    The default is honoured only if it is still a person the caller can
+    reach: one pointing at an archived person or at a since-revoked grant
+    falls back to the single-person rule rather than redirecting into a
+    permanent 404 the user has no way out of.
+    """
+    persons, default_person_id = await _reachable_persons(request)
+    if not persons:
+        return HTMLResponse(_NO_REACHABLE_PERSON_HTML)
+
+    for person_id, slug in persons:
+        if person_id == default_person_id:
+            return RedirectResponse(f"/p/{slug}/", status_code=302)
+
+    if len(persons) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "More than one person is available and no default is set. "
+                "Open one directly at /p/{slug}/, e.g. "
+                + ", ".join(f"/p/{slug}/" for _, slug in persons[:5])
+            ),
+        )
+
+    return RedirectResponse(f"/p/{persons[0][1]}/", status_code=302)
+
+
+@app.get("/p/{slug}/")
+async def person_index(request: Request, slug: str, person_id: int = Depends(require_person("view"))):
     return templates.TemplateResponse("index.html", {
         "request": request,
+        "person_slug": slug,
         "weight_url": os.environ.get("WEIGHT_URL", ""),
         "default_unit": os.environ.get("DEFAULT_UNIT", "lbs"),
         "tz": os.environ.get("TZ", ""),
     })
 
 
-@app.post("/api/sync")
-async def trigger_sync(days: int = Query(default=7, ge=1, le=90)):
+@app.post("/p/{slug}/api/sync")
+async def trigger_sync(
+    days: int = Query(default=7, ge=1, le=90),
+    person_id: int = Depends(require_person("manage")),
+):
     """Trigger a manual data sync."""
+    # require_person authorized this caller FOR THIS PERSON. It cannot
+    # authorize them for the DATA SOURCE, and there is only one: a single
+    # module-level Garmin client on deployment-wide credentials. Without this
+    # check, a caller holding `manage` on their own person triggers a pull of
+    # the primary person's sleep, HRV and heart rate, writes it under theirs,
+    # and reads it back at 200 -- every SQL statement correctly person-scoped
+    # the whole way. INSERT OR REPLACE on (person_id, date) means it also
+    # silently overwrites any real measurement they already had for those
+    # dates.
+    #
+    # 409, not 404: the caller demonstrably holds `manage` on this person, so
+    # naming the reason leaks nothing -- the same reasoning that makes the
+    # ingest token/slug mismatch a 403 rather than a 404.
+    source_person_id = await garmin_credential_person_id()
+    if person_id != source_person_id:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This person has no Garmin account of their own. The deployment holds one "
+                "set of Garmin credentials, which belong to a different person, and syncing "
+                "would file their measurements under this one. Per-person Garmin linking "
+                "arrives in Phase 3."
+            ),
+        )
+
     if _sync_lock.locked():
         return {"status": "already_running", "message": "A sync is already in progress"}
 
     async def _do_sync():
-        person_id = await get_primary_person_id()
+        # person_id is captured from the enclosing scope, never re-resolved in
+        # here: this closure runs via create_task after the response has been
+        # sent, with no request left to authorize against.
         async with _sync_lock:
             await run_sync(days=days, person_id=person_id)
 
@@ -134,10 +299,9 @@ async def trigger_sync(days: int = Query(default=7, ge=1, le=90)):
     return {"status": "started", "days": days}
 
 
-@app.get("/api/sync/status")
-async def sync_status():
+@app.get("/p/{slug}/api/sync/status")
+async def sync_status(person_id: int = Depends(require_person("view"))):
     """Return last sync time and result."""
-    person_id = await get_primary_person_id()
     db = await get_db()
     try:
         cursor = await db.execute(
@@ -159,8 +323,12 @@ async def sync_status():
     }
 
 
-@app.get("/api/metrics/{metric_name}")
-async def get_metrics(metric_name: str, days: int = Query(default=30, ge=1, le=365)):
+@app.get("/p/{slug}/api/metrics/{metric_name}")
+async def get_metrics(
+    metric_name: str,
+    days: int = Query(default=30, ge=1, le=365),
+    person_id: int = Depends(require_person("view")),
+):
     """Return time series data for a metric with 7-day moving average."""
     if metric_name not in METRIC_TABLES:
         raise HTTPException(
@@ -169,7 +337,6 @@ async def get_metrics(metric_name: str, days: int = Query(default=30, ge=1, le=3
         )
 
     table, column = METRIC_TABLES[metric_name]
-    person_id = await get_primary_person_id()
 
     db = await get_db()
     try:
@@ -202,18 +369,17 @@ async def get_metrics(metric_name: str, days: int = Query(default=30, ge=1, le=3
     }
 
 
-@app.get("/api/readiness")
-async def api_readiness():
+@app.get("/p/{slug}/api/readiness")
+async def api_readiness(person_id: int = Depends(require_person("view"))):
     """Get the composite readiness/recovery score (0-100)."""
     try:
-        person_id = await get_primary_person_id()
         return await compute_readiness(person_id)
     except Exception as e:
         logger.error("Readiness scoring failed: %s", e)
         raise HTTPException(status_code=500, detail="Failed to compute readiness score")
 
 
-async def _export_rows(metrics: list[str], days: int):
+async def _export_rows(person_id: int, metrics: list[str], days: int):
     """Yield (metric_name, date, value) tuples for the given metrics.
 
     Reuses get_metrics()'s exact query pattern (same WHERE/ORDER BY clause,
@@ -222,8 +388,12 @@ async def _export_rows(metrics: list[str], days: int):
     connection per metric. `table`/`column` are always looked up from
     METRIC_TABLES (never taken from the raw request), so the f-string
     interpolation into the SQL identifier positions below is safe.
+
+    `person_id` is a parameter rather than something resolved in here: this
+    generator is consumed by StreamingResponse after export_data() has
+    returned, so there is no request scope left to authorize against.
+    export_data() takes it from require_person and threads it down.
     """
-    person_id = await get_primary_person_id()
     db = await get_db()
     try:
         for metric_name in metrics:
@@ -248,7 +418,7 @@ async def _export_rows(metrics: list[str], days: int):
         await db.close()
 
 
-async def _export_csv(metrics: list[str], days: int, include_metric_column: bool):
+async def _export_csv(person_id: int, metrics: list[str], days: int, include_metric_column: bool):
     """Stream export rows as CSV text chunks."""
     buf = io.StringIO()
     writer = csv.writer(buf)
@@ -258,18 +428,18 @@ async def _export_csv(metrics: list[str], days: int, include_metric_column: bool
     buf.seek(0)
     buf.truncate(0)
 
-    async for metric_name, date, value in _export_rows(metrics, days):
+    async for metric_name, date, value in _export_rows(person_id, metrics, days):
         writer.writerow([metric_name, date, value] if include_metric_column else [date, value])
         yield buf.getvalue()
         buf.seek(0)
         buf.truncate(0)
 
 
-async def _export_json(metrics: list[str], days: int, include_metric_column: bool):
+async def _export_json(person_id: int, metrics: list[str], days: int, include_metric_column: bool):
     """Stream export rows as a JSON array, one object per row."""
     first = True
     yield "["
-    async for metric_name, date, value in _export_rows(metrics, days):
+    async for metric_name, date, value in _export_rows(person_id, metrics, days):
         if not first:
             yield ","
         first = False
@@ -280,11 +450,12 @@ async def _export_json(metrics: list[str], days: int, include_metric_column: boo
     yield "]"
 
 
-@app.get("/api/export")
+@app.get("/p/{slug}/api/export")
 async def export_data(
     metric: str = Query(default="all"),
     days: int = Query(default=30, ge=1, le=365),
     format: str = Query(default="csv"),
+    person_id: int = Depends(require_person("view")),
 ):
     """Stream metric data as a CSV or JSON file download.
 
@@ -304,10 +475,10 @@ async def export_data(
     filename = f"vitalforge-export-{metric}-{days}d.{format}"
 
     if format == "csv":
-        generator = _export_csv(metrics_to_export, days, include_metric_column)
+        generator = _export_csv(person_id, metrics_to_export, days, include_metric_column)
         media_type = "text/csv"
     else:
-        generator = _export_json(metrics_to_export, days, include_metric_column)
+        generator = _export_json(person_id, metrics_to_export, days, include_metric_column)
         media_type = "application/json"
 
     return StreamingResponse(
@@ -317,30 +488,32 @@ async def export_data(
     )
 
 
-@app.get("/api/recommendations")
-async def api_recommendations(refresh: bool = Query(default=False)):
+@app.get("/p/{slug}/api/recommendations")
+async def api_recommendations(
+    refresh: bool = Query(default=False),
+    person_id: int = Depends(require_person("view")),
+):
     """Get AI-powered health recommendations."""
     try:
-        person_id = await get_primary_person_id()
         return await get_recommendations(person_id, force=refresh)
     except Exception as e:
         logger.error("Recommendations failed: %s", e)
         raise HTTPException(status_code=500, detail="Failed to generate recommendations")
 
 
-@app.get("/api/recommendations/rules-only")
-async def api_rules_only():
+@app.get("/p/{slug}/api/recommendations/rules-only")
+async def api_rules_only(person_id: int = Depends(require_person("view"))):
     """Get rules engine output without LLM."""
-    person_id = await get_primary_person_id()
     return await get_rules_only(person_id)
 
 
-@app.get("/api/correlations")
+@app.get("/p/{slug}/api/correlations")
 async def api_correlations(
     metrics: str = Query(..., description="Comma-separated metric names, e.g. sleep_duration,hrv"),
     days: int = Query(default=30, ge=1, le=365),
     lag: int = Query(default=0, ge=-365, le=365, description="Calendar days to shift each row metric forward before joining"),
     min_pairs: int = Query(default=5, ge=2, description="Minimum aligned pairs required to report r instead of null"),
+    person_id: int = Depends(require_person("view")),
 ):
     """Ad-hoc cross-metric correlation matrix.
 
@@ -365,8 +538,6 @@ async def api_correlations(
             status_code=400,
             detail=f"Unknown metric(s): {', '.join(unknown)}. Valid: {', '.join(sorted(METRIC_TABLES))}",
         )
-
-    person_id = await get_primary_person_id()
 
     db = await get_db()
     try:
@@ -433,8 +604,11 @@ async def _read_upload_capped(file: UploadFile, max_bytes: int) -> bytes:
     return b"".join(chunks)
 
 
-@app.post("/api/import/activity")
-async def import_activity(file: UploadFile = File(...)):
+@app.post("/p/{slug}/api/import/activity")
+async def import_activity(
+    file: UploadFile = File(...),
+    person_id: int = Depends(require_person("manage")),
+):
     """Import a local FIT activity file. FIT-only for this first slice --
     TCX/GPX are explicitly deferred. Dedup is two-stage and race-free: an
     exact `file_sha256` match, then a (sport, start_time_utc) time-window
@@ -455,7 +629,6 @@ async def import_activity(file: UploadFile = File(...)):
     raw_summary_json = json.dumps(record.raw_summary, default=str)
 
     columns_sql = ", ".join(_ACTIVITY_COLUMNS)
-    person_id = await get_primary_person_id()
 
     db = await get_db()
     try:
@@ -539,11 +712,13 @@ async def import_activity(file: UploadFile = File(...)):
     return result
 
 
-@app.get("/api/activities")
-async def list_activities(limit: int = Query(default=50, ge=1, le=200)):
+@app.get("/p/{slug}/api/activities")
+async def list_activities(
+    limit: int = Query(default=50, ge=1, le=200),
+    person_id: int = Depends(require_person("view")),
+):
     """List imported activities, most recent first."""
     columns_sql = ", ".join(_ACTIVITY_COLUMNS)
-    person_id = await get_primary_person_id()
     db = await get_db()
     try:
         cursor = await db.execute(
@@ -558,12 +733,11 @@ async def list_activities(limit: int = Query(default=50, ge=1, le=200)):
     return {"count": len(rows), "activities": [_activity_row_to_dict(row) for row in rows]}
 
 
-@app.get("/api/activities/{activity_id}")
-async def get_activity(activity_id: int):
+@app.get("/p/{slug}/api/activities/{activity_id}")
+async def get_activity(activity_id: int, person_id: int = Depends(require_person("view"))):
     """A single imported activity, including its full raw FIT session
     summary."""
     columns_sql = ", ".join(_ACTIVITY_COLUMNS)
-    person_id = await get_primary_person_id()
     db = await get_db()
     try:
         cursor = await db.execute(
@@ -621,7 +795,24 @@ async def _owned_goal_or_404(request: Request, goal_id: int) -> dict:
     someone else and the caller isn't an admin -- mirrors shared/auth.py's
     revoke_token ownership check exactly (existence checked, and only then
     ownership), so a wrong-owner request can never be mistaken for a
-    not-found one."""
+    not-found one.
+
+    THE SECOND DELIBERATE 403 IN THE /p/{slug}/ FAMILY, stated here because a
+    security review flagged it against the phase's 404-never-403 rule. That
+    rule exists to hide PERSON existence: a 403 from require_person would
+    confirm a household member by name to anyone who guessed it. Goals are
+    USER-owned, not person-owned, so the three observables here (404 absent /
+    403 not-yours / 200 yours) leak only that a goal id exists somewhere in
+    the account -- they say nothing about which persons exist or who can
+    reach them, and require_person still gates the person before any of this
+    runs.
+
+    The cost is real but bounded: a caller can enumerate goal ids and count
+    other users' goals. Accepted rather than collapsed to 404 because the
+    ownership-check shape is this codebase's existing convention for
+    user-owned resources (revoke_token), and having one rule for person-scoped
+    resources and a different one for account-scoped resources is clearer than
+    a single rule with an unexplained exception."""
     identity = await require_account_identity(request)
     goal = await get_goal(goal_id)
     if goal is None:
@@ -631,40 +822,49 @@ async def _owned_goal_or_404(request: Request, goal_id: int) -> dict:
     return goal
 
 
-@app.post("/api/goals", status_code=201)
-async def create_goal_route(data: GoalCreate, request: Request):
+@app.post("/p/{slug}/api/goals", status_code=201)
+async def create_goal_route(
+    data: GoalCreate,
+    request: Request,
+    person_id: int = Depends(require_person("view")),
+):
     identity = await require_account_identity(request)
     _validate_goal_metric(data.metric)
     goal_id = await create_goal(identity.user_id, data)
     goal = await get_goal(goal_id)
-    person_id = await get_primary_person_id()
     return await _goal_out(goal, person_id)
 
 
-@app.get("/api/goals")
-async def list_goals_route(request: Request):
+@app.get("/p/{slug}/api/goals")
+async def list_goals_route(request: Request, person_id: int = Depends(require_person("view"))):
     identity = await require_account_identity(request)
     goals = await list_goals(identity.user_id)
-    person_id = await get_primary_person_id()
     return [await _goal_out(goal, person_id) for goal in goals]
 
 
-@app.get("/api/goals/{goal_id}")
-async def get_goal_route(goal_id: int, request: Request):
+@app.get("/p/{slug}/api/goals/{goal_id}")
+async def get_goal_route(goal_id: int, request: Request, person_id: int = Depends(require_person("view"))):
     goal = await _owned_goal_or_404(request, goal_id)
-    person_id = await get_primary_person_id()
     return await _goal_out(goal, person_id)
 
 
-@app.patch("/api/goals/{goal_id}")
-async def patch_goal_route(goal_id: int, data: GoalUpdate, request: Request):
+@app.patch("/p/{slug}/api/goals/{goal_id}")
+async def patch_goal_route(
+    goal_id: int,
+    data: GoalUpdate,
+    request: Request,
+    person_id: int = Depends(require_person("view")),
+):
     await _owned_goal_or_404(request, goal_id)
     _validate_goal_metric(data.metric)
     updated = await update_goal(goal_id, data)
-    person_id = await get_primary_person_id()
     return await _goal_out(updated, person_id)
 
 
+# Account-scoped, and therefore the one goals route that does NOT move under
+# /p/{slug}/: deleting a goal takes no person_id at all (the person only ever
+# fed progress computation on the routes above), so there is nothing here for
+# require_person to authorize.
 @app.delete("/api/goals/{goal_id}")
 async def delete_goal_route(goal_id: int, request: Request):
     await _owned_goal_or_404(request, goal_id)

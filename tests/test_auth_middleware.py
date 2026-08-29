@@ -12,7 +12,7 @@ from fastapi.responses import HTMLResponse
 from httpx import ASGITransport, AsyncClient, Headers
 
 from shared.auth import add_auth_routes, create_session_cookie
-from tests.conftest import seed_token, seed_user
+from tests.conftest import PERSON_PREFIX, seed_token, seed_user
 
 
 def _build_matrix_app() -> FastAPI:
@@ -257,7 +257,7 @@ async def test_weight_service_api_401_shape(weight_app_module):
     await seed_user("someone")
     transport = ASGITransport(app=weight_app_module.app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
-        resp = await ac.get("/api/weight/recent")
+        resp = await ac.get(f"{PERSON_PREFIX}/api/weight/recent")
     assert resp.status_code == 401
     assert resp.json() == {"detail": "Not authenticated"}
 
@@ -266,6 +266,6 @@ async def test_dashboard_service_api_401_shape(dashboard_app_module):
     await seed_user("someone")
     transport = ASGITransport(app=dashboard_app_module.app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
-        resp = await ac.get("/api/sync/status")
+        resp = await ac.get(f"{PERSON_PREFIX}/api/sync/status")
     assert resp.status_code == 401
     assert resp.json() == {"detail": "Not authenticated"}
