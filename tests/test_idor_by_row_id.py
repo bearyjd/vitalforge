@@ -145,3 +145,68 @@ async def test_activity_detail_cannot_reach_another_persons_activity(dashboard_c
         "not covered by require_person"
     )
     assert "their-hash" not in resp.text
+
+
+# --- the data SOURCE is not person-scoped, only the destination is -----------
+
+
+async def test_sync_refuses_a_person_the_garmin_account_does_not_describe(
+    dashboard_app_module, dashboard_client, two_persons, monkeypatch
+):
+    """require_person authorizes the caller for a TARGET PERSON. It cannot
+    authorize them for a DATA SOURCE, and there is exactly one: a module-level
+    Garmin client on deployment-wide credentials.
+
+    Found by security review, then reproduced: a caller holding `manage` on
+    their own person triggered a pull of the PRIMARY person's sleep, HRV and
+    heart rate, had it written under theirs, and read it back at 200. Every
+    SQL statement on that path is correctly person-scoped, which is exactly
+    why a scoping audit could not see it -- the destination was right and the
+    source was wrong.
+
+    INSERT OR REPLACE on (person_id, date) makes it silent data loss too: a
+    real measurement the victim already had for those dates is overwritten.
+
+    Patches run_sync on the APP module, not on sync: app.py does
+    `from sync import run_sync`, which binds the name at import time, so
+    patching sync.run_sync leaves the route calling the real one -- which
+    reaches for Garmin and hangs.
+    """
+    _mine, theirs = two_persons
+    cookies = await _authorized_as("mallory3", theirs, access="manage")
+
+    called = []
+
+    async def _must_not_run(*args, **kwargs):
+        called.append(kwargs.get("person_id"))
+
+    monkeypatch.setattr(dashboard_app_module, "run_sync", _must_not_run)
+
+    resp = await dashboard_client.post("/p/bryn/api/sync?days=1", cookies=cookies)
+
+    assert resp.status_code == 409, (
+        f"sync into a person the Garmin credentials do not describe returned "
+        f"{resp.status_code}; it must refuse before pulling"
+    )
+    assert not called, (
+        f"run_sync ran for person {called} despite the refusal -- the global Garmin "
+        "account's data would be filed under the wrong person"
+    )
+
+
+async def test_sync_still_works_for_the_person_the_credentials_describe(
+    dashboard_app_module, dashboard_client, two_persons, monkeypatch
+):
+    """The refusal above is worthless if it also blocks the legitimate case."""
+    mine, _theirs = two_persons
+    cookies = await _authorized_as("realowner", mine, access="manage")
+
+    ran = []
+
+    async def _record(*args, **kwargs):
+        ran.append(kwargs.get("person_id"))
+
+    monkeypatch.setattr(dashboard_app_module, "run_sync", _record)
+
+    resp = await dashboard_client.post(f"{PERSON_PREFIX}/api/sync?days=1", cookies=cookies)
+    assert resp.status_code == 200, f"sync refused for the credential owner: {resp.text}"

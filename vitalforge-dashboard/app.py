@@ -47,7 +47,12 @@ from shared.auth import (
     require_account_identity,
     require_person,
 )
-from shared.database import ensure_primary_person_grant, get_db, init_db
+from shared.database import (
+    ensure_primary_person_grant,
+    garmin_credential_person_id,
+    get_db,
+    init_db,
+)
 from shared.garmin_client import authenticate
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -255,6 +260,31 @@ async def trigger_sync(
     person_id: int = Depends(require_person("manage")),
 ):
     """Trigger a manual data sync."""
+    # require_person authorized this caller FOR THIS PERSON. It cannot
+    # authorize them for the DATA SOURCE, and there is only one: a single
+    # module-level Garmin client on deployment-wide credentials. Without this
+    # check, a caller holding `manage` on their own person triggers a pull of
+    # the primary person's sleep, HRV and heart rate, writes it under theirs,
+    # and reads it back at 200 -- every SQL statement correctly person-scoped
+    # the whole way. INSERT OR REPLACE on (person_id, date) means it also
+    # silently overwrites any real measurement they already had for those
+    # dates.
+    #
+    # 409, not 404: the caller demonstrably holds `manage` on this person, so
+    # naming the reason leaks nothing -- the same reasoning that makes the
+    # ingest token/slug mismatch a 403 rather than a 404.
+    source_person_id = await garmin_credential_person_id()
+    if person_id != source_person_id:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This person has no Garmin account of their own. The deployment holds one "
+                "set of Garmin credentials, which belong to a different person, and syncing "
+                "would file their measurements under this one. Per-person Garmin linking "
+                "arrives in Phase 3."
+            ),
+        )
+
     if _sync_lock.locked():
         return {"status": "already_running", "message": "A sync is already in progress"}
 
@@ -765,7 +795,24 @@ async def _owned_goal_or_404(request: Request, goal_id: int) -> dict:
     someone else and the caller isn't an admin -- mirrors shared/auth.py's
     revoke_token ownership check exactly (existence checked, and only then
     ownership), so a wrong-owner request can never be mistaken for a
-    not-found one."""
+    not-found one.
+
+    THE SECOND DELIBERATE 403 IN THE /p/{slug}/ FAMILY, stated here because a
+    security review flagged it against the phase's 404-never-403 rule. That
+    rule exists to hide PERSON existence: a 403 from require_person would
+    confirm a household member by name to anyone who guessed it. Goals are
+    USER-owned, not person-owned, so the three observables here (404 absent /
+    403 not-yours / 200 yours) leak only that a goal id exists somewhere in
+    the account -- they say nothing about which persons exist or who can
+    reach them, and require_person still gates the person before any of this
+    runs.
+
+    The cost is real but bounded: a caller can enumerate goal ids and count
+    other users' goals. Accepted rather than collapsed to 404 because the
+    ownership-check shape is this codebase's existing convention for
+    user-owned resources (revoke_token), and having one rule for person-scoped
+    resources and a different one for account-scoped resources is clearer than
+    a single rule with an unexplained exception."""
     identity = await require_account_identity(request)
     goal = await get_goal(goal_id)
     if goal is None:

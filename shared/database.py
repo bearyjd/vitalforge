@@ -510,6 +510,29 @@ async def get_primary_person_id() -> int:
     return row["id"]
 
 
+async def garmin_credential_person_id() -> int:
+    """The person the deployment's single Garmin account actually describes.
+
+    shared/garmin_client.py holds ONE module-level client authenticated from
+    the deployment-wide GARMIN_EMAIL/GARMIN_PASSWORD. Whatever it returns is
+    that one human's sleep, HRV and heart rate, no matter which person_id the
+    caller asks to write it under. Until Phase 3 gives each person their own
+    credentials and token store, that human is the primary person.
+
+    require_person() authorizes a caller FOR A TARGET PERSON. It cannot
+    authorize them for a DATA SOURCE, and nothing else did either -- so a
+    caller holding `manage` on their own person could trigger a pull that
+    wrote the primary person's Garmin data under theirs, then read it back.
+    Every SQL statement involved was correctly person-scoped; the source was
+    not. Callers that pull from Garmin must compare their target against this.
+
+    PHASE 3 REPLACES THIS. When garmin_links exists, the question stops being
+    "is this the primary person" and becomes "does this person have their own
+    linked account", and this function is the single place that changes.
+    """
+    return await get_primary_person_id()
+
+
 async def _grant_primary_person_to_first_admin(db, person_id: int) -> None:
     """Give the first admin an 'own' grant on `person_id` and make it their
     default. Runs on the caller's connection and does not commit.
