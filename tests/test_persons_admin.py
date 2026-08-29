@@ -486,6 +486,45 @@ async def test_archiving_clears_a_default_person_id_pointing_at_it(client):
     assert row["default_person_id"] is None
 
 
+async def test_re_archiving_also_clears_a_dangling_default_person_id(client):
+    """The idempotent branch returns early, so it used to skip the cleanup the
+    first archive performs -- the two paths differed in what they left behind.
+
+    Both the state and this test are constructed with raw SQL because no
+    production writer can reach it: default_person_id is only ever set to the
+    current primary, the primary cannot be archived, and an archived person
+    cannot be promoted. The symmetry is defensive, and the review that found
+    the gap also found that the earlier mutation run never covered it -- so it
+    gets a test rather than a claim.
+    """
+    _, cookies = await _as("root", role="admin")
+    bob_id, _ = await _as("bob")
+    created = (
+        await client.post("/api/persons", json={"display_name": "Bryn"}, cookies=cookies)
+    ).json()
+    assert (
+        await client.post(f"/api/persons/{created['id']}/archive", cookies=cookies)
+    ).status_code == 200
+
+    db = await get_db()
+    try:
+        await db.execute(
+            "UPDATE users SET default_person_id = ? WHERE id = ?", (created["id"], bob_id)
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+    # The second archive is the idempotent path.
+    resp = await client.post(f"/api/persons/{created['id']}/archive", cookies=cookies)
+    assert resp.status_code == 200
+
+    row = await _fetchone("SELECT default_person_id FROM users WHERE id = ?", (bob_id,))
+    assert row["default_person_id"] is None, (
+        "re-archiving skipped the cleanup the first archive performs"
+    )
+
+
 async def test_archive_nonexistent_person_returns_404(client):
     _, cookies = await _as("root", role="admin")
     resp = await client.post("/api/persons/999999/archive", cookies=cookies)
@@ -604,6 +643,15 @@ async def test_grant_routes_positive_control_for_an_own_holder(client, method, t
         client, method, template, body, person_id, owner_id, owner_cookies
     )
     assert resp.status_code == 200, f"{method.upper()} {template} gave {resp.status_code}"
+
+    # State, not just status: a route that 200s while writing nothing would
+    # satisfy a status-only control and leave the negative tests above
+    # unanchored.
+    row = await _fetchone(
+        "SELECT COUNT(*) AS n FROM person_grants WHERE person_id = ? AND user_id = ?",
+        (person_id, owner_id),
+    )
+    assert row["n"] == (0 if method == "delete" else 1)
 
 
 async def test_a_stranger_gets_the_same_404_as_a_nonexistent_person(client):

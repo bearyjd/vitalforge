@@ -120,6 +120,69 @@ async def test_starting_a_sync_is_not_blocked_by_another_persons_sync(
     assert resp.json()["status"] == "already_running"
 
 
+async def test_a_sync_task_cancelled_before_it_starts_still_clears_the_flag(
+    client, dashboard_app_module, monkeypatch
+):
+    """The registration is acquired on the REQUEST path, so pairing it with a
+    `finally` inside the task body is positional, not structural: a task
+    cancelled before its first step never enters that body, and the person
+    would stay marked as syncing until the process restarted -- reporting a
+    sync that is not running and refusing every retry.
+
+    Nothing cancels these tasks today (the lifespan cancels `scheduled_sync`,
+    not these), so this pins the done-callback against a future caller rather
+    than a live bug.
+    """
+
+    ran = []
+
+    async def _noop_run_sync(days, *, person_id):
+        ran.append(True)
+        return "ok"
+
+    monkeypatch.setattr(dashboard_app_module, "run_sync", _noop_run_sync)
+    person_id = await get_primary_person_id()
+
+    # The window this guards is one event-loop iteration wide -- by the time
+    # the response is awaited the task has normally already run to completion --
+    # so it is forced deterministically rather than raced for.
+    cancelled = []
+    real_create_task = asyncio.create_task
+
+    def _create_and_cancel(coro):
+        task = real_create_task(coro)
+        task.cancel()
+        cancelled.append(task)
+        return task
+
+    # Restored by hand in a finally rather than through monkeypatch:
+    # monkeypatch.undo() reverts EVERY patch this test's fixtures made,
+    # including the temp DB path, and the assertions below still need those.
+    asyncio.create_task = _create_and_cancel
+    try:
+        resp = await client.post(f"{PERSON_PREFIX}/api/sync", json={"days": 1})
+    finally:
+        asyncio.create_task = real_create_task
+    assert resp.json()["status"] == "started"
+
+    task = cancelled[0]
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if task.done():
+            break
+    assert task.cancelled(), "the task was not cancelled"
+    assert not ran, "the task body ran; this test is no longer exercising the pre-start window"
+
+    assert person_id not in dashboard_app_module._syncing_person_ids, (
+        "a task cancelled before it started stranded the person as syncing"
+    )
+    assert (await client.get(f"{PERSON_PREFIX}/api/sync/status")).json()["syncing"] is False
+    # And a retry is accepted rather than answering "already_running" forever.
+    assert (
+        await client.post(f"{PERSON_PREFIX}/api/sync", json={"days": 1})
+    ).json()["status"] == "started"
+
+
 async def test_the_scheduled_backfill_registers_itself_as_syncing(
     client, dashboard_app_module, monkeypatch
 ):

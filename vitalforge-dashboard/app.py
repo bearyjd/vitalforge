@@ -77,6 +77,10 @@ _sync_lock = asyncio.Lock()
 # leaked observable is fixed.
 _syncing_person_ids = SyncRegistry()
 
+# Strong references to the detached sync tasks. asyncio keeps only a weak one,
+# so a task nobody holds can be garbage-collected part-way through a sync.
+_inflight_sync_tasks: set[asyncio.Task] = set()
+
 METRIC_TABLES = {
     "sleep_duration": ("sleep", "duration_seconds"),
     "sleep_score": ("sleep", "sleep_score"),
@@ -332,17 +336,24 @@ async def trigger_sync(
         # person_id is captured from the enclosing scope, never re-resolved in
         # here: this closure runs via create_task after the response has been
         # sent, with no request left to authorize against.
-        try:
-            async with _sync_lock:
-                await run_sync(days=days, person_id=person_id)
-        finally:
-            # try/finally, and wrapping the lock acquisition too: run_sync
-            # raising -- or the task being cancelled while queued -- would
-            # otherwise leave this person permanently marked as syncing with
-            # nothing running and no way to clear it.
-            _syncing_person_ids.release(person_id)
+        async with _sync_lock:
+            await run_sync(days=days, person_id=person_id)
 
-    asyncio.create_task(_do_sync())
+    # The release is a done-callback rather than a `finally` inside _do_sync,
+    # because the acquire happens out here on the request path: a task
+    # cancelled BEFORE its first step never enters its own body, so a `finally`
+    # there would not run and this person would stay marked as syncing until
+    # the process restarts. add_done_callback fires for that case too, which
+    # makes the pairing structural instead of positional. (Nothing cancels
+    # these tasks today -- the lifespan's cancel targets scheduled_sync -- so
+    # this is defence against a future caller, not a live bug.)
+    task = asyncio.create_task(_do_sync())
+    task.add_done_callback(lambda _t: _syncing_person_ids.release(person_id))
+    # asyncio only holds a weak reference to a running task, so a task nobody
+    # retains can be garbage-collected mid-flight. Keep a strong reference
+    # until it finishes.
+    _inflight_sync_tasks.add(task)
+    task.add_done_callback(_inflight_sync_tasks.discard)
     return {"status": "started", "days": days}
 
 
