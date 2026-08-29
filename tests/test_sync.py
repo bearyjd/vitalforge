@@ -69,7 +69,7 @@ async def test_scheduled_sync_serializes_against_shared_lock(initialized_db, mon
 
     monkeypatch.setattr(sync, "run_sync", fake_run_sync)
 
-    task = asyncio.create_task(sync.scheduled_sync(lock))
+    task = asyncio.create_task(sync.scheduled_sync(lock, sync.SyncRegistry()))
     try:
         await asyncio.wait_for(second_call.wait(), timeout=5.0)
     finally:

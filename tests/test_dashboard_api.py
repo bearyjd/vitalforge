@@ -7,13 +7,14 @@ request time — they only read the local SQLite tables populated by
 Garmin client at all.
 """
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from shared.database import get_db, get_primary_person_id
-from tests.conftest import PERSON_PREFIX
+from tests.conftest import PERSON_PREFIX, seed_person
 
 
 def days_ago(n: int) -> str:
@@ -56,6 +57,211 @@ async def test_sync_status_never_synced(client):
     body = resp.json()
     assert body["last_sync_time"] is None
     assert body["last_sync_result"] == "never"
+
+
+async def test_sync_status_does_not_leak_another_persons_sync(
+    client, dashboard_app_module, monkeypatch
+):
+    """`syncing` used to report `_sync_lock.locked()` -- one module-level lock
+    -- on an otherwise person-scoped response, so one household member's sync
+    was visible from another's status endpoint.
+
+    The lock's SERIALIZATION is still shared (Phase 4 fixes that); only the
+    leaked flag is scoped here.
+    """
+    other_person = await seed_person("bryn")
+    registry = dashboard_app_module.SyncRegistry()
+    registry.acquire(other_person)
+    monkeypatch.setattr(dashboard_app_module, "_syncing_person_ids", registry)
+
+    resp = await client.get(f"{PERSON_PREFIX}/api/sync/status")
+    assert resp.status_code == 200
+    assert resp.json()["syncing"] is False, "another person's sync was visible from this one"
+
+    # Positive control: the person who IS syncing still sees it, so the test
+    # above cannot pass against a `syncing` that is hardcoded False.
+    resp = await client.get("/p/bryn/api/sync/status")
+    assert resp.json()["syncing"] is True
+
+
+async def test_starting_a_sync_is_not_blocked_by_another_persons_sync(
+    client, dashboard_app_module, monkeypatch
+):
+    """POST /api/sync answered "already_running" off the module-level lock, so
+    a caller who had started nothing was told their sync was in progress --
+    the same cross-person observable that leaked out of /api/sync/status.
+
+    The shared lock still SERIALIZES the work (Phase 4 changes that); the
+    second person's request now queues on it rather than being refused.
+    """
+    other_person = await seed_person("bryn")
+    person_id = await get_primary_person_id()
+    registry = dashboard_app_module.SyncRegistry()
+    registry.acquire(other_person)
+    monkeypatch.setattr(dashboard_app_module, "_syncing_person_ids", registry)
+
+    # This test is about the routing decision, not the sync: a real run_sync
+    # here reaches shared.garmin_client's authenticate path and blocks on the
+    # network.
+    async def _noop_run_sync(days, *, person_id):
+        return "ok"
+
+    monkeypatch.setattr(dashboard_app_module, "run_sync", _noop_run_sync)
+
+    resp = await client.post(f"{PERSON_PREFIX}/api/sync", json={"days": 1})
+    assert resp.json()["status"] == "started"
+
+    # Positive control: the person who IS syncing is still refused a second
+    # run. Asserted on the primary person, because a non-primary one is
+    # refused earlier by the Garmin-source 409 and would never reach this
+    # branch -- which is exactly how the first assertion could pass vacuously.
+    registry.acquire(person_id)
+    resp = await client.post(f"{PERSON_PREFIX}/api/sync", json={"days": 1})
+    assert resp.json()["status"] == "already_running"
+
+
+async def test_a_sync_task_cancelled_before_it_starts_still_clears_the_flag(
+    client, dashboard_app_module, monkeypatch
+):
+    """The registration is acquired on the REQUEST path, so pairing it with a
+    `finally` inside the task body is positional, not structural: a task
+    cancelled before its first step never enters that body, and the person
+    would stay marked as syncing until the process restarted -- reporting a
+    sync that is not running and refusing every retry.
+
+    Nothing cancels these tasks today (the lifespan cancels `scheduled_sync`,
+    not these), so this pins the done-callback against a future caller rather
+    than a live bug.
+    """
+
+    ran = []
+
+    async def _noop_run_sync(days, *, person_id):
+        ran.append(True)
+        return "ok"
+
+    monkeypatch.setattr(dashboard_app_module, "run_sync", _noop_run_sync)
+    person_id = await get_primary_person_id()
+
+    # The window this guards is one event-loop iteration wide -- by the time
+    # the response is awaited the task has normally already run to completion --
+    # so it is forced deterministically rather than raced for.
+    cancelled = []
+    real_create_task = asyncio.create_task
+
+    def _create_and_cancel(coro):
+        task = real_create_task(coro)
+        task.cancel()
+        cancelled.append(task)
+        return task
+
+    # Restored by hand in a finally rather than through monkeypatch:
+    # monkeypatch.undo() reverts EVERY patch this test's fixtures made,
+    # including the temp DB path, and the assertions below still need those.
+    asyncio.create_task = _create_and_cancel
+    try:
+        resp = await client.post(f"{PERSON_PREFIX}/api/sync", json={"days": 1})
+    finally:
+        asyncio.create_task = real_create_task
+    assert resp.json()["status"] == "started"
+
+    task = cancelled[0]
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if task.done():
+            break
+    assert task.cancelled(), "the task was not cancelled"
+    assert not ran, "the task body ran; this test is no longer exercising the pre-start window"
+
+    assert person_id not in dashboard_app_module._syncing_person_ids, (
+        "a task cancelled before it started stranded the person as syncing"
+    )
+    assert (await client.get(f"{PERSON_PREFIX}/api/sync/status")).json()["syncing"] is False
+    # And a retry is accepted rather than answering "already_running" forever.
+    assert (
+        await client.post(f"{PERSON_PREFIX}/api/sync", json={"days": 1})
+    ).json()["status"] == "started"
+
+
+async def test_the_scheduled_backfill_registers_itself_as_syncing(
+    client, dashboard_app_module, monkeypatch
+):
+    """`scheduled_sync` takes the same lock the manual trigger does, so when
+    `syncing` was `_sync_lock.locked()` the boot backfill was reported. Scoping
+    the flag by person regressed that unless the scheduled path registers too:
+    the dashboard's poll stops as soon as `syncing` goes false, so it would
+    announce a finished sync during a 90-day backfill that had not started
+    writing yet -- and the manual trigger, still blocked by the lock, would
+    have created no task.
+    """
+    import sync as sync_module
+
+    registry = dashboard_app_module.SyncRegistry()
+    monkeypatch.setattr(dashboard_app_module, "_syncing_person_ids", registry)
+    person_id = await get_primary_person_id()
+    observed = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _slow_run_sync(days, *, person_id):
+        observed.append(person_id in registry)
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(sync_module, "run_sync", _slow_run_sync)
+    task = asyncio.create_task(
+        sync_module.scheduled_sync(dashboard_app_module._sync_lock, registry)
+    )
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        assert observed == [True], "the scheduled backfill did not register the person it syncs"
+        status = (await client.get(f"{PERSON_PREFIX}/api/sync/status")).json()
+        assert status["syncing"] is True, "the dashboard reports idle during the boot backfill"
+    finally:
+        release.set()
+        task.cancel()
+    # Positive control: once it finishes, the registration is released.
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if person_id not in registry:
+            break
+    assert person_id not in registry
+
+
+async def test_a_failed_sync_does_not_leave_the_person_marked_as_syncing(
+    client, dashboard_app_module, monkeypatch
+):
+    """Without the try/finally, run_sync raising leaves the person marked as
+    syncing forever while the lock itself releases normally -- a dashboard
+    stuck on "syncing" with nothing running, and a POST that answers
+    "already_running" from then on."""
+    ran = []
+
+    async def _boom(**kwargs):
+        ran.append(True)
+        raise RuntimeError("garmin exploded")
+
+    monkeypatch.setattr(dashboard_app_module, "run_sync", _boom)
+    person_id = await get_primary_person_id()
+    assert person_id not in dashboard_app_module._syncing_person_ids
+
+    resp = await client.post(f"{PERSON_PREFIX}/api/sync", json={"days": 1})
+    assert resp.status_code == 200
+    # The sync runs as a detached task after the response; yield until it has
+    # actually run. Asserting `ran` rather than only the end state is what stops
+    # this passing against a task that never started at all.
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if ran:
+            break
+    assert ran, "the detached sync task never ran; the assertions below prove nothing"
+
+    assert person_id not in dashboard_app_module._syncing_person_ids
+    assert (await client.get(f"{PERSON_PREFIX}/api/sync/status")).json()["syncing"] is False
+    # And a retry is accepted rather than answering "already_running" forever.
+    assert (
+        await client.post(f"{PERSON_PREFIX}/api/sync", json={"days": 1})
+    ).json()["status"] == "started"
 
 
 @pytest.mark.parametrize(

@@ -309,7 +309,47 @@ async def run_sync(days: int = 7, *, person_id: int):
     return result
 
 
-async def scheduled_sync(lock: asyncio.Lock):
+class SyncRegistry:
+    """Which persons have a sync in flight -- queued or running.
+
+    `/api/sync/status` answers its person-scoped `syncing` field from this, and
+    `POST /api/sync` refuses a second run from it. Neither can be answered from
+    the shared `_sync_lock`: that lock is module-level, so `locked()` is true
+    whenever ANY person is syncing, which leaked one household member's
+    activity to another and refused a sync to someone who had started nothing.
+
+    **Every writer must register here**, not just the manual trigger. Both this
+    loop and `/api/sync` take the same lock, so a status endpoint that only
+    knew about one of them would report "not syncing" through the whole
+    90-day boot backfill -- and the dashboard's poll, which stops as soon as
+    `syncing` goes false, would announce a finished sync that never ran.
+
+    Reference-counted rather than a set, because the two writers can overlap:
+    the manual trigger registers before creating its task, so a scheduled sync
+    that registers the same person while that task waits on the lock would --
+    with a plain set -- have its own `discard` clear the flag out from under
+    the still-running manual sync. Mutated only from the event loop, so it
+    needs no lock of its own.
+    """
+
+    def __init__(self) -> None:
+        self._counts: dict[int, int] = {}
+
+    def __contains__(self, person_id: int) -> bool:
+        return person_id in self._counts
+
+    def acquire(self, person_id: int) -> None:
+        self._counts[person_id] = self._counts.get(person_id, 0) + 1
+
+    def release(self, person_id: int) -> None:
+        remaining = self._counts.get(person_id, 0) - 1
+        if remaining > 0:
+            self._counts[person_id] = remaining
+        else:
+            self._counts.pop(person_id, None)
+
+
+async def scheduled_sync(lock: asyncio.Lock, registry: SyncRegistry):
     """Background loop that syncs every SYNC_INTERVAL_HOURS.
 
     Takes the same lock `/api/sync`'s manual trigger holds during `run_sync`
@@ -317,6 +357,9 @@ async def scheduled_sync(lock: asyncio.Lock):
     through `upsert()`'s last-writer-wins INSERT OR REPLACE, so without
     shared serialization a manual sync and this backfill/scheduled loop can
     interleave and let an older pull silently overwrite a newer one.
+
+    `registry` is required, not optional: see SyncRegistry's docstring for what
+    a writer that forgets to register looks like from the dashboard.
     """
     from shared.database import get_primary_person_id
 
@@ -324,8 +367,12 @@ async def scheduled_sync(lock: asyncio.Lock):
     logger.info("Running initial 90-day backfill...")
     try:
         person_id = await get_primary_person_id()
-        async with lock:
-            await run_sync(days=90, person_id=person_id)
+        registry.acquire(person_id)
+        try:
+            async with lock:
+                await run_sync(days=90, person_id=person_id)
+        finally:
+            registry.release(person_id)
     except Exception as e:
         logger.error("Initial backfill failed: %s", e)
 
@@ -334,7 +381,11 @@ async def scheduled_sync(lock: asyncio.Lock):
         try:
             person_id = await get_primary_person_id()
             logger.info("Running scheduled sync...")
-            async with lock:
-                await run_sync(days=3, person_id=person_id)
+            registry.acquire(person_id)
+            try:
+                async with lock:
+                    await run_sync(days=3, person_id=person_id)
+            finally:
+                registry.release(person_id)
         except Exception as e:
             logger.error("Scheduled sync failed: %s", e)

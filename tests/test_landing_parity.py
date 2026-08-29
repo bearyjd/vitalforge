@@ -84,6 +84,77 @@ def test_landing_serves_open_access_mode(service):
     )
 
 
+@pytest.mark.parametrize("service_module", ["vitalforge-weight.app", "vitalforge-dashboard.app"])
+async def test_landing_denies_an_unrecognised_grant_value(
+    initialized_db, fake_garmin_client, monkeypatch, service_module
+):
+    """The last place the two rules disagreed, pinned BEHAVIOURALLY.
+
+    require_person denies an access value outside the three via
+    `_ACCESS_ORDER.get(granted, -1)`. Both `_reachable_persons` joined
+    person_grants without inspecting `access` at all, so such a grant made
+    GET / redirect to a /p/{slug}/ that then 404s -- a dead end with no way
+    out. person_grants' CHECK constraint makes the value unreachable today,
+    but CHECK constraints are exactly what a future table rebuild relaxes, and
+    both docstrings claimed to mirror require_person while not doing so.
+
+    Asserted by driving the two routes rather than by grepping the SQL: a
+    source check here reads the query text INCLUDING its comments, so deleting
+    the predicate while leaving the words in a comment above it passed. A guard
+    a comment can satisfy is not a guard.
+    """
+    from httpx import ASGITransport, AsyncClient
+
+    from shared.auth import create_session_cookie
+    from shared.database import get_db
+    from tests.conftest import import_service_module, seed_person, seed_user
+
+    module = import_service_module(service_module)
+    monkeypatch.setattr(module, "authenticate", lambda: None)
+    if hasattr(module, "scheduled_sync"):
+
+        async def _noop(lock, registry):
+            return None
+
+        monkeypatch.setattr(module, "scheduled_sync", _noop)
+
+    person_id = await seed_person("bryn")
+    user_id = await seed_user("bob")
+    db = await get_db()
+    try:
+        # The CHECK constraint is the reason this value is unreachable through
+        # any route; suspending it is how the test reaches the state a future
+        # table rebuild could reintroduce.
+        await db.execute("PRAGMA ignore_check_constraints = ON")
+        await db.execute(
+            "INSERT INTO person_grants (person_id, user_id, access, granted_at) "
+            "VALUES (?, ?, 'superuser', '2026-01-01T00:00:00+00:00')",
+            (person_id, user_id),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+    cookies = {"vf_session": create_session_cookie("bob", user_id, 1)}
+    transport = ASGITransport(app=module.app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        landing = await ac.get("/", cookies=cookies, follow_redirects=False)
+        # require_person's answer, for comparison: the grant does not
+        # authorize. GET /p/{slug}/ is the one person-scoped route both
+        # services carry.
+        scoped = await ac.get("/p/bryn/", cookies=cookies)
+
+    assert scoped.status_code == 404, (
+        f"{service_module}: require_person accepted an unrecognised grant value; this test's "
+        "premise is gone and the assertion below proves nothing"
+    )
+    assert landing.headers.get("location") != "/p/bryn/", (
+        f"{service_module}: GET / redirected to a person require_person then refuses -- a dead "
+        "end the user cannot clear. _reachable_persons must deny the same grant values "
+        "require_person denies."
+    )
+
+
 def test_both_services_agree_on_the_landing_status_codes():
     """302 to the person, 400 when ambiguous, 200 HTML when there is nothing
     to show. A new account awaiting a grant is not a client error, and a

@@ -196,8 +196,45 @@ blocks the other:
 - Rotate `VITALFORGE_SECRET` to invalidate every outstanding session cookie at once.
 - Revoke an individual bearer token from `/auth/account`, or from the administrator token
   list. Tokens do not expire automatically.
-- Delete a user's account from `/auth/admin/users` to revoke their sessions and all of their
-  tokens outright — takes effect immediately, not just on their next login.
+- Delete a user's account from `/auth/admin/users` to revoke their sessions, all of their
+  tokens, and every person-access grant they held outright — takes effect immediately, not
+  just on their next login.
+
+### People and access
+
+Accounts (*who logs in*) and people (*whose health data it is*) are separate. Every
+person-scoped URL is `/p/{slug}/…`, and an account can only open a person it holds a grant
+on. Administrators manage both from `/auth/admin/persons`.
+
+Three access levels, ranked — a route asking for `view` is satisfied by anything higher:
+
+| Level | Can |
+|---|---|
+| `view` | Read that person's dashboard, metrics, weight history and recommendations |
+| `manage` | Everything in `view`, plus logging weigh-ins and triggering a sync |
+| `own` | Everything in `manage`, plus granting and revoking other accounts' access |
+
+Administrators reach every non-archived person regardless of grants, and can manage grants on
+any person including archived ones.
+
+A few behaviours are deliberate and worth knowing before they surprise you:
+
+- **A person is archived, never deleted.** Their data is kept, they drop out of every
+  dashboard, and `/p/{slug}/` stops resolving. **Slugs are never reused**, archived ones
+  included — a freed slug would let an old bookmark open a different person's health data.
+  For the same reason a slug cannot be renamed after creation.
+- **Exactly one person is primary**, and scheduled Garmin syncs follow them (per-person
+  Garmin linking arrives in a later phase). The primary person cannot be archived; promote
+  someone else first.
+- **A person can end up with zero grants** — by revoking the last one, or by deleting the
+  only account that held it. That is allowed on purpose: any administrator can still reach
+  them and restore access, and the alternative would make deleting an *account* fail for
+  reasons invisible from the users page.
+- **Asking for a person you cannot reach returns 404, not 403**, whether or not they exist.
+  The two answers are identical so that guessing cannot enumerate the household.
+- **Open access (empty `users` table) does not include these pages.** Like `/auth/admin/users`,
+  the person-administration surface needs a real admin account. Use `scripts/seed_db.py
+  --person` to put extra people into a development database.
 
 If a token is leaked, revoke that token. If the session signing secret is leaked, rotate
 `VITALFORGE_SECRET` to invalidate all cookies.

@@ -41,6 +41,19 @@ _ALLOWED_SHIM_FILES = {
     "scripts/seed_db.py",
 }
 
+# Every route shared/persons_admin.py is allowed to mount. Person-COLLECTION
+# routes only: create, list, rename/promote, archive, and grant management.
+# See test_the_person_admin_module_stays_a_collection_surface for why this is
+# an exact list rather than a prefix.
+_PERSON_ADMIN_PATHS = {
+    "/auth/admin/persons",
+    "/api/persons",
+    "/api/persons/{person_id}",
+    "/api/persons/{person_id}/archive",
+    "/api/persons/{person_id}/grants",
+    "/api/persons/{person_id}/grants/{user_id}",
+}
+
 
 def _python_sources():
     for d in ("shared", "vitalforge-dashboard", "vitalforge-weight", "scripts"):
@@ -206,6 +219,72 @@ def test_require_person_is_never_used_outside_a_slug_path(service):
         f"{service}: {offenders} use require_person on a path with no {{slug}} placeholder. "
         "FastAPI will bind slug from the query string instead, silently, and the route will "
         "answer 200 to ?slug=<anyone>."
+    )
+
+
+def test_the_person_admin_module_stays_a_collection_surface():
+    """The guards above scan only the two service app.py files, so routes added
+    to shared/persons_admin.py escape them entirely.
+
+    That module is Phase 2's one deliberate exception to "person-scoped means
+    /p/{slug}/": the person COLLECTION is addressed by id at the root, because
+    it must reach archived persons and require_person deliberately cannot. The
+    exception is bounded here rather than left implicit -- a route that both
+    lives in this module and takes a person as its SUBJECT belongs under
+    /p/{slug}/ with the rest, and would otherwise be invisible to every
+    structural guard in this file.
+    """
+    src = (REPO / "shared/persons_admin.py").read_text()
+    tree = ast.parse(src)
+
+    seen = 0
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+            continue
+        for dec in node.decorator_list:
+            if not (isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute)):
+                continue
+            if dec.func.attr not in {"get", "post", "patch", "put", "delete"}:
+                continue
+            if not (dec.args and isinstance(dec.args[0], ast.Constant)):
+                continue
+            path = dec.args[0].value
+            if not isinstance(path, str):
+                continue
+            seen += 1
+            # An exact allowlist, not a prefix. `startswith("/api/persons")`
+            # would wave through `/api/persons/{person_id}/metrics/{name}` --
+            # a person-SUBJECT route serving health data from a root path,
+            # which is precisely what this guard exists to stop. Adding a route
+            # here should be a deliberate edit to this list.
+            if path not in _PERSON_ADMIN_PATHS:
+                offenders.append(f"{path} ({node.name}, line {node.lineno})")
+            # Matched via AST, not substring: this module's own
+            # `_require_person_owner` CONTAINS the string "require_person", and
+            # a substring check flags it -- a guard that fires on the helper it
+            # is meant to protect trains people to delete it.
+            for call in ast.walk(node):
+                if not isinstance(call, ast.Call):
+                    continue
+                fn = call.func
+                name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
+                if name == "require_person":
+                    offenders.append(
+                        f"{path} ({node.name}, line {node.lineno}) uses require_person on a "
+                        "path with no {slug}; FastAPI would bind slug from the query string"
+                    )
+
+    # A FLOOR, not a count -- see the same reasoning in
+    # test_every_person_scoped_route_declares_require_person.
+    assert seen >= 5, (
+        f"found only {seen} routes in shared/persons_admin.py; either the module moved or "
+        "the route-matching above stopped recognising them"
+    )
+    assert not offenders, (
+        f"shared/persons_admin.py mounts {offenders}. This module is the person COLLECTION "
+        "surface only. Anything whose subject is one person belongs under /p/{slug}/ where "
+        "require_person and the guards above can see it."
     )
 
 

@@ -37,7 +37,7 @@ from goals import (
 )
 from readiness import compute_readiness
 from recommendations import get_recommendations, get_rules_only
-from sync import run_sync, scheduled_sync
+from sync import SyncRegistry, run_sync, scheduled_sync
 
 from shared.auth import (
     add_auth_routes,
@@ -54,12 +54,32 @@ from shared.database import (
     init_db,
 )
 from shared.garmin_client import authenticate
+from shared.persons_admin import add_person_routes
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 # Track whether a sync is currently running
 _sync_lock = asyncio.Lock()
+
+# WHICH persons have a sync in flight -- queued or running. See SyncRegistry
+# in sync.py for why this exists and why it is reference-counted; it lives
+# there rather than here because scheduled_sync must register in it too, and
+# sync.py cannot import this module.
+#
+# Acquired on the REQUEST path before the task is created and released in the
+# task's finally, so it covers the queued window as well as the running one --
+# a person cannot stack up tasks by clicking twice while someone else's sync
+# holds the lock.
+#
+# Making the LOCK itself per-person is Phase 4: one person's sync still
+# serializes everyone's, and that is deliberately left alone here. Only the
+# leaked observable is fixed.
+_syncing_person_ids = SyncRegistry()
+
+# Strong references to the detached sync tasks. asyncio keeps only a weak one,
+# so a task nobody holds can be garbage-collected part-way through a sync.
+_inflight_sync_tasks: set[asyncio.Task] = set()
 
 METRIC_TABLES = {
     "sleep_duration": ("sleep", "duration_seconds"),
@@ -102,7 +122,7 @@ async def lifespan(app: FastAPI):
         logger.warning("Garmin authentication failed (will retry on first sync): %s", e)
 
     # Start background sync scheduler
-    sync_task = asyncio.create_task(scheduled_sync(_sync_lock))
+    sync_task = asyncio.create_task(scheduled_sync(_sync_lock, _syncing_person_ids))
     yield
     sync_task.cancel()
 
@@ -111,6 +131,11 @@ app = FastAPI(title="VitalForge Dashboard", lifespan=lifespan)
 
 # Auth routes and middleware (must be added before other routes)
 add_auth_routes(app)
+# Person-collection admin (/api/persons, /auth/admin/persons). Registered on
+# BOTH services for the same reason add_auth_routes is: one login covers both,
+# so an admin who opened the weight service should not have to switch ports to
+# add someone.
+add_person_routes(app)
 
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
@@ -186,9 +211,20 @@ async def _reachable_persons(request: Request) -> tuple[list[tuple[int, str]], i
             )
         else:
             cursor = await db.execute(
+                # The access IN (...) predicate is what makes "mirrors
+                # require_person" true rather than nearly true. require_person
+                # denies an unrecognised grant value via
+                # _ACCESS_ORDER.get(granted, -1); without this predicate the
+                # join accepts it, and the two disagree: GET / would redirect
+                # to a /p/{slug}/ that then 404s -- a dead end the user cannot
+                # clear. person_grants' CHECK constraint makes that value
+                # unreachable today, but CHECK constraints are exactly what
+                # table rebuilds relax (see CLAUDE.md on _REBUILD_TABLES), and
+                # matching the authorization rule costs one line.
                 "SELECT p.id AS id, p.slug AS slug FROM persons p "
                 "JOIN person_grants g ON g.person_id = p.id AND g.user_id = ? "
-                "WHERE p.archived_at IS NULL ORDER BY p.id",
+                "WHERE p.archived_at IS NULL AND g.access IN ('view', 'manage', 'own') "
+                "ORDER BY p.id",
                 (identity.user_id,),
             )
         rows = await cursor.fetchall()
@@ -285,8 +321,16 @@ async def trigger_sync(
             ),
         )
 
-    if _sync_lock.locked():
+    # THIS person's sync, not _sync_lock.locked(): the lock is module-level, so
+    # answering from it told a caller "already running" because somebody ELSE
+    # was syncing -- the same cross-person observable that used to leak out of
+    # /api/sync/status. A second person's request now queues on the lock
+    # instead, which is what the shared lock has always meant.
+    if person_id in _syncing_person_ids:
         return {"status": "already_running", "message": "A sync is already in progress"}
+    # Added here rather than inside the task so a double-click cannot stack up
+    # two tasks during the window where the first is waiting on the lock.
+    _syncing_person_ids.acquire(person_id)
 
     async def _do_sync():
         # person_id is captured from the enclosing scope, never re-resolved in
@@ -295,7 +339,21 @@ async def trigger_sync(
         async with _sync_lock:
             await run_sync(days=days, person_id=person_id)
 
-    asyncio.create_task(_do_sync())
+    # The release is a done-callback rather than a `finally` inside _do_sync,
+    # because the acquire happens out here on the request path: a task
+    # cancelled BEFORE its first step never enters its own body, so a `finally`
+    # there would not run and this person would stay marked as syncing until
+    # the process restarts. add_done_callback fires for that case too, which
+    # makes the pairing structural instead of positional. (Nothing cancels
+    # these tasks today -- the lifespan's cancel targets scheduled_sync -- so
+    # this is defence against a future caller, not a live bug.)
+    task = asyncio.create_task(_do_sync())
+    task.add_done_callback(lambda _t: _syncing_person_ids.release(person_id))
+    # asyncio only holds a weak reference to a running task, so a task nobody
+    # retains can be garbage-collected mid-flight. Keep a strong reference
+    # until it finishes.
+    _inflight_sync_tasks.add(task)
+    task.add_done_callback(_inflight_sync_tasks.discard)
     return {"status": "started", "days": days}
 
 
@@ -312,14 +370,20 @@ async def sync_status(person_id: int = Depends(require_person("view"))):
     finally:
         await db.close()
 
+    # _syncing_person_ids, not _sync_lock.locked(): the lock is module-level, so
+    # reporting it here would tell every person that "a sync is running"
+    # whenever any OTHER person's sync is running -- household activity leaking
+    # across an otherwise person-scoped response. See _syncing_person_ids.
+    syncing = person_id in _syncing_person_ids
+
     if not row:
-        return {"last_sync_time": None, "last_sync_result": "never", "syncing": _sync_lock.locked()}
+        return {"last_sync_time": None, "last_sync_result": "never", "syncing": syncing}
 
     return {
         "last_sync_time": row["last_sync_time"],
         "last_sync_result": row["last_sync_result"],
         "last_sync_days": row["last_sync_days"],
-        "syncing": _sync_lock.locked(),
+        "syncing": syncing,
     }
 
 
