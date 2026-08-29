@@ -135,6 +135,12 @@ async def _resolve_person(database, slug: str | None) -> tuple[int, str]:
     is the whole point of the flag, and requiring the operator to first create
     one through an admin route that does not exist until Phase 2's PR 3 would
     make the flag unusable in exactly the phase that needs it.
+
+    A created person gets NO person_grants row, deliberately. Once Phase 2's
+    require_person lands, that person's data will 404 for every user until
+    someone grants access -- which is exactly the state a cross-person
+    isolation test wants, and the reason this script does not guess at one.
+    The caller is told so on stdout rather than discovering it as a bug.
     """
     from shared.slugs import RESERVED_SLUGS, slugify
 
@@ -158,18 +164,21 @@ async def _resolve_person(database, slug: str | None) -> tuple[int, str]:
 
     db = await database.get_db()
     try:
-        row = await (
-            await db.execute("SELECT id FROM persons WHERE slug = ?", (normalized,))
-        ).fetchone()
-        if row is not None:
-            return row["id"], normalized
-        cursor = await db.execute(
-            "INSERT INTO persons (slug, display_name, created_at, is_primary) VALUES (?, ?, ?, 0)",
+        # Idempotent by constraint, not by pre-check -- the convention this
+        # codebase states in shared/database.py's _grant_primary_person_to_
+        # first_admin and _add_columns. A check-then-insert here would let two
+        # concurrent runs both miss the SELECT and one die on persons.slug
+        # UNIQUE with a raw traceback.
+        await db.execute(
+            "INSERT INTO persons (slug, display_name, created_at, is_primary) "
+            "VALUES (?, ?, ?, 0) ON CONFLICT (slug) DO NOTHING",
             (normalized, normalized, datetime.now(timezone.utc).isoformat()),
         )
         await db.commit()
-        print(f"Created person '{normalized}' (id={cursor.lastrowid})")
-        return cursor.lastrowid, normalized
+        row = await (
+            await db.execute("SELECT id FROM persons WHERE slug = ?", (normalized,))
+        ).fetchone()
+        return row["id"], normalized
     finally:
         await db.close()
 
@@ -215,6 +224,13 @@ async def seed(db_path: Path, days: int, pattern: str, seed_value: int, person: 
         f"Seeded {days} days of synthetic '{pattern}' data for person "
         f"'{person_slug}' (id={person_id}) into {db_path}"
     )
+    if person is not None:
+        print(
+            f"Note: '{person_slug}' has no person_grants row. Once access control "
+            "lands, this person's data is reachable only by an admin or by a user "
+            "you grant explicitly -- which is the intended starting state for a "
+            "cross-person isolation test."
+        )
 
 
 def main():

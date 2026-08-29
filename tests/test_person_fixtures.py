@@ -58,8 +58,17 @@ async def test_seed_person_takes_an_explicit_display_name(initialized_db):
 
 async def test_seed_person_grants_nothing_by_default(initialized_db):
     """The load-bearing property. An implicit grant here would make every
-    'user without access gets 404' test pass for the wrong reason."""
-    user_id = await seed_user("nobody")
+    'user without access gets 404' test pass for the wrong reason.
+
+    Asserts ZERO grants on the person, not zero grants for one named user:
+    seed_person takes no user argument, so a per-user assertion could only
+    ever be tautological. The realistic regression is someone mirroring
+    _grant_primary_person_to_first_admin (shared/database.py, one file over,
+    doing exactly this) into seed_person -- that grants the FIRST ADMIN, whom
+    a per-user check on some other username would never look at.
+    """
+    await seed_user("nobody")
+    await seed_user("an-admin", role="admin")
     person_id = await seed_person("bryn")
 
     from shared.database import get_db
@@ -68,11 +77,13 @@ async def test_seed_person_grants_nothing_by_default(initialized_db):
     try:
         row = await (
             await db.execute(
-                "SELECT COUNT(*) FROM person_grants WHERE person_id = ? AND user_id = ?",
-                (person_id, user_id),
+                "SELECT COUNT(*) FROM person_grants WHERE person_id = ?", (person_id,)
             )
         ).fetchone()
-        assert row[0] == 0, "seed_person created a grant it was not asked for"
+        assert row[0] == 0, (
+            "seed_person created a grant it was not asked for -- every negative "
+            "isolation test built on this fixture would now pass for the wrong reason"
+        )
     finally:
         await db.close()
 
@@ -111,8 +122,15 @@ async def test_grant_person_rejects_an_invalid_access_level(initialized_db):
 
 
 async def test_grant_person_is_idempotent(initialized_db):
-    """Both services' lifespans race the same grant logic at startup, and
-    tests re-grant freely; a second call must update, not raise."""
+    """Re-granting must update rather than raise or duplicate.
+
+    This is a statement about the FIXTURE, not about production. The fixture
+    uses INSERT OR REPLACE so a test can freely upgrade view -> own; the
+    lifespan path (_grant_primary_person_to_first_admin) uses INSERT OR IGNORE
+    and would leave the level at 'view'. Do not read this test as evidence
+    about that path. Note OR REPLACE deletes and re-inserts, so re-granting
+    also resets granted_at and clears granted_by.
+    """
     user_id = await seed_user("repeat")
     person_id = await seed_person("bryn")
     await grant_person(person_id, user_id, access="view")

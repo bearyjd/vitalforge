@@ -119,8 +119,10 @@ Phase 2 needs to seed **two** people to test isolation at all.
 `tests/conftest.py` has no person fixtures. `seed_user()` (`:179-196`) creates a user with no
 grant, so `require_person` would 404 every seeded user in the existing suite.
 
-- Add `seed_person(slug, display_name)` and `grant(person, user, access)` fixtures.
-- `seed_token()` (`:199-214`) omits `person_id`; extend it to take an optional person.
+- Add `seed_person(slug, display_name)` and `grant_person(person, user, access)` fixtures.
+- **`seed_token()` is NOT touched here.** `api_tokens.person_id` does not exist until PR 4, so
+  extending the fixture belongs there, alongside the column — see §4.1. (An earlier draft of
+  this plan listed it under PR 1, contradicting its own PR 4 scope.)
 - Leave `production_schema_db` (`:113-159`) alone — it deliberately seeds pre-`person_id` rows.
 
 **Gate:** full suite green, no URL changed yet.
@@ -245,6 +247,10 @@ Mirror `/auth/admin/users`: list, create form, archive control, and per-person g
 ## PR 4 — tokens, ingest, and the unmount
 
 ### 4.1 `api_tokens.person_id` (deltas A2, A3)
+
+Also extend `tests/conftest.py`'s `seed_token()` to take an optional person here — it was
+deliberately left alone in PR 1 because the column did not exist yet.
+
 
 New `_API_TOKENS_ADDITIVE_COLUMNS = ["person_id INTEGER"]` — additive, nullable, no
 non-constant default, so it needs `_add_columns`, **not** a migration runner entry. Add

@@ -18,6 +18,7 @@ test that ran afterward. The subprocess also exercises what actually broke --
 the CLI, as a person would invoke it.
 """
 
+import os
 import sqlite3
 import subprocess
 import sys
@@ -30,12 +31,25 @@ SEED_SCRIPT = REPO_ROOT / "scripts" / "seed_db.py"
 
 
 def _run_seed(*args: str) -> subprocess.CompletedProcess:
+    """Run the seeder with a sanitized environment.
+
+    VITALFORGE_PRIMARY_PERSON must be cleared: shared/migrations.py reads it
+    when naming the primary person, and README documents it as a .env setting.
+    A developer who has it exported (direnv, `set -a; source .env`) would
+    otherwise see these tests fail against a perfectly working seeder -- the
+    primary person's slug would be their value instead of "primary", and if it
+    happened to be "bryn" the second-person test would find the existing
+    primary by slug and create nobody. CI never has a .env, so this would bite
+    locally only, which is the worst place for a spurious failure.
+    """
+    env = {k: v for k, v in os.environ.items() if k != "VITALFORGE_PRIMARY_PERSON"}
     return subprocess.run(
         [sys.executable, str(SEED_SCRIPT), *args],
         capture_output=True,
         text=True,
         cwd=REPO_ROOT,
         timeout=120,
+        env=env,
     )
 
 

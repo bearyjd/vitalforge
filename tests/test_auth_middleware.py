@@ -149,6 +149,19 @@ async def test_person_scoped_api_path_works_when_authenticated(matrix_client):
         ("/p/alice", False),
         ("/page", False),
         ("/", False),
+        # Pre-existing root-path asymmetry, pinned rather than changed: the
+        # root arm is startswith("/api/") and needs the slash, while the
+        # person arm's (?:/|$) accepts a bare /p/{slug}/api. Not fixed here --
+        # /api is not a route, and widening the root arm is a behavior change
+        # that belongs nowhere near a precondition PR.
+        ("/api", False),
+        # Routing is case-sensitive, so this 404s when authenticated. It gets
+        # a login redirect rather than a 401 when not, which is acceptable for
+        # a path no real client can produce (SLUG_RE is lowercase-only).
+        ("/P/alice/api/thing", False),
+        # uvicorn percent-decodes into scope["path"] before middleware AND
+        # before routing, so both read the same string and cannot disagree.
+        ("/p/alice/%61pi/thing", False),  # pre-decode form; never seen by _is_api_path
         # A slug can never contain "/", so this is a page under some other
         # prefix, not an API path -- matching it would send a browser JSON.
         ("/p/alice/extra/api/thing", False),
