@@ -251,7 +251,6 @@ Mirror `/auth/admin/users`: list, create form, archive control, and per-person g
 Also extend `tests/conftest.py`'s `seed_token()` to take an optional person here — it was
 deliberately left alone in PR 1 because the column did not exist yet.
 
-
 New `_API_TOKENS_ADDITIVE_COLUMNS = ["person_id INTEGER"]` — additive, nullable, no
 non-constant default, so it needs `_add_columns`, **not** a migration runner entry. Add
 `person_id` to `_Identity` and to `_resolve_bearer_token`'s SELECT; cookie identities supply

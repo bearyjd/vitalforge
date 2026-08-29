@@ -31,18 +31,29 @@ SEED_SCRIPT = REPO_ROOT / "scripts" / "seed_db.py"
 
 
 def _run_seed(*args: str) -> subprocess.CompletedProcess:
-    """Run the seeder with a sanitized environment.
+    """Run the seeder with every VITALFORGE_* variable stripped.
 
-    VITALFORGE_PRIMARY_PERSON must be cleared: shared/migrations.py reads it
-    when naming the primary person, and README documents it as a .env setting.
-    A developer who has it exported (direnv, `set -a; source .env`) would
-    otherwise see these tests fail against a perfectly working seeder -- the
-    primary person's slug would be their value instead of "primary", and if it
-    happened to be "bryn" the second-person test would find the existing
-    primary by slug and create nobody. CI never has a .env, so this would bite
-    locally only, which is the worst place for a spurious failure.
+    The concrete problem is VITALFORGE_PRIMARY_PERSON: shared/migrations.py
+    reads it when naming the primary person, and README documents it as a .env
+    setting. A developer who has it exported (direnv, `set -a; source .env`)
+    would otherwise watch these tests fail against a perfectly working seeder
+    -- the primary person's slug would be their value instead of "primary",
+    and if it happened to be "bryn" the second-person test would find the
+    existing primary by slug, create nobody, and report a working seeder as
+    broken. CI never has a .env, so it bites locally only, which is the worst
+    place for a spurious failure.
+
+    Stripping the whole VITALFORGE_ prefix rather than that one name closes the
+    class instead of the instance. VITALFORGE_SKIP_MIGRATION_SNAPSHOT is also
+    read on this path (shared/migrations.py) and is a one-way-door flag a
+    developer could plausibly have exported; it changes no assertion today only
+    because nothing yet asserts on snapshot side effects.
+
+    This is a subtractive filter, not a whitelist -- PATH, VIRTUAL_ENV,
+    PYTHONPATH and HOME all pass through untouched. A whitelist here would be
+    the dangerous shape.
     """
-    env = {k: v for k, v in os.environ.items() if k != "VITALFORGE_PRIMARY_PERSON"}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("VITALFORGE_")}
     return subprocess.run(
         [sys.executable, str(SEED_SCRIPT), *args],
         capture_output=True,
