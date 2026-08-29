@@ -6,17 +6,29 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.requests import Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from shared.auth import add_auth_routes, bootstrap_first_admin, bootstrap_migrated_token
-from shared.database import ensure_primary_person_grant, get_db, get_primary_person_id, init_db
+# _get_current_identity is private, but it is the only accessor that returns
+# the open-access `anonymous` sentinel instead of raising: its public sibling
+# require_account_identity() 401s whenever `user_id is None`, and GET /
+# below must keep working in the empty-users-table mode CLAUDE.md documents.
+# A public identity-or-None accessor in shared/auth.py would retire this
+# import.
+from shared.auth import (
+    _get_current_identity,
+    add_auth_routes,
+    bootstrap_first_admin,
+    bootstrap_migrated_token,
+    require_person,
+)
+from shared.database import ensure_primary_person_grant, get_db, init_db
 from shared.garmin_client import authenticate, push_weight
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -128,10 +140,113 @@ async def health():
     return {"status": "ok", "service": "vitalforge-weight"}
 
 
+_NO_PERSONS_PAGE = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VitalForge &mdash; no person available</title></head>
+<body style="font-family: system-ui, sans-serif; max-width: 32rem; margin: 4rem auto; padding: 0 1rem;">
+<h1>Nothing to show yet</h1>
+<p>Your account cannot currently reach any person's data, so there is no weight
+log to open. An administrator needs to grant you access to a person.</p>
+<p><a href="/auth/logout">Sign out</a></p>
+</body></html>
+"""
+
+
+async def _reachable_persons(user_id: int | None, is_admin: bool) -> list[tuple[int, str]]:
+    """Active persons this caller may reach, as (id, slug) in stable id order.
+
+    Deliberately mirrors shared.auth._identity_and_grant's predicate --
+    `archived_at IS NULL`, plus the anonymous and admin bypasses
+    require_person() applies. A slug this returns must be one
+    require_person("view") accepts on the very next request, or the redirect
+    below would hand the browser a 404.
+    """
+    db = await get_db()
+    try:
+        if user_id is None or is_admin:
+            # Open-access mode holds implicit `own` on everyone, and the admin
+            # bypass is the same one every /auth/admin/* route already uses.
+            cursor = await db.execute(
+                "SELECT id, slug FROM persons WHERE archived_at IS NULL ORDER BY id"
+            )
+        else:
+            cursor = await db.execute(
+                "SELECT p.id AS id, p.slug AS slug FROM persons p "
+                "JOIN person_grants g ON g.person_id = p.id AND g.user_id = ? "
+                "WHERE p.archived_at IS NULL ORDER BY p.id",
+                (user_id,),
+            )
+        return [(row["id"], row["slug"]) for row in await cursor.fetchall()]
+    finally:
+        await db.close()
+
+
+async def _default_person_id(user_id: int) -> int | None:
+    db = await get_db()
+    try:
+        row = await (
+            await db.execute("SELECT default_person_id FROM users WHERE id = ?", (user_id,))
+        ).fetchone()
+    finally:
+        await db.close()
+    return row["default_person_id"] if row is not None else None
+
+
 @app.get("/")
 async def index(request: Request):
+    """Redirect to the caller's own person page.
+
+    `users.default_person_id` builds this redirect and nothing else -- it is
+    never an implicit fallback inside a person-scoped data route (design spec
+    SSf.2). It is resolved *through* the reachable set rather than
+    dereferenced directly, so a default pointing at an archived person, or one
+    whose grant was revoked, falls through to the single-person rule instead
+    of redirecting to a URL require_person() would 404.
+
+    NULL (or unusable) default means "the single person this caller can
+    reach", or 400 if that is ambiguous. Zero reachable persons is not covered
+    by the spec and is not a client error either -- a newly created account
+    waiting on a grant lands here -- so it renders an explanatory 200 page
+    rather than a bare 400.
+    """
+    identity = await _get_current_identity(request)
+    if identity is None:
+        # auth_middleware normally redirects an unauthenticated browser to the
+        # login page before routing gets here; this is the belt-and-braces arm.
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    reachable = await _reachable_persons(identity.user_id, identity.role == "admin")
+    if not reachable:
+        return HTMLResponse(_NO_PERSONS_PAGE)
+
+    slug = None
+    if identity.user_id is not None:
+        default_id = await _default_person_id(identity.user_id)
+        if default_id is not None:
+            slug = next((s for person_id, s in reachable if person_id == default_id), None)
+
+    if slug is None:
+        if len(reachable) > 1:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "No default person is set and several are available; "
+                    "open one directly: " + ", ".join(f"/p/{s}/" for _, s in reachable)
+                ),
+            )
+        slug = reachable[0][1]
+
+    return RedirectResponse(f"/p/{slug}/", status_code=302)
+
+
+@app.get("/p/{slug}/")
+async def person_index(request: Request, slug: str, person_id: int = Depends(require_person("view"))):
+    # person_id is unused here -- the Depends IS the authorization, and
+    # dropping it would make this page readable by anyone with an account.
     return templates.TemplateResponse("index.html", {
         "request": request,
+        "person_slug": slug,
         "dashboard_url": os.environ.get("DASHBOARD_URL", ""),
         "default_unit": os.environ.get("DEFAULT_UNIT", "lbs"),
         "tz": os.environ.get("TZ", ""),
@@ -172,8 +287,8 @@ def _push_composition(weight_grams: int, timestamp: datetime, composition: dict)
         return str(e)
 
 
-@app.post("/api/weight")
-async def post_weight(data: WeightIn):
+@app.post("/p/{slug}/api/weight")
+async def post_weight(data: WeightIn, person_id: int = Depends(require_person("manage"))):
     unit = data.unit.lower()
     if unit not in ("lbs", "kg"):
         raise HTTPException(status_code=400, detail="unit must be 'lbs' or 'kg'")
@@ -188,7 +303,6 @@ async def post_weight(data: WeightIn):
     weight_grams = round(weight_kg * GRAMS_PER_KG)
     now = datetime.now(timezone.utc)
     timestamp = now.isoformat()
-    person_id = await get_primary_person_id()
 
     # Atomic: read for a duplicate and (if any) write inside one transaction,
     # so two concurrent requests can never both observe "no duplicate". The
@@ -419,9 +533,8 @@ async def post_weight(data: WeightIn):
     return result
 
 
-@app.get("/api/weight/recent")
-async def get_recent_weights():
-    person_id = await get_primary_person_id()
+@app.get("/p/{slug}/api/weight/recent")
+async def get_recent_weights(person_id: int = Depends(require_person("view"))):
     db = await get_db()
     try:
         cursor = await db.execute(
@@ -445,10 +558,9 @@ async def get_recent_weights():
     ]
 
 
-@app.get("/api/weight/trend")
-async def get_weight_trend():
+@app.get("/p/{slug}/api/weight/trend")
+async def get_weight_trend(person_id: int = Depends(require_person("view"))):
     """Return last 30 days of weights for the trend chart."""
-    person_id = await get_primary_person_id()
     db = await get_db()
     try:
         cursor = await db.execute(
@@ -466,11 +578,13 @@ async def get_weight_trend():
     ]
 
 
-@app.delete("/api/weight/{weight_id}")
-async def delete_weight(weight_id: int):
-    person_id = await get_primary_person_id()
+@app.delete("/p/{slug}/api/weight/{weight_id}")
+async def delete_weight(weight_id: int, person_id: int = Depends(require_person("manage"))):
     db = await get_db()
     try:
+        # The dependency authorizes the caller for this person; `person_id` in
+        # the predicate is still what stops an id belonging to a *different*
+        # person being deleted through a slug the caller does hold.
         cursor = await db.execute(
             "DELETE FROM weight_log WHERE id = ? AND person_id = ?", (weight_id, person_id)
         )

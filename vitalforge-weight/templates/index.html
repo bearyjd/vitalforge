@@ -206,7 +206,7 @@
 </head>
 <body>
     <nav class="nav">
-        <a href="/" class="active">Weight</a>
+        <a href="/p/{{ person_slug }}/" class="active">Weight</a>
         <a href="#" id="dashLink">Dashboard</a>
         <a href="/auth/logout">Logout</a>
     </nav>
@@ -244,15 +244,30 @@
     <div class="toast" id="toast"></div>
 
     <script>
-        // Nav link — use configured URL, or fall back to port-based for local dev
+        // ── Person scope ──
+        // Every API call and in-app link on this page is built from these two
+        // bases. There is no unscoped /api/... route any more, so an empty slug
+        // must fail here and loudly rather than produce confusing 404s further
+        // down.
+        const PERSON_SLUG = "{{ person_slug }}";
+        if (!PERSON_SLUG) {
+            throw new Error("person_slug is missing from the template context — cannot build API URLs");
+        }
+        const PERSON_HOME = `/p/${encodeURIComponent(PERSON_SLUG)}/`;
+        const API_BASE = `${PERSON_HOME}api`;
+
+        // Nav link — use configured URL, or fall back to port-based for local dev.
+        // Slugs are global across the shared database, so the same person path is
+        // valid on the dashboard service and carrying it keeps the person context
+        // across the hop.
         (function() {
             const dashLink = document.getElementById("dashLink");
             const configured = "{{ dashboard_url }}";
             if (configured) {
-                dashLink.href = configured;
+                dashLink.href = configured.replace(/\/+$/, "") + PERSON_HOME;
             } else {
                 const loc = window.location;
-                dashLink.href = loc.protocol + "//" + loc.hostname + ":8086/";
+                dashLink.href = loc.protocol + "//" + loc.hostname + ":8086" + PERSON_HOME;
             }
         })();
 
@@ -301,7 +316,7 @@
 
         async function loadRecent() {
             try {
-                const res = await fetch("/api/weight/recent");
+                const res = await fetch(`${API_BASE}/weight/recent`);
                 const data = await res.json();
                 if (data.length === 0) {
                     recentList.innerHTML = '<li class="empty-state">No weigh-ins yet</li>';
@@ -330,7 +345,7 @@
         async function deleteEntry(id) {
             if (!confirm("Delete this weigh-in?")) return;
             try {
-                const res = await fetch(`/api/weight/${id}`, { method: "DELETE" });
+                const res = await fetch(`${API_BASE}/weight/${id}`, { method: "DELETE" });
                 if (res.ok) {
                     showToast("Deleted", "success");
                     loadRecent();
@@ -353,7 +368,7 @@
             submitBtn.textContent = "Logging...";
 
             try {
-                const res = await fetch("/api/weight", {
+                const res = await fetch(`${API_BASE}/weight`, {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ weight: value, unit: currentUnit, source: "pwa" }),
@@ -391,7 +406,7 @@
         // Trend chart
         async function loadTrendChart() {
             try {
-                const res = await fetch("/api/weight/trend");
+                const res = await fetch(`${API_BASE}/weight/trend`);
                 const data = await res.json();
                 if (data.length < 2) return;
 

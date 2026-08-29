@@ -198,7 +198,7 @@
 <body>
     <nav class="nav">
         <a href="#" id="weightLink">Weight</a>
-        <a href="/" class="active">Dashboard</a>
+        <a href="/p/{{ person_slug }}/" class="active">Dashboard</a>
         <a href="/auth/logout">Logout</a>
     </nav>
     <div class="container">
@@ -352,19 +352,36 @@
     </div>
 
     <script>
+        // ── Person scope ──
+        // Every API call and in-app link on this page is built from these two
+        // bases. There is no unscoped /api/... route any more, so an empty slug
+        // must fail here and loudly rather than produce confusing 404s further
+        // down. window.VF_API_BASE is how static/correlations.js (no Jinja)
+        // picks the same base up.
+        const PERSON_SLUG = "{{ person_slug }}";
+        if (!PERSON_SLUG) {
+            throw new Error("person_slug is missing from the template context — cannot build API URLs");
+        }
+        const PERSON_HOME = `/p/${encodeURIComponent(PERSON_SLUG)}/`;
+        const API_BASE = `${PERSON_HOME}api`;
+        window.VF_API_BASE = API_BASE;
+
         if ("serviceWorker" in navigator) {
             navigator.serviceWorker.register("/static/sw.js");
         }
 
-        // Nav link — use configured URL, or fall back to port-based for local dev
+        // Nav link — use configured URL, or fall back to port-based for local dev.
+        // Slugs are global across the shared database, so the same person path is
+        // valid on the weight service and carrying it keeps the person context
+        // across the hop.
         (function() {
             const wLink = document.getElementById("weightLink");
             const configured = "{{ weight_url }}";
             if (configured) {
-                wLink.href = configured;
+                wLink.href = configured.replace(/\/+$/, "") + PERSON_HOME;
             } else {
                 const loc = window.location;
-                wLink.href = loc.protocol + "//" + loc.hostname + ":8085/";
+                wLink.href = loc.protocol + "//" + loc.hostname + ":8085" + PERSON_HOME;
             }
         })();
 
@@ -407,7 +424,7 @@
             const key = `${name}_${days}`;
             if (metricCache[key]) return metricCache[key];
             try {
-                const res = await fetch(`/api/metrics/${name}?days=${days}`);
+                const res = await fetch(`${API_BASE}/metrics/${name}?days=${days}`);
                 if (!res.ok) return { data: [] };
                 const json = await res.json();
                 metricCache[key] = json;
@@ -416,7 +433,7 @@
         }
 
         async function fetchSyncStatus() {
-            try { const res = await fetch("/api/sync/status"); return await res.json(); }
+            try { const res = await fetch(`${API_BASE}/sync/status`); return await res.json(); }
             catch { return null; }
         }
 
@@ -424,7 +441,7 @@
             const btn = document.getElementById("syncBtn");
             btn.disabled = true; btn.textContent = "Syncing...";
             try {
-                await fetch("/api/sync", { method: "POST" });
+                await fetch(`${API_BASE}/sync`, { method: "POST" });
                 const poll = setInterval(async () => {
                     const status = await fetchSyncStatus();
                     if (status && !status.syncing) {
@@ -520,7 +537,7 @@
         // ── Recommendations ──
         async function loadRecommendations(refresh) {
             try {
-                const url = refresh ? "/api/recommendations?refresh=true" : "/api/recommendations";
+                const url = refresh ? `${API_BASE}/recommendations?refresh=true` : `${API_BASE}/recommendations`;
                 const res = await fetch(url);
                 if (!res.ok) return;
                 const data = await res.json();
@@ -556,7 +573,7 @@
         async function loadReadiness() {
             const tile = document.getElementById("readinessTile");
             try {
-                const res = await fetch("/api/readiness");
+                const res = await fetch(`${API_BASE}/readiness`);
                 if (!res.ok) { tile.style.display = "none"; return; }
                 const data = await res.json();
                 if (data.score == null) { tile.style.display = "none"; return; }

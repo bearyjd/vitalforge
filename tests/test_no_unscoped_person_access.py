@@ -31,7 +31,15 @@ SERVICES = ["vitalforge-dashboard/app.py", "vitalforge-weight/app.py"]
 #                                round-robin cursor replaces this; until then
 #                                the shim is the honest answer, and saying so
 #                                here is what stops Phase 4 leaking forward.
-_ALLOWED_SHIM_FILES = {"shared/database.py", "vitalforge-dashboard/sync.py"}
+#   scripts/seed_db.py        -- a CLI tool. There is no request and no
+#                                caller to authorize; --person addresses a
+#                                person explicitly and this is only the
+#                                default when it is omitted.
+_ALLOWED_SHIM_FILES = {
+    "shared/database.py",
+    "vitalforge-dashboard/sync.py",
+    "scripts/seed_db.py",
+}
 
 
 def _python_sources():
@@ -42,13 +50,26 @@ def _python_sources():
 
 
 def test_no_request_path_resolves_a_person_without_authorizing():
-    """get_primary_person_id() must not appear outside its two sanctioned
-    homes. This is the whole point of Phase 2: one supplier of person_id."""
-    offenders = [
-        rel
-        for rel, src in _python_sources()
-        if "get_primary_person_id" in src and rel not in _ALLOWED_SHIM_FILES
-    ]
+    """get_primary_person_id() must not be CALLED outside its sanctioned
+    homes. This is the whole point of Phase 2: one supplier of person_id.
+
+    Matches call sites via AST, not substring. A substring check also flags
+    docstrings and comments -- it flagged shared/auth.py, whose require_person
+    docstring merely explains that the shim is retired from request paths. A
+    guard that fires on prose about itself trains people to widen the
+    allowlist, which is exactly how the thing it guards gets back in.
+    """
+    offenders = []
+    for rel, src in _python_sources():
+        if rel in _ALLOWED_SHIM_FILES:
+            continue
+        for node in ast.walk(ast.parse(src)):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
+            if name == "get_primary_person_id":
+                offenders.append(f"{rel}:{node.lineno}")
     assert not offenders, (
         f"{offenders} still resolve a person without authorizing. Every request path must "
         "obtain person_id from Depends(require_person(...)). If a new non-request caller is "
