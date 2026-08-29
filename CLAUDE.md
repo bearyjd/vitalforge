@@ -163,6 +163,15 @@ the original test-suite rationale (marked DONE).
   (`002-activities-person-id` exists because the `activities` gap was found after 001 had
   already run on dev databases), and list it in `shared/migrations.py`'s `_KNOWN_MIGRATIONS` in
   the same commit — an applied marker missing from that tuple boot-loops the container.
+- **Everything on the `init_db()` path runs TWICE, concurrently, against one file.** Compose
+  starts both services together, so any step there needs its own cross-process story, and each
+  one picks a different mechanism: `_add_columns` uses attempt-and-swallow, `run_migration` uses
+  `BEGIN IMMEDIATE`, and `ensure_pre_migration_snapshot` uses an `flock` (it cannot use
+  `BEGIN IMMEDIATE` — SQLite refuses `VACUUM` inside a transaction). A step with no such story
+  is a bug: the snapshot had none and both services raced the same `.partial` path on the real
+  001 upgrade, killing the dashboard's lifespan with a bare `disk I/O error`. Prefer an flock
+  over a sentinel file — a killed container releases an flock, a sentinel file deadlocks every
+  later boot.
 - **A table rebuild resets `AUTOINCREMENT` unless you carry `sqlite_sequence` across by hand.**
   `DROP TABLE` deletes that table's `sqlite_sequence` row, and the `INSERT ... SELECT` leaves the
   new counter at `MAX(id)` of the rows that survived — so any id above it, belonging to a row
