@@ -5,6 +5,8 @@ See docs/superpowers/specs/2026-08-25-family-multitenancy-design.md section
 verbatim; deviations from the spec's code samples are noted inline.
 """
 
+import asyncio
+import fcntl
 import logging
 import os
 import time
@@ -463,6 +465,16 @@ async def ensure_pre_migration_snapshot(
     integrity_check, so exists() on the fixed name really does mean "a good
     snapshot exists." os.rename is atomic within a filesystem, and both
     paths are on the same data volume by construction (DB_PATH.parent).
+
+    Serialized across processes by an flock on `<snapshot_name>.lock`, for
+    the same reason run_migration takes BEGIN IMMEDIATE: docker-compose
+    starts both services at once, and they share this volume. Without the
+    lock both pass the exists() check above, both unlink the SAME `.partial`
+    path, and both VACUUM INTO it -- the loser dies with a bare
+    "disk I/O error". Observed in production on the 001 upgrade, 4.7ms apart.
+    The lock is held across the whole write-verify-rename sequence, and
+    `final.exists()` is re-checked once inside it, so the loser wakes up,
+    sees the winner's finished snapshot, and returns without a second VACUUM.
     """
     # local, so DB_PATH is resolved per-call -- a module-top binding would
     # freeze the value at import and defeat DB_PATH overrides in tests.
@@ -479,6 +491,45 @@ async def ensure_pre_migration_snapshot(
         )
         return
 
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lock = await asyncio.to_thread(_acquire_snapshot_lock, DB_PATH.parent / f"{snapshot_name}.lock")
+    try:
+        # Double-checked: the first exists() above is an uncontended fast
+        # path, this one is the one that actually decides. The loser of the
+        # race reaches here only after the winner has renamed.
+        if final.exists():
+            return
+        await _write_verified_snapshot(DB_PATH, snapshot_name, final, needs_snapshot)
+    finally:
+        await asyncio.to_thread(_release_snapshot_lock, lock)
+
+
+def _acquire_snapshot_lock(lock_path):
+    """Block until this process owns the snapshot lock.
+
+    Advisory flock, not a lock *file* whose existence is the lock: a killed
+    container releases an flock automatically when the kernel closes its fds,
+    while a sentinel file would survive and deadlock every later boot. The
+    file itself is never read or written, only locked, and is left behind on
+    purpose -- creating it is not the acquisition.
+    """
+    handle = open(lock_path, "w")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    except BaseException:
+        handle.close()
+        raise
+    return handle
+
+
+def _release_snapshot_lock(handle) -> None:
+    handle.close()  # closing drops the flock
+
+
+async def _write_verified_snapshot(DB_PATH, snapshot_name, final, needs_snapshot) -> None:
+    """VACUUM INTO a temp name, verify it, rename into place. Caller holds
+    the snapshot lock, so the fixed `.partial` name is safe to reuse and any
+    file already at it is genuinely abandoned."""
     db = await get_db()
     try:
         if not await needs_snapshot(db):
@@ -498,18 +549,28 @@ async def ensure_pre_migration_snapshot(
         await db.commit()
         try:
             await db.execute("VACUUM INTO ?", (str(tmp),))
-        except Exception:
+        except Exception as exc:
             # Scoped to the VACUUM only: a failure in needs_snapshot() is not
             # a disk-space problem and must not be reported as one.
+            #
+            # The underlying error is logged FIRST and in full. This branch
+            # used to assert insufficient disk space as the cause, which sent
+            # an operator to check free space during the 001 production
+            # upgrade while 123G was free -- the actual fault was two
+            # services racing this function, now serialized by the snapshot
+            # lock. Name disk space as the common case, not the diagnosis.
             logger.error(
-                "Pre-migration snapshot failed. The most likely cause is insufficient "
-                "free space on the data volume: VACUUM INTO needs room for a full "
-                "second copy of the database. Free space and restart, or -- after "
-                "taking a volume-level backup by other means -- set "
+                "Pre-migration snapshot failed: %s: %s. Commonly this is insufficient "
+                "free space on the data volume -- VACUUM INTO needs room for a full "
+                "second copy of the database -- but check the error above before "
+                "assuming that. Resolve it and restart, or -- after taking a "
+                "volume-level backup by other means -- set "
                 "VITALFORGE_SKIP_MIGRATION_SNAPSHOT=1 to proceed without it. Until one "
                 "of those happens this container will restart-loop "
                 "(restart: unless-stopped), which is deliberate: migrating without a "
-                "backup is worse."
+                "backup is worse.",
+                type(exc).__name__,
+                exc,
             )
             raise
     finally:

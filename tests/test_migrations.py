@@ -353,6 +353,89 @@ async def test_snapshot_raises_actionable_error_when_integrity_check_itself_rais
 
 
 @pytest.mark.asyncio
+async def test_concurrent_snapshot_callers_do_not_clobber_each_other(tmp_path, monkeypatch):
+    """docker-compose starts both services at once against the same volume,
+    so two processes reach this function simultaneously. Unserialized, both
+    pass the exists() check, both unlink the SAME `.partial` path, and both
+    VACUUM INTO it -- the loser dies with a bare "disk I/O error" and takes
+    its container's lifespan down with it. Observed in production during the
+    001 upgrade, the two log lines 4.7ms apart.
+
+    flock is held per open file description, so two concurrent callers in one
+    process contend exactly as two processes do, and this reproduces it.
+    """
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "fitness.db")
+    db = await database.get_db()
+    try:
+        await db.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY, payload TEXT)")
+        for i in range(500):  # big enough that VACUUM INTO is not instantaneous
+            await db.execute("INSERT INTO probe (payload) VALUES (?)", ("x" * 200,))
+        await db.commit()
+    finally:
+        await db.close()
+
+    async def needs_snapshot(_db):
+        return True
+
+    results = await asyncio.gather(
+        migrations.ensure_pre_migration_snapshot("test.pre-migration.db", needs_snapshot),
+        migrations.ensure_pre_migration_snapshot("test.pre-migration.db", needs_snapshot),
+        migrations.ensure_pre_migration_snapshot("test.pre-migration.db", needs_snapshot),
+        return_exceptions=True,
+    )
+    failures = [r for r in results if isinstance(r, BaseException)]
+    assert not failures, (
+        f"concurrent snapshot callers collided: {failures!r} -- unserialized, they share "
+        "one .partial path and unlink/VACUUM over each other"
+    )
+
+    final = tmp_path / "test.pre-migration.db"
+    assert final.exists(), "no snapshot was produced"
+    assert not (tmp_path / "test.pre-migration.db.partial").exists(), "a .partial leaked"
+
+    check = await aiosqlite.connect(str(final))
+    try:
+        assert (await (await check.execute("PRAGMA integrity_check")).fetchone())[0] == "ok"
+        rows = (await (await check.execute("SELECT COUNT(*) FROM probe")).fetchone())[0]
+        assert rows == 500, f"snapshot holds {rows} rows, not the 500 that existed"
+    finally:
+        await check.close()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_loser_skips_a_redundant_vacuum(tmp_path, monkeypatch):
+    """The loser must re-check final.exists() INSIDE the lock and return, not
+    wait its turn and then take a second full copy of the database."""
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "fitness.db")
+    db = await database.get_db()
+    try:
+        await db.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
+        await db.commit()
+    finally:
+        await db.close()
+
+    vacuums = 0
+    real_execute = aiosqlite.Connection.execute
+
+    async def counting_execute(self, sql, *args, **kwargs):
+        nonlocal vacuums
+        if isinstance(sql, str) and "VACUUM INTO" in sql:
+            vacuums += 1
+        return await real_execute(self, sql, *args, **kwargs)
+
+    monkeypatch.setattr(aiosqlite.Connection, "execute", counting_execute)
+
+    async def needs_snapshot(_db):
+        return True
+
+    await asyncio.gather(
+        migrations.ensure_pre_migration_snapshot("test.pre-migration.db", needs_snapshot),
+        migrations.ensure_pre_migration_snapshot("test.pre-migration.db", needs_snapshot),
+    )
+    assert vacuums == 1, f"{vacuums} VACUUMs ran; the loser must no-op on the winner's snapshot"
+
+
+@pytest.mark.asyncio
 async def test_assert_schema_understood_passes_on_empty_migrations_table(tmp_path, monkeypatch):
     monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
     db = await database.get_db()
