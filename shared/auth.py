@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import logging
 import os
+import re
 import secrets
 import time
 from datetime import datetime, timezone
@@ -64,6 +65,28 @@ _RESERVED_USERNAMES = {"anonymous", "api-token"}
 # /p/{slug}/" is a different and larger rule than _RESERVED_USERNAMES' "safe
 # as a username", and keeping it out of here lets shared/migrations.py avoid
 # importing this module at all.
+
+# Person-scoped API paths, i.e. /p/{slug}/api/... -- the shape Phase 2 moves
+# every person-scoped route to. Deliberately NOT anchored to a valid slug:
+# auth_middleware runs before routing, so it cannot know whether the slug
+# resolves, and a request shaped like an API call must get a machine-readable
+# 401 either way. An unknown slug then 404s from the router, after auth.
+_PERSON_API_PATH_RE = re.compile(r"^/p/[^/]+/api(?:/|$)")
+
+
+def _is_api_path(path: str) -> bool:
+    """True for paths whose unauthenticated response must be a 401 JSON body
+    rather than a 302 to the HTML login page.
+
+    Both shapes count: the root `/api/...` routes, and the `/p/{slug}/api/...`
+    routes Phase 2 introduces. Testing only `startswith("/api/")` -- which is
+    what this replaced -- silently sends every person-scoped API call to the
+    login page instead, and the bearer-token clients README documents
+    (Tasker, Bascule) would receive HTML they cannot parse rather than a 401
+    with WWW-Authenticate. That break would land the moment the first route
+    moved, which is why this ships one PR ahead of the move.
+    """
+    return path.startswith("/api/") or _PERSON_API_PATH_RE.match(path) is not None
 
 # scrypt cost parameters for password hashing. n=2**14 (OWASP's minimum
 # recommendation for interactive/low-throughput logins) rather than a
@@ -1283,7 +1306,7 @@ def add_auth_routes(app):
 
         user = await get_current_user(request)
         if user is None:
-            if path.startswith("/api/"):
+            if _is_api_path(path):
                 return JSONResponse(
                     status_code=401,
                     content={"detail": "Not authenticated"},

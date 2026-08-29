@@ -23,6 +23,17 @@ def _build_matrix_app() -> FastAPI:
     async def api_thing():
         return {"ok": True}
 
+    # Phase 2 moves every person-scoped route to this shape. The middleware
+    # has to recognise it as an API path or bearer clients get an HTML login
+    # page instead of a 401 -- see _is_api_path in shared/auth.py.
+    @app.get("/p/{slug}/api/thing")
+    async def person_api_thing(slug: str):
+        return {"ok": True, "slug": slug}
+
+    @app.get("/p/{slug}/")
+    async def person_page(slug: str):
+        return HTMLResponse("<html></html>")
+
     @app.get("/page")
     async def page():
         return HTMLResponse("<html></html>")
@@ -81,6 +92,75 @@ async def test_html_path_redirects_to_login_not_401(configured_auth, matrix_clie
     resp = await matrix_client.get("/page", follow_redirects=False)
     assert resp.status_code == 302
     assert resp.headers["location"] == "/auth/login"
+
+
+# --- person-scoped API paths (Phase 2 precondition) ---------------------------
+# Phase 2 moves every person-scoped route from /api/... to /p/{slug}/api/...
+# The middleware's old `path.startswith("/api/")` test goes FALSE for that
+# shape, so an unauthenticated bearer client would receive a 302 to an HTML
+# login page instead of a 401 it can parse. These pin the fix in place before
+# the first route moves.
+
+
+async def test_person_scoped_api_path_returns_401_json_not_a_redirect(
+    configured_auth, matrix_client
+):
+    resp = await matrix_client.get("/p/alice/api/thing", follow_redirects=False)
+    assert resp.status_code == 401, (
+        "a person-scoped API path fell through to the HTML login redirect -- every "
+        "bearer client (Tasker, Bascule) would get HTML it cannot parse"
+    )
+    assert resp.headers["content-type"].startswith("application/json")
+    assert resp.json() == {"detail": "Not authenticated"}
+
+
+async def test_person_scoped_api_401_includes_www_authenticate_bearer(
+    configured_auth, matrix_client
+):
+    resp = await matrix_client.get("/p/alice/api/thing", follow_redirects=False)
+    assert resp.headers["www-authenticate"] == "Bearer"
+
+
+async def test_person_scoped_html_path_still_redirects_to_login(configured_auth, matrix_client):
+    """Only the /api/ segment makes it an API path. The person's page itself is
+    HTML and must still redirect, or a browser user gets raw JSON."""
+    resp = await matrix_client.get("/p/alice/", follow_redirects=False)
+    assert resp.status_code == 302
+    assert resp.headers["location"] == "/auth/login"
+
+
+async def test_person_scoped_api_path_works_when_authenticated(matrix_client):
+    user_id = await seed_user("personuser")
+    cookie = create_session_cookie("personuser", user_id, 1)
+    resp = await matrix_client.get("/p/alice/api/thing", cookies={"vf_session": cookie})
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "slug": "alice"}
+
+
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        ("/api/thing", True),
+        ("/api/", True),
+        ("/p/alice/api/thing", True),
+        ("/p/alice/api", True),
+        ("/p/a-b-1/api/metrics/sleep", True),
+        ("/p/alice/", False),
+        ("/p/alice", False),
+        ("/page", False),
+        ("/", False),
+        # A slug can never contain "/", so this is a page under some other
+        # prefix, not an API path -- matching it would send a browser JSON.
+        ("/p/alice/extra/api/thing", False),
+        # Near-misses that must not be mistaken for the person-scoped shape.
+        ("/papi/thing", False),
+        ("/p//api/thing", False),
+    ],
+)
+def test_is_api_path_classification(path, expected):
+    from shared.auth import _is_api_path
+
+    assert _is_api_path(path) is expected, f"{path!r} classified wrong"
 
 
 async def test_valid_cookie_still_works_with_token_enabled(matrix_client):

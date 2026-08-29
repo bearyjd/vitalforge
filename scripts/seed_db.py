@@ -126,13 +126,63 @@ def build_day(i: int, days: int, pattern: str, rng: random.Random) -> dict:
     }
 
 
-async def seed(db_path: Path, days: int, pattern: str, seed_value: int):
+async def _resolve_person(database, slug: str | None) -> tuple[int, str]:
+    """Return (person_id, slug) for the person to seed, creating them if needed.
+
+    With no --person, this is the primary person the migration created, which
+    keeps the pre-multi-tenancy behavior of this script intact. With --person,
+    a missing person is CREATED rather than erroring: seeding a second person
+    is the whole point of the flag, and requiring the operator to first create
+    one through an admin route that does not exist until Phase 2's PR 3 would
+    make the flag unusable in exactly the phase that needs it.
+    """
+    from shared.slugs import RESERVED_SLUGS, slugify
+
+    if slug is None:
+        person_id = await database.get_primary_person_id()
+        db = await database.get_db()
+        try:
+            row = await (
+                await db.execute("SELECT slug FROM persons WHERE id = ?", (person_id,))
+            ).fetchone()
+        finally:
+            await db.close()
+        return person_id, row["slug"]
+
+    normalized = slugify(slug)
+    if not normalized or normalized in RESERVED_SLUGS:
+        raise SystemExit(
+            f"--person '{slug}' is not a usable slug "
+            f"(normalizes to '{normalized}'; reserved: {sorted(RESERVED_SLUGS)})"
+        )
+
+    db = await database.get_db()
+    try:
+        row = await (
+            await db.execute("SELECT id FROM persons WHERE slug = ?", (normalized,))
+        ).fetchone()
+        if row is not None:
+            return row["id"], normalized
+        cursor = await db.execute(
+            "INSERT INTO persons (slug, display_name, created_at, is_primary) VALUES (?, ?, ?, 0)",
+            (normalized, normalized, datetime.now(timezone.utc).isoformat()),
+        )
+        await db.commit()
+        print(f"Created person '{normalized}' (id={cursor.lastrowid})")
+        return cursor.lastrowid, normalized
+    finally:
+        await db.close()
+
+
+async def seed(db_path: Path, days: int, pattern: str, seed_value: int, person: str | None = None):
     os.environ["DB_PATH"] = str(db_path)
 
     from shared import database
 
     database.DB_PATH = db_path  # module-level override, mirrors tests/conftest.py
     await database.init_db()
+
+    person_id, person_slug = await _resolve_person(database, person)
 
     rng = random.Random(seed_value)
     today = datetime.now(timezone.utc).date()
@@ -145,10 +195,14 @@ async def seed(db_path: Path, days: int, pattern: str, seed_value: int):
             day = build_day(i, days, pattern, rng)
 
             for table, columns in day.items():
-                cols = ["date"] + list(columns.keys())
+                # person_id is not optional: every metric table is keyed
+                # (person_id, date) NOT NULL since migration 001, so omitting
+                # it does not write rows nobody can read -- it raises
+                # IntegrityError on the first insert and seeds nothing.
+                cols = ["person_id", "date"] + list(columns.keys())
                 placeholders = ", ".join(["?"] * len(cols))
                 col_names = ", ".join(cols)
-                values = [date_str] + list(columns.values())
+                values = [person_id, date_str] + list(columns.values())
                 await db.execute(
                     f"INSERT OR REPLACE INTO [{table}] ({col_names}) VALUES ({placeholders})",
                     values,
@@ -157,7 +211,10 @@ async def seed(db_path: Path, days: int, pattern: str, seed_value: int):
     finally:
         await db.close()
 
-    print(f"Seeded {days} days of synthetic '{pattern}' data into {db_path}")
+    print(
+        f"Seeded {days} days of synthetic '{pattern}' data for person "
+        f"'{person_slug}' (id={person_id}) into {db_path}"
+    )
 
 
 def main():
@@ -166,6 +223,11 @@ def main():
     parser.add_argument("--db-path", type=Path, required=True, help="Path to the SQLite DB to seed (never the real fitness.db)")
     parser.add_argument("--pattern", choices=PATTERNS, default="normal", help="Synthetic trend pattern to generate")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument(
+        "--person",
+        default=None,
+        help="Slug of the person to seed. Created if absent. Defaults to the primary person.",
+    )
     args = parser.parse_args()
 
     resolved = args.db_path.resolve()
@@ -175,7 +237,7 @@ def main():
             "Use a scratch path (e.g. /tmp/vf.db)."
         )
 
-    asyncio.run(seed(args.db_path, args.days, args.pattern, args.seed))
+    asyncio.run(seed(args.db_path, args.days, args.pattern, args.seed, args.person))
 
 
 if __name__ == "__main__":
