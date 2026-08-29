@@ -84,6 +84,26 @@ def test_landing_serves_open_access_mode(service):
     )
 
 
+@pytest.mark.parametrize("service", SERVICES)
+def test_landing_denies_an_unrecognised_grant_value(service):
+    """The last place the two rules disagreed.
+
+    require_person denies an access value outside the three via
+    `_ACCESS_ORDER.get(granted, -1)`. Both `_reachable_persons` joined
+    person_grants without inspecting `access` at all, so such a grant made
+    GET / redirect to a /p/{slug}/ that then 404s -- a dead end with no way
+    out. person_grants' CHECK constraint makes the value unreachable today,
+    but CHECK constraints are exactly what table rebuilds relax, and both
+    docstrings claimed to mirror require_person while not doing so.
+    """
+    src = _reachable_persons_source(service)
+    assert "access IN ('view', 'manage', 'own')" in src, (
+        f"{service}: _reachable_persons accepts any person_grants.access value, while "
+        "require_person denies anything outside the three levels. The landing rule would "
+        "redirect to a person the dependency then refuses."
+    )
+
+
 def test_both_services_agree_on_the_landing_status_codes():
     """302 to the person, 400 when ambiguous, 200 HTML when there is nothing
     to show. A new account awaiting a grant is not a client error, and a

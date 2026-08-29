@@ -54,12 +54,27 @@ from shared.database import (
     init_db,
 )
 from shared.garmin_client import authenticate
+from shared.persons_admin import add_person_routes
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 # Track whether a sync is currently running
 _sync_lock = asyncio.Lock()
+
+# WHICH person the in-flight sync belongs to, or None when none is running.
+#
+# _sync_lock alone cannot answer /api/sync/status's `syncing` question under
+# multi-tenancy: it is one module-level lock, so `_sync_lock.locked()` on an
+# otherwise person-scoped response reports "syncing" to every person whenever
+# ANY person is syncing -- one household member's activity visible from
+# another's status endpoint.
+#
+# Making the lock itself per-person is Phase 4 (one person's sync still
+# serializes everyone's, and that is deliberately left alone here). The leaked
+# *flag* is separable from that and is fixed now: written only while the lock
+# is held, so it is single-writer by construction and needs no lock of its own.
+_syncing_person_id: int | None = None
 
 METRIC_TABLES = {
     "sleep_duration": ("sleep", "duration_seconds"),
@@ -111,6 +126,11 @@ app = FastAPI(title="VitalForge Dashboard", lifespan=lifespan)
 
 # Auth routes and middleware (must be added before other routes)
 add_auth_routes(app)
+# Person-collection admin (/api/persons, /auth/admin/persons). Registered on
+# BOTH services for the same reason add_auth_routes is: one login covers both,
+# so an admin who opened the weight service should not have to switch ports to
+# add someone.
+add_person_routes(app)
 
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
@@ -186,9 +206,20 @@ async def _reachable_persons(request: Request) -> tuple[list[tuple[int, str]], i
             )
         else:
             cursor = await db.execute(
+                # The access IN (...) predicate is what makes "mirrors
+                # require_person" true rather than nearly true. require_person
+                # denies an unrecognised grant value via
+                # _ACCESS_ORDER.get(granted, -1); without this predicate the
+                # join accepts it, and the two disagree: GET / would redirect
+                # to a /p/{slug}/ that then 404s -- a dead end the user cannot
+                # clear. person_grants' CHECK constraint makes that value
+                # unreachable today, but CHECK constraints are exactly what
+                # table rebuilds relax (see CLAUDE.md on _REBUILD_TABLES), and
+                # matching the authorization rule costs one line.
                 "SELECT p.id AS id, p.slug AS slug FROM persons p "
                 "JOIN person_grants g ON g.person_id = p.id AND g.user_id = ? "
-                "WHERE p.archived_at IS NULL ORDER BY p.id",
+                "WHERE p.archived_at IS NULL AND g.access IN ('view', 'manage', 'own') "
+                "ORDER BY p.id",
                 (identity.user_id,),
             )
         rows = await cursor.fetchall()
@@ -292,8 +323,16 @@ async def trigger_sync(
         # person_id is captured from the enclosing scope, never re-resolved in
         # here: this closure runs via create_task after the response has been
         # sent, with no request left to authorize against.
+        global _syncing_person_id
         async with _sync_lock:
-            await run_sync(days=days, person_id=person_id)
+            _syncing_person_id = person_id
+            try:
+                await run_sync(days=days, person_id=person_id)
+            finally:
+                # try/finally, not a plain assignment after the await: run_sync
+                # raising would otherwise leave this person permanently marked
+                # as syncing while the lock itself is released normally.
+                _syncing_person_id = None
 
     asyncio.create_task(_do_sync())
     return {"status": "started", "days": days}
@@ -312,14 +351,20 @@ async def sync_status(person_id: int = Depends(require_person("view"))):
     finally:
         await db.close()
 
+    # _syncing_person_id, not _sync_lock.locked(): the lock is module-level, so
+    # reporting it here would tell every person that "a sync is running"
+    # whenever any OTHER person's sync is running -- household activity leaking
+    # across an otherwise person-scoped response. See _syncing_person_id.
+    syncing = _syncing_person_id == person_id
+
     if not row:
-        return {"last_sync_time": None, "last_sync_result": "never", "syncing": _sync_lock.locked()}
+        return {"last_sync_time": None, "last_sync_result": "never", "syncing": syncing}
 
     return {
         "last_sync_time": row["last_sync_time"],
         "last_sync_result": row["last_sync_result"],
         "last_sync_days": row["last_sync_days"],
-        "syncing": _sync_lock.locked(),
+        "syncing": syncing,
     }
 
 

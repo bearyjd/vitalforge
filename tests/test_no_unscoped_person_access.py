@@ -209,6 +209,67 @@ def test_require_person_is_never_used_outside_a_slug_path(service):
     )
 
 
+def test_the_person_admin_module_stays_a_collection_surface():
+    """The guards above scan only the two service app.py files, so routes added
+    to shared/persons_admin.py escape them entirely.
+
+    That module is Phase 2's one deliberate exception to "person-scoped means
+    /p/{slug}/": the person COLLECTION is addressed by id at the root, because
+    it must reach archived persons and require_person deliberately cannot. The
+    exception is bounded here rather than left implicit -- a route that both
+    lives in this module and takes a person as its SUBJECT belongs under
+    /p/{slug}/ with the rest, and would otherwise be invisible to every
+    structural guard in this file.
+    """
+    src = (REPO / "shared/persons_admin.py").read_text()
+    tree = ast.parse(src)
+
+    seen = 0
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+            continue
+        for dec in node.decorator_list:
+            if not (isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute)):
+                continue
+            if dec.func.attr not in {"get", "post", "patch", "put", "delete"}:
+                continue
+            if not (dec.args and isinstance(dec.args[0], ast.Constant)):
+                continue
+            path = dec.args[0].value
+            if not isinstance(path, str):
+                continue
+            seen += 1
+            if not (path.startswith("/api/persons") or path.startswith("/auth/admin/")):
+                offenders.append(f"{path} ({node.name}, line {node.lineno})")
+            # Matched via AST, not substring: this module's own
+            # `_require_person_owner` CONTAINS the string "require_person", and
+            # a substring check flags it -- a guard that fires on the helper it
+            # is meant to protect trains people to delete it.
+            for call in ast.walk(node):
+                if not isinstance(call, ast.Call):
+                    continue
+                fn = call.func
+                name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
+                if name == "require_person":
+                    offenders.append(
+                        f"{path} ({node.name}, line {node.lineno}) uses require_person on a "
+                        "path with no {slug}; FastAPI would bind slug from the query string"
+                    )
+
+    # A FLOOR, not a count -- see the same reasoning in
+    # test_every_person_scoped_route_declares_require_person.
+    assert seen >= 5, (
+        f"found only {seen} routes in shared/persons_admin.py; either the module moved or "
+        "the route-matching above stopped recognising them"
+    )
+    assert not offenders, (
+        f"shared/persons_admin.py mounts {offenders}. This module is the person COLLECTION "
+        "surface only. Anything whose subject is one person belongs under /p/{slug}/ where "
+        "require_person and the guards above can see it."
+    )
+
+
 def test_no_frontend_code_calls_an_unscoped_api_path():
     """Templates and static JS calling /api/... would hit routes that no
     longer exist. Catches the case where a route moved and its caller did

@@ -7,13 +7,14 @@ request time — they only read the local SQLite tables populated by
 Garmin client at all.
 """
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from shared.database import get_db, get_primary_person_id
-from tests.conftest import PERSON_PREFIX
+from tests.conftest import PERSON_PREFIX, seed_person
 
 
 def days_ago(n: int) -> str:
@@ -56,6 +57,54 @@ async def test_sync_status_never_synced(client):
     body = resp.json()
     assert body["last_sync_time"] is None
     assert body["last_sync_result"] == "never"
+
+
+async def test_sync_status_does_not_leak_another_persons_sync(
+    client, dashboard_app_module, monkeypatch
+):
+    """`syncing` used to report `_sync_lock.locked()` -- one module-level lock
+    -- on an otherwise person-scoped response, so one household member's sync
+    was visible from another's status endpoint.
+
+    The lock's SERIALIZATION is still shared (Phase 4 fixes that); only the
+    leaked flag is scoped here.
+    """
+    other_person = await seed_person("bryn")
+    monkeypatch.setattr(dashboard_app_module, "_syncing_person_id", other_person)
+
+    resp = await client.get(f"{PERSON_PREFIX}/api/sync/status")
+    assert resp.status_code == 200
+    assert resp.json()["syncing"] is False, "another person's sync was visible from this one"
+
+    # Positive control: the person who IS syncing still sees it, so the test
+    # above cannot pass against a `syncing` that is hardcoded False.
+    resp = await client.get("/p/bryn/api/sync/status")
+    assert resp.json()["syncing"] is True
+
+
+async def test_a_failed_sync_does_not_leave_the_person_marked_as_syncing(
+    client, dashboard_app_module, monkeypatch
+):
+    """Without the try/finally, run_sync raising leaves the flag set forever
+    while the lock itself releases normally -- a dashboard stuck on "syncing"
+    with nothing running."""
+
+    async def _boom(**kwargs):
+        raise RuntimeError("garmin exploded")
+
+    monkeypatch.setattr(dashboard_app_module, "run_sync", _boom)
+    assert dashboard_app_module._syncing_person_id is None
+
+    resp = await client.post(f"{PERSON_PREFIX}/api/sync", json={"days": 1})
+    assert resp.status_code == 200
+    # The sync runs as a detached task after the response; yield to it.
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if not dashboard_app_module._sync_lock.locked():
+            break
+
+    assert dashboard_app_module._syncing_person_id is None
+    assert (await client.get(f"{PERSON_PREFIX}/api/sync/status")).json()["syncing"] is False
 
 
 @pytest.mark.parametrize(

@@ -16,7 +16,7 @@ from httpx import ASGITransport, AsyncClient
 from shared import auth as shared_auth
 from shared.auth import add_auth_routes, create_session_cookie
 from shared.database import get_db
-from tests.conftest import seed_user
+from tests.conftest import grant_person, primary_person_id, seed_user
 
 
 def _build_app() -> FastAPI:
@@ -426,6 +426,84 @@ async def test_deleting_a_user_cascade_deletes_their_goals(client):
     finally:
         await db.close()
     assert goal_count_after == 0
+
+
+async def test_deleting_a_user_cascade_deletes_their_person_grants(client):
+    """users.id is AUTOINCREMENT, so an orphaned grant left behind here would
+    hand the NEXT account created with a reused id this account's access to
+    someone's health data -- the same username-reuse hazard validate_session's
+    docstring reasons about, one table over.
+
+    Asserted through the reused id rather than through a row count, because a
+    row count passes against a cascade that deletes the wrong user's grants.
+    """
+    await seed_user("root", role="admin")
+    bob_id = await seed_user("bob", role="user")
+    person_id = await primary_person_id()
+    await grant_person(person_id, bob_id, access="own")
+
+    resp = await client.delete(f"/auth/admin/users/{bob_id}", cookies=await _cookies_for("root"))
+    assert resp.status_code == 200
+
+    db = await get_db()
+    try:
+        remaining = (
+            await (
+                await db.execute(
+                    "SELECT COUNT(*) FROM person_grants WHERE user_id = ?", (bob_id,)
+                )
+            ).fetchone()
+        )[0]
+    finally:
+        await db.close()
+    assert remaining == 0, "a deleted account's grants survived and can be resurrected by id reuse"
+
+    # The positive control: an unrelated user's grant on the same person is
+    # untouched, so the cascade is scoped and not a blanket delete.
+    carol_id = await seed_user("carol", role="user")
+    await grant_person(person_id, carol_id, access="view")
+    await client.delete(f"/auth/admin/users/{bob_id}", cookies=await _cookies_for("root"))
+    db = await get_db()
+    try:
+        carol_grants = (
+            await (
+                await db.execute(
+                    "SELECT COUNT(*) FROM person_grants WHERE user_id = ?", (carol_id,)
+                )
+            ).fetchone()
+        )[0]
+    finally:
+        await db.close()
+    assert carol_grants == 1
+
+
+async def test_deleting_a_user_nulls_grants_they_had_issued(client):
+    """granted_by is the same hazard one step removed: display-only today, but
+    a dangling users.id that a later AUTOINCREMENT reuse re-points at a
+    different account is an audit-trail lie."""
+    await seed_user("root", role="admin")
+    granter_id = await seed_user("granter", role="admin")
+    carol_id = await seed_user("carol", role="user")
+    person_id = await primary_person_id()
+    await grant_person(person_id, carol_id, access="view", granted_by=granter_id)
+
+    resp = await client.delete(
+        f"/auth/admin/users/{granter_id}", cookies=await _cookies_for("root")
+    )
+    assert resp.status_code == 200
+
+    db = await get_db()
+    try:
+        row = await (
+            await db.execute(
+                "SELECT granted_by FROM person_grants WHERE person_id = ? AND user_id = ?",
+                (person_id, carol_id),
+            )
+        ).fetchone()
+    finally:
+        await db.close()
+    assert row is not None, "the grantee's own grant must survive their granter's deletion"
+    assert row["granted_by"] is None
 
 
 async def test_delete_nonexistent_user_returns_404(client):

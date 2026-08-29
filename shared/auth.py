@@ -251,22 +251,44 @@ async def get_current_user_role(username: str) -> str | None:
     return row["role"] if row is not None else None
 
 
-async def _require_admin(request: Request) -> str:
+async def _require_admin(request: Request) -> "_Identity":
     """require_auth() plus the admin-only role check every /auth/admin/*
     route needs -- was five copies of the same three lines (fix-review
-    finding)."""
+    finding).
+
+    Returns the full identity rather than just the username: the person-admin
+    routes in shared/persons_admin.py need the acting admin's `user_id` (the
+    creator's automatic `own` grant, and `person_grants.granted_by`), and
+    re-resolving the identity a second time in those routes would mean two
+    queries where the rest of this module deliberately uses one. Every
+    /auth/admin/* caller below discards the return value, so widening it
+    changes nothing for them.
+
+    Note this refuses the open-access anonymous sentinel, whose role is None --
+    the whole /auth/admin/* surface is closed while the users table is empty.
+    That is existing, intentional behaviour, and persons_admin.py mirrors it
+    rather than inventing a second superuser story.
+    """
     identity = await _get_current_identity(request)
     if identity is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     if identity.role != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
-    return identity.username
+    return identity
 
 
 # Public alias for callers outside this module (e.g. dashboard goal
 # ownership checks) that need the full account-bound identity, including
 # live role, without reaching into this module's private names.
 Identity = _Identity
+
+# Public alias for _require_admin, so shared/persons_admin.py gates the person
+# collection with the *same* function every /auth/admin/* route uses rather
+# than a second copy of the role check. Same precedent as Identity,
+# get_current_identity and require_account_identity below: a private name that
+# a sibling module legitimately needs is a missing public accessor, not a
+# reason to import the underscore.
+require_admin = _require_admin
 
 
 async def require_account_identity(request: Request) -> Identity:
@@ -1447,10 +1469,26 @@ def add_auth_routes(app):
                     await db.rollback()
                     raise HTTPException(status_code=409, detail="Cannot delete the last remaining admin")
             # SQLite foreign keys are not enabled in this project, so the
-            # REFERENCES declaration cannot cascade. Remove credentials and
-            # goals in the same transaction before deleting their owner.
+            # REFERENCES declaration cannot cascade. Remove credentials,
+            # goals and person access in the same transaction before deleting
+            # their owner.
             await db.execute("DELETE FROM api_tokens WHERE user_id = ?", (user_id,))
             await db.execute("DELETE FROM goals WHERE user_id = ?", (user_id,))
+            # users.id is AUTOINCREMENT, so an orphaned grant left behind here
+            # would hand the NEXT account created with a reused id this
+            # account's access to someone's health data -- the same
+            # username-reuse hazard validate_session's docstring reasons about,
+            # one table over.
+            await db.execute("DELETE FROM person_grants WHERE user_id = ?", (user_id,))
+            # granted_by is the same hazard one step removed: display-only
+            # today ("granted by alice"), but a dangling users.id that a later
+            # AUTOINCREMENT reuse re-points at a different account is an
+            # audit-trail lie. NULL it rather than leave it.
+            await db.execute(
+                "UPDATE person_grants SET granted_by = NULL WHERE granted_by = ?", (user_id,)
+            )
+            # users.default_person_id needs nothing: it is a column on the row
+            # being deleted, and no other user's copy references this user.
             await db.execute("DELETE FROM users WHERE id = ?", (user_id,))
             await db.commit()
         finally:

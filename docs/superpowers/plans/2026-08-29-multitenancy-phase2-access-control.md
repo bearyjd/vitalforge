@@ -212,12 +212,22 @@ gets reads, `manage` gets writes, and admin bypasses. Zero request-path callers 
 
 ## PR 3 — persons, grants, and the admin page (D7)
 
+### Decisions taken while implementing PR 3
+
+| # | Decision | Rationale |
+|---|---|---|
+| D9 | **Slugs are immutable after creation.** `PATCH` renames the display name only; §3.1's "slug rename" is dropped. | Constraint 6's mechanism for "an archived person's slug is permanently taken" is that the row keeps the slug in the `UNIQUE` column. A rename *frees* the old slug for a later create to claim, so a stale bookmark or a cached service-worker URL for `/p/alex/` then resolves to a different human — verbatim "the worst failure this design can produce". Renaming needs a slug-history table that keeps retired slugs reserved; that is not in this PR. |
+| D10 | **`PATCH` gains `is_primary` (promote only).** | §3.1's archive guard must 409 with "promote another person first", and without a promote endpoint that message names a fix the API cannot perform. Implemented as a transactional swap inside `BEGIN IMMEDIATE` — `idx_persons_primary` is a partial `UNIQUE` index, so the old primary must be cleared before the new one is set. Demotion (`is_primary: false`) is a 422: there must always be exactly one primary, because `get_primary_person_id()` raises when there is none and `scheduled_sync` still depends on it through Phase 3 (D3). Promoting therefore **repoints scheduled sync** — which is the intended meaning of primary until Phase 3's `garmin_links` lands. |
+| D11 | **The routes live in `shared/persons_admin.py` (+ `shared/persons_admin_page.py`), not `shared/auth.py`.** | auth.py is already 1480 lines. More importantly these routes are Phase 2's one deliberate exception to "person-scoped means `/p/{slug}/`", and the exception belongs in one file named for what it is rather than scattered through the module whose subject is the rule. `_require_admin` gained a public `require_admin` alias (same precedent as `Identity` / `get_current_identity` / `require_account_identity`) and now returns the full `Identity`, because the creator's automatic grant and `granted_by` need the acting admin's `user_id`. |
+| D12 | **Grant routes answer 404, never 403,** to a caller who is neither an admin nor an `own` holder. | Constraint 2's reason — "a 403 confirms the person exists and leaks household membership" — applies directly to a by-id route over *persons*. The 403 carve-out is for account-scoped resources (goals); a person is not one. |
+| D13 | **Person CRUD is closed in open-access mode.** | `require_admin` refuses the anonymous sentinel (role `None`), exactly as `/auth/admin/users` does today. One superuser story, not two — and an empty `users` table has nobody to grant anything to. `scripts/seed_db.py --person` remains the way to get a second person into a development database. |
+
 ### 3.1 Endpoints
 
 `/api/persons` and `/api/persons/{id}`, admin-addressed **by id** so archived persons are
 reachable: create (creator gets an automatic `own` grant, §f.6:1795), list including archived,
-`PATCH` for slug and display-name rename under the same `SLUG_RE` / `RESERVED_SLUGS`
-validation, and archive.
+`PATCH` for display-name rename and promotion to primary (D9, D10) under the same `SLUG_RE` /
+`RESERVED_SLUGS` validation at creation, and archive.
 
 - **Archive, never delete** (§f.6:1796). Deleting means 11 tables with no FK cascade.
 - **The primary person cannot be archived** while `is_primary = 1` — 409, with a message naming

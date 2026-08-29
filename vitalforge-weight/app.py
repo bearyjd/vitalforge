@@ -28,6 +28,7 @@ from shared.auth import (
 )
 from shared.database import ensure_primary_person_grant, get_db, init_db
 from shared.garmin_client import authenticate, push_weight
+from shared.persons_admin import add_person_routes
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -63,6 +64,11 @@ app = FastAPI(title="VitalForge Weight", lifespan=lifespan)
 
 # Auth routes and middleware
 add_auth_routes(app)
+# Person-collection admin (/api/persons, /auth/admin/persons). Registered on
+# BOTH services for the same reason add_auth_routes is: one login covers both,
+# so an admin who opened the weight service should not have to switch ports to
+# add someone.
+add_person_routes(app)
 
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
@@ -183,9 +189,15 @@ async def _reachable_persons(user_id: int | None) -> list[tuple[int, str]]:
             )
         else:
             cursor = await db.execute(
+                # See the identical predicate in vitalforge-dashboard's
+                # _reachable_persons: require_person denies an unrecognised
+                # grant value, so a join that accepts one would land the
+                # browser on a /p/{slug}/ that immediately 404s. The two
+                # services must stay identical here -- they share one login.
                 "SELECT p.id AS id, p.slug AS slug FROM persons p "
                 "JOIN person_grants g ON g.person_id = p.id AND g.user_id = ? "
-                "WHERE p.archived_at IS NULL ORDER BY p.id",
+                "WHERE p.archived_at IS NULL AND g.access IN ('view', 'manage', 'own') "
+                "ORDER BY p.id",
                 (user_id,),
             )
         return [(row["id"], row["slug"]) for row in await cursor.fetchall()]
