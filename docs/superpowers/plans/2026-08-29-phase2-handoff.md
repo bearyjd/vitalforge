@@ -7,25 +7,26 @@ session can pick up cold.
 
 | | |
 |---|---|
-| `main` | `68e80f3` — Phase 1 + Phase 2 PR 1/4 |
-| Open PR | **#35**, `CLEAN`, 3/3 CI green at `22b84b5`, **not merged** |
-| Branch | `feat/multitenancy-phase2-require-person`, pushed, clean tree |
+| `main` | `24f6acb` — Phase 1 + Phase 2 PRs 1/4 and 2/4, CI green |
+| Open PRs | **none** |
+| Branches | all merged branches deleted local and remote; tree clean |
 | Production | `knowledge` (100.74.76.39), both services healthy, running **Phase 1** |
-| Suite | 561 passed, 4 deselected, ruff clean |
+| Suite | 561 passed, 4 deselected, ruff clean, on `main` |
 
-Prod is **two merges behind** `main`: it lacks PR #33 (snapshot race) and #34
-(PR 1). Harmless — 001/002 are already applied there and #33 protects the
-*next* migration — but a redeploy would align it.
+**Phase 2 is half done.** PRs 1/4 and 2/4 are merged; 3/4 and 4/4 remain.
 
-## PR #35 — ready to merge
+### Prod is now THREE merges behind `main`
 
-5 commits. `require_person`, all 17 person-scoped routes moved under
-`/p/{slug}/`, frontend + service workers, test migration, and three security
-fixes. Reviewed by an independent security agent across six attack surfaces;
-its HIGH was reproduced, fixed, and the fix verified across nine bypass
-vectors.
+It lacks #33 (snapshot race), #34 (PR 1) and #35 (PR 2). Nothing is urgent —
+migrations 001/002 are already applied there, and #33 protects the *next*
+migration rather than one already run.
 
-**Merge it or review it further — nothing is outstanding on it.**
+**But a redeploy is no longer routine.** PR 2 moved every person-scoped route
+to `/p/{slug}/` and unmounts nothing yet, so the deployed PWAs' hardcoded
+`/api/...` calls would 404 against new images. Treat a redeploy the way the
+Phase 1 upgrade was treated: stop BOTH services, then bring them up together.
+The service-worker `CACHE_NAME` bump to `-v2` is already in, so installed
+clients will pick up the new shell.
 
 ## What Phase 2 still needs (PRs 3 and 4)
 
@@ -36,6 +37,16 @@ Per `2026-08-29-multitenancy-phase2-access-control.md`:
   nulling `granted_by`).
 - **PR 4** — `api_tokens.person_id`, the ingest resolution order (§f.7), the
   legacy unmount, and README/docs.
+
+## Start here for PR 3
+
+1. Read `2026-08-29-multitenancy-phase2-access-control.md` §PR 3 for scope, and
+   the spec deltas at the top of it — the design spec is stale in six places
+   against what shipped, and A2 (token identity "works unchanged") is simply
+   wrong.
+2. Read "Carried forward" below before writing anything. Item 1 is a
+   requirement of PR 3 itself, not a nicety.
+3. Branch from `main` at `24f6acb`.
 
 ## Carried forward — read before starting PR 3
 
