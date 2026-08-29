@@ -41,6 +41,19 @@ _ALLOWED_SHIM_FILES = {
     "scripts/seed_db.py",
 }
 
+# Every route shared/persons_admin.py is allowed to mount. Person-COLLECTION
+# routes only: create, list, rename/promote, archive, and grant management.
+# See test_the_person_admin_module_stays_a_collection_surface for why this is
+# an exact list rather than a prefix.
+_PERSON_ADMIN_PATHS = {
+    "/auth/admin/persons",
+    "/api/persons",
+    "/api/persons/{person_id}",
+    "/api/persons/{person_id}/archive",
+    "/api/persons/{person_id}/grants",
+    "/api/persons/{person_id}/grants/{user_id}",
+}
+
 
 def _python_sources():
     for d in ("shared", "vitalforge-dashboard", "vitalforge-weight", "scripts"):
@@ -240,7 +253,12 @@ def test_the_person_admin_module_stays_a_collection_surface():
             if not isinstance(path, str):
                 continue
             seen += 1
-            if not (path.startswith("/api/persons") or path.startswith("/auth/admin/")):
+            # An exact allowlist, not a prefix. `startswith("/api/persons")`
+            # would wave through `/api/persons/{person_id}/metrics/{name}` --
+            # a person-SUBJECT route serving health data from a root path,
+            # which is precisely what this guard exists to stop. Adding a route
+            # here should be a deliberate edit to this list.
+            if path not in _PERSON_ADMIN_PATHS:
                 offenders.append(f"{path} ({node.name}, line {node.lineno})")
             # Matched via AST, not substring: this module's own
             # `_require_person_owner` CONTAINS the string "require_person", and

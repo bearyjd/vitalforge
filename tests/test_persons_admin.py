@@ -286,7 +286,16 @@ async def test_patch_cannot_change_the_slug(client):
     assert row["slug"] == "bryn"
 
 
-async def test_patch_promotes_a_person_to_primary_and_demotes_the_old_one(client):
+async def test_promotion_is_refused_without_acknowledging_the_garmin_handover(client):
+    """`is_primary` is ALSO what garmin_credential_person_id() returns, i.e.
+    which person this deployment's single Garmin account is taken to describe.
+    Promoting therefore reassigns that account, and the next scheduled sync
+    files the original human's sleep, HRV and weight under the new primary.
+
+    The contamination is invisible until someone reads the data and believes
+    it, so the acknowledgement is enforced by the API rather than by the admin
+    page's confirm() -- a scripted PATCH bypasses the dialog entirely.
+    """
     _, cookies = await _as("root", role="admin")
     old_primary = await primary_person_id()
     created = (
@@ -295,6 +304,36 @@ async def test_patch_promotes_a_person_to_primary_and_demotes_the_old_one(client
 
     resp = await client.patch(
         f"/api/persons/{created['id']}", json={"is_primary": True}, cookies=cookies
+    )
+    assert resp.status_code == 409
+    assert "Garmin" in resp.json()["detail"]
+    assert await primary_person_id() == old_primary, "the promotion happened anyway"
+
+
+async def test_renaming_does_not_require_the_garmin_acknowledgement(client):
+    """The flag gates promotion specifically. A display-name change touches
+    nothing Garmin-related and must not be made harder."""
+    _, cookies = await _as("root", role="admin")
+    created = (
+        await client.post("/api/persons", json={"display_name": "Bryn"}, cookies=cookies)
+    ).json()
+    resp = await client.patch(
+        f"/api/persons/{created['id']}", json={"display_name": "Bryn W."}, cookies=cookies
+    )
+    assert resp.status_code == 200
+
+
+async def test_patch_promotes_a_person_to_primary_and_demotes_the_old_one(client):
+    _, cookies = await _as("root", role="admin")
+    old_primary = await primary_person_id()
+    created = (
+        await client.post("/api/persons", json={"display_name": "Bryn"}, cookies=cookies)
+    ).json()
+
+    resp = await client.patch(
+        f"/api/persons/{created['id']}",
+        json={"is_primary": True, "acknowledge_garmin_reassignment": True},
+        cookies=cookies,
     )
     assert resp.status_code == 200, resp.text
 
@@ -334,9 +373,24 @@ async def test_patch_refuses_to_promote_an_archived_person(client):
     await client.post(f"/api/persons/{created['id']}/archive", cookies=cookies)
 
     resp = await client.patch(
-        f"/api/persons/{created['id']}", json={"is_primary": True}, cookies=cookies
+        f"/api/persons/{created['id']}",
+        json={"is_primary": True, "acknowledge_garmin_reassignment": True},
+        cookies=cookies,
     )
     assert resp.status_code == 409
+    # The archived check must win over the Garmin acknowledgement check, or
+    # this test would pass for the wrong reason.
+    assert "archived" in resp.json()["detail"].lower()
+
+
+async def test_promoting_a_nonexistent_person_is_404_not_the_garmin_409(client):
+    """Order of checks: existence first. Otherwise a typo'd id gets a lecture
+    about Garmin credentials instead of "no such person"."""
+    _, cookies = await _as("root", role="admin")
+    resp = await client.patch(
+        "/api/persons/999999", json={"is_primary": True}, cookies=cookies
+    )
+    assert resp.status_code == 404
 
 
 async def test_patch_nonexistent_person_returns_404(client):
@@ -387,7 +441,11 @@ async def test_the_primary_person_can_be_archived_after_promoting_another(client
     created = (
         await client.post("/api/persons", json={"display_name": "Bryn"}, cookies=cookies)
     ).json()
-    await client.patch(f"/api/persons/{created['id']}", json={"is_primary": True}, cookies=cookies)
+    await client.patch(
+        f"/api/persons/{created['id']}",
+        json={"is_primary": True, "acknowledge_garmin_reassignment": True},
+        cookies=cookies,
+    )
 
     resp = await client.post(f"/api/persons/{old_primary}/archive", cookies=cookies)
     assert resp.status_code == 200
@@ -473,19 +531,79 @@ async def test_an_own_holder_who_is_not_an_admin_can_manage_grants(client):
     assert {g["username"] for g in listed} == {"owner", "bob"}
 
 
+# Every grant route, so the parametrized authorization tests below cover the
+# WRITES too. Reviewing this PR found that `_require_person_owner` could be
+# deleted from both upsert_grant and revoke_grant with the whole suite green,
+# because only the read was exercised -- letting any authenticated account
+# grant itself `own` on anyone. A guard that cannot be made to fail is
+# decorative; a guard nothing calls is worse.
+_GRANT_ROUTES = [
+    ("get", "/api/persons/{person_id}/grants", None),
+    ("put", "/api/persons/{person_id}/grants/{user_id}", {"access": "own"}),
+    ("delete", "/api/persons/{person_id}/grants/{user_id}", None),
+]
+
+
+async def _call_grant_route(client, method, template, body, person_id, user_id, cookies):
+    path = template.format(person_id=person_id, user_id=user_id)
+    kwargs = {"cookies": cookies}
+    if body is not None:
+        kwargs["json"] = body
+    return await getattr(client, method)(path, **kwargs)
+
+
 @pytest.mark.parametrize("access", ["view", "manage"])
-async def test_a_lesser_grant_holder_gets_404_not_403(client, access):
+@pytest.mark.parametrize("method,template,body", _GRANT_ROUTES)
+async def test_a_lesser_grant_holder_gets_404_not_403(client, access, method, template, body):
     """THE leak test for this surface. These routes address a person by ID, so
     a 403 would confirm that person exists to anyone logged in who can count
     upward. Mutation-checked: changing the 404 in _require_person_owner to a
-    403 fails this test."""
-    user_id, cookies = await _as(f"holder-{access}")
+    403 fails this test, and so does removing the call from any of the three
+    routes."""
+    user_id, cookies = await _as(f"holder-{access}-{method}")
     person_id = await seed_person("bryn")
     await grant_person(person_id, user_id, access=access)
 
-    resp = await client.get(f"/api/persons/{person_id}/grants", cookies=cookies)
-    assert resp.status_code == 404
+    resp = await _call_grant_route(
+        client, method, template, body, person_id, user_id, cookies
+    )
+    assert resp.status_code == 404, f"{method.upper()} {template} gave {resp.status_code}"
     assert "bryn" not in resp.text
+
+
+@pytest.mark.parametrize("method,template,body", _GRANT_ROUTES)
+async def test_an_account_with_no_grant_cannot_grant_itself_access(
+    client, method, template, body
+):
+    """The escalation this surface must refuse: an authenticated account with
+    no relationship to a person, granting itself `own` on them."""
+    user_id, cookies = await _as(f"stranger-{method}")
+    person_id = await seed_person("bryn")
+
+    resp = await _call_grant_route(
+        client, method, template, body, person_id, user_id, cookies
+    )
+    assert resp.status_code == 404
+
+    row = await _fetchone(
+        "SELECT COUNT(*) AS n FROM person_grants WHERE person_id = ? AND user_id = ?",
+        (person_id, user_id),
+    )
+    assert row["n"] == 0, "a caller with no grant wrote itself one"
+
+
+@pytest.mark.parametrize("method,template,body", _GRANT_ROUTES)
+async def test_grant_routes_positive_control_for_an_own_holder(client, method, template, body):
+    """The control for both tests above: an `own` holder reaches all three, so
+    neither can pass against routes that refuse everyone."""
+    owner_id, owner_cookies = await _as(f"owner-{method}")
+    person_id = await seed_person("bryn")
+    await grant_person(person_id, owner_id, access="own")
+
+    resp = await _call_grant_route(
+        client, method, template, body, person_id, owner_id, owner_cookies
+    )
+    assert resp.status_code == 200, f"{method.upper()} {template} gave {resp.status_code}"
 
 
 async def test_a_stranger_gets_the_same_404_as_a_nonexistent_person(client):
@@ -522,6 +640,43 @@ async def test_grants_on_an_archived_person_stay_manageable(client):
         f"/api/persons/{created['id']}/grants/{bob_id}", json={"access": "view"}, cookies=cookies
     )
     assert resp.status_code == 200
+
+
+async def test_an_orphaned_grant_is_listed_and_revocable(client):
+    """A grant whose account was deleted before the cascade shipped is counted
+    by `grant_count`, so it must also be LISTED -- an inner join here made the
+    people table say "1 grant" while the access table showed none, and the
+    invisible row is exactly the id-reuse hazard the cascade closes.
+    Unfixable from the UI is the worst of both.
+    """
+    _, cookies = await _as("root", role="admin")
+    person_id = await seed_person("bryn")
+    db = await get_db()
+    try:
+        # Straight to SQL: the route refuses to create this state, which is the
+        # point -- it can only arrive from a database written before the fix.
+        await db.execute(
+            "INSERT INTO person_grants (person_id, user_id, access, granted_at) "
+            "VALUES (?, 999999, 'view', '2026-01-01T00:00:00+00:00')",
+            (person_id,),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+    listed = (await client.get(f"/api/persons/{person_id}/grants", cookies=cookies)).json()
+    assert len(listed) == 1, "the orphaned grant is invisible on the access page"
+    assert listed[0]["user_id"] == 999999
+    assert listed[0]["username"] is None
+
+    counted = [
+        p for p in (await client.get("/api/persons", cookies=cookies)).json() if p["id"] == person_id
+    ][0]["grant_count"]
+    assert counted == len(listed), "grant_count and the grant list disagree"
+
+    revoked = await client.delete(f"/api/persons/{person_id}/grants/999999", cookies=cookies)
+    assert revoked.status_code == 200
+    assert (await client.get(f"/api/persons/{person_id}/grants", cookies=cookies)).json() == []
 
 
 async def test_granting_to_a_nonexistent_user_is_refused(client):
@@ -648,6 +803,27 @@ async def test_revoking_one_grant_leaves_the_others_alone(client):
 
 
 # --- the admin page -----------------------------------------------------------
+
+
+async def _assert_surface_registered(module, label):
+    _, cookies = await _as("root", role="admin")
+    transport = ASGITransport(app=module.app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        for path in ("/api/persons", "/auth/admin/persons"):
+            resp = await ac.get(path, cookies=cookies)
+            assert resp.status_code == 200, f"{label} does not serve {path}"
+
+
+async def test_the_surface_is_registered_on_the_weight_service(weight_app_module):
+    """`add_person_routes` is called from both app.py files so one login covers
+    both ports. Every other test here builds a bare FastAPI app, so removing
+    either registration left the whole suite green -- the cross-service claim
+    had no coverage on either real service."""
+    await _assert_surface_registered(weight_app_module, "vitalforge-weight")
+
+
+async def test_the_surface_is_registered_on_the_dashboard_service(dashboard_app_module):
+    await _assert_surface_registered(dashboard_app_module, "vitalforge-dashboard")
 
 
 async def test_admin_persons_page_is_admin_only(client):

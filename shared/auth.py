@@ -997,7 +997,7 @@ ADMIN_USERS_PAGE_HTML = """<!DOCTYPE html>
             <thead><tr><th>Owner</th><th>Label</th><th>Created</th><th>Last used</th><th></th></tr></thead>
             <tbody id="admin-tokens-body"></tbody>
         </table>
-        <p style="margin-top:1rem"><a href="/">Back</a></p>
+        <p style="margin-top:1rem"><a href="/auth/admin/persons">People</a> &middot; <a href="/">Back</a></p>
     </div>
     <script>
         // Every cell built from server data uses textContent/option.value, never

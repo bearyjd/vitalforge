@@ -37,7 +37,7 @@ from goals import (
 )
 from readiness import compute_readiness
 from recommendations import get_recommendations, get_rules_only
-from sync import run_sync, scheduled_sync
+from sync import SyncRegistry, run_sync, scheduled_sync
 
 from shared.auth import (
     add_auth_routes,
@@ -62,19 +62,20 @@ logger = logging.getLogger(__name__)
 # Track whether a sync is currently running
 _sync_lock = asyncio.Lock()
 
-# WHICH person the in-flight sync belongs to, or None when none is running.
+# WHICH persons have a sync in flight -- queued or running. See SyncRegistry
+# in sync.py for why this exists and why it is reference-counted; it lives
+# there rather than here because scheduled_sync must register in it too, and
+# sync.py cannot import this module.
 #
-# _sync_lock alone cannot answer /api/sync/status's `syncing` question under
-# multi-tenancy: it is one module-level lock, so `_sync_lock.locked()` on an
-# otherwise person-scoped response reports "syncing" to every person whenever
-# ANY person is syncing -- one household member's activity visible from
-# another's status endpoint.
+# Acquired on the REQUEST path before the task is created and released in the
+# task's finally, so it covers the queued window as well as the running one --
+# a person cannot stack up tasks by clicking twice while someone else's sync
+# holds the lock.
 #
-# Making the lock itself per-person is Phase 4 (one person's sync still
-# serializes everyone's, and that is deliberately left alone here). The leaked
-# *flag* is separable from that and is fixed now: written only while the lock
-# is held, so it is single-writer by construction and needs no lock of its own.
-_syncing_person_id: int | None = None
+# Making the LOCK itself per-person is Phase 4: one person's sync still
+# serializes everyone's, and that is deliberately left alone here. Only the
+# leaked observable is fixed.
+_syncing_person_ids = SyncRegistry()
 
 METRIC_TABLES = {
     "sleep_duration": ("sleep", "duration_seconds"),
@@ -117,7 +118,7 @@ async def lifespan(app: FastAPI):
         logger.warning("Garmin authentication failed (will retry on first sync): %s", e)
 
     # Start background sync scheduler
-    sync_task = asyncio.create_task(scheduled_sync(_sync_lock))
+    sync_task = asyncio.create_task(scheduled_sync(_sync_lock, _syncing_person_ids))
     yield
     sync_task.cancel()
 
@@ -316,23 +317,30 @@ async def trigger_sync(
             ),
         )
 
-    if _sync_lock.locked():
+    # THIS person's sync, not _sync_lock.locked(): the lock is module-level, so
+    # answering from it told a caller "already running" because somebody ELSE
+    # was syncing -- the same cross-person observable that used to leak out of
+    # /api/sync/status. A second person's request now queues on the lock
+    # instead, which is what the shared lock has always meant.
+    if person_id in _syncing_person_ids:
         return {"status": "already_running", "message": "A sync is already in progress"}
+    # Added here rather than inside the task so a double-click cannot stack up
+    # two tasks during the window where the first is waiting on the lock.
+    _syncing_person_ids.acquire(person_id)
 
     async def _do_sync():
         # person_id is captured from the enclosing scope, never re-resolved in
         # here: this closure runs via create_task after the response has been
         # sent, with no request left to authorize against.
-        global _syncing_person_id
-        async with _sync_lock:
-            _syncing_person_id = person_id
-            try:
+        try:
+            async with _sync_lock:
                 await run_sync(days=days, person_id=person_id)
-            finally:
-                # try/finally, not a plain assignment after the await: run_sync
-                # raising would otherwise leave this person permanently marked
-                # as syncing while the lock itself is released normally.
-                _syncing_person_id = None
+        finally:
+            # try/finally, and wrapping the lock acquisition too: run_sync
+            # raising -- or the task being cancelled while queued -- would
+            # otherwise leave this person permanently marked as syncing with
+            # nothing running and no way to clear it.
+            _syncing_person_ids.release(person_id)
 
     asyncio.create_task(_do_sync())
     return {"status": "started", "days": days}
@@ -351,11 +359,11 @@ async def sync_status(person_id: int = Depends(require_person("view"))):
     finally:
         await db.close()
 
-    # _syncing_person_id, not _sync_lock.locked(): the lock is module-level, so
+    # _syncing_person_ids, not _sync_lock.locked(): the lock is module-level, so
     # reporting it here would tell every person that "a sync is running"
     # whenever any OTHER person's sync is running -- household activity leaking
-    # across an otherwise person-scoped response. See _syncing_person_id.
-    syncing = _syncing_person_id == person_id
+    # across an otherwise person-scoped response. See _syncing_person_ids.
+    syncing = person_id in _syncing_person_ids
 
     if not row:
         return {"last_sync_time": None, "last_sync_result": "never", "syncing": syncing}

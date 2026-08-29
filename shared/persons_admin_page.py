@@ -124,6 +124,12 @@ ADMIN_PERSONS_PAGE_HTML = """<!DOCTYPE html>
         async function failureDetail(res, fallback) {
             try {
                 const body = await res.json();
+                // FastAPI's own RequestValidationError returns `detail` as a
+                // LIST of error objects, not a string; assigning that to
+                // textContent renders "[object Object]".
+                if (Array.isArray(body.detail)) {
+                    return body.detail.map(e => e.msg || String(e)).join("; ") || fallback;
+                }
                 return body.detail || fallback;
             } catch (e) {
                 return fallback;
@@ -234,11 +240,22 @@ ADMIN_PERSONS_PAGE_HTML = """<!DOCTYPE html>
         }
 
         async function promotePerson(p) {
+            // The wording matches the API's own refusal, because this dialog
+            // is a courtesy and the API is the guard: a promotion without
+            // acknowledge_garmin_reassignment is refused server-side.
             if (!confirm(
-                `Make ${p.display_name} the primary person? Scheduled Garmin syncs follow the ` +
-                `primary person until per-person Garmin linking ships.`
+                `Make ${p.display_name} the primary person?\\n\\n` +
+                `The primary person is also whose Garmin account this deployment is taken to ` +
+                `hold. After this, scheduled syncs will file that account's sleep, HRV and ` +
+                `weight under ${p.display_name}. If the Garmin account should change too, ` +
+                `update GARMIN_EMAIL/GARMIN_PASSWORD and clear the .garth token directory.`
             )) return;
-            patchPerson(p.id, {is_primary: true}, "Primary person changed.", "Failed to promote.");
+            patchPerson(
+                p.id,
+                {is_primary: true, acknowledge_garmin_reassignment: true},
+                "Primary person changed.",
+                "Failed to promote."
+            );
         }
 
         async function archivePerson(p) {
@@ -290,7 +307,11 @@ ADMIN_PERSONS_PAGE_HTML = """<!DOCTYPE html>
             }
             for (const g of await res.json()) {
                 const row = document.createElement("tr");
-                row.appendChild(cell(g.username));
+                // username is null for a grant whose account was deleted before
+                // the cascade shipped. Such a row is counted by the people
+                // table, so it must be shown here -- and revocable, which is
+                // the only way to clear it.
+                row.appendChild(cell(g.username || `deleted account #${g.user_id}`));
 
                 const accessCell = document.createElement("td");
                 const select = document.createElement("select");
