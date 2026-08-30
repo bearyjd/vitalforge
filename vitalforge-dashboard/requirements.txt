@@ -1,6 +1,14 @@
-fastapi==0.115.6
+# fastapi/starlette are bumped together and pinned together. fastapi's own
+# constraint is what gates starlette: 0.115.6 required starlette<0.42.0, so the
+# security fix for PYSEC-2026-1942 (unauthenticated Range-header DoS in
+# FileResponse, reachable through the unauthenticated /static/ mount) could not
+# be applied without moving fastapi too. 0.120 was the first release admitting
+# starlette 0.49.x; this goes to current instead, because 0.49.x is already far
+# behind and only the current line audits clean. See issue #37.
+fastapi==0.141.1
+starlette==1.6.0
 uvicorn[standard]==0.34.0
-jinja2==3.1.5
+jinja2==3.1.6
 aiosqlite==0.21.0
 # Exact-pinned deliberately: 0.2.38->0.3.11 was a breaking rewrite (dropped
 # `garth`, changed the auth/token-persistence API) that broke shared/
@@ -8,7 +16,7 @@ aiosqlite==0.21.0
 # and tests/test_garmin_client_api.py. Before bumping this again, re-read
 # authenticate() against the new version's source, not just the changelog.
 garminconnect==0.3.11
-python-multipart==0.0.20
+python-multipart==0.0.32
 anthropic>=0.40.0
 itsdangerous>=2.1.0
 # Pure-Python FIT (Garmin activity file) parser for the local activity
