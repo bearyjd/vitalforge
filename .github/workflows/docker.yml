@@ -23,11 +23,27 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r vitalforge-weight/requirements.txt -r vitalforge-dashboard/requirements.txt
-          pip install pytest pytest-asyncio httpx ruff playwright pytest-playwright
+          pip install pytest pytest-asyncio httpx ruff playwright pytest-playwright pip-audit
           pip install -e .
 
       - name: Lint (ruff)
         run: ruff check .
+
+      # Nothing was auditing dependencies before this: the starlette advisory
+      # that prompted issue #37 surfaced from a one-off run during a code
+      # review, which is not a process.
+      #
+      # Scoped to the two requirements files rather than the whole installed
+      # environment, deliberately. pip-audit still resolves and audits their
+      # TRANSITIVE dependencies -- which is what matters here, since starlette
+      # was transitive until this commit -- but an advisory in pytest, ruff or
+      # playwright will not block an image push for a vulnerability that never
+      # ships in the image.
+      - name: Audit dependencies (pip-audit)
+        run: |
+          pip-audit --progress-spinner off \
+            -r vitalforge-weight/requirements.txt \
+            -r vitalforge-dashboard/requirements.txt
 
       - name: Run tests
         run: pytest -q
