@@ -267,13 +267,20 @@ async def index(request: Request):
 async def person_index(request: Request, slug: str, person_id: int = Depends(require_person("view"))):
     # person_id is unused here -- the Depends IS the authorization, and
     # dropping it would make this page readable by anyone with an account.
-    return templates.TemplateResponse("index.html", {
-        "request": request,
-        "person_slug": slug,
-        "dashboard_url": os.environ.get("DASHBOARD_URL", ""),
-        "default_unit": os.environ.get("DEFAULT_UNIT", "lbs"),
-        "tz": os.environ.get("TZ", ""),
-    })
+    # See the identical call in vitalforge-dashboard: the signature is
+    # (request, name, context), and the old (name, {"request": ...}) form is
+    # gone in starlette 1.x -- it renders as `unhashable type: 'dict'` from
+    # Jinja2's template cache, i.e. a 500 on every page load.
+    return templates.TemplateResponse(
+        request,
+        "index.html",
+        {
+            "person_slug": slug,
+            "dashboard_url": os.environ.get("DASHBOARD_URL", ""),
+            "default_unit": os.environ.get("DEFAULT_UNIT", "lbs"),
+            "tz": os.environ.get("TZ", ""),
+        },
+    )
 
 
 DEDUP_WEIGHT_TOLERANCE_GRAMS = 50
