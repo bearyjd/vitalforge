@@ -27,6 +27,13 @@ _WEIGHT_LOG_ADDITIVE_COLUMNS = [
     "bone_mass_kg REAL",
     "source TEXT",
     "person_id INTEGER",
+    # Client-generated idempotency key (A6, docs/prp/00-design.md SS4.4 in the
+    # Bascule repo). NULL for every pre-existing row and for any client that
+    # still doesn't send one -- those fall back to the timestamp+weight-window
+    # dedup below, unchanged. Enforced unique per person by
+    # idx_weight_log_person_client_id (a partial index, so NULLs -- the
+    # overwhelming majority of rows -- are excluded).
+    "client_id TEXT",
 ]
 
 # Additive columns for weight_history's Garmin-sourced composition read path
@@ -151,6 +158,21 @@ async def init_db():
         # Additive migration for weight_log on databases that already exist
         # (a fresh DB already has these columns from the CREATE TABLE above).
         await _add_columns(db, "weight_log", _WEIGHT_LOG_ADDITIVE_COLUMNS)
+
+        # Belt-and-suspenders: the request-path BEGIN IMMEDIATE transaction
+        # (vitalforge-weight/app.py post_weight) already serializes the
+        # check-then-insert on client_id, so this index isn't load-bearing for
+        # the race -- it's a hard DB-level guarantee of the same invariant, in
+        # case a future write path (a script, a different endpoint) ever
+        # bypasses that transaction. Unguarded, like idx_weight_log_person_timestamp
+        # below: client_id exists on every row by this point in this same
+        # init_db() call, added by _add_columns above, not by the heavier
+        # migrations.py runner (contrast the guarded activities index, whose
+        # person_id column only migrations.py adds, later than this point).
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_weight_log_person_client_id "
+            "ON weight_log(person_id, client_id) WHERE client_id IS NOT NULL"
+        )
 
         # Phase 2: metric tables — one per metric type, all keyed by date
         await db.execute("""

@@ -37,6 +37,12 @@ LBS_PER_KG = 2.20462
 GRAMS_PER_LB = 453.592
 GRAMS_PER_KG = 1000
 
+# How far ahead of receipt time a client-supplied `captured_at` may be before
+# WeightIn._validate_captured_at rejects it -- ordinary clock skew tolerance,
+# not a real allowance for a future weigh-in. Defined ahead of WeightIn,
+# unlike DEDUP_WINDOW_SECONDS below (which the route, not the model, needs).
+CAPTURED_AT_FUTURE_TOLERANCE_SECONDS = 60
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -115,6 +121,17 @@ class WeightIn(BaseModel):
     muscle_pct: float | None = Field(default=None, ge=10.0, le=90.0)
     bone_mass_kg: float | None = Field(default=None, ge=0.5, le=10.0)
     source: Literal["pwa", "bascule", "bridge", "tasker"] | None = None
+    # A6 (Bascule docs/prp/00-design.md SS4.4): client-generated idempotency
+    # key. Bounded, not free-form -- this is an opaque token, not user text.
+    client_id: str | None = Field(default=None, min_length=1, max_length=128)
+    # The other half of A6: the client's own capture time, distinct from this
+    # request's receipt time. Lets a delayed replay -- receipt time months
+    # after the original weigh-in -- still dedup-match against a row VitalForge
+    # already stored near its true capture time, instead of only ever matching
+    # within DEDUP_WINDOW_SECONDS of *this* request's arrival. Optional: a
+    # client that never sends it (pwa/tasker/legacy bascule) keeps today's
+    # receipt-time-anchored behavior exactly as-is.
+    captured_at: datetime | None = None
 
     @field_validator("weight", "body_fat_pct", "body_water_pct", "muscle_pct", "bone_mass_kg", mode="before")
     @classmethod
@@ -136,6 +153,24 @@ class WeightIn(BaseModel):
         weight_kg = self.weight if unit == "kg" else self.weight / LBS_PER_KG
         if not (2.0 <= weight_kg <= 500.0):
             raise ValueError("weight must be between 2 and 500 kg after unit conversion")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_captured_at(self):
+        if self.captured_at is None:
+            return self
+        # Naive datetimes are ambiguous (server-local? UTC? the phone's own
+        # zone?) -- exactly the kind of guess this codebase's dedup-precision
+        # tests exist to avoid making silently. Require an explicit offset.
+        if self.captured_at.tzinfo is None:
+            raise ValueError("captured_at must include a UTC offset")
+        # Unlike the past (arbitrarily old, by design -- that's what makes a
+        # months-later replay's dedup match work at all), the future is
+        # bounded: nothing legitimate reports a capture time ahead of when it
+        # was sent, beyond ordinary clock skew.
+        skew = self.captured_at - datetime.now(timezone.utc)
+        if skew > timedelta(seconds=CAPTURED_AT_FUTURE_TOLERANCE_SECONDS):
+            raise ValueError("captured_at must not be in the future")
         return self
 
 
@@ -325,7 +360,29 @@ async def post_weight(data: WeightIn, person_id: int = Depends(require_person("m
 
     weight_grams = round(weight_kg * GRAMS_PER_KG)
     now = datetime.now(timezone.utc)
-    timestamp = now.isoformat()
+    # The moment this row's dedup window and stored timestamp anchor on.
+    # `captured_at`, when the client sends one, is the true weigh-in moment --
+    # not this request's receipt time, which for a delayed replay (A6) can be
+    # months later and would otherwise miss every window check entirely.
+    # Absent `captured_at` (pwa/tasker/legacy bascule), this is exactly `now`,
+    # i.e. today's behavior, unchanged.
+    #
+    # .astimezone(timezone.utc) is required, not cosmetic: WeightIn only
+    # requires captured_at to carry SOME offset, not specifically +00:00 (a
+    # client-local "-05:00" is valid input). Every existing row's `timestamp`
+    # TEXT column was written as `now.isoformat()`, always +00:00. The
+    # sargable prefilter (`timestamp >= ?`, below) is a plain TEXT comparison
+    # -- it does not parse offsets -- so a captured_at retained in its
+    # original offset can string-compare *before* a same-instant +00:00 row,
+    # silently dropping that row from the SELECT before the authoritative
+    # julianday() bounds even see it, and inserting a duplicate. The same raw
+    # value also reaches Garmin via push_weight's strftime, which has no `%z`
+    # and would silently drop a non-UTC offset rather than convert it,
+    # corrupting the pushed timestamp by the offset amount. Normalizing once,
+    # here, keeps every downstream use (storage, the prefilter, julianday
+    # comparisons, and the Garmin push) consistently UTC (codex review P1).
+    dedup_anchor = (data.captured_at if data.captured_at is not None else now).astimezone(timezone.utc)
+    timestamp = dedup_anchor.isoformat()
 
     # Atomic: read for a duplicate and (if any) write inside one transaction,
     # so two concurrent requests can never both observe "no duplicate". The
@@ -335,6 +392,33 @@ async def post_weight(data: WeightIn, person_id: int = Depends(require_person("m
     db = await get_db()
     try:
         await db.execute("BEGIN IMMEDIATE")
+
+        # TODO(follow-up): existing-row resolution (client_id lookup, then
+        # the timestamp+weight window fallback, then the conflict/enrichment
+        # merge) is now three sequential decision points before the actual
+        # insert/update, on top of the transaction and Garmin-push logic this
+        # function already carried. Worth extracting to its own function once
+        # this stabilizes in production -- deferred here to keep this PR
+        # reviewable as "the A6 fix," not a structural refactor riding along
+        # with it (Devil's-advocate review, Round 5).
+
+        # Primary match: an exact client_id hit is a known-identical reading
+        # regardless of how far its timestamp is from this request's receipt
+        # time -- the whole point of A6. Only when this misses (no client_id
+        # sent, or a client_id VitalForge has never seen) does the
+        # timestamp+weight window below even run.
+        existing = None
+        matched_by_client_id = False
+        if data.client_id is not None:
+            cursor = await db.execute(
+                "SELECT id, weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin, "
+                "body_fat_pct, body_water_pct, muscle_pct, bone_mass_kg, source, client_id "
+                "FROM weight_log WHERE person_id = ? AND client_id = ?",
+                (person_id, data.client_id),
+            )
+            existing = await cursor.fetchone()
+            matched_by_client_id = existing is not None
+
         # `timestamp >= ?` is a sargable prefilter, not the authoritative
         # bound -- plain string comparison is NOT reliably safe here despite
         # every row coming from this same route's own
@@ -381,29 +465,40 @@ async def post_weight(data: WeightIn, person_id: int = Depends(require_person("m
         # against SQLite's own offset computation instead avoids the
         # subtraction/cancellation entirely (0/200k failures). Caught by
         # Codex review the same day the symmetric-window fix landed.
-        sargable_cutoff = (now - timedelta(seconds=DEDUP_WINDOW_SECONDS + 1)).isoformat()
-        cursor = await db.execute(
-            "SELECT id, weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin, "
-            "body_fat_pct, body_water_pct, muscle_pct, bone_mass_kg, source "
-            "FROM weight_log "
-            "WHERE person_id = ? "
-            "AND timestamp >= ? "
-            "AND ABS(weight_grams - ?) <= ? "
-            "AND julianday(timestamp) >= julianday(?, ?) "
-            "AND julianday(timestamp) <= julianday(?, ?) "
-            "ORDER BY timestamp DESC LIMIT 1",
-            (
-                person_id,
-                sargable_cutoff,
-                weight_grams,
-                DEDUP_WEIGHT_TOLERANCE_GRAMS,
-                timestamp,
-                f"-{DEDUP_WINDOW_SECONDS} seconds",
-                timestamp,
-                f"+{DEDUP_WINDOW_SECONDS} seconds",
-            ),
-        )
-        existing = await cursor.fetchone()
+        # Anchored on dedup_anchor (== captured_at when the client sent one),
+        # not `now` -- see the comment on dedup_anchor's assignment above.
+        # Legacy rows this same replay could match were themselves stamped
+        # near their own true capture time (a live v1 delivery's receipt time
+        # is a close proxy for it), so anchoring the *new* request's window on
+        # its own true capture time is what lets the two line up months apart
+        # in wall-clock receipt time. A row whose original delivery was itself
+        # delayed by more than the window is a known residual gap (its stored
+        # timestamp isn't a close proxy for capture time either) -- undetectable
+        # without a capture time VitalForge never had the chance to record.
+        sargable_cutoff = (dedup_anchor - timedelta(seconds=DEDUP_WINDOW_SECONDS + 1)).isoformat()
+        if existing is None:
+            cursor = await db.execute(
+                "SELECT id, weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin, "
+                "body_fat_pct, body_water_pct, muscle_pct, bone_mass_kg, source, client_id "
+                "FROM weight_log "
+                "WHERE person_id = ? "
+                "AND timestamp >= ? "
+                "AND ABS(weight_grams - ?) <= ? "
+                "AND julianday(timestamp) >= julianday(?, ?) "
+                "AND julianday(timestamp) <= julianday(?, ?) "
+                "ORDER BY timestamp DESC LIMIT 1",
+                (
+                    person_id,
+                    sargable_cutoff,
+                    weight_grams,
+                    DEDUP_WEIGHT_TOLERANCE_GRAMS,
+                    timestamp,
+                    f"-{DEDUP_WINDOW_SECONDS} seconds",
+                    timestamp,
+                    f"+{DEDUP_WINDOW_SECONDS} seconds",
+                ),
+            )
+            existing = await cursor.fetchone()
 
         updates = {}
         conflicts = []
@@ -418,11 +513,38 @@ async def post_weight(data: WeightIn, person_id: int = Depends(require_person("m
                 elif existing_value != incoming_value:
                     conflicts.append(field)
 
+            # client_id is deliberately not in ENRICHABLE_FIELDS: a mismatch
+            # here means two DISTINCT client-side readings collided inside the
+            # dedup window, not a value to merge -- silently overwriting one
+            # row's identity with the other's client_id would make a later
+            # replay of the *original* reading match the wrong row.
+            if data.client_id is not None:
+                if existing["client_id"] is None:
+                    updates["client_id"] = data.client_id
+                elif existing["client_id"] != data.client_id:
+                    conflicts.append("client_id")
+
+            # A client_id match asserts "this is the same reading" -- unlike
+            # the window path (bounded to +-50g of measurement noise by its
+            # own SQL, so within-tolerance differences there are deliberately
+            # silent), the client_id fast path has no weight check at all
+            # otherwise. A colliding client_id (client-side bug, id reuse)
+            # with a wildly different weight would silently keep the stale
+            # stored value with zero signal to anyone. Scoped to the
+            # client_id match specifically -- applying this to a window match
+            # too would flag every legitimate within-tolerance difference the
+            # window's own +-50g exists to accept silently (test_dedup_tolerance_49g_collapses).
+            # weight is never overwritten after the fact (same first-write-
+            # wins convention as every enrichable field) -- this only makes
+            # the disagreement visible.
+            if matched_by_client_id and existing["weight_grams"] != weight_grams:
+                conflicts.append("weight")
+
         if existing is None:
             cursor = await db.execute(
                 "INSERT INTO weight_log (person_id, weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin, "
-                "body_fat_pct, body_water_pct, muscle_pct, bone_mass_kg, source) "
-                "VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)",
+                "body_fat_pct, body_water_pct, muscle_pct, bone_mass_kg, source, client_id) "
+                "VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)",
                 (
                     person_id,
                     round(weight_lbs, 2),
@@ -434,6 +556,7 @@ async def post_weight(data: WeightIn, person_id: int = Depends(require_person("m
                     data.muscle_pct,
                     data.bone_mass_kg,
                     data.source,
+                    data.client_id,
                 ),
             )
             row_id = cursor.lastrowid
@@ -481,9 +604,20 @@ async def post_weight(data: WeightIn, person_id: int = Depends(require_person("m
         synced = False
         try:
             if existing is None:
+                # dedup_anchor here can be an arbitrarily old captured_at
+                # (a replay of a months-old weigh-in) -- this is the first
+                # code path in this file able to push a backdated timestamp
+                # to Garmin at all; every prior push used either `now` or a
+                # pre-existing row's own timestamp, which the window's +-60s
+                # bound kept close to receipt time. shared/garmin_client.py's
+                # push_weight/add_body_composition does no bound-checking of
+                # its own (verified by reading it), so this is UNVERIFIED
+                # against real Garmin Connect behavior for a large backdate --
+                # confirm with a live account before this path sees real
+                # replay traffic (Devil's-advocate review, Round 2).
                 garmin_error = _push_composition(
                     weight_grams,
-                    now,
+                    dedup_anchor,
                     {
                         "body_fat_pct": data.body_fat_pct,
                         "body_water_pct": data.body_water_pct,
@@ -535,6 +669,8 @@ async def post_weight(data: WeightIn, person_id: int = Depends(require_person("m
             value = getattr(data, field_name)
             if value is not None:
                 result[field_name] = value
+        if data.client_id is not None:
+            result["client_id"] = data.client_id
     else:
         result = {
             "success": True,
