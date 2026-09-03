@@ -81,17 +81,41 @@ async def test_client_id_match_short_circuits_time_window(client):
     assert await row_count() == 1
 
 
-async def test_client_id_match_ignores_weight_tolerance(client):
-    """Identity trumps the +-50g tolerance too -- a client_id match is the
-    same reading by definition, not a fuzzy candidate."""
+async def test_client_id_match_ignores_weight_tolerance_but_flags_the_disagreement(client):
+    """Identity trumps the +-50g tolerance for MATCHING -- a client_id match
+    is the same reading by definition, not a fuzzy candidate, so it's still
+    treated as one row. But unlike the window path (whose own +-50g bound
+    makes a small difference deliberately silent), any weight disagreement
+    under a client_id match is surfaced as a conflict: a colliding client_id
+    across two genuinely different readings should never look identical to a
+    clean match (Devil's-advocate review, Round 1)."""
     row_id, _ = await seed_row(84096, seconds_ago=5, client_id="reading-1")
     resp = await client.post(
         f"{PERSON_PREFIX}/api/weight",
         json={"weight": (84096 + 5000) / 1000, "unit": "kg", "client_id": "reading-1"},
     )
-    assert resp.json()["deduplicated"] is True
-    assert resp.json()["id"] == row_id
+    body = resp.json()
+    assert body["deduplicated"] is True
+    assert body["id"] == row_id
     assert await row_count() == 1
+    assert body["conflict"] is True
+    assert "weight" in body["conflict_fields"]
+    # the stored weight is authoritative and never silently overwritten
+    assert body["weight_kg"] == pytest.approx(84.1, abs=0.01)
+
+
+async def test_client_id_match_with_identical_weight_raises_no_conflict(client):
+    """The weight-conflict check must not fire on genuine idempotent
+    replay -- a same client_id, same weight resubmission is exactly the
+    no-op the whole feature exists to support."""
+    await seed_row(84096, seconds_ago=5, client_id="reading-1")
+    resp = await client.post(
+        f"{PERSON_PREFIX}/api/weight",
+        json={"weight": 84096 / 1000, "unit": "kg", "client_id": "reading-1"},
+    )
+    body = resp.json()
+    assert body["deduplicated"] is True
+    assert "conflict" not in body
 
 
 async def test_client_id_conflict_within_window_is_flagged_not_overwritten(client):
@@ -234,6 +258,39 @@ async def test_captured_at_is_stored_as_the_row_timestamp(client):
     )
     body = resp.json()
     assert datetime.fromisoformat(body["timestamp"]) == captured_at
+
+
+async def test_captured_at_is_used_as_the_garmin_push_timestamp_on_fresh_insert(client, fake_garmin_client):
+    """Not just the stored row -- the timestamp actually forwarded to Garmin
+    must be the true capture time too, not receipt time. This is the first
+    code path able to push a backdated timestamp to Garmin at all (Devil's-
+    advocate review, Round 2) -- unverified against real Garmin Connect
+    behavior for a large backdate, but this pins what THIS app sends."""
+    captured_at = datetime.now(timezone.utc) - timedelta(days=90)
+    resp = await client.post(
+        f"{PERSON_PREFIX}/api/weight",
+        json={"weight": 185.4, "unit": "lbs", "body_fat_pct": 18.4, "captured_at": captured_at.isoformat()},
+    )
+    assert resp.json()["synced_to_garmin"] is True
+    pushed_ts = fake_garmin_client.pushed_weights[-1]["timestamp"]
+    assert pushed_ts == captured_at
+
+
+async def test_captured_at_without_client_id_still_anchors_the_window(client):
+    """captured_at doesn't require client_id -- a client resubmitting a
+    known-old reading with only a timestamp (e.g. a one-time migration from
+    another data source) still benefits from anchoring the dedup window on
+    the true capture time instead of receipt time."""
+    original_capture = datetime.now(timezone.utc) - timedelta(days=30)
+    row_id, _ = await seed_row(84096, seconds_ago=(datetime.now(timezone.utc) - original_capture).total_seconds())
+
+    resp = await client.post(
+        f"{PERSON_PREFIX}/api/weight",
+        json={"weight": 185.4, "unit": "lbs", "captured_at": original_capture.isoformat()},
+    )
+    body = resp.json()
+    assert body["deduplicated"] is True
+    assert body["id"] == row_id
 
 
 async def test_captured_at_naive_datetime_rejected(client):

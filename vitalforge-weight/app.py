@@ -378,12 +378,22 @@ async def post_weight(data: WeightIn, person_id: int = Depends(require_person("m
     try:
         await db.execute("BEGIN IMMEDIATE")
 
+        # TODO(follow-up): existing-row resolution (client_id lookup, then
+        # the timestamp+weight window fallback, then the conflict/enrichment
+        # merge) is now three sequential decision points before the actual
+        # insert/update, on top of the transaction and Garmin-push logic this
+        # function already carried. Worth extracting to its own function once
+        # this stabilizes in production -- deferred here to keep this PR
+        # reviewable as "the A6 fix," not a structural refactor riding along
+        # with it (Devil's-advocate review, Round 5).
+
         # Primary match: an exact client_id hit is a known-identical reading
         # regardless of how far its timestamp is from this request's receipt
         # time -- the whole point of A6. Only when this misses (no client_id
         # sent, or a client_id VitalForge has never seen) does the
         # timestamp+weight window below even run.
         existing = None
+        matched_by_client_id = False
         if data.client_id is not None:
             cursor = await db.execute(
                 "SELECT id, weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin, "
@@ -392,6 +402,7 @@ async def post_weight(data: WeightIn, person_id: int = Depends(require_person("m
                 (person_id, data.client_id),
             )
             existing = await cursor.fetchone()
+            matched_by_client_id = existing is not None
 
         # `timestamp >= ?` is a sargable prefilter, not the authoritative
         # bound -- plain string comparison is NOT reliably safe here despite
@@ -498,6 +509,22 @@ async def post_weight(data: WeightIn, person_id: int = Depends(require_person("m
                 elif existing["client_id"] != data.client_id:
                     conflicts.append("client_id")
 
+            # A client_id match asserts "this is the same reading" -- unlike
+            # the window path (bounded to +-50g of measurement noise by its
+            # own SQL, so within-tolerance differences there are deliberately
+            # silent), the client_id fast path has no weight check at all
+            # otherwise. A colliding client_id (client-side bug, id reuse)
+            # with a wildly different weight would silently keep the stale
+            # stored value with zero signal to anyone. Scoped to the
+            # client_id match specifically -- applying this to a window match
+            # too would flag every legitimate within-tolerance difference the
+            # window's own +-50g exists to accept silently (test_dedup_tolerance_49g_collapses).
+            # weight is never overwritten after the fact (same first-write-
+            # wins convention as every enrichable field) -- this only makes
+            # the disagreement visible.
+            if matched_by_client_id and existing["weight_grams"] != weight_grams:
+                conflicts.append("weight")
+
         if existing is None:
             cursor = await db.execute(
                 "INSERT INTO weight_log (person_id, weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin, "
@@ -562,6 +589,17 @@ async def post_weight(data: WeightIn, person_id: int = Depends(require_person("m
         synced = False
         try:
             if existing is None:
+                # dedup_anchor here can be an arbitrarily old captured_at
+                # (a replay of a months-old weigh-in) -- this is the first
+                # code path in this file able to push a backdated timestamp
+                # to Garmin at all; every prior push used either `now` or a
+                # pre-existing row's own timestamp, which the window's +-60s
+                # bound kept close to receipt time. shared/garmin_client.py's
+                # push_weight/add_body_composition does no bound-checking of
+                # its own (verified by reading it), so this is UNVERIFIED
+                # against real Garmin Connect behavior for a large backdate --
+                # confirm with a live account before this path sees real
+                # replay traffic (Devil's-advocate review, Round 2).
                 garmin_error = _push_composition(
                     weight_grams,
                     dedup_anchor,
