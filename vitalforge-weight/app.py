@@ -366,7 +366,22 @@ async def post_weight(data: WeightIn, person_id: int = Depends(require_person("m
     # months later and would otherwise miss every window check entirely.
     # Absent `captured_at` (pwa/tasker/legacy bascule), this is exactly `now`,
     # i.e. today's behavior, unchanged.
-    dedup_anchor = data.captured_at if data.captured_at is not None else now
+    #
+    # .astimezone(timezone.utc) is required, not cosmetic: WeightIn only
+    # requires captured_at to carry SOME offset, not specifically +00:00 (a
+    # client-local "-05:00" is valid input). Every existing row's `timestamp`
+    # TEXT column was written as `now.isoformat()`, always +00:00. The
+    # sargable prefilter (`timestamp >= ?`, below) is a plain TEXT comparison
+    # -- it does not parse offsets -- so a captured_at retained in its
+    # original offset can string-compare *before* a same-instant +00:00 row,
+    # silently dropping that row from the SELECT before the authoritative
+    # julianday() bounds even see it, and inserting a duplicate. The same raw
+    # value also reaches Garmin via push_weight's strftime, which has no `%z`
+    # and would silently drop a non-UTC offset rather than convert it,
+    # corrupting the pushed timestamp by the offset amount. Normalizing once,
+    # here, keeps every downstream use (storage, the prefilter, julianday
+    # comparisons, and the Garmin push) consistently UTC (codex review P1).
+    dedup_anchor = (data.captured_at if data.captured_at is not None else now).astimezone(timezone.utc)
     timestamp = dedup_anchor.isoformat()
 
     # Atomic: read for a duplicate and (if any) write inside one transaction,

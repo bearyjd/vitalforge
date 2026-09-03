@@ -301,6 +301,46 @@ async def test_captured_at_naive_datetime_rejected(client):
     assert resp.status_code == 422
 
 
+async def test_captured_at_non_utc_offset_is_stored_normalized_to_utc(client):
+    """A valid non-UTC offset is accepted (WeightIn only requires SOME
+    offset, not specifically +00:00) but must be normalized before storage --
+    every pre-existing row's TEXT timestamp is always +00:00, and the
+    sargable dedup prefilter is a plain string comparison that only works
+    when every row shares one offset convention (codex review finding)."""
+    captured_at = datetime(2026, 5, 1, 10, 0, 0, tzinfo=timezone(timedelta(hours=-5)))
+    resp = await client.post(
+        f"{PERSON_PREFIX}/api/weight",
+        json={"weight": 185.4, "unit": "lbs", "captured_at": captured_at.isoformat()},
+    )
+    body = resp.json()
+    stored = datetime.fromisoformat(body["timestamp"])
+    assert stored == captured_at  # same instant
+    assert body["timestamp"].endswith("+00:00")  # but normalized on the wire
+
+
+async def test_captured_at_non_utc_offset_still_dedup_matches_a_utc_stored_row(client):
+    """The failure mode this guards against, made concrete: a row is stored
+    (as every row is) with a +00:00 timestamp. A replay expresses the exact
+    same instant in a different offset. Without normalizing captured_at
+    before computing the prefilter, this reproduces the exact scenario the
+    codex review named: the TEXT prefilter string-compares "...T10:00:00-05:00"
+    against a "...T15:00:00+00:00" row and can exclude a real match before
+    the authoritative julianday() bounds ever see it, inserting a duplicate."""
+    row_id, ts = await seed_row(84096, seconds_ago=0)  # stored +00:00, like every real row
+    stored_instant = datetime.fromisoformat(ts)
+
+    # The identical instant, expressed in a different offset.
+    replay_captured_at = stored_instant.astimezone(timezone(timedelta(hours=-5)))
+    resp = await client.post(
+        f"{PERSON_PREFIX}/api/weight",
+        json={"weight": 185.4, "unit": "lbs", "captured_at": replay_captured_at.isoformat()},
+    )
+    body = resp.json()
+    assert body["deduplicated"] is True
+    assert body["id"] == row_id
+    assert await row_count() == 1
+
+
 async def test_captured_at_far_future_rejected(client):
     future = datetime.now(timezone.utc) + timedelta(hours=1)
     resp = await client.post(
