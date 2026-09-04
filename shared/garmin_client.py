@@ -58,16 +58,21 @@ def push_weight(
     percent_hydration: float | None = None,
     muscle_mass_kg: float | None = None,
     bone_mass_kg: float | None = None,
+    bmi: float | None = None,
+    basal_met: float | None = None,
+    active_met: float | None = None,
 ):
     """Push a weight measurement, and optionally body composition, to Garmin
     Connect via FIT file upload.
 
     Composition kwargs map straight through to add_body_composition's
-    percent_fat/percent_hydration/muscle_mass/bone_mass -- see
-    docs/prp/00-design.md SS3.4 for the full mapping table and the FIT
+    percent_fat/percent_hydration/muscle_mass/bone_mass/bmi/basal_met/active_met
+    -- see docs/prp/00-design.md SS3.4 for the full mapping table and the FIT
     encoder's truncation caveat (values are floored to 0.01 resolution).
     A None value lands as the FIT invalid sentinel, the correct encoding
-    for "not measured".
+    for "not measured". basal_met/active_met are kcal/day, matching
+    garminconnect's own convention -- callers (vitalforge-weight's WeightIn)
+    already validate in that unit, not kJ.
     """
     if timestamp is None:
         timestamp = datetime.now(timezone.utc)
@@ -83,6 +88,9 @@ def push_weight(
         percent_hydration=percent_hydration,
         muscle_mass=muscle_mass_kg,
         bone_mass=bone_mass_kg,
+        bmi=bmi,
+        basal_met=basal_met,
+        active_met=active_met,
     )
     logger.info("add_body_composition response: %s", result)
     logger.info("Weight pushed to Garmin successfully")
