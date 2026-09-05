@@ -323,6 +323,18 @@ COMPOSITION_FIELDS = ("body_fat_pct", "body_water_pct", "muscle_pct", "bone_mass
 # client (Phase 4 adversarial review finding).
 ENRICHABLE_FIELDS = (*COMPOSITION_FIELDS, "source")
 
+# The column list both existing-row SELECTs in post_weight need (the client_id
+# primary match and the timestamp+weight window fallback). Deduplicated after
+# a devil's-advocate review: two independently-maintained copies meant a
+# future ENRICHABLE_FIELDS addition updated in only one place would raise
+# IndexError/KeyError on `existing[field]` for whichever request path hit the
+# stale SELECT -- an uncaught exception mid-transaction, not a graceful
+# degraded response.
+_WEIGHT_LOG_EXISTING_ROW_COLUMNS = (
+    "id, weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin, "
+    "body_fat_pct, body_water_pct, muscle_pct, bone_mass_kg, source, client_id"
+)
+
 
 def _push_composition(weight_grams: int, timestamp: datetime, composition: dict) -> str | None:
     """Push weight + composition to Garmin; returns an error string, or None
@@ -411,8 +423,7 @@ async def post_weight(data: WeightIn, person_id: int = Depends(require_person("m
         matched_by_client_id = False
         if data.client_id is not None:
             cursor = await db.execute(
-                "SELECT id, weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin, "
-                "body_fat_pct, body_water_pct, muscle_pct, bone_mass_kg, source, client_id "
+                f"SELECT {_WEIGHT_LOG_EXISTING_ROW_COLUMNS} "
                 "FROM weight_log WHERE person_id = ? AND client_id = ?",
                 (person_id, data.client_id),
             )
@@ -478,8 +489,7 @@ async def post_weight(data: WeightIn, person_id: int = Depends(require_person("m
         sargable_cutoff = (dedup_anchor - timedelta(seconds=DEDUP_WINDOW_SECONDS + 1)).isoformat()
         if existing is None:
             cursor = await db.execute(
-                "SELECT id, weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin, "
-                "body_fat_pct, body_water_pct, muscle_pct, bone_mass_kg, source, client_id "
+                f"SELECT {_WEIGHT_LOG_EXISTING_ROW_COLUMNS} "
                 "FROM weight_log "
                 "WHERE person_id = ? "
                 "AND timestamp >= ? "
@@ -600,6 +610,28 @@ async def post_weight(data: WeightIn, person_id: int = Depends(require_person("m
         # property of the current single-worker deployment, not something
         # this code enforces; moving the push to a thread/worker pool would
         # reopen a stale-read window here.
+        # The second clause closes a real gap a devil's-advocate review
+        # found: without it, a client_id-matched retry of a reading whose
+        # Garmin push had failed could never succeed -- nothing in
+        # ENRICHABLE_FIELDS changes on an exact resubmit (existing values
+        # match, so `updates` stays empty), so composition_changed alone
+        # would stay False forever, and no other branch here ever
+        # re-attempts the push. Before A6, a sufficiently delayed retry
+        # missed the 60s window and landed as a brand-new row instead,
+        # getting a fresh push attempt by accident -- client_id closes that
+        # window on purpose, so it needs to inherit the retry, not just the
+        # identity match. Scoped to client_id specifically (not the
+        # window-match path): a client_id resubmission is an explicit "this
+        # is the same reading," a stronger signal than an incidental window
+        # match, so retrying the push here and not there is deliberate, not
+        # an oversight. Named once and reused below (the synced_to_garmin
+        # persistence gate) rather than repeating the condition -- the two
+        # must never drift apart, or a retried push's outcome would compute
+        # correctly but never actually get saved.
+        should_attempt_garmin_push = composition_changed or (
+            matched_by_client_id and existing is not None and not existing["synced_to_garmin"]
+        )
+
         garmin_error = None
         synced = False
         try:
@@ -626,7 +658,7 @@ async def post_weight(data: WeightIn, person_id: int = Depends(require_person("m
                     },
                 )
                 synced = garmin_error is None
-            elif composition_changed:
+            elif should_attempt_garmin_push:
                 merged = {field: updates.get(field, existing[field]) for field in COMPOSITION_FIELDS}
                 # Parsed locally, not left to the outer except below: a row
                 # whose timestamp SQLite's own julianday() accepted (so the
@@ -646,7 +678,7 @@ async def post_weight(data: WeightIn, person_id: int = Depends(require_person("m
             else:
                 synced = bool(existing["synced_to_garmin"])
 
-            if existing is None or composition_changed:
+            if existing is None or should_attempt_garmin_push:
                 await db.execute("UPDATE weight_log SET synced_to_garmin = ? WHERE id = ?", (int(synced), row_id))
                 await db.commit()
         except Exception as e:
@@ -686,6 +718,17 @@ async def post_weight(data: WeightIn, person_id: int = Depends(require_person("m
         if conflicts:
             result["conflict"] = True
             result["conflict_fields"] = conflicts
+        # Echo the row's client_id on a dedup response too, not just a fresh
+        # insert -- otherwise the one response a *retrying* client actually
+        # receives never confirms the identity key it matched on, and a
+        # window-match client_id conflict never states which client_id
+        # actually won (devil's-advocate review). `updates.get(...)` rather
+        # than `existing["client_id"]` alone: `existing` is the PRE-update
+        # row, so a client_id that was just backfilled this request (existing
+        # was NULL) needs the post-update value, not the stale None.
+        final_client_id = updates.get("client_id", existing["client_id"])
+        if final_client_id is not None:
+            result["client_id"] = final_client_id
     if garmin_error:
         result["garmin_error"] = garmin_error
 
