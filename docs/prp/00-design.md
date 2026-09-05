@@ -743,6 +743,8 @@ which forwards to the single `add_body_composition` call:
 | `body_water_pct` | `percent_hydration` | % | pass-through* |
 | `muscle_pct` | `muscle_mass` | **kg** | `weight_kg × muscle_pct / 100` ← **§6 D1** |
 | `bone_mass_kg` | `bone_mass` | kg | pass-through* |
+| `bmr` | `basal_met` | kcal/day | pass-through, floored to 0.25 kcal (scale 4, FIT field 7) — added later than the rest of this table; see the "Not sent" paragraph below for `bmi`, which took the opposite path |
+| `amr` | `active_met` | kcal/day | pass-through, floored to 0.25 kcal (scale 4, FIT field 9) |
 
 \* **"Pass-through" means no unit conversion, not no loss.** The FIT encoder
 multiplies by the scale (100) and then **truncates** — `int(value)`, not
@@ -764,11 +766,25 @@ provide — see §3.5, and note that any future assertion comparing a pushed val
 to a read-back value **must use a tolerance**. The same truncation is
 pre-existing for `weight` (84.096 kg already encodes as 84.09).
 
-Not sent: `visceral_fat_mass`, `basal_met`, `active_met`, `physique_rating`,
-`metabolic_age`, `visceral_fat_rating`, `bmi`. The BF720 does not report them and
-`bmi` is already derived by Garmin from weight and the user's profile height —
-sending our own would create a second source of truth for a value Garmin already
-computes.
+**Updated 2026-09-04**: `basal_met`/`active_met` (`bmr`/`amr`) are sent now —
+see the table row above. The BF720 doesn't report either, but `VitalForge`'s
+own `WeightIn` accepts them from any client that does (Bascule, currently),
+and neither has anywhere else in this schema they could round-trip back
+into, unlike `bmi` below.
+
+Still not sent: `visceral_fat_mass`, `physique_rating`, `metabolic_age`,
+`visceral_fat_rating`, `bmi`. The BF720 does not report the first three, and
+`bmi` is deliberately withheld even though `WeightIn` now accepts it (stored
+in `weight_log`, echoed in the response) — it's already derived by Garmin
+from weight and the user's profile height, and `vitalforge-dashboard/sync.py`
+reads that Garmin-computed value back into `weight_history.bmi` on every
+scheduled sync. Sending our own would create a second source of truth for a
+value Garmin already computes, and risks a scale-pushed `bmi` overwriting
+Garmin's own on the next sync (devil's-advocate review, bmi/bmr/amr PR).
+Unverified: whether Garmin's server actually does overwrite a
+profile-derived `bmi` with a scale-pushed one — this reasoning avoids
+needing that answer by simply never sending it, not by confirming the
+overwrite risk is real.
 
 `None` fields are passed through as `None` and land in the FIT record as the
 base type's *invalid* sentinel (`0xFFFF`), which is the correct FIT encoding for

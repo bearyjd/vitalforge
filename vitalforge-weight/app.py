@@ -128,7 +128,16 @@ class WeightIn(BaseModel):
     # bmr/amr are kcal/day (Bascule converts from the SIG profile's raw kJ at
     # persistence, docs/prp/02-interface-revision.md in the Bascule repo) --
     # the same unit garminconnect's basal_met/active_met already expect.
+    # bmi is stored/echoed but deliberately never pushed to Garmin -- see the
+    # ENRICHABLE_FIELDS comment further down this file for why.
     bmi: float | None = Field(default=None, ge=10.0, le=100.0)
+    # The bound below is a plausibility gate, not a full unit guard -- like
+    # bone_mass_kg's kg-vs-grams gap (test_bone_mass_in_grams_rejected_422),
+    # it cannot reliably catch every kJ-instead-of-kcal mixup: a true BMR in
+    # the ~1000-1195 kcal range submitted as raw kJ (~4184-5000) still lands
+    # inside this bound and is silently accepted. Not fixed with an extra
+    # heuristic (e.g. "amr must exceed bmr") since that assumes a relationship
+    # between the two the API never asserts -- same precedent as bone_mass_kg.
     bmr: float | None = Field(default=None, ge=500.0, le=5000.0)
     amr: float | None = Field(default=None, ge=500.0, le=10000.0)
     source: Literal["pwa", "bascule", "bridge", "tasker"] | None = None
@@ -326,15 +335,26 @@ async def person_index(request: Request, slug: str, person_id: int = Depends(req
 
 DEDUP_WEIGHT_TOLERANCE_GRAMS = 50
 DEDUP_WINDOW_SECONDS = 60
-COMPOSITION_FIELDS = ("body_fat_pct", "body_water_pct", "muscle_pct", "bone_mass_kg", "bmi", "bmr", "amr")
+COMPOSITION_FIELDS = ("body_fat_pct", "body_water_pct", "muscle_pct", "bone_mass_kg", "bmr", "amr")
 # Same first-write-wins-or-conflict treatment as COMPOSITION_FIELDS, plus
-# `source`. Kept separate from COMPOSITION_FIELDS (which also names exactly
-# what _push_composition forwards to Garmin) so that boundary stays
+# `source` and `bmi`. Kept separate from COMPOSITION_FIELDS (which also names
+# exactly what _push_composition forwards to Garmin) so that boundary stays
 # explicit; `source` has no Garmin analog and was previously excluded from
 # enrichment entirely, so a row's provenance label could permanently
 # misattribute composition data actually added by a different, later
-# client (Phase 4 adversarial review finding).
-ENRICHABLE_FIELDS = (*COMPOSITION_FIELDS, "source")
+# client (Phase 4 adversarial review finding). `bmi` joined it for a
+# different reason (codex/devil's-advocate review on the bmi/bmr/amr PR):
+# 00-design.md SS3.4 already rejected sending bmi to Garmin -- Garmin derives
+# its own from weight + the profile's height, and vitalforge-dashboard/sync.py
+# reads that Garmin-computed value back into weight_history.bmi on every
+# scheduled sync. Forwarding a second, independently-computed bmi risks
+# overwriting Garmin's own on the next push, which then round-trips back into
+# a table this repo already treats as Garmin-sourced data. bmi is still
+# stored in weight_log and echoed in the response -- only the Garmin push
+# (and the composition_changed/re-sync trigger a bmi-only edit would
+# otherwise cause) is withheld. bmr/amr have no such round-trip target
+# (weight_history has no bmr/amr columns) and stay in COMPOSITION_FIELDS.
+ENRICHABLE_FIELDS = (*COMPOSITION_FIELDS, "bmi", "source")
 
 
 def _push_composition(weight_grams: int, timestamp: datetime, composition: dict) -> str | None:
@@ -351,7 +371,9 @@ def _push_composition(weight_grams: int, timestamp: datetime, composition: dict)
             percent_hydration=composition.get("body_water_pct"),
             muscle_mass_kg=muscle_mass_kg,
             bone_mass_kg=composition.get("bone_mass_kg"),
-            bmi=composition.get("bmi"),
+            # bmi intentionally NOT forwarded -- see the ENRICHABLE_FIELDS
+            # comment above. Still stored in weight_log and echoed in the
+            # response; only the Garmin push is withheld.
             basal_met=composition.get("bmr"),
             active_met=composition.get("amr"),
         )
@@ -642,9 +664,10 @@ async def post_weight(data: WeightIn, person_id: int = Depends(require_person("m
                         "body_water_pct": data.body_water_pct,
                         "muscle_pct": data.muscle_pct,
                         "bone_mass_kg": data.bone_mass_kg,
-                        "bmi": data.bmi,
                         "bmr": data.bmr,
                         "amr": data.amr,
+                        # bmi deliberately omitted -- _push_composition never
+                        # forwards it, see the ENRICHABLE_FIELDS comment above.
                     },
                 )
                 synced = garmin_error is None

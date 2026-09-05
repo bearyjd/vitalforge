@@ -332,16 +332,23 @@ async def test_composition_persisted_to_weight_log(client):
     assert row["source"] == "bascule"
 
 
-async def test_composition_pushed_to_garmin_includes_bmi_bmr_amr(client, fake_garmin_client):
-    """bmi/basal_met/active_met pass straight through to Garmin, unlike
-    muscle_pct (which push_weight itself converts from a percentage to a
-    mass) -- pinning the exact kwarg names/values that reach
-    add_body_composition, not just that the request succeeds."""
+async def test_composition_pushed_to_garmin_includes_bmr_amr_but_not_bmi(client, fake_garmin_client):
+    """Pins _push_composition's own field-to-kwarg mapping (data.bmr ->
+    basal_met, data.amr -> active_met) at the app.py boundary, and that bmi
+    is withheld (00-design.md SS3.4 -- Garmin derives its own bmi and
+    vitalforge-dashboard/sync.py reads it back; forwarding ours risks
+    overwriting Garmin's on the next sync).
+
+    NOTE: weight_app_module fakes push_weight itself (conftest.py), so this
+    does not reach the real shared.garmin_client.push_weight or
+    add_body_composition -- that wire-level coverage lives in
+    tests/test_garmin_mapping.py (test_bmr_maps_to_basal_met,
+    test_amr_maps_to_active_met, and F5's signature guard)."""
     resp = await client.post(f"{PERSON_PREFIX}/api/weight", json=COMPOSITION_PAYLOAD)
     assert resp.status_code == 200
 
     pushed = fake_garmin_client.pushed_weights[-1]
-    assert pushed["bmi"] == 25.3
+    assert pushed.get("bmi") is None
     assert pushed["basal_met"] == 1620.0
     assert pushed["active_met"] == 2400.0
 
