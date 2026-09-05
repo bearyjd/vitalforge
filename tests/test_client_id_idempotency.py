@@ -233,6 +233,25 @@ async def test_client_id_match_already_synced_does_not_repush(client, fake_garmi
     assert len(fake_garmin_client.pushed_weights) == 0
 
 
+async def test_client_id_retry_with_new_composition_field_enriches_and_pushes(client, fake_garmin_client):
+    """Devil's-advocate review, round 6: composition_changed and the retry
+    clause (matched_by_client_id and not synced_to_garmin) can both be True
+    at once -- a client_id match on a not-yet-synced row that ALSO has a
+    genuinely new composition field to enrich. The merged dict construction
+    is generic to which clause fired, but this combination was untested."""
+    row_id, _ = await seed_row(84096, seconds_ago=3600, client_id="reading-1", synced_to_garmin=0)
+    resp = await client.post(
+        f"{PERSON_PREFIX}/api/weight",
+        json={"weight": 185.4, "unit": "lbs", "client_id": "reading-1", "body_fat_pct": 18.4},
+    )
+    body = resp.json()
+    assert body["id"] == row_id
+    assert body["synced_to_garmin"] is True
+    assert body["enriched"] is True
+    assert len(fake_garmin_client.pushed_weights) == 1
+    assert fake_garmin_client.pushed_weights[-1]["percent_fat"] == 18.4
+
+
 async def test_client_id_only_backfill_does_not_repush_or_touch_sync_flag(client, fake_garmin_client):
     """Mirrors this file's own source-only-enrichment convention
     (tests/test_dedup.py's test_source_only_enrichment_does_not_repush_to_garmin):

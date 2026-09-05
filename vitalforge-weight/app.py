@@ -631,6 +631,16 @@ async def post_weight(data: WeightIn, person_id: int = Depends(require_person("m
         should_attempt_garmin_push = composition_changed or (
             matched_by_client_id and existing is not None and not existing["synced_to_garmin"]
         )
+        # This path pushes outside the transaction on a column
+        # (synced_to_garmin) not written until after that push returns --
+        # safe today only because push_weight is synchronous and this
+        # single-worker deployment can't interleave two requests across it
+        # (see the comment above this block). Attempted to reproduce a
+        # double-push under concurrency
+        # (test_two_concurrent_identical_retries_push_to_garmin_once in
+        # tests/test_dedup_concurrency.py) and could not -- if push_weight
+        # ever becomes async, or this service gains a second worker, that
+        # test is what would catch it (devil's-advocate review, round 3).
 
         garmin_error = None
         synced = False
