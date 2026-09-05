@@ -192,6 +192,82 @@ async def test_client_id_replay_enriches_via_client_id_outside_window(client, fa
     assert len(fake_garmin_client.pushed_weights) == 1
 
 
+async def test_client_id_match_retries_a_previously_failed_garmin_push(client, fake_garmin_client):
+    """Devil's-advocate review finding: without this, an exact resubmit of a
+    reading whose original Garmin push failed (synced_to_garmin=0) could
+    never retry -- nothing in ENRICHABLE_FIELDS differs on an identical
+    resubmit, so composition_changed alone stays False forever and no other
+    branch re-attempts the push. This is the literal scenario A6 exists to
+    support (a client resubmitting a reading much later), so it must
+    actually retry, not silently inherit the stale failure forever."""
+    row_id, _ = await seed_row(84096, seconds_ago=3600, client_id="reading-1", synced_to_garmin=0)
+    resp = await client.post(
+        f"{PERSON_PREFIX}/api/weight",
+        json={"weight": 185.4, "unit": "lbs", "client_id": "reading-1"},
+    )
+    body = resp.json()
+    assert body["deduplicated"] is True
+    assert body["id"] == row_id
+    assert body["synced_to_garmin"] is True
+    assert len(fake_garmin_client.pushed_weights) == 1
+
+    db = await get_db()
+    try:
+        row = await (await db.execute("SELECT synced_to_garmin FROM weight_log WHERE id = ?", (row_id,))).fetchone()
+    finally:
+        await db.close()
+    assert row["synced_to_garmin"] == 1
+
+
+async def test_client_id_match_already_synced_does_not_repush(client, fake_garmin_client):
+    """The companion property to the retry fix above: an exact resubmit of a
+    reading that already synced successfully must NOT re-push -- the retry
+    gate is specifically `not existing["synced_to_garmin"]`, not "any
+    client_id match repushes unconditionally"."""
+    await seed_row(84096, seconds_ago=3600, client_id="reading-1", synced_to_garmin=1)
+    resp = await client.post(
+        f"{PERSON_PREFIX}/api/weight",
+        json={"weight": 185.4, "unit": "lbs", "client_id": "reading-1"},
+    )
+    assert resp.json()["synced_to_garmin"] is True
+    assert len(fake_garmin_client.pushed_weights) == 0
+
+
+async def test_client_id_only_backfill_does_not_repush_or_touch_sync_flag(client, fake_garmin_client):
+    """Mirrors this file's own source-only-enrichment convention
+    (tests/test_dedup.py's test_source_only_enrichment_does_not_repush_to_garmin):
+    a client_id backfill onto a window-matched row (no composition field
+    actually changed) must not trigger a Garmin re-push or touch
+    synced_to_garmin -- composition_changed must stay False for a
+    client_id-only update, the same way it does for a source-only one."""
+    row_id, _ = await seed_row(84096, seconds_ago=5, body_fat_pct=18.4, synced_to_garmin=1)
+    resp = await client.post(
+        f"{PERSON_PREFIX}/api/weight",
+        json={"weight": 185.4, "unit": "lbs", "client_id": "reading-1"},
+    )
+    body = resp.json()
+    assert body["deduplicated"] is True
+    assert body["id"] == row_id
+    assert body["client_id"] == "reading-1"
+    assert body["synced_to_garmin"] is True
+    assert len(fake_garmin_client.pushed_weights) == 0
+
+
+async def test_client_id_conflict_response_echoes_the_stored_client_id(client):
+    """The response the client actually receives when its client_id
+    collided must state which client_id won -- otherwise the client can't
+    tell which of its own readings actually holds the row without a
+    separate GET."""
+    await seed_row(84096, seconds_ago=5, client_id="reading-1")
+    resp = await client.post(
+        f"{PERSON_PREFIX}/api/weight",
+        json={"weight": 185.4, "unit": "lbs", "client_id": "reading-2"},
+    )
+    body = resp.json()
+    assert body["conflict"] is True
+    assert body["client_id"] == "reading-1"
+
+
 # --- captured_at: anchors the window for rows with no client_id yet --------
 
 
@@ -389,7 +465,13 @@ async def test_unique_index_rejects_duplicate_client_id_for_same_person(initiali
 
 async def test_unique_index_allows_multiple_null_client_ids(initialized_db):
     """NULL client_id (every legacy row, every non-replay client) must not
-    collide with itself under the partial unique index."""
+    collide with itself. NOTE, per a devil's-advocate review: this alone does
+    NOT discriminate the partial predicate specifically -- SQLite treats
+    NULLs as distinct in any UNIQUE index, partial or not, so a plain
+    UNIQUE(person_id, client_id) would pass this exact assertion too. Kept as
+    a real regression pin (three NULL rows must genuinely coexist), paired
+    with the partial-predicate check below rather than overclaiming that
+    check into the docstring here."""
     person_id = await get_primary_person_id()
     db = await get_db()
     try:
@@ -403,3 +485,25 @@ async def test_unique_index_allows_multiple_null_client_ids(initialized_db):
     finally:
         await db.close()
     assert await row_count() == 3
+
+
+async def test_client_id_index_is_actually_partial(initialized_db):
+    """The specific property test_unique_index_allows_multiple_null_client_ids
+    cannot: that idx_weight_log_person_client_id is declared WHERE client_id
+    IS NOT NULL, not a plain unique index that happens to also tolerate NULLs.
+    A regression here (someone "simplifies" the index definition) wouldn't
+    fail the NULL-coexistence test above, since a non-partial unique index
+    tolerates NULLs too -- it would only show up as unnecessary index bloat
+    over the overwhelming NULL-majority of rows, never as a functional
+    failure. Pin the DDL directly instead of waiting for that."""
+    db = await get_db()
+    try:
+        row = await (
+            await db.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_weight_log_person_client_id'"
+            )
+        ).fetchone()
+    finally:
+        await db.close()
+    assert row is not None, "idx_weight_log_person_client_id must exist"
+    assert "WHERE client_id IS NOT NULL" in row["sql"]
