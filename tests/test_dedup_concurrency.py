@@ -108,6 +108,48 @@ async def test_two_concurrent_enrichment_posts_update_once_and_push_once(client,
     assert row["body_fat_pct"] == 18.4
 
 
+async def seed_failed_client_id_row(weight_grams: int, client_id: str) -> int:
+    """A row whose original Garmin push failed (synced_to_garmin=0), tagged
+    with client_id -- the state a real delayed retry (A6) would find."""
+    ts = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    weight_kg = weight_grams / 1000.0
+    person_id = await get_primary_person_id()
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "INSERT INTO weight_log (person_id, weight_lbs, weight_kg, weight_grams, timestamp, "
+            "synced_to_garmin, client_id) VALUES (?, ?, ?, ?, ?, 0, ?)",
+            (person_id, round(weight_kg * 2.20462, 2), round(weight_kg, 2), weight_grams, ts, client_id),
+        )
+        await db.commit()
+        return cursor.lastrowid
+    finally:
+        await db.close()
+
+
+async def test_two_concurrent_identical_retries_push_to_garmin_once(client, fake_garmin_client):
+    """Devil's-advocate review, round 1: the client_id retry path
+    (should_attempt_garmin_push in post_weight) pushes outside the
+    transaction on a synced_to_garmin column not written until after that
+    push returns. Raised as a theoretical double-push risk under concurrent
+    identical retries; attempted to reproduce and could not -- this is safe
+    today only because push_weight is synchronous and this single-worker
+    deployment can't interleave two requests across it (see the comment on
+    should_attempt_garmin_push in app.py). Pinned as a regression guard: if
+    push_weight ever becomes async, or this service gains a second worker,
+    this is what would catch the double-push that comment says is currently
+    avoided only by deployment shape, not by design."""
+    await seed_failed_client_id_row(84096, "reading-1")
+
+    results = await asyncio.gather(
+        client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 185.4, "unit": "lbs", "client_id": "reading-1"}),
+        client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 185.4, "unit": "lbs", "client_id": "reading-1"}),
+    )
+    assert all(r.status_code == 200 for r in results)
+    assert len(fake_garmin_client.pushed_weights) == 1
+    assert await row_count() == 1
+
+
 async def test_concurrent_writer_not_blocked_by_garmin_push(client, weight_app_module, monkeypatch):
     """Proves the push is genuinely outside the transaction: a sync.py-style
     writer on a completely separate connection/thread must succeed quickly
