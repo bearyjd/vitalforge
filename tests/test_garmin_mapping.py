@@ -30,7 +30,12 @@ def test_real_client_signature_accepts_our_kwargs():
     import garminconnect
 
     params = set(inspect.signature(garminconnect.Garmin.add_body_composition).parameters)
-    assert params >= {"percent_fat", "percent_hydration", "bone_mass", "muscle_mass"}
+    # bmi is deliberately excluded here -- push_weight accepts it, but no
+    # production call site forwards it (00-design.md SS3.4), so it isn't
+    # something a garminconnect rename could silently break for us today.
+    assert params >= {
+        "percent_fat", "percent_hydration", "bone_mass", "muscle_mass", "basal_met", "active_met",
+    }
 
 
 def test_fake_client_captures_composition_kwargs(fake_garmin_client):
@@ -51,6 +56,16 @@ def test_body_water_maps_to_percent_hydration(fake_garmin_client):
 def test_bone_mass_kg_passes_through_unconverted(fake_garmin_client):
     garmin_client.push_weight(81600, bone_mass_kg=3.2)
     assert fake_garmin_client.pushed_weights[-1]["bone_mass"] == 3.2
+
+
+def test_bmr_maps_to_basal_met(fake_garmin_client):
+    garmin_client.push_weight(81600, basal_met=1620.0)
+    assert fake_garmin_client.pushed_weights[-1]["basal_met"] == 1620.0
+
+
+def test_amr_maps_to_active_met(fake_garmin_client):
+    garmin_client.push_weight(81600, active_met=2400.0)
+    assert fake_garmin_client.pushed_weights[-1]["active_met"] == 2400.0
 
 
 def test_omitted_composition_passed_as_none(fake_garmin_client):

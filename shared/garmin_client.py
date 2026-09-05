@@ -58,16 +58,31 @@ def push_weight(
     percent_hydration: float | None = None,
     muscle_mass_kg: float | None = None,
     bone_mass_kg: float | None = None,
+    bmi: float | None = None,
+    basal_met: float | None = None,
+    active_met: float | None = None,
 ):
     """Push a weight measurement, and optionally body composition, to Garmin
     Connect via FIT file upload.
 
     Composition kwargs map straight through to add_body_composition's
-    percent_fat/percent_hydration/muscle_mass/bone_mass -- see
-    docs/prp/00-design.md SS3.4 for the full mapping table and the FIT
-    encoder's truncation caveat (values are floored to 0.01 resolution).
-    A None value lands as the FIT invalid sentinel, the correct encoding
-    for "not measured".
+    percent_fat/percent_hydration/bone_mass/muscle_mass/bmi/basal_met/active_met
+    -- see docs/prp/00-design.md SS3.4 for the FIT field table (row 221/223
+    there gives each field's own scale factor). A None value lands as the
+    FIT invalid sentinel, the correct encoding for "not measured".
+    percent_fat/percent_hydration/bone_mass/muscle_mass are floored to 0.01
+    resolution (scale 100); bmi is floored to 0.1 (scale 10, FIT field 13);
+    basal_met/active_met are floored to 0.25 kcal (scale 4, FIT fields 7/9)
+    -- coarser than the other four, not a uniform 0.01 across every kwarg.
+    basal_met/active_met are kcal/day, matching garminconnect's own
+    convention -- callers (vitalforge-weight's WeightIn) already validate in
+    that unit, not kJ. NOTE: vitalforge-weight's _push_composition
+    deliberately never passes bmi (00-design.md SS3.4 already rejects
+    sending it -- Garmin derives its own from weight + profile height, and
+    vitalforge-dashboard/sync.py reads that value back); the kwarg exists
+    here because it's a real, valid add_body_composition parameter a future
+    caller might have a legitimate reason to set explicitly, not because
+    anything currently calls push_weight with it.
     """
     if timestamp is None:
         timestamp = datetime.now(timezone.utc)
@@ -83,6 +98,9 @@ def push_weight(
         percent_hydration=percent_hydration,
         muscle_mass=muscle_mass_kg,
         bone_mass=bone_mass_kg,
+        bmi=bmi,
+        basal_met=basal_met,
+        active_met=active_met,
     )
     logger.info("add_body_composition response: %s", result)
     logger.info("Weight pushed to Garmin successfully")

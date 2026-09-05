@@ -34,6 +34,12 @@ _WEIGHT_LOG_ADDITIVE_COLUMNS = [
     # idx_weight_log_person_client_id (a partial index, so NULLs -- the
     # overwhelming majority of rows -- are excluded).
     "client_id TEXT",
+    # Bascule's V2Shaper has sent these three since it was written; WeightIn
+    # had nowhere to put them until now (extra="forbid" 422'd the whole
+    # request the moment one was ever populated). bmr/amr are kcal/day.
+    "bmi REAL",
+    "bmr REAL",
+    "amr REAL",
 ]
 
 # Additive columns for weight_history's Garmin-sourced composition read path

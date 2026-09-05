@@ -124,6 +124,9 @@ COMPOSITION_PAYLOAD = {
     "body_water_pct": 55.2,
     "muscle_pct": 40.1,
     "bone_mass_kg": 3.2,
+    "bmi": 25.3,
+    "bmr": 1620.0,
+    "amr": 2400.0,
     "source": "bascule",
 }
 
@@ -136,6 +139,9 @@ async def test_composition_fields_accepted_and_echoed(client):
     assert body["body_water_pct"] == 55.2
     assert body["muscle_pct"] == 40.1
     assert body["bone_mass_kg"] == 3.2
+    assert body["bmi"] == 25.3
+    assert body["bmr"] == 1620.0
+    assert body["amr"] == 2400.0
     assert body["source"] == "bascule"
 
 
@@ -144,7 +150,7 @@ async def test_weight_only_payload_still_succeeds(client):
     assert resp.status_code == 200
     body = resp.json()
     assert body["success"] is True
-    for field in ("body_fat_pct", "body_water_pct", "muscle_pct", "bone_mass_kg", "source"):
+    for field in ("body_fat_pct", "body_water_pct", "muscle_pct", "bone_mass_kg", "bmi", "bmr", "amr", "source"):
         assert field not in body
 
 
@@ -191,7 +197,27 @@ async def test_bone_mass_in_grams_rejected_422(client):
     assert resp.status_code == 422
 
 
-@pytest.mark.parametrize("field", ["weight", "body_fat_pct", "body_water_pct", "muscle_pct", "bone_mass_kg"])
+@pytest.mark.parametrize("value", [9.9, 100.1])
+async def test_bmi_bounds_rejected_422(client, value):
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 180.0, "unit": "lbs", "bmi": value})
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("value", [499.9, 5000.1])
+async def test_bmr_bounds_rejected_422(client, value):
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 180.0, "unit": "lbs", "bmr": value})
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("value", [499.9, 10000.1])
+async def test_amr_bounds_rejected_422(client, value):
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 180.0, "unit": "lbs", "amr": value})
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "field", ["weight", "body_fat_pct", "body_water_pct", "muscle_pct", "bone_mass_kg", "bmi", "bmr", "amr"],
+)
 async def test_boolean_value_rejected_not_silently_coerced(client, field):
     """Pydantic v2 treats bool as an int subtype, so a bare `float` field
     would otherwise silently coerce JSON true/false to 1.0/0.0.
@@ -207,7 +233,9 @@ async def test_boolean_value_rejected_not_silently_coerced(client, field):
 
 
 @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
-@pytest.mark.parametrize("field", ["weight", "body_fat_pct", "body_water_pct", "muscle_pct", "bone_mass_kg"])
+@pytest.mark.parametrize(
+    "field", ["weight", "body_fat_pct", "body_water_pct", "muscle_pct", "bone_mass_kg", "bmi", "bmr", "amr"],
+)
 async def test_non_finite_float_rejected_422_not_500(client, field, bad_value):
     """`json.dumps` accepts bare NaN/Infinity by default (a non-standard
     extension), so a bridge/scale that forwards a failed-reading NaN reaches
@@ -288,7 +316,7 @@ async def test_composition_persisted_to_weight_log(client):
     try:
         row = await (
             await db.execute(
-                "SELECT body_fat_pct, body_water_pct, muscle_pct, bone_mass_kg, source "
+                "SELECT body_fat_pct, body_water_pct, muscle_pct, bone_mass_kg, bmi, bmr, amr, source "
                 "FROM weight_log ORDER BY id DESC LIMIT 1"
             )
         ).fetchone()
@@ -298,7 +326,31 @@ async def test_composition_persisted_to_weight_log(client):
     assert row["body_water_pct"] == 55.2
     assert row["muscle_pct"] == 40.1
     assert row["bone_mass_kg"] == 3.2
+    assert row["bmi"] == 25.3
+    assert row["bmr"] == 1620.0
+    assert row["amr"] == 2400.0
     assert row["source"] == "bascule"
+
+
+async def test_composition_pushed_to_garmin_includes_bmr_amr_but_not_bmi(client, fake_garmin_client):
+    """Pins _push_composition's own field-to-kwarg mapping (data.bmr ->
+    basal_met, data.amr -> active_met) at the app.py boundary, and that bmi
+    is withheld (00-design.md SS3.4 -- Garmin derives its own bmi and
+    vitalforge-dashboard/sync.py reads it back; forwarding ours risks
+    overwriting Garmin's on the next sync).
+
+    NOTE: weight_app_module fakes push_weight itself (conftest.py), so this
+    does not reach the real shared.garmin_client.push_weight or
+    add_body_composition -- that wire-level coverage lives in
+    tests/test_garmin_mapping.py (test_bmr_maps_to_basal_met,
+    test_amr_maps_to_active_met, and F5's signature guard)."""
+    resp = await client.post(f"{PERSON_PREFIX}/api/weight", json=COMPOSITION_PAYLOAD)
+    assert resp.status_code == 200
+
+    pushed = fake_garmin_client.pushed_weights[-1]
+    assert pushed.get("bmi") is None
+    assert pushed["basal_met"] == 1620.0
+    assert pushed["active_met"] == 2400.0
 
 
 @pytest.mark.asyncio
