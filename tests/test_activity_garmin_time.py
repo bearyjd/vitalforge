@@ -95,6 +95,42 @@ async def test_empty_tz_is_treated_as_unset(client, fake_garmin_client, monkeypa
     assert fake_garmin_client.created_activities[0]["time_zone"] == "UTC"
 
 
+@pytest.mark.parametrize(
+    "start_utc,expected_wall_clock",
+    [
+        # 01:30 EST. The transition is at 02:00 local, so this instant is
+        # still on the winter offset (UTC-5).
+        ("2026-03-08T06:30:00+00:00", "2026-03-08T01:30:00.000"),
+        # 03:30 EDT, one hour later in real time but TWO on the wall clock:
+        # the summer offset (UTC-4) is now in force.
+        ("2026-03-08T07:30:00+00:00", "2026-03-08T03:30:00.000"),
+    ],
+)
+async def test_dst_transition_day_uses_the_offset_in_force(
+    client, fake_garmin_client, monkeypatch, start_utc, expected_wall_clock
+):
+    """2026-03-08 is the US spring-forward date, and both instants must be
+    converted with the offset actually in force at that moment.
+
+    The second row is the one with teeth. A hardcoded -5, or any conversion
+    that resolves the offset once and reuses it, yields 02:30 -- a wall-clock
+    time that DOES NOT EXIST on that date, because the clock jumps 01:59:59
+    straight to 03:00:00. Garmin would either reject it or file the session
+    an hour out, silently. Only a real tz database lookup per instant, which
+    is what ZoneInfo does, gets both rows right.
+
+    The first row alone would pass against a hardcoded -5, which is why the
+    two are parametrized together rather than tested separately.
+    """
+    monkeypatch.setenv("TZ", "America/New_York")
+    resp = await client.post(f"{PERSON_PREFIX}/api/activity", json={**BODY, "start": start_utc})
+    assert resp.status_code == 202
+
+    call = fake_garmin_client.created_activities[0]
+    assert call["start_datetime"] == expected_wall_clock
+    assert call["time_zone"] == "America/New_York"
+
+
 async def test_stored_start_time_is_utc(client, monkeypatch):
     """Storage stays UTC regardless of TZ. The local wall clock exists only
     for the duration of the Garmin call."""

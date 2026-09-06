@@ -110,13 +110,27 @@ async def test_override_prefixes_activity_name_with_display_name(client, son, fa
 
 
 async def test_override_logs_a_warning(client, son, caplog):
+    """Both person_ids must appear, in their own positions.
+
+    A bare `f"person_id={son}" in caplog.text` is not enough: the format
+    string contains "person_id=%s" TWICE, so that assertion passes even if
+    the two ids were swapped -- which is exactly the confusion this log line
+    exists to resolve (whose session went into whose account). Anchoring on
+    the surrounding words pins each id to its own slot.
+    """
+    from shared.database import get_primary_person_id
+
+    credential_person = await get_primary_person_id()
+    assert credential_person != son, "the fixture must not make the son the credential person"
+
     with caplog.at_level("WARNING"):
         await client.post(
             "/p/son/api/activity", json=body(push_to_garmin=True, garmin_target="credential_person")
         )
     assert "D-015 override" in caplog.text
-    assert f"person_id={son}" in caplog.text
-    assert "'Son'" in caplog.text
+    assert f"for person_id={son} filed under" in caplog.text
+    assert f"Garmin credential person_id={credential_person}" in caplog.text
+    assert "display_name='Son'" in caplog.text
 
 
 async def test_override_is_ignored_when_push_false(client, son, fake_garmin_client):
