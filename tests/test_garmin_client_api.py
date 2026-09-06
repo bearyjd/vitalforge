@@ -39,3 +39,43 @@ def test_garmin_client_has_no_garth_attribute():
     again."""
     client = Garmin(email="test@example.com", password="x")
     assert not hasattr(client, "garth")
+
+
+def test_create_manual_activity_signature():
+    """push_activity() calls create_manual_activity with these six names as
+    keywords. Every other test in this suite fakes that call, so a version
+    bump that renamed or reordered a parameter would be invisible until a
+    real push failed in production."""
+    sig = inspect.signature(Garmin.create_manual_activity)
+    for name in ("start_datetime", "time_zone", "type_key", "distance_km", "duration_min", "activity_name"):
+        assert name in sig.parameters, f"create_manual_activity lost {name!r}"
+
+
+def test_set_activity_exercise_sets_signature():
+    """push_activity_sets() calls this positionally as (activity_id, payload)."""
+    sig = inspect.signature(Garmin.set_activity_exercise_sets)
+    assert list(sig.parameters) == ["self", "activity_id", "payload"]
+
+
+def test_get_activity_exercise_sets_exists():
+    """JD's probe 1 -- the one live call that settles the exerciseSets
+    payload's field names -- goes through this method. If a version bump
+    removes it, the enhancement path behind VITALFORGE_GARMIN_EXERCISE_SETS
+    has no way left to be verified before it ships."""
+    sig = inspect.signature(Garmin.get_activity_exercise_sets)
+    assert "activity_id" in sig.parameters
+
+
+def test_exercise_categories_are_available_for_model_validation():
+    """ActivityExerciseIn validates garmin_category against this list at the
+    model layer, so an unknown category is a local 422 rather than a Garmin
+    400 discovered after the activity has already been created."""
+    from garminconnect.exercises import CATEGORIES
+
+    assert isinstance(CATEGORIES, list)
+    # A representative spread of the categories Cadence actually emits.
+    for category in ("BENCH_PRESS", "SQUAT", "DEADLIFT", "PLANK", "CARRY", "PULL_UP"):
+        assert category in CATEGORIES
+    # UNKNOWN is deliberately NOT a category in this catalog -- the correct
+    # "I don't know the variant" encoding is a known category with name=None.
+    assert "UNKNOWN" not in CATEGORIES
