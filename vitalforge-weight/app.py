@@ -2,9 +2,10 @@ import json
 import logging
 import math
 import os
+import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo
@@ -41,6 +42,7 @@ from shared.garmin_client import (
     authenticate,
     build_exercise_sets_payload,
     extract_activity_id,
+    find_activities_by_date,
     push_activity,
     push_activity_sets,
     push_weight,
@@ -236,7 +238,7 @@ class ActivityExerciseIn(BaseModel):
     # set_activity_exercise_sets' own docstring, so this is deliberately NOT
     # validated against a list -- the 1527-entry catalog is keyed by parent
     # and Garmin is the authority on which child belongs to which.
-    garmin_exercise: str | None = None
+    garmin_exercise: str | None = Field(default=None, max_length=100)
     sets: int = Field(ge=1, le=100)
     reps: int = Field(ge=1, le=100)
     # Time-measured work: planks, dead hangs, carries, and the whole mobility
@@ -1117,6 +1119,97 @@ class ActivityPushOutcome:
     garmin_sets_status: str
 
 
+# garmin_error is echoed to the client AND stored, so it is the one place a
+# raw exception string from garminconnect crosses a trust boundary. Those
+# strings have been observed to carry the account email (login failures) and
+# request URLs with tokens in them.
+_ERROR_EMAIL_RE = re.compile(r"[^\s@,;<>()\[\]]+@[^\s@,;<>()\[\]]+\.[^\s@,;<>()\[\]]+")
+_ERROR_TOKEN_RE = re.compile(r"[A-Za-z0-9_\-]{24,}")
+_GARMIN_ERROR_MAX_CHARS = 300
+
+# Exception class names that mean the request may ALREADY HAVE REACHED Garmin
+# when it failed. Matched by name across the exception's MRO and its cause
+# chain rather than by isinstance, because garminconnect layers requests,
+# urllib3 and curl_cffi and which one surfaces is a detail of its transport
+# that a version bump can change.
+_AMBIGUOUS_TRANSPORT_ERRORS = frozenset({
+    "ChunkedEncodingError",
+    "IncompleteRead",
+    "ProtocolError",
+    "ReadTimeout",
+    "ReadTimeoutError",
+    "RemoteDisconnected",
+    "Timeout",
+    "TimeoutError",
+    "ConnectionError",
+    "ConnectionResetError",
+    "BrokenPipeError",
+    "CurlError",
+})
+# Checked FIRST, and win over the set above: these mean the connection was
+# never established, so nothing was sent and a retry is safe. ConnectTimeout
+# subclasses both Timeout and ConnectionError in requests, which is exactly
+# why the precedence has to be explicit.
+_PRE_SEND_ERRORS = frozenset({
+    "ConnectTimeout",
+    "ConnectTimeoutError",
+    "ConnectionRefusedError",
+    "NameResolutionError",
+    "gaierror",
+    "SSLError",
+    "GarminConnectAuthenticationError",
+    "GarminConnectTooManyRequestsError",
+})
+
+
+def _sanitise_error(message: str) -> str:
+    """Strip credentials out of an exception string and bound its length.
+
+    garminconnect's errors quote the request it was making, which on a login
+    failure includes the account email and on a data call can include a URL
+    carrying a token. That string is stored on the row and returned to the
+    client, so it is sanitised once, here, at the boundary.
+    """
+    cleaned = _ERROR_EMAIL_RE.sub("[redacted]", message)
+    cleaned = _ERROR_TOKEN_RE.sub("[redacted]", cleaned)
+    if len(cleaned) > _GARMIN_ERROR_MAX_CHARS:
+        cleaned = cleaned[: _GARMIN_ERROR_MAX_CHARS - 1].rstrip() + "…"
+    return cleaned
+
+
+def _exception_names(error: BaseException) -> set[str]:
+    """Every class name in the exception's MRO, plus its cause/context chain.
+
+    requests wraps urllib3 wraps http.client, so the interesting name is
+    routinely two levels down in __cause__ rather than on the exception the
+    caller sees.
+    """
+    names: set[str] = set()
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        names.update(klass.__name__ for klass in type(current).__mro__)
+        current = current.__cause__ or current.__context__
+    return names
+
+
+def _push_outcome_is_ambiguous(error: BaseException) -> bool:
+    """Whether a failed push may nonetheless have created the activity.
+
+    The asymmetry is deliberate. Calling an ambiguous failure 'failed' invites
+    a retry that files a SECOND activity for one session, permanently, because
+    this service has no delete path. Calling a genuine failure 'unknown' costs
+    one reconciliation lookup on the next re-POST. The second is much cheaper,
+    but it is not free -- an 'unknown' row is never retried automatically --
+    so the pre-send names are checked first and win.
+    """
+    names = _exception_names(error)
+    if names & _PRE_SEND_ERRORS:
+        return False
+    return bool(names & _AMBIGUOUS_TRANSPORT_ERRORS)
+
+
 def _garmin_claim_is_live(claimed_at: str | None, now: datetime) -> bool:
     """Whether another request is currently pushing this row to Garmin.
 
@@ -1235,11 +1328,20 @@ def _push_activity(
     TZ is an operator error that must degrade to garmin_status='failed' with
     the message stored.
     """
+    # Split from the push below on purpose: everything in this block happens
+    # BEFORE any request goes out, so its failures are unambiguously 'failed'
+    # and safe to retry. Keeping them in one try with the push would force the
+    # transport classifier to reason about our own json/ZoneInfo errors too.
     try:
         exercises = json.loads(exercises_json)
         authenticate()
         time_zone = _garmin_time_zone()
         start_local = datetime.fromisoformat(start_time_utc).astimezone(ZoneInfo(time_zone))
+    except Exception as e:
+        logger.error("Could not prepare the Garmin activity push: %s", e)
+        return ActivityPushOutcome("failed", None, _sanitise_error(str(e)), "not_attempted")
+
+    try:
         # LOCAL wall clock, no offset, plus the zone name alongside -- the
         # library's documented contract. A UTC string sent with a local zone
         # name, or a string carrying an offset, silently shifts the activity
@@ -1258,8 +1360,22 @@ def _push_activity(
             activity_name=activity_name,
         )
     except Exception as e:
+        if _push_outcome_is_ambiguous(e):
+            # The request may already have been on the wire. Retrying blind
+            # would file a second activity for one session, and this service
+            # has no delete path, so the duplicate would be permanent.
+            logger.error(
+                "Garmin activity push failed ambiguously (%s: %s); marking the session "
+                "'unknown' -- a re-POST reconciles it by lookup before pushing again.",
+                type(e).__name__, e,
+            )
+            return ActivityPushOutcome(
+                "unknown", None,
+                _sanitise_error(f"push outcome unknown ({type(e).__name__}): {e}"),
+                "not_attempted",
+            )
         logger.error("Failed to push activity to Garmin: %s", e)
-        return ActivityPushOutcome("failed", None, str(e), "not_attempted")
+        return ActivityPushOutcome("failed", None, _sanitise_error(str(e)), "not_attempted")
 
     activity_id = extract_activity_id(response)
     if activity_id is None:
@@ -1293,6 +1409,60 @@ def _push_activity(
     return ActivityPushOutcome("synced", activity_id, None, "synced")
 
 
+def _reconcile_activity(*, start_time_utc: str, activity_name: str) -> ActivityPushOutcome | None:
+    """Ask Garmin whether an ambiguous push actually landed. NEVER RAISES.
+
+    Returns a resolved outcome, or None meaning "Garmin answered and the
+    activity is genuinely not there, so pushing again is safe".
+
+    The three answers are deliberately distinct. A lookup that FAILS must not
+    collapse into "not found" -- that is precisely the mistake that turns one
+    session into two activities, so it returns 'unknown' again and the row
+    stays un-retryable until someone asks once more.
+
+    Matching is on the exact activity_name we would have sent, within the
+    session's LOCAL date plus or minus a day. The window is one day wide on
+    each side because the name is composed from a local wall clock and Garmin
+    files by its own account-local date; a session near midnight can land on
+    the neighbouring day. The name carries the session label and, for a D-015
+    push, the person's display name, which makes a same-day collision between
+    two genuinely different sessions unlikely but not impossible -- the honest
+    limit of reconciling without an idempotency key Garmin does not offer.
+    """
+    try:
+        time_zone = _garmin_time_zone()
+        local_date = datetime.fromisoformat(start_time_utc).astimezone(ZoneInfo(time_zone)).date()
+        activities = find_activities_by_date(
+            (local_date - timedelta(days=1)).isoformat(),
+            (local_date + timedelta(days=1)).isoformat(),
+        )
+    except Exception as e:
+        logger.error("Could not reconcile an ambiguous Garmin push (%s: %s)", type(e).__name__, e)
+        return ActivityPushOutcome(
+            "unknown", None,
+            _sanitise_error(f"reconciliation pending, Garmin lookup failed ({type(e).__name__}): {e}"),
+            "not_attempted",
+        )
+
+    for activity in activities or []:
+        if not isinstance(activity, dict) or activity.get("activityName") != activity_name:
+            continue
+        activity_id = activity.get("activityId")
+        if activity_id is None:
+            continue
+        logger.warning(
+            "Reconciled an ambiguous Garmin push: activity %s named %r already exists; "
+            "not pushing again.", activity_id, activity_name,
+        )
+        # garmin_sets_status stays 'not_attempted': the activity exists, but
+        # whether the exercise-sets call ever ran for it is not knowable from
+        # this lookup, and claiming 'synced' would be a guess.
+        return ActivityPushOutcome("synced", str(activity_id), None, "not_attempted")
+
+    logger.info("Reconciliation found no activity named %r; the push is safe to repeat.", activity_name)
+    return None
+
+
 async def _record_activity_garmin_outcome(db, row_id: int, outcome: ActivityPushOutcome) -> None:
     """Persist one Garmin attempt's result against an already-committed row.
 
@@ -1322,6 +1492,82 @@ async def _record_activity_garmin_outcome(db, row_id: int, outcome: ActivityPush
         ),
     )
     await db.commit()
+
+
+def _normalise_since(since: str) -> str:
+    """Turn a client `since` into a value comparable against start_time_utc.
+
+    start_time_utc is TEXT holding a UTC isoformat string, and SQLite compares
+    it as a string, so a value that merely LOOKS date-ish does not error -- it
+    silently returns the wrong window. Three cases, deliberately distinct:
+
+    - A bare date ("2026-09-06") is used as a PREFIX. "2026-09-06T..." sorts
+      at or after "2026-09-06", so `>=` selects that whole day onward, which
+      is what a caller filtering by day means.
+    - An offset-aware datetime is normalised to UTC isoformat first. A
+      client-local "-04:00" compared raw would string-sort against stored
+      "+00:00" values by its wall-clock digits, quietly shifting the window by
+      the offset -- the same class of bug the write path normalises away.
+    - A naive datetime is REJECTED. Guessing whose clock it belongs to is
+      exactly what the write path refuses to do for `start`.
+    """
+    try:
+        date.fromisoformat(since)
+    except ValueError:
+        pass
+    else:
+        return since
+
+    try:
+        parsed = datetime.fromisoformat(since)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail="since must be an ISO 8601 date (2026-09-06) or an offset-aware datetime",
+        ) from None
+    if parsed.tzinfo is None:
+        raise HTTPException(
+            status_code=422,
+            detail="since must include a UTC offset when given as a datetime",
+        )
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+async def _mark_activity_outcome_unknown(db, row_id: int, reason: str) -> None:
+    """Last-resort downgrade when recording a real outcome failed.
+
+    Deliberately the smallest possible write: no activity id, no sets status,
+    just the status that stops an automatic retry, plus the claim cleared so
+    a DELIBERATE re-POST can reconcile immediately rather than waiting out the
+    claim timeout. Its whole purpose is to have a better chance of landing
+    than the fuller UPDATE that just failed.
+    """
+    await db.execute(
+        "UPDATE strength_sessions SET garmin_status = 'unknown', garmin_error = ?, "
+        "garmin_claimed_at = NULL, updated_at = ? WHERE id = ?",
+        (
+            _sanitise_error(f"push outcome could not be recorded: {reason}"),
+            datetime.now(timezone.utc).isoformat(),
+            row_id,
+        ),
+    )
+    await db.commit()
+
+
+async def _read_activity_outcome(db, row_id: int) -> ActivityPushOutcome | None:
+    """The row's DURABLE Garmin state, for answering after a write failed."""
+    row = await (
+        await db.execute(
+            "SELECT garmin_status, garmin_activity_id, garmin_error, garmin_sets_status "
+            "FROM strength_sessions WHERE id = ?",
+            (row_id,),
+        )
+    ).fetchone()
+    if row is None:
+        return None
+    return ActivityPushOutcome(
+        row["garmin_status"], row["garmin_activity_id"], row["garmin_error"], row["garmin_sets_status"]
+    )
 
 
 def _activity_conflicts(existing, incoming: dict) -> list[str]:
@@ -1405,6 +1651,7 @@ async def post_activity(
     # on a lookup that has nothing to do with any of them.
     override_applied = False
     override_display_name = None
+    override_credential_person_id = None
     if data.push_to_garmin:
         source_person_id = await garmin_credential_person_id()
         if person_id != source_person_id:
@@ -1422,12 +1669,13 @@ async def post_activity(
                     "credential owner's account with this person's name in the activity title."
                 ))
             override_applied = True
+            override_credential_person_id = source_person_id
             override_display_name = await _person_display_name(person_id)
-            logger.warning(
-                "D-015 override: session %s for person_id=%s filed under Garmin credential "
-                "person_id=%s; activity name prefixed with display_name=%r",
-                data.session_id, person_id, source_person_id, override_display_name,
-            )
+            # Deliberately NOT logged here. Reaching this point only means the
+            # override was ASKED FOR and accepted; whether it has any effect
+            # depends on what the transaction below decides, and a WARNING for
+            # a re-POST that pushes nothing trains the reader to ignore the
+            # line that matters.
 
     # Atomic: the duplicate lookup and the insert happen inside one
     # transaction, so two concurrent requests can never both observe "no
@@ -1475,6 +1723,9 @@ async def post_activity(
                 "pending" if data.push_to_garmin else "skipped", None, None, "not_attempted"
             )
             should_push = data.push_to_garmin
+            # A row that did not exist a moment ago has no ambiguous earlier
+            # attempt to reconcile against.
+            should_reconcile = False
         else:
             # First-write-wins: the stored payload is never modified.
             row_id = existing["id"]
@@ -1500,17 +1751,29 @@ async def post_activity(
             # to happen inside this one BEGIN IMMEDIATE for the decision to be
             # serialized.
             should_push = data.push_to_garmin and outcome.garmin_status in _RETRYABLE_GARMIN_STATUSES
-            if should_push and _garmin_claim_is_live(existing["garmin_claimed_at"], now_dt):
-                # Someone else is mid-push. Report 'pending' rather than the
-                # stored status: a push really is in flight, and echoing a
-                # stale 'failed' would invite the client to retry immediately
-                # into the same race.
-                should_push = False
-                outcome = replace(outcome, garmin_status="pending")
+            # 'unknown' is NOT in _RETRYABLE_GARMIN_STATUSES and never becomes
+            # retryable, however old its claim gets: the push may already have
+            # landed, so the only safe next step is to ASK Garmin. That
+            # reconciliation still needs the claim, so two concurrent
+            # re-POSTs cannot both fall through the lookup and both push.
+            should_reconcile = data.push_to_garmin and outcome.garmin_status == "unknown"
+
+            if (should_push or should_reconcile) and _garmin_claim_is_live(
+                existing["garmin_claimed_at"], now_dt
+            ):
+                # Someone else is mid-push. On a retryable row report
+                # 'pending' rather than the stored status: a push really is in
+                # flight, and echoing a stale 'failed' would invite an
+                # immediate retry into the same race. An 'unknown' row keeps
+                # saying 'unknown', because that is still true.
                 logger.info(
                     "Session %s already has a live Garmin push claim (%s); not pushing again",
                     data.session_id, existing["garmin_claimed_at"],
                 )
+                if should_push:
+                    outcome = replace(outcome, garmin_status="pending", garmin_error=None)
+                should_push = False
+                should_reconcile = False
             elif should_push:
                 if existing["garmin_claimed_at"] is not None:
                     # Only reachable when the previous claimant died mid-push:
@@ -1521,6 +1784,22 @@ async def post_activity(
                         "creates a duplicate activity.",
                         data.session_id, existing["garmin_claimed_at"],
                     )
+                # The claim, the status and the stale error move together in
+                # ONE statement. A concurrent reader must never see a row
+                # claimed for a fresh attempt while still carrying the
+                # previous attempt's 'failed' and its error text -- it would
+                # report a failure that is already being retried.
+                await db.execute(
+                    "UPDATE strength_sessions SET garmin_claimed_at = ?, garmin_status = 'pending', "
+                    "garmin_error = NULL, updated_at = ? WHERE id = ?",
+                    (now, now, row_id),
+                )
+                outcome = replace(outcome, garmin_status="pending", garmin_error=None)
+            elif should_reconcile:
+                # Claim without touching the status: it must stay 'unknown'
+                # for as long as it is unknown, so that a crash during
+                # reconciliation cannot leave behind a row that looks
+                # ordinarily retryable.
                 await db.execute(
                     "UPDATE strength_sessions SET garmin_claimed_at = ?, updated_at = ? WHERE id = ?",
                     (now, now, row_id),
@@ -1534,22 +1813,47 @@ async def post_activity(
                 data.session_id, row_id, conflicts,
             )
 
-        if should_push:
-            # Push the STORED payload, never the incoming one. First-write-wins
-            # means the row is the truth, and on a retry the incoming body may
-            # legitimately differ from it -- pushing the newer body would put
-            # something on Garmin that no stored row describes. `incoming` and
-            # a strength_sessions Row share these key names deliberately, so
-            # the fresh and retry cases read identically here.
+        if should_push or should_reconcile:
+            # Act on the STORED payload, never the incoming one.
+            # First-write-wins means the row is the truth, and on a retry the
+            # incoming body may legitimately differ -- pushing the newer body
+            # would put something on Garmin that no stored row describes.
+            # `incoming` and a strength_sessions Row share these key names
+            # deliberately, so the fresh and retry cases read identically.
             stored = incoming if existing is None else existing
-            outcome = _push_activity(
-                start_time_utc=stored["start_time_utc"],
-                duration_min=stored["duration_seconds"] // 60,
-                activity_name=_activity_name(
-                    stored["session_label"], override_display_name if override_applied else None
-                ),
-                exercises_json=stored["exercises_json"],
+            activity_name = _activity_name(
+                stored["session_label"], override_display_name if override_applied else None
             )
+            if override_applied:
+                # Logged HERE, not at the guard: this is the point at which
+                # the override actually decides where someone's session goes.
+                logger.warning(
+                    "D-015 override: session %s for person_id=%s filed under Garmin credential "
+                    "person_id=%s; activity name prefixed with display_name=%r",
+                    data.session_id, person_id, override_credential_person_id, override_display_name,
+                )
+
+            if should_reconcile:
+                # ASK before pushing. The stored status is 'unknown', meaning
+                # the previous attempt may already have created this activity.
+                reconciled = _reconcile_activity(
+                    start_time_utc=stored["start_time_utc"], activity_name=activity_name
+                )
+            else:
+                reconciled = None
+
+            if reconciled is not None:
+                # Either the activity was found (resolved 'synced'), or the
+                # lookup itself failed (still 'unknown'). Either way, no push.
+                outcome = reconciled
+            else:
+                outcome = _push_activity(
+                    start_time_utc=stored["start_time_utc"],
+                    duration_min=stored["duration_seconds"] // 60,
+                    activity_name=activity_name,
+                    exercises_json=stored["exercises_json"],
+                )
+
             try:
                 await _record_activity_garmin_outcome(db, row_id, outcome)
             except Exception as e:
@@ -1564,15 +1868,38 @@ async def post_activity(
                 # that id is the sole surviving record of an activity now
                 # orphaned on Garmin with no row pointing at it. Without it
                 # the only way to reconcile is to hunt through Garmin by
-                # timestamp. The claim is deliberately left in place -- it
-                # ages out on its own, and until it does it stops an
-                # immediate retry from duplicating that activity.
+                # timestamp.
                 logger.error(
                     "Post-commit Garmin outcome update failed for row %s (session %s): %s. "
                     "Unrecorded outcome: status=%s activity_id=%s sets_status=%s error=%s",
                     row_id, data.session_id, e, outcome.garmin_status, outcome.garmin_activity_id,
                     outcome.garmin_sets_status, outcome.garmin_error,
                 )
+                if outcome.garmin_status in ("synced", "unknown"):
+                    # An activity may exist on Garmin that this row does not
+                    # point at, and the row currently reads 'pending', which
+                    # IS retryable -- so once the claim ages out something
+                    # would push again and duplicate it. Downgrading the row
+                    # to 'unknown' is a much smaller write than the one that
+                    # just failed and has a real chance of landing; if it does
+                    # not, the log line above is the only record.
+                    try:
+                        await _mark_activity_outcome_unknown(db, row_id, str(e))
+                    except Exception as mark_error:
+                        logger.error(
+                            "Could not even mark row %s 'unknown' after a failed outcome write: %s. "
+                            "This row may be retried and duplicate Garmin activity %s.",
+                            row_id, mark_error, outcome.garmin_activity_id,
+                        )
+                # Report what is DURABLE, not what this request hoped to
+                # write. Answering with the in-memory outcome would tell the
+                # client 'synced' over a row that still says otherwise, and
+                # the client would stop retrying a session nothing recorded.
+                try:
+                    outcome = await _read_activity_outcome(db, row_id) or outcome
+                except Exception as read_error:
+                    logger.error("Could not re-read row %s after a failed outcome write: %s",
+                                 row_id, read_error)
     finally:
         await db.close()
 
@@ -1594,9 +1921,19 @@ async def post_activity(
         if conflicts:
             result["conflict"] = True
             result["conflict_fields"] = conflicts
-    if outcome.garmin_status == "failed" and outcome.garmin_error:
+    # 'unknown' carries an error too: it is the only signal telling the client
+    # why the session is neither confirmed nor retryable, and that a re-POST
+    # reconciles rather than duplicates.
+    if outcome.garmin_status in ("failed", "unknown") and outcome.garmin_error:
         result["garmin_error"] = outcome.garmin_error
-    if override_applied:
+    # Echoed when the override actually decided where this push went, or when
+    # the stored row records that an earlier one did. NOT merely because the
+    # caller sent the field: a re-POST of a 'skipped' row pushes nothing, and
+    # echoing garmin_target there would tell the client its session had been
+    # filed under the credential owner when nothing was filed at all.
+    if (override_applied and (should_push or should_reconcile)) or (
+        existing is not None and existing["garmin_target"] == "credential_person"
+    ):
         result["garmin_target"] = "credential_person"
     return result
 
@@ -1650,15 +1987,8 @@ async def list_strength_sessions(
         # malformed `since` does not error, it silently returns the wrong
         # window -- "yesterday" for `since=2026-9-1`, everything for
         # `since=banana`. A 422 says so instead.
-        try:
-            datetime.fromisoformat(since)
-        except ValueError:
-            raise HTTPException(
-                status_code=422,
-                detail="since must be an ISO 8601 date or datetime, e.g. 2026-09-06",
-            ) from None
         sql += " AND start_time_utc >= ?"
-        params.append(since)
+        params.append(_normalise_since(since))
     sql += " ORDER BY start_time_utc DESC LIMIT ?"
     params.append(limit)
 

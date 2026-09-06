@@ -319,3 +319,29 @@ async def test_time_measured_exercise_accepted(client):
         json=body(exercises=[{"name": "Plank", "garmin_category": "PLANK", "sets": 3, "reps": 1, "seconds": 45}]),
     )
     assert resp.status_code == 202
+
+
+async def test_garmin_exercise_over_100_chars_rejected_422(client):
+    """Bounded like every other free-text field: it is an opaque Garmin
+    sub-category name, not user prose, and it is stored in the exercises blob
+    on every row."""
+    resp = await client.post(
+        f"{PERSON_PREFIX}/api/activity",
+        json=body(exercises=[{
+            "name": "Bench Press", "garmin_category": "BENCH_PRESS",
+            "garmin_exercise": "X" * 101, "sets": 3, "reps": 10,
+        }]),
+    )
+    assert resp.status_code == 422
+
+
+async def test_garmin_exercise_at_100_chars_accepted(client):
+    """The boundary, so a future off-by-one cannot pass by rejecting all."""
+    resp = await client.post(
+        f"{PERSON_PREFIX}/api/activity",
+        json=body(exercises=[{
+            "name": "Bench Press", "garmin_category": "BENCH_PRESS",
+            "garmin_exercise": "X" * 100, "sets": 3, "reps": 10,
+        }]),
+    )
+    assert resp.status_code == 202

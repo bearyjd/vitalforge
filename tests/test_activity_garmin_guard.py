@@ -181,3 +181,38 @@ async def test_garmin_target_rejects_unknown_value(client, son):
         "/p/son/api/activity", json=body(push_to_garmin=True, garmin_target="parent")
     )
     assert resp.status_code == 422
+
+
+async def test_override_not_echoed_when_no_push_happens(client, son, fake_garmin_client, caplog):
+    """A re-POST of a 'skipped' row with the override pushes nothing --
+    'skipped' is not retryable. Echoing garmin_target there would tell the
+    client its session had been filed under the credential owner's account
+    when nothing was filed at all, and a D-015 WARNING for a push that never
+    happened trains the reader to ignore the line that matters."""
+    await client.post("/p/son/api/activity", json=body())
+    assert (await fetch_row())["garmin_status"] == "skipped"
+
+    with caplog.at_level("WARNING"):
+        resp = await client.post(
+            "/p/son/api/activity", json=body(push_to_garmin=True, garmin_target="credential_person")
+        )
+
+    assert resp.status_code == 200
+    assert "garmin_target" not in resp.json()
+    assert "D-015 override" not in caplog.text
+    assert fake_garmin_client.created_activities == []
+
+
+async def test_override_is_echoed_on_a_later_read_of_an_overridden_row(client, son, fake_garmin_client):
+    """The converse: a row that really WAS filed under the credential owner
+    keeps saying so on every later dedup response, even though that request
+    pushed nothing itself."""
+    await client.post(
+        "/p/son/api/activity", json=body(push_to_garmin=True, garmin_target="credential_person")
+    )
+    resp = await client.post(
+        "/p/son/api/activity", json=body(push_to_garmin=True, garmin_target="credential_person")
+    )
+    assert resp.status_code == 200
+    assert resp.json()["garmin_target"] == "credential_person"
+    assert len(fake_garmin_client.created_activities) == 1

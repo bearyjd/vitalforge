@@ -139,3 +139,41 @@ async def test_list_rejects_malformed_since(client, since):
 async def test_list_accepts_iso_date_and_datetime_since(client, since):
     resp = await client.get(f"{PERSON_PREFIX}/api/strength-sessions", params={"since": since})
     assert resp.status_code == 200
+
+
+async def test_since_offset_aware_datetime_is_normalised_to_utc(client):
+    """A client-local "-04:00" compared raw would string-sort against stored
+    "+00:00" values by its wall-clock digits, quietly shifting the window by
+    the offset. 12:00-04:00 is 16:00Z, which is AFTER this session's 08:00Z,
+    so a correctly normalised comparison excludes it."""
+    await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
+
+    excluded = await client.get(
+        f"{PERSON_PREFIX}/api/strength-sessions", params={"since": "2026-09-06T12:00:00-04:00"}
+    )
+    assert excluded.status_code == 200
+    assert excluded.json()["count"] == 0
+
+    included = await client.get(
+        f"{PERSON_PREFIX}/api/strength-sessions", params={"since": "2026-09-06T00:00:00-04:00"}
+    )
+    assert included.json()["count"] == 1
+
+
+async def test_since_naive_datetime_rejected_422(client):
+    """Guessing whose clock a naive datetime belongs to is exactly what the
+    write path refuses to do for `start`."""
+    resp = await client.get(
+        f"{PERSON_PREFIX}/api/strength-sessions", params={"since": "2026-09-06T08:00:00"}
+    )
+    assert resp.status_code == 422
+
+
+async def test_since_bare_date_selects_the_whole_day(client):
+    """A bare date is used as a prefix: "2026-09-06T..." sorts at or after
+    "2026-09-06", so >= selects that whole day onward."""
+    await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
+    resp = await client.get(
+        f"{PERSON_PREFIX}/api/strength-sessions", params={"since": "2026-09-06"}
+    )
+    assert resp.json()["count"] == 1

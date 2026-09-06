@@ -500,8 +500,16 @@ async def init_db():
                 exercises_json     TEXT NOT NULL,
                 notes              TEXT,
                 source             TEXT,
+                -- 'unknown' means the push may or may not have reached Garmin:
+                -- a transport error raised after the request was already on
+                -- the wire, or a successful push whose outcome could not be
+                -- written back. It is deliberately NOT retryable and not
+                -- auto-reclaimed, because a blind retry over a session Garmin
+                -- may already hold creates a permanent duplicate (this
+                -- service has no delete path). An explicit re-POST reconciles
+                -- it by looking the activity up by name and date first.
                 garmin_status      TEXT NOT NULL DEFAULT 'skipped'
-                                   CHECK (garmin_status IN ('skipped','pending','synced','failed')),
+                                   CHECK (garmin_status IN ('skipped','pending','synced','failed','unknown')),
                 garmin_activity_id TEXT,
                 garmin_error       TEXT,
                 garmin_target      TEXT,

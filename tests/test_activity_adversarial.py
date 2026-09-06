@@ -223,7 +223,10 @@ async def test_pending_row_with_live_claim_is_not_pushed_again(
     first = await client.post(f"{PERSON_PREFIX}/api/activity", json=body(push_to_garmin=True))
     assert first.status_code == 202
     assert len(fake_garmin_client.created_activities) == 1
-    assert (await fetch_row())["garmin_status"] == "pending"
+    # 'unknown' now, not 'pending': the push succeeded and only recording it
+    # failed, so the row is deliberately taken OUT of the retry set rather
+    # than left looking like a push that never ran.
+    assert (await fetch_row())["garmin_status"] == "unknown"
 
     # POST 2 is an ordinary client retry of the same session_id -- exactly
     # what PRP §5.2 tells Cadence to do, and what D-016 bounds.

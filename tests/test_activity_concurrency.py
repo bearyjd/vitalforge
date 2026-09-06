@@ -175,7 +175,9 @@ async def test_second_request_does_not_duplicate_a_push_already_in_flight(
 
         second["resp"] = asyncio.run(_go())
 
-    thread = threading.Thread(target=second_request)
+    # daemon: if the first request raises, push_started is never set and
+    # a non-daemon thread would keep the interpreter alive past the test.
+    thread = threading.Thread(target=second_request, daemon=True)
     thread.start()
     first = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
     thread.join(timeout=10)

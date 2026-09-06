@@ -102,11 +102,23 @@ async def test_post_commit_update_failure_does_not_500(client, weight_app_module
 
     resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
     assert resp.status_code == 202
-    # The row survives; only its Garmin bookkeeping is stale, which the next
-    # re-POST repairs (the stored status stays retryable).
     row = await fetch_row()
     assert row is not None
-    assert row["garmin_status"] == "pending"
+    # 'unknown', NOT 'pending'. The push succeeded and only the write of its
+    # outcome failed, so an activity exists on Garmin that this row does not
+    # point at. 'pending' is retryable, so once the claim aged out something
+    # would push again and duplicate it permanently. The fallback downgrade
+    # takes the row out of the retry set and leaves reconciliation as the only
+    # way forward.
+    assert row["garmin_status"] == "unknown"
+    assert row["garmin_error"]
+    # The claim is released, so a deliberate re-POST can reconcile at once
+    # rather than waiting out the timeout.
+    assert row["garmin_claimed_at"] is None
+    # The response reports the DURABLE state, not what this request hoped to
+    # write -- answering 'synced' over a row that says otherwise would stop
+    # the client retrying a session nothing recorded.
+    assert resp.json()["garmin_status"] == "unknown"
 
 
 async def test_no_activity_id_returned_is_synced_not_failed(client, weight_app_module, monkeypatch):
@@ -241,3 +253,72 @@ async def test_corrupt_exercises_does_not_reach_garmin(client, fake_garmin_clien
 
     await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
     assert fake_garmin_client.created_activities == []
+
+
+async def test_garmin_error_redacts_email_and_token(client, weight_app_module, monkeypatch):
+    """garmin_error is stored AND returned to the client, so it is the one
+    place a raw garminconnect exception string crosses a trust boundary.
+    Those strings quote the request being made: a login failure carries the
+    account email, and a data call can carry a URL with a token in it."""
+    secret_token = "eyJhbGciOiJIUzI1NiJ9abcdefghijklmnop"
+
+    def leaky(**kwargs):
+        raise RuntimeError(
+            f"401 for user jd@beary.us using Bearer {secret_token} at /activity-service"
+        )
+
+    monkeypatch.setattr(weight_app_module, "push_activity", leaky)
+
+    resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
+    error = resp.json()["garmin_error"]
+    assert "jd@beary.us" not in error
+    assert secret_token not in error
+    assert "[redacted]" in error
+    # The row is sanitised too, not just the response -- it is read back by
+    # the status route and by anyone querying the database directly.
+    assert "jd@beary.us" not in (await fetch_row())["garmin_error"]
+    assert secret_token not in (await fetch_row())["garmin_error"]
+
+
+async def test_garmin_error_is_truncated(client, weight_app_module, monkeypatch):
+    """An unbounded exception string would be stored per row and echoed on
+    every status poll. 300 characters is enough to identify the failure."""
+    # Deliberately NOT one long run of word characters: the token redactor
+    # would collapse that to "[redacted]" before truncation ever applied, and
+    # the test would pass without exercising the length bound at all.
+    def verbose(**kwargs):
+        raise RuntimeError("Garmin refused the request. " * 200)
+
+    monkeypatch.setattr(weight_app_module, "push_activity", verbose)
+
+    resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
+    error = resp.json()["garmin_error"]
+    assert len(error) <= 300
+    assert error.endswith("…")
+    assert error.startswith("Garmin refused the request.")
+
+
+async def test_short_error_is_left_intact(client, weight_app_module, monkeypatch):
+    """The sanitiser must not mangle an ordinary message -- an operator
+    reading 'failed' rows needs them legible."""
+    def plain(**kwargs):
+        raise RuntimeError("Garmin returned 503 Service Unavailable")
+
+    monkeypatch.setattr(weight_app_module, "push_activity", plain)
+
+    resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
+    assert resp.json()["garmin_error"] == "Garmin returned 503 Service Unavailable"
+
+
+async def test_long_alphanumeric_run_is_redacted_not_just_truncated(client, weight_app_module, monkeypatch):
+    """The token pattern is deliberately blunt: any run of 24+ word
+    characters goes, because a bearer token, a session id and a signed URL
+    fragment all look like that and none of them may be stored. A legitimate
+    long identifier being redacted is the accepted cost."""
+    def leaky(**kwargs):
+        raise RuntimeError("failed with correlation abcdefghijklmnopqrstuvwxyz012345")
+
+    monkeypatch.setattr(weight_app_module, "push_activity", leaky)
+
+    resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
+    assert resp.json()["garmin_error"] == "failed with correlation [redacted]"

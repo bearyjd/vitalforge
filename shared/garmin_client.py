@@ -169,6 +169,18 @@ def push_activity_sets(activity_id: str, payload: dict):
     return result
 
 
+def find_activities_by_date(start_date: str, end_date: str, activity_type: str = STRENGTH_ACTIVITY_TYPE_KEY):
+    """List activities in a date range, for reconciling an ambiguous push.
+
+    Dates are YYYY-MM-DD in the account's own local terms. Raising, like
+    every other push-side helper here: the caller decides what an
+    unreachable Garmin means for the row, and swallowing the error here
+    would make "no activities" and "could not ask" indistinguishable -- the
+    one distinction reconciliation depends on.
+    """
+    return get_client().get_activities_by_date(start_date, end_date, activitytype=activity_type)
+
+
 def extract_activity_id(response) -> str | None:
     """Pull the new activity's id out of create_manual_activity's response.
 
