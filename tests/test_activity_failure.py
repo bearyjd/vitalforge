@@ -177,3 +177,67 @@ async def test_unparsable_stored_start_time_does_not_500_on_retry(client):
     assert resp.json()["garmin_status"] == "failed"
     assert resp.json()["garmin_error"]
     assert (await fetch_row())["garmin_status"] == "failed"
+
+
+async def test_unparsable_stored_exercises_does_not_500_on_retry(client):
+    """The companion to the start_time_utc parse guard.
+
+    A retry pushes the STORED exercises_json, which comes back out of SQLite
+    as text. Parsing it in the route -- after commit -- meant an unreadable
+    row raised on the request path over durable data, 500ing and sending the
+    client into a retry that could create a second Garmin activity.
+
+    Parsed inside _push_activity's try instead, so it degrades to
+    garmin_status='failed' with the message stored. 'failed' rather than
+    pushing an activity with no exercises: filing a session on Garmin while
+    unable to read what was actually done is worse than saying so.
+    """
+    from datetime import datetime, timezone
+
+    from shared.database import get_primary_person_id
+
+    person_id = await get_primary_person_id()
+    now = datetime.now(timezone.utc).isoformat()
+    db = await get_db()
+    try:
+        await db.execute(
+            "INSERT INTO strength_sessions (person_id, session_id, session_label, start_time_utc, "
+            "duration_seconds, exercises_json, garmin_status, created_at, updated_at) "
+            "VALUES (?, ?, 'Lower A', ?, 2520, '{not json', 'failed', ?, ?)",
+            (person_id, BODY["session_id"], START, now, now),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+    resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
+    assert resp.status_code == 200
+    assert resp.json()["garmin_status"] == "failed"
+    assert resp.json()["garmin_error"]
+    assert (await fetch_row())["garmin_status"] == "failed"
+
+
+async def test_corrupt_exercises_does_not_reach_garmin(client, fake_garmin_client):
+    """The activity itself needs only start, duration and name, so a corrupt
+    exercises blob COULD have been pushed as a bare activity. Deliberately is
+    not: an unreadable row is not one to file on someone's Garmin account."""
+    from datetime import datetime, timezone
+
+    from shared.database import get_primary_person_id
+
+    person_id = await get_primary_person_id()
+    now = datetime.now(timezone.utc).isoformat()
+    db = await get_db()
+    try:
+        await db.execute(
+            "INSERT INTO strength_sessions (person_id, session_id, start_time_utc, duration_seconds, "
+            "exercises_json, garmin_status, created_at, updated_at) "
+            "VALUES (?, ?, ?, 2520, '{not json', 'failed', ?, ?)",
+            (person_id, BODY["session_id"], START, now, now),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+    await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
+    assert fake_garmin_client.created_activities == []

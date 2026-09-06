@@ -120,3 +120,40 @@ async def test_person_start_index_exists(initialized_db):
     finally:
         await db.close()
     assert row is not None
+
+
+async def test_garmin_claimed_at_column_exists(initialized_db):
+    """The mutual-exclusion column that stops two concurrent requests both
+    deciding to push. Nullable and with no default: NULL means "no push in
+    flight", which is the correct state for the overwhelming majority of rows
+    and for every row that never pushes at all."""
+    db = await get_db()
+    try:
+        columns = {
+            row["name"]: row
+            for row in await (await db.execute("PRAGMA table_info(strength_sessions)")).fetchall()
+        }
+    finally:
+        await db.close()
+    assert "garmin_claimed_at" in columns
+    assert columns["garmin_claimed_at"]["notnull"] == 0
+    assert columns["garmin_claimed_at"]["dflt_value"] is None
+
+
+@pytest.mark.asyncio
+async def test_garmin_claimed_at_present_on_an_upgraded_database(production_schema_db, monkeypatch):
+    """The column is part of the CREATE TABLE rather than an _add_columns
+    shim, which is only safe because strength_sessions is new in this same
+    unmerged branch -- no deployed database has the table at all, so there is
+    no database that could have it WITHOUT this column. Pinned here so that
+    stops being an assumption."""
+    monkeypatch.setattr(database, "DB_PATH", production_schema_db)
+    await database.init_db()
+    db = await get_db()
+    try:
+        columns = {
+            row["name"] for row in await (await db.execute("PRAGMA table_info(strength_sessions)")).fetchall()
+        }
+    finally:
+        await db.close()
+    assert "garmin_claimed_at" in columns

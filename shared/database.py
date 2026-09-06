@@ -507,6 +507,21 @@ async def init_db():
                 garmin_target      TEXT,
                 garmin_sets_status TEXT NOT NULL DEFAULT 'not_attempted'
                                    CHECK (garmin_sets_status IN ('not_attempted','synced','failed')),
+                -- UTC ISO instant at which some request claimed the right to
+                -- push this row to Garmin, or NULL when no push is in flight.
+                -- The retry gate reads garmin_status, but the winning request
+                -- writes 'synced' only AFTER its (synchronous, unbounded)
+                -- Garmin call returns and its transaction has long since
+                -- committed -- so a concurrent second request would see
+                -- 'pending', judge it retryable, and create a SECOND activity
+                -- for the same session. The claim is taken INSIDE the same
+                -- BEGIN IMMEDIATE that reads the row, which is what makes the
+                -- decision serialized rather than the status. Cleared when the
+                -- outcome is recorded; a claim older than
+                -- _GARMIN_CLAIM_TIMEOUT_SECONDS is treated as stale (the
+                -- claiming process died) and may be re-claimed, so a crash
+                -- mid-push cannot strand a session forever.
+                garmin_claimed_at  TEXT,
                 created_at         TEXT NOT NULL,
                 updated_at         TEXT NOT NULL,
                 -- A PLAIN unique constraint, not the partial index

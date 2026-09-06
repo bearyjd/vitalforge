@@ -122,3 +122,20 @@ async def test_list_empty_is_not_an_error(client):
     resp = await client.get(f"{PERSON_PREFIX}/api/strength-sessions")
     assert resp.status_code == 200
     assert resp.json() == {"count": 0, "sessions": []}
+
+
+@pytest.mark.parametrize("since", ["banana", "2026-13-01", "06/09/2026", ""])
+async def test_list_rejects_malformed_since(client, since):
+    """start_time_utc is TEXT and SQLite compares it as a string, so a
+    malformed `since` does not error -- it silently returns the wrong window.
+    `2026-9-1` (unpadded) sorts after every zero-padded September date and
+    would return almost nothing; `banana` sorts after everything and returns
+    nothing at all. Both look like "no sessions" to the client."""
+    resp = await client.get(f"{PERSON_PREFIX}/api/strength-sessions", params={"since": since})
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("since", ["2026-09-01", "2026-09-01T08:00:00+00:00"])
+async def test_list_accepts_iso_date_and_datetime_since(client, since):
+    resp = await client.get(f"{PERSON_PREFIX}/api/strength-sessions", params={"since": since})
+    assert resp.status_code == 200
