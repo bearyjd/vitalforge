@@ -138,3 +138,42 @@ async def test_bad_tz_degrades_to_failed_not_500(client, monkeypatch):
     assert resp.status_code == 202
     assert resp.json()["garmin_status"] == "failed"
     assert (await fetch_row())["garmin_error"]
+
+
+async def test_unparsable_stored_start_time_does_not_500_on_retry(client):
+    """A retry pushes the STORED start_time_utc, which comes back out of
+    SQLite as text. Parsing it must happen inside the never-raise helper: a
+    row Python's fromisoformat() cannot read would otherwise raise on the
+    request path AFTER the row was committed, turning durable data into a
+    500 and telling the client the whole request failed when it did not.
+
+    Unreachable through this route today -- every row is written by its own
+    .isoformat(). That was equally true of post_weight's timestamp parse
+    when the identical bug was found there, which is why it now parses
+    defensively too. SQLite's julianday() accepts strings fromisoformat()
+    rejects, so a hand-written row or a future write path can produce one.
+    """
+    from datetime import datetime, timezone
+
+    from shared.database import get_primary_person_id
+
+    person_id = await get_primary_person_id()
+    now = datetime.now(timezone.utc).isoformat()
+    db = await get_db()
+    try:
+        await db.execute(
+            "INSERT INTO strength_sessions (person_id, session_id, session_label, start_time_utc, "
+            "duration_seconds, exercises_json, garmin_status, created_at, updated_at) "
+            "VALUES (?, ?, 'Lower A', '2026-09-06 08:00:00 UTC', 2520, '[]', 'failed', ?, ?)",
+            (person_id, BODY["session_id"], now, now),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+    resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
+    assert resp.status_code == 200
+    assert resp.json()["deduplicated"] is True
+    assert resp.json()["garmin_status"] == "failed"
+    assert resp.json()["garmin_error"]
+    assert (await fetch_row())["garmin_status"] == "failed"

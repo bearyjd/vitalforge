@@ -1169,7 +1169,7 @@ async def _person_display_name(person_id: int) -> str | None:
 
 def _push_activity(
     *,
-    start_utc: datetime,
+    start_time_utc: str,
     duration_min: int,
     activity_name: str,
     exercises: list[dict],
@@ -1182,14 +1182,25 @@ def _push_activity(
     function would be replaced by the fake, and the tests that pin it would
     be asserting on nothing.
 
-    ZoneInfo() construction is inside the try on purpose: a typo'd TZ is an
-    operator error that must degrade to garmin_status='failed' with the
-    message stored, not a 500 over a row that is already committed.
+    Takes the stored ISO STRING rather than a datetime so that parsing it is
+    inside this function's try, not the caller's. On a retry the value comes
+    back out of SQLite, and a row whose start_time_utc Python's
+    fromisoformat() cannot parse would otherwise raise on the request path
+    AFTER the row was committed -- a 500 over durable data, telling the
+    client the whole request failed when it did not. post_weight hit exactly
+    this and parses defensively for the same reason (see its
+    `could not parse stored timestamp` branch). Unreachable today, because
+    every row is written by this route's own .isoformat(); that was equally
+    true of the weight path when the bug was found there.
+
+    ZoneInfo() construction is inside the try for the same reason: a typo'd
+    TZ is an operator error that must degrade to garmin_status='failed' with
+    the message stored.
     """
     try:
         authenticate()
         time_zone = _garmin_time_zone()
-        start_local = start_utc.astimezone(ZoneInfo(time_zone))
+        start_local = datetime.fromisoformat(start_time_utc).astimezone(ZoneInfo(time_zone))
         # LOCAL wall clock, no offset, plus the zone name alongside -- the
         # library's documented contract. A UTC string sent with a local zone
         # name, or a string carrying an offset, silently shifts the activity
@@ -1436,14 +1447,18 @@ async def post_activity(
             )
 
         if should_push:
+            # Push the STORED payload, never the incoming one. First-write-wins
+            # means the row is the truth, and on a retry the incoming body may
+            # legitimately differ from it -- pushing the newer body would put
+            # something on Garmin that no stored row describes. `incoming` and
+            # a strength_sessions Row share these key names deliberately, so
+            # the fresh and retry cases read identically here.
+            stored = incoming if existing is None else existing
             outcome = _push_activity(
-                start_utc=start_utc if existing is None else datetime.fromisoformat(existing["start_time_utc"]),
-                duration_min=(incoming["duration_seconds"] if existing is None else existing["duration_seconds"]) // 60,
-                activity_name=_activity_name(
-                    data.session_label if existing is None else existing["session_label"],
-                    override_display_name,
-                ),
-                exercises=exercise_dicts if existing is None else json.loads(existing["exercises_json"]),
+                start_time_utc=stored["start_time_utc"],
+                duration_min=stored["duration_seconds"] // 60,
+                activity_name=_activity_name(stored["session_label"], override_display_name),
+                exercises=json.loads(stored["exercises_json"]),
             )
             try:
                 await _record_activity_garmin_outcome(db, row_id, outcome)
