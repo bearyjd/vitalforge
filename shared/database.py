@@ -470,6 +470,60 @@ async def init_db():
                 "ON activities(person_id, start_time_utc)"
             )
 
+        # Completed strength sessions posted by Cadence (POST
+        # /p/{slug}/api/activity, vitalforge-weight/app.py). Deliberately NOT
+        # the `activities` table above: that one is FIT-import-only by its own
+        # `CHECK (source_format IN ('fit'))` and keyed on `file_sha256 NOT
+        # NULL`, neither of which a manually-entered session has -- and SQLite
+        # cannot alter a CHECK constraint, so reuse would force a full rebuild
+        # of a table two dashboard read routes already serve. The two concepts
+        # stay separate on purpose; see CLAUDE.md.
+        #
+        # No migration marker, unguarded, like the other 19 tables here: the
+        # whole DDL block runs BEFORE any run_migration() call, and CREATE
+        # TABLE IF NOT EXISTS is already correct on a fresh database and on an
+        # upgrade alike, so a `003` apply-function would be a no-op on every
+        # path. It would also be actively harmful -- assert_schema_understood()
+        # boot-loops any image that sees a marker outside its own
+        # _KNOWN_MIGRATIONS, so a rollback to a pre-Cadence image would refuse
+        # to start, where a bare extra table it does not know about is ignored
+        # harmlessly. `person_id` is in the CREATE TABLE itself, so the
+        # PRAGMA guard the activities index needs does not apply here.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS strength_sessions (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_id          INTEGER NOT NULL,
+                session_id         TEXT NOT NULL,
+                session_label      TEXT,
+                start_time_utc     TEXT NOT NULL,
+                duration_seconds   INTEGER NOT NULL,
+                exercises_json     TEXT NOT NULL,
+                notes              TEXT,
+                source             TEXT,
+                garmin_status      TEXT NOT NULL DEFAULT 'skipped'
+                                   CHECK (garmin_status IN ('skipped','pending','synced','failed')),
+                garmin_activity_id TEXT,
+                garmin_error       TEXT,
+                garmin_target      TEXT,
+                garmin_sets_status TEXT NOT NULL DEFAULT 'not_attempted'
+                                   CHECK (garmin_sets_status IN ('not_attempted','synced','failed')),
+                created_at         TEXT NOT NULL,
+                updated_at         TEXT NOT NULL,
+                -- A PLAIN unique constraint, not the partial index
+                -- idx_weight_log_person_client_id uses: that one is partial
+                -- only because client_id is nullable. session_id is required
+                -- here, so there are no NULLs to exclude. Scoped to
+                -- (person_id, session_id) rather than session_id alone --
+                -- two people may legitimately hold the same client-generated
+                -- id, and a global UNIQUE would reject the second one.
+                UNIQUE (person_id, session_id)
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_strength_sessions_person_start "
+            "ON strength_sessions(person_id, start_time_utc)"
+        )
+
         # Durable one-time markers for shared/migrations.py's run_migration().
         await db.execute(SCHEMA_MIGRATIONS_TABLE_SQL)
 
