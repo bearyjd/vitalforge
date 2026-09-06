@@ -171,7 +171,7 @@ async def test_unknown_row_is_not_auto_retried(client, weight_app_module, fake_g
     # Garmin now answers normally, and says it does hold the activity.
     state["failing"] = False
     fake_garmin_client.activities_by_date.append(
-        {"activityId": 555, "activityName": "Cadence — Lower A"}
+        {"activityId": 555, "activityName": "Cadence — Lower A [6-a3f9]"}
     )
 
     resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
@@ -233,7 +233,7 @@ async def test_reconciliation_matches_on_exact_name(client, weight_app_module, f
 
     state["failing"] = False
     fake_garmin_client.activities_by_date.append(
-        {"activityId": 999, "activityName": "Cadence — Upper B"}
+        {"activityId": 999, "activityName": "Cadence — Upper B [6-a3f9]"}
     )
 
     resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
@@ -282,3 +282,59 @@ async def test_unknown_row_is_inert_without_push_to_garmin(client, fake_garmin_c
     assert resp.status_code == 200
     assert resp.json()["garmin_status"] == "unknown"
     assert fake_garmin_client.activity_lookups == []
+
+
+async def test_same_label_same_day_sessions_do_not_collide(
+    client, weight_app_module, fake_garmin_client, monkeypatch
+):
+    """The residual limit the session marker exists to close.
+
+    Reconciliation can only match on a name, because Garmin offers no
+    idempotency key. Without the marker, two sessions the same person
+    completed on one day under one label -- a morning and an evening
+    workout, or a redo -- produce the identical title, and reconciling the
+    second would adopt the FIRST one's activityId: the second session would
+    read 'synced' pointing at an activity that is not it, and its own push
+    would never happen.
+    """
+    first = {**BODY, "session_id": "cadence-2026-09-06-aaaaaa"}
+    second = {**BODY, "session_id": "cadence-2026-09-06-bbbbbb"}
+
+    # The first session lands normally.
+    await client.post(f"{PERSON_PREFIX}/api/activity", json=first)
+    assert len(fake_garmin_client.created_activities) == 1
+
+    # The second, same label and same day, pushes ambiguously.
+    state = timing_out_until(weight_app_module, monkeypatch)
+    await client.post(f"{PERSON_PREFIX}/api/activity", json=second)
+
+    # Reconciling it must NOT find the first session's activity.
+    state["failing"] = False
+    resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=second)
+    assert resp.json()["garmin_status"] == "synced"
+    assert len(fake_garmin_client.created_activities) == 2, (
+        "the second session was mistaken for the first and never reached Garmin"
+    )
+
+    names = [call["activity_name"] for call in fake_garmin_client.created_activities]
+    assert names == ["Cadence — Lower A [aaaaaa]", "Cadence — Lower A [bbbbbb]"]
+
+
+async def test_reconciliation_searches_for_the_name_the_push_sent(
+    client, weight_app_module, fake_garmin_client, monkeypatch
+):
+    """The name is composed once and used for both. A second composition that
+    could drift would search for a title the push never sent, report "not on
+    Garmin" for something that is, and duplicate."""
+    state = timing_out_until(weight_app_module, monkeypatch)
+    await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
+
+    # Garmin holds it under exactly the name the push would have used.
+    fake_garmin_client.activities_by_date.append(
+        {"activityId": 777, "activityName": "Cadence — Lower A [6-a3f9]"}
+    )
+    state["failing"] = False
+
+    resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
+    assert resp.json()["garmin_activity_id"] == "777"
+    assert fake_garmin_client.created_activities == []

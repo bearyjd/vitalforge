@@ -106,7 +106,7 @@ async def test_override_prefixes_activity_name_with_display_name(client, son, fa
     await client.post(
         "/p/son/api/activity", json=body(push_to_garmin=True, garmin_target="credential_person")
     )
-    assert fake_garmin_client.created_activities[0]["activity_name"] == "Cadence (Son) — Lower A"
+    assert fake_garmin_client.created_activities[0]["activity_name"] == "Cadence (Son) — Lower A [6-a3f9]"
 
 
 async def test_override_logs_a_warning(client, son, caplog):
@@ -154,7 +154,7 @@ async def test_same_person_push_needs_no_override(client, fake_garmin_client):
     assert resp.status_code == 202
     assert resp.json()["garmin_status"] == "synced"
     assert "garmin_target" not in resp.json()
-    assert fake_garmin_client.created_activities[0]["activity_name"] == "Cadence — Lower A"
+    assert fake_garmin_client.created_activities[0]["activity_name"] == "Cadence — Lower A [6-a3f9]"
 
 
 async def test_no_session_label_defaults_to_strength(client, fake_garmin_client):
@@ -162,7 +162,7 @@ async def test_no_session_label_defaults_to_strength(client, fake_garmin_client)
         f"{PERSON_PREFIX}/api/activity", json=body(push_to_garmin=True, session_label=None)
     )
     assert resp.status_code == 202
-    assert fake_garmin_client.created_activities[0]["activity_name"] == "Cadence — Strength"
+    assert fake_garmin_client.created_activities[0]["activity_name"] == "Cadence — Strength [6-a3f9]"
 
 
 async def test_cross_person_store_only_is_the_normal_path(client, son, fake_garmin_client):

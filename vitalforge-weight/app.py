@@ -1088,6 +1088,11 @@ _STRENGTH_SESSION_COLUMNS = (
 # is still UNIQUE (person_id, session_id).
 _GARMIN_CLAIM_TIMEOUT_SECONDS = 600
 
+# How many trailing characters of session_id go into the Garmin activity
+# title. Enough that two sessions the same person completed on one day cannot
+# realistically share one, short enough to stay readable in an activity list.
+_SESSION_MARKER_CHARS = 6
+
 # Fields compared between an incoming repeat POST and the stored row, named in
 # the REQUEST's vocabulary (the warning is read by whoever wrote the client,
 # not by whoever wrote the schema) alongside the column that holds each.
@@ -1267,18 +1272,33 @@ def _garmin_time_zone() -> str:
     return time_zone.strip()
 
 
-def _activity_name(session_label: str | None, display_name: str | None) -> str:
+def _activity_name(session_label: str | None, display_name: str | None, session_id: str) -> str:
     """The Garmin activity title. Exact strings, D-015.
 
     display_name is non-None only on the cross-person override, and is read
     from persons.display_name for the TARGET person -- never from the request
     body, which cannot be trusted to name the person the path addressed.
     The dash is U+2014 with one space either side.
+
+    The trailing session marker is what makes reconciliation EXACT. Garmin
+    offers no idempotency key, so an ambiguous push can only be resolved by
+    looking activities up and matching a name -- and "Cadence — Lower A" is
+    not unique: the same label twice in one day (a morning and an evening
+    session, or a redo) would collide, and reconciliation would adopt the
+    wrong activity's id or skip a push that never happened. The last 6
+    characters of the client-generated session_id disambiguate that at the
+    cost of a short suffix in the title. Short deliberately: it is a
+    disambiguator, not an identifier, and the whole session_id (up to 128
+    chars) in a Garmin activity title would be unreadable.
+
+    It is a SUFFIX so the human-meaningful part of the name still leads in
+    Garmin's activity list, where long titles are truncated from the right.
     """
     label = session_label or "Strength"
+    marker = session_id[-_SESSION_MARKER_CHARS:]
     if display_name is not None:
-        return f"Cadence ({display_name}) — {label}"
-    return f"Cadence — {label}"
+        return f"Cadence ({display_name}) — {label} [{marker}]"
+    return f"Cadence — {label} [{marker}]"
 
 
 async def _person_display_name(person_id: int) -> str | None:
@@ -1821,8 +1841,14 @@ async def post_activity(
             # `incoming` and a strength_sessions Row share these key names
             # deliberately, so the fresh and retry cases read identically.
             stored = incoming if existing is None else existing
+            # Composed ONCE and used for both the push and the reconciliation
+            # lookup. Two compositions that could drift would mean a
+            # reconciliation searching for a name the push never sent, which
+            # reports "not on Garmin" for something that is, and duplicates.
             activity_name = _activity_name(
-                stored["session_label"], override_display_name if override_applied else None
+                stored["session_label"],
+                override_display_name if override_applied else None,
+                data.session_id,
             )
             if override_applied:
                 # Logged HERE, not at the guard: this is the point at which
