@@ -1,18 +1,22 @@
+import json
 import logging
 import math
 import os
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
+from zoneinfo import ZoneInfo
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.requests import Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from garminconnect.exercises import CATEGORIES
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # get_current_identity, not require_account_identity: the latter 401s
@@ -26,8 +30,21 @@ from shared.auth import (
     get_current_identity,
     require_person,
 )
-from shared.database import ensure_primary_person_grant, get_db, init_db
-from shared.garmin_client import authenticate, push_weight
+from shared.database import (
+    ensure_primary_person_grant,
+    garmin_credential_person_id,
+    get_db,
+    init_db,
+)
+from shared.garmin_client import (
+    STRENGTH_ACTIVITY_TYPE_KEY,
+    authenticate,
+    build_exercise_sets_payload,
+    extract_activity_id,
+    push_activity,
+    push_activity_sets,
+    push_weight,
+)
 from shared.persons_admin import add_person_routes
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -193,6 +210,104 @@ class WeightIn(BaseModel):
         skew = self.captured_at - datetime.now(timezone.utc)
         if skew > timedelta(seconds=CAPTURED_AT_FUTURE_TOLERANCE_SECONDS):
             raise ValueError("captured_at must not be in the future")
+        return self
+
+
+# The 47 parent exercise categories garminconnect 0.3.11 ships. Validated
+# HERE, at the model layer, rather than discovered as a Garmin 400 "Invalid
+# Sub-Category Passed" halfway through a push that has already created the
+# activity. Frozen into a set at import time: CATEGORIES is a plain list in
+# the library, and this is a per-exercise membership test on every POST.
+#
+# NOTE for a reader coming from Cadence's D-018, which speaks of "the 26
+# confirmed names": that number was how many of the categories Cadence asked
+# about exist here, not a whitelist. The library's own list is the authority,
+# so `UNKNOWN` is rejected (it genuinely is not a category) while the other
+# 21 names Cadence never asked about are accepted.
+GARMIN_EXERCISE_CATEGORIES = frozenset(CATEGORIES)
+
+
+class ActivityExerciseIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(max_length=100)
+    garmin_category: str | None = None
+    # Sub-category. None is always accepted under a known parent, per
+    # set_activity_exercise_sets' own docstring, so this is deliberately NOT
+    # validated against a list -- the 1527-entry catalog is keyed by parent
+    # and Garmin is the authority on which child belongs to which.
+    garmin_exercise: str | None = None
+    sets: int = Field(ge=1, le=100)
+    reps: int = Field(ge=1, le=100)
+    # Time-measured work: planks, dead hangs, carries, and the whole mobility
+    # prelude have no meaningful rep count, but `reps` is required ge=1, so
+    # those rows arrive as reps=1 plus the hold in `seconds`.
+    # create_manual_activity ignores this; it feeds the exerciseSets
+    # `duration` when the flag is on.
+    seconds: int | None = Field(default=None, ge=1, le=3600)
+    weight_kg: float | None = Field(default=None, ge=0, le=500)
+    rest_s: int | None = Field(default=None, ge=0, le=3600)
+
+    @field_validator("sets", "reps", "seconds", "weight_kg", "rest_s", mode="before")
+    @classmethod
+    def _reject_bool(cls, value):
+        # Same reason as WeightIn._reject_bool: bool subclasses int, so
+        # Pydantic's lax mode silently coerces JSON true to 1 -- which every
+        # bound here (sets ge=1, reps ge=1, seconds ge=1) happily accepts.
+        # `true` would land as a real one-rep set.
+        if isinstance(value, bool):
+            raise ValueError("must be a number, not a boolean")
+        return value
+
+    @field_validator("garmin_category")
+    @classmethod
+    def _known_garmin_category(cls, value):
+        if value is not None and value not in GARMIN_EXERCISE_CATEGORIES:
+            raise ValueError(f"unknown Garmin exercise category {value!r}")
+        return value
+
+
+class ActivityIn(BaseModel):
+    """A completed strength session. THE PATH CARRIES THE PERSON -- there is
+    deliberately no `profile`/`person` field here, and extra="forbid" turns an
+    attempt at one into a 422 rather than a silently ignored key."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Client-generated idempotency key, same bounds as WeightIn.client_id.
+    session_id: str = Field(min_length=1, max_length=128)
+    # Becomes the Garmin activity name's suffix ("Cadence — Lower A").
+    session_label: str | None = Field(default=None, max_length=60)
+    start: datetime
+    duration_min: int = Field(ge=1, le=600)
+    exercises: list[ActivityExerciseIn] = Field(min_length=1, max_length=50)
+    notes: str | None = Field(default=None, max_length=1000)
+    source: Literal["cadence", "pwa", "manual"] | None = None
+    # Defaults to False deliberately: the safe default is to store, and a
+    # destructive-side-effect default should never be implicit.
+    push_to_garmin: bool = False
+    # D-015 override. Inert on its own -- consulted only when push_to_garmin
+    # is true AND the target person is not the Garmin-credential person.
+    garmin_target: Literal["credential_person"] | None = None
+
+    @field_validator("duration_min", mode="before")
+    @classmethod
+    def _reject_bool(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("must be a number, not a boolean")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_start(self):
+        # WeightIn._validate_captured_at's rules, on this model's own field.
+        # Naive datetimes are ambiguous (server-local? UTC? the phone's own
+        # zone?) and this route converts to a Garmin wall clock later, where
+        # guessing wrong misfiles the activity by the offset amount.
+        if self.start.tzinfo is None:
+            raise ValueError("start must include a UTC offset")
+        skew = self.start - datetime.now(timezone.utc)
+        if skew > timedelta(seconds=CAPTURED_AT_FUTURE_TOLERANCE_SECONDS):
+            raise ValueError("start must not be in the future")
         return self
 
 
@@ -946,3 +1061,481 @@ async def delete_weight(weight_id: int, person_id: int = Depends(require_person(
         await db.close()
 
     return {"success": True, "deleted_id": weight_id}
+
+
+# ---------------------------------------------------------------------------
+# Strength sessions (Cadence): POST /p/{slug}/api/activity and its two reads
+# ---------------------------------------------------------------------------
+
+# Columns every strength_sessions read in this module needs. One list, for the
+# same reason _WEIGHT_LOG_EXISTING_ROW_COLUMNS is one list: two copies drift,
+# and the drift surfaces as a KeyError mid-transaction rather than a graceful
+# response.
+_STRENGTH_SESSION_COLUMNS = (
+    "id, person_id, session_id, session_label, start_time_utc, duration_seconds, exercises_json, "
+    "notes, source, garmin_status, garmin_activity_id, garmin_error, garmin_target, "
+    "garmin_sets_status, created_at, updated_at"
+)
+
+# Fields compared between an incoming repeat POST and the stored row, named in
+# the REQUEST's vocabulary (the warning is read by whoever wrote the client,
+# not by whoever wrote the schema) alongside the column that holds each.
+_ACTIVITY_CONFLICT_FIELDS = (
+    ("start", "start_time_utc"),
+    ("duration_min", "duration_seconds"),
+    ("exercises", "exercises_json"),
+    ("notes", "notes"),
+    ("source", "source"),
+    ("session_label", "session_label"),
+)
+
+# Garmin outcomes a repeat POST is allowed to re-attempt. 'skipped' is
+# deliberately absent: a session stored with push_to_garmin false never
+# becomes pushable by flipping the flag on a later POST, matching
+# should_attempt_garmin_push's shape for weight. A client that wants a
+# session on Garmin must say so on the FIRST post of that session_id.
+_RETRYABLE_GARMIN_STATUSES = ("pending", "failed")
+
+
+@dataclass(frozen=True)
+class ActivityPushOutcome:
+    """What one Garmin attempt did. Frozen: the route threads it into the
+    response and the post-commit UPDATE, and neither may edit it in place."""
+
+    garmin_status: str
+    garmin_activity_id: str | None
+    garmin_error: str | None
+    garmin_sets_status: str
+
+
+def _exercise_sets_enabled() -> bool:
+    """Whether to attempt the per-exercise exerciseSets upload.
+
+    Read on EVERY call, not captured at import: this module is imported once
+    per test session (importlib, via tests/conftest.py's weight_app_module),
+    so a module-level constant would freeze whatever the environment held
+    during the first test that imported it.
+
+    Parsed as a string, never `bool(os.environ.get(...))` -- that is True for
+    the literal "0", which is exactly the value this ships with.
+    """
+    return os.environ.get("VITALFORGE_GARMIN_EXERCISE_SETS", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _garmin_time_zone() -> str:
+    """The IANA zone name create_manual_activity's wall clock belongs to.
+
+    Read per call, for the same reason as _exercise_sets_enabled. An unset or
+    empty TZ falls back to UTC and SAYS SO -- guessing the host zone would
+    silently misfile every activity by the offset amount, and a silent
+    fallback makes that invisible. This service's own TZ is authoritative
+    for the conversion; Cadence always sends UTC with an explicit offset and
+    nobody adjusts it on the client side.
+    """
+    time_zone = os.environ.get("TZ") or ""
+    if not time_zone.strip():
+        logger.warning(
+            "TZ is unset; filing this Garmin activity against UTC. Set TZ to the "
+            "deployment's IANA zone or activities land at the wrong local time."
+        )
+        return "UTC"
+    return time_zone.strip()
+
+
+def _activity_name(session_label: str | None, display_name: str | None) -> str:
+    """The Garmin activity title. Exact strings, D-015.
+
+    display_name is non-None only on the cross-person override, and is read
+    from persons.display_name for the TARGET person -- never from the request
+    body, which cannot be trusted to name the person the path addressed.
+    The dash is U+2014 with one space either side.
+    """
+    label = session_label or "Strength"
+    if display_name is not None:
+        return f"Cadence ({display_name}) — {label}"
+    return f"Cadence — {label}"
+
+
+async def _person_display_name(person_id: int) -> str | None:
+    db = await get_db()
+    try:
+        row = await (
+            await db.execute("SELECT display_name FROM persons WHERE id = ?", (person_id,))
+        ).fetchone()
+    finally:
+        await db.close()
+    return row["display_name"] if row is not None else None
+
+
+def _push_activity(
+    *,
+    start_utc: datetime,
+    duration_min: int,
+    activity_name: str,
+    exercises: list[dict],
+) -> ActivityPushOutcome:
+    """Push one session to Garmin. NEVER RAISES -- mirrors _push_composition.
+
+    The UTC-to-local-wall-clock conversion lives here rather than in
+    shared/garmin_client.push_activity because tests patch that name in this
+    module's namespace (tests/conftest.py); a conversion inside the patched
+    function would be replaced by the fake, and the tests that pin it would
+    be asserting on nothing.
+
+    ZoneInfo() construction is inside the try on purpose: a typo'd TZ is an
+    operator error that must degrade to garmin_status='failed' with the
+    message stored, not a 500 over a row that is already committed.
+    """
+    try:
+        authenticate()
+        time_zone = _garmin_time_zone()
+        start_local = start_utc.astimezone(ZoneInfo(time_zone))
+        # LOCAL wall clock, no offset, plus the zone name alongside -- the
+        # library's documented contract. A UTC string sent with a local zone
+        # name, or a string carrying an offset, silently shifts the activity
+        # by the offset amount and nobody notices for weeks.
+        response = push_activity(
+            start_datetime=start_local.strftime("%Y-%m-%dT%H:%M:%S.000"),
+            time_zone=time_zone,
+            # Passed explicitly rather than defaulted inside push_activity so
+            # every argument Garmin receives is visible at the one call site,
+            # and so a test can assert on the type key -- it is confirmed only
+            # as a strength WORKOUT sportTypeKey, not as an ACTIVITY typeKey,
+            # and JD's live get_activity_types() probe may yet rename it.
+            type_key=STRENGTH_ACTIVITY_TYPE_KEY,
+            distance_km=0.0,
+            duration_min=duration_min,
+            activity_name=activity_name,
+        )
+    except Exception as e:
+        logger.error("Failed to push activity to Garmin: %s", e)
+        return ActivityPushOutcome("failed", None, str(e), "not_attempted")
+
+    activity_id = extract_activity_id(response)
+    if activity_id is None:
+        # The activity really is on Garmin -- 'synced' is the honest status.
+        # There is simply no id to address it by, so the sets step cannot run.
+        logger.warning(
+            "create_manual_activity returned no usable activity id (%r); "
+            "the activity was created but exercise sets cannot be attached.",
+            response,
+        )
+        return ActivityPushOutcome("synced", None, None, "not_attempted")
+
+    if not _exercise_sets_enabled():
+        return ActivityPushOutcome("synced", activity_id, None, "not_attempted")
+
+    try:
+        payload = build_exercise_sets_payload(exercises, start_local)
+        if not payload["exerciseSets"]:
+            # Every exercise lacked a garmin_category. Nothing to send, and
+            # nothing failed.
+            return ActivityPushOutcome("synced", activity_id, None, "not_attempted")
+        push_activity_sets(activity_id, payload)
+    except Exception as e:
+        # Only garmin_sets_status degrades. garmin_status stays 'synced'
+        # because the activity itself genuinely exists on Garmin -- flipping
+        # it to 'failed' would make the client re-POST and create a SECOND
+        # activity for the same session.
+        logger.error("Failed to push exercise sets for activity %s: %s", activity_id, e)
+        return ActivityPushOutcome("synced", activity_id, None, "failed")
+
+    return ActivityPushOutcome("synced", activity_id, None, "synced")
+
+
+async def _record_activity_garmin_outcome(db, row_id: int, outcome: ActivityPushOutcome) -> None:
+    """Persist one Garmin attempt's result against an already-committed row.
+
+    A module-level function, not an inline statement, so a test can
+    monkeypatch it to raise and prove the route still answers 202 rather than
+    turning durable data into a 500.
+
+    Race-free only under the single-worker deployment this service already
+    assumes: the push above is synchronous and this route awaits nothing
+    during it, so no second request can interleave between the push and this
+    write. A second uvicorn worker would reopen that window here and in
+    post_weight alike.
+    """
+    await db.execute(
+        "UPDATE strength_sessions SET garmin_status = ?, garmin_activity_id = ?, garmin_error = ?, "
+        "garmin_sets_status = ?, updated_at = ? WHERE id = ?",
+        (
+            outcome.garmin_status,
+            outcome.garmin_activity_id,
+            outcome.garmin_error,
+            outcome.garmin_sets_status,
+            datetime.now(timezone.utc).isoformat(),
+            row_id,
+        ),
+    )
+    await db.commit()
+
+
+def _activity_conflicts(existing, incoming: dict) -> list[str]:
+    """Fields where a repeat POST disagrees with the stored row.
+
+    Reported, never applied: first-write-wins, the same convention
+    ENRICHABLE_FIELDS follows. A differing body is NOT a 409 -- a client
+    replaying a session it edited locally should still get its idempotent
+    200, with the disagreement made visible rather than silently resolved
+    either way.
+    """
+    return [
+        request_name
+        for request_name, column in _ACTIVITY_CONFLICT_FIELDS
+        if existing[column] != incoming[column]
+    ]
+
+
+def _serialize_strength_session(row) -> dict:
+    """One stored row as the read routes return it, with `exercises` parsed
+    back out of the JSON blob and duration re-expressed in minutes (the unit
+    the write route accepts)."""
+    return {
+        "id": row["id"],
+        "session_id": row["session_id"],
+        "session_label": row["session_label"],
+        "start_time_utc": row["start_time_utc"],
+        "duration_min": row["duration_seconds"] // 60,
+        "duration_seconds": row["duration_seconds"],
+        "exercises": json.loads(row["exercises_json"]),
+        "notes": row["notes"],
+        "source": row["source"],
+        "garmin_status": row["garmin_status"],
+        "garmin_activity_id": row["garmin_activity_id"],
+        "garmin_error": row["garmin_error"],
+        "garmin_target": row["garmin_target"],
+        "garmin_sets_status": row["garmin_sets_status"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+@app.post("/p/{slug}/api/activity", status_code=202)
+async def post_activity(
+    data: ActivityIn,
+    response: Response,
+    person_id: int = Depends(require_person("manage")),
+):
+    """Store a completed strength session; optionally file it on Garmin.
+
+    202 on a fresh insert, 200 on an idempotent repeat. The decorator's
+    status_code applies to EVERY return, so the dedup branch overrides it
+    explicitly -- without that, a retry also answers 202 and the client
+    cannot tell "created" from "already had it" by status alone.
+    """
+    start_utc = data.start.astimezone(timezone.utc)
+    now = datetime.now(timezone.utc).isoformat()
+    exercise_dicts = [exercise.model_dump() for exercise in data.exercises]
+    incoming = {
+        "start_time_utc": start_utc.isoformat(),
+        "duration_seconds": data.duration_min * 60,
+        "exercises_json": json.dumps(exercise_dicts),
+        "notes": data.notes,
+        "source": data.source,
+        "session_label": data.session_label,
+    }
+
+    # BEFORE anything is stored. The deployment holds ONE Garmin credential,
+    # belonging to the primary person, and whatever it accepts is that one
+    # human's data no matter which person_id the caller named. require_person
+    # authorizes a caller FOR A TARGET PERSON; it cannot authorize them for a
+    # DATA SOURCE. Rejecting before the insert is deliberate: storing the row
+    # and answering 409 would leave it 'pending' forever while every retry
+    # 409s too, and the caller would have no way to tell a stored session
+    # from a rejected one.
+    override_display_name = None
+    if data.push_to_garmin:
+        source_person_id = await garmin_credential_person_id()
+        if person_id != source_person_id:
+            if data.garmin_target != "credential_person":
+                # 409, not 404: the caller demonstrably holds `manage` on this
+                # person, so naming the reason leaks nothing. And never a
+                # silent downgrade to store-only -- an explicit
+                # push_to_garmin: true that quietly does nothing is worse than
+                # an error.
+                raise HTTPException(status_code=409, detail=(
+                    "This person has no Garmin account of their own. The deployment holds one "
+                    "set of Garmin credentials, which belong to a different person, and pushing "
+                    "would file this session under theirs. Per-person Garmin linking arrives in "
+                    "Phase 3. Send garmin_target=\"credential_person\" to file it under the "
+                    "credential owner's account with this person's name in the activity title."
+                ))
+            override_display_name = await _person_display_name(person_id)
+            logger.warning(
+                "D-015 override: session %s for person_id=%s filed under Garmin credential "
+                "person_id=%s; activity name prefixed with display_name=%r",
+                data.session_id, person_id, source_person_id, override_display_name,
+            )
+
+    # Atomic: the duplicate lookup and the insert happen inside one
+    # transaction, so two concurrent requests can never both observe "no
+    # duplicate". The Garmin push happens after COMMIT, outside the lock, for
+    # the same reason post_weight does it there -- the call is synchronous
+    # with no timeout mechanism to bound it.
+    db = await get_db()
+    try:
+        await db.execute("BEGIN IMMEDIATE")
+        existing = await (
+            await db.execute(
+                f"SELECT {_STRENGTH_SESSION_COLUMNS} FROM strength_sessions "
+                "WHERE person_id = ? AND session_id = ?",
+                (person_id, data.session_id),
+            )
+        ).fetchone()
+
+        conflicts: list[str] = []
+        if existing is None:
+            cursor = await db.execute(
+                "INSERT INTO strength_sessions (person_id, session_id, session_label, start_time_utc, "
+                "duration_seconds, exercises_json, notes, source, garmin_status, garmin_target, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    person_id,
+                    data.session_id,
+                    data.session_label,
+                    incoming["start_time_utc"],
+                    incoming["duration_seconds"],
+                    incoming["exercises_json"],
+                    data.notes,
+                    data.source,
+                    "pending" if data.push_to_garmin else "skipped",
+                    "credential_person" if override_display_name is not None else None,
+                    now,
+                    now,
+                ),
+            )
+            row_id = cursor.lastrowid
+            outcome = ActivityPushOutcome(
+                "pending" if data.push_to_garmin else "skipped", None, None, "not_attempted"
+            )
+            should_push = data.push_to_garmin
+        else:
+            # First-write-wins: the stored payload is never modified.
+            row_id = existing["id"]
+            conflicts = _activity_conflicts(existing, incoming)
+            outcome = ActivityPushOutcome(
+                existing["garmin_status"],
+                existing["garmin_activity_id"],
+                existing["garmin_error"],
+                existing["garmin_sets_status"],
+            )
+            # Client-driven retry, the only retry mechanism this codebase has
+            # for anything: a repeat POST of the same session_id re-attempts
+            # the push iff it has not already succeeded. There is no
+            # background worker, and building one here would be new machinery
+            # nothing else in VitalForge has.
+            should_push = data.push_to_garmin and outcome.garmin_status in _RETRYABLE_GARMIN_STATUSES
+
+        await db.commit()
+
+        if conflicts:
+            logger.warning(
+                "Activity POST for session %s conflicts with stored row %s on fields: %s",
+                data.session_id, row_id, conflicts,
+            )
+
+        if should_push:
+            outcome = _push_activity(
+                start_utc=start_utc if existing is None else datetime.fromisoformat(existing["start_time_utc"]),
+                duration_min=(incoming["duration_seconds"] if existing is None else existing["duration_seconds"]) // 60,
+                activity_name=_activity_name(
+                    data.session_label if existing is None else existing["session_label"],
+                    override_display_name,
+                ),
+                exercises=exercise_dicts if existing is None else json.loads(existing["exercises_json"]),
+            )
+            try:
+                await _record_activity_garmin_outcome(db, row_id, outcome)
+            except Exception as e:
+                # The row is already durably committed by this point. A
+                # failure here must never surface as a 500 over
+                # already-successful data -- that would tell the client the
+                # whole request failed when it did not, and send it into a
+                # retry that re-pushes an activity Garmin already has.
+                logger.error("Post-commit Garmin outcome update failed for row %s: %s", row_id, e)
+    finally:
+        await db.close()
+
+    result = {
+        "success": True,
+        "id": row_id,
+        "session_id": data.session_id,
+        "garmin_status": outcome.garmin_status,
+        "garmin_activity_id": outcome.garmin_activity_id,
+        "garmin_sets_status": outcome.garmin_sets_status,
+    }
+    if existing is None:
+        result["person_id"] = person_id
+        result["start_time_utc"] = incoming["start_time_utc"]
+        result["duration_min"] = data.duration_min
+    else:
+        response.status_code = 200
+        result["deduplicated"] = True
+        if conflicts:
+            result["conflict"] = True
+            result["conflict_fields"] = conflicts
+    if outcome.garmin_status == "failed" and outcome.garmin_error:
+        result["garmin_error"] = outcome.garmin_error
+    if override_display_name is not None:
+        result["garmin_target"] = "credential_person"
+    return result
+
+
+@app.get("/p/{slug}/api/activity/{session_id}")
+async def get_activity(session_id: str, person_id: int = Depends(require_person("view"))):
+    """One stored session by its client-generated id.
+
+    person_id is in the WHERE clause, not just in the dependency: the
+    dependency authorizes the caller for this person, and this predicate is
+    what stops one person's session_id being read through another person's
+    slug. 404, never 403, for a session that exists under someone else.
+    """
+    db = await get_db()
+    try:
+        row = await (
+            await db.execute(
+                f"SELECT {_STRENGTH_SESSION_COLUMNS} FROM strength_sessions "
+                "WHERE person_id = ? AND session_id = ?",
+                (person_id, session_id),
+            )
+        ).fetchone()
+    finally:
+        await db.close()
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="Strength session not found")
+    return _serialize_strength_session(row)
+
+
+@app.get("/p/{slug}/api/strength-sessions")
+async def list_strength_sessions(
+    since: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    person_id: int = Depends(require_person("view")),
+):
+    """This person's stored sessions, newest first.
+
+    Named /strength-sessions rather than /activities because that path is
+    already the dashboard's FIT-import list route over a different table, and
+    the two concepts are deliberately separate. There is no ?person= --
+    person addressing is by path segment only.
+    """
+    sql = (
+        f"SELECT {_STRENGTH_SESSION_COLUMNS} FROM strength_sessions WHERE person_id = ?"
+    )
+    params: list = [person_id]
+    if since is not None:
+        sql += " AND start_time_utc >= ?"
+        params.append(since)
+    sql += " ORDER BY start_time_utc DESC LIMIT ?"
+    params.append(limit)
+
+    db = await get_db()
+    try:
+        rows = await (await db.execute(sql, tuple(params))).fetchall()
+    finally:
+        await db.close()
+
+    sessions = [_serialize_strength_session(row) for row in rows]
+    return {"count": len(sessions), "sessions": sessions}
