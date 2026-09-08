@@ -30,3 +30,7 @@ Thumbs.db
 # Code-review artifacts stay local. Note this is deliberately narrower than
 # .claude/ -- .claude/PRPs/plans/ and .claude/PRPs/reports/ ARE tracked.
 .claude/PRPs/reviews/
+
+# gstack scratch: codex stderr captures and other tool output.
+# 11.5k lines of one landed in #43 via `git add -A`.
+.gstack/
