@@ -1648,6 +1648,12 @@ async def post_activity(
         "notes": data.notes,
         "source": data.source,
         "session_label": data.session_label,
+        # Present so `incoming` and a strength_sessions Row really do share
+        # these key names, which the comment on `stored` below promises. Without
+        # it, `stored["garmin_name_prefix"]` is a KeyError on the fresh-insert
+        # path and only clause ordering hides that -- a footgun for the next
+        # edit, not a property.
+        "garmin_name_prefix": None,
     }
 
     # BEFORE anything is stored. The deployment holds ONE Garmin credential,
@@ -1685,6 +1691,9 @@ async def post_activity(
             override_applied = True
             override_credential_person_id = source_person_id
             override_display_name = await _person_display_name(person_id)
+            # Captured into the payload that becomes the row, so a fresh insert
+            # and a retry read the effective name from the same key.
+            incoming["garmin_name_prefix"] = override_display_name
             # Deliberately NOT logged here. Reaching this point only means the
             # override was ASKED FOR and accepted; whether it has any effect
             # depends on what the transaction below decides, and a WARNING for
@@ -1729,8 +1738,9 @@ async def post_activity(
                     "pending" if data.push_to_garmin else "skipped",
                     "credential_person" if override_applied else None,
                     now if data.push_to_garmin else None,
-                    # Captured at insert, read back on every retry. See below.
-                    override_display_name if override_applied else None,
+                    # One source for this value: the same key the retry path
+                    # reads off `stored`, so insert and re-read cannot drift.
+                    incoming["garmin_name_prefix"],
                     now,
                     now,
                 ),
@@ -1852,11 +1862,17 @@ async def post_activity(
             # activity does not exist, and the retry would file a PERMANENT
             # duplicate (there is no delete path). Same first-write-wins rule
             # the `stored` payload above follows, for the same reason.
-            effective_display_name = (
-                stored["garmin_name_prefix"]
-                if existing is not None and stored["garmin_name_prefix"] is not None
-                else (override_display_name if override_applied else None)
-            )
+            # Total, not best-effort, and with no fallback to a fresh
+            # persons.display_name read -- that fallback WAS the bug, still
+            # reachable. NULL here means "no override", which is exactly the
+            # None this needs: a cross-person push cannot produce a NULL-prefix
+            # row, because a cross-person POST without garmin_target is refused
+            # with 409 before anything is stored, so any row that WAS overridden
+            # carries its prefix. The one shape that could have broken that (a
+            # row written after the table shipped but before this column did)
+            # never existed -- the deployment held 0 strength_sessions rows at
+            # the upgrade -- so the window is closed, not merely narrow.
+            effective_display_name = stored["garmin_name_prefix"]
             activity_name = _activity_name(
                 stored["session_label"],
                 effective_display_name,

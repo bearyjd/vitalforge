@@ -252,9 +252,16 @@ async def test_rename_between_push_and_retry_does_not_duplicate(
     )
     assert first.json()["garmin_status"] == "unknown"
 
-    # Garmin does hold it, under the title the FIRST push sent.
+    # Garmin holds the real one under the title the FIRST push sent, and a
+    # DECOY under the title a re-derived (post-rename) prefix would produce.
+    # Both are present so the assertion discriminates on WHICH name was
+    # searched: asserting only that reconciliation "found something" would
+    # pass just as well against the wrong lookup.
     fake_garmin_client.activities_by_date.append(
         {"activityId": 4242, "activityName": "Cadence (Son) — Lower A [6-a3f9]"}
+    )
+    fake_garmin_client.activities_by_date.append(
+        {"activityId": 9999, "activityName": "Cadence (Sonny) — Lower A [6-a3f9]"}
     )
 
     # An admin renames the person before the retry.
@@ -271,7 +278,8 @@ async def test_rename_between_push_and_retry_does_not_duplicate(
     )
 
     assert retry.json()["garmin_activity_id"] == "4242", (
-        "reconciliation searched under the NEW display name and missed the activity"
+        "reconciliation matched the post-rename title (9999) instead of the one the "
+        "first push actually sent (4242)"
     )
     assert fake_garmin_client.created_activities == [], (
         "filed a second, permanent Garmin activity for one session after a rename"
