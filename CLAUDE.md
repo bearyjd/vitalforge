@@ -91,9 +91,10 @@ DB_PATH=/tmp/vf-test.db GARTH_TOKEN_DIR=/tmp/vf-garth \
 # starlette/jinja2 out from under them:
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r vitalforge-weight/requirements.txt -r vitalforge-dashboard/requirements.txt
-pip install pytest pytest-asyncio httpx ruff playwright pytest-playwright
+pip install pytest pytest-asyncio httpx ruff playwright pytest-playwright pip-audit
 pip install -e .
 ruff check .
+pip-audit -r vitalforge-weight/requirements.txt -r vitalforge-dashboard/requirements.txt
 pytest -q
 
 # UI smoke tests (Playwright) — excluded from the default `pytest -q` run, see below:
@@ -116,9 +117,14 @@ the same session (`RuntimeError: Runner.run() cannot be called from a running ev
 loop`). Never remove that `addopts` line or merge the two suites into one `pytest`
 invocation — run `pytest -q -m playwright` as a genuinely separate process instead (see
 `tests/live_server.py` and `tests/test_smoke_ui.py`).
-`.github/workflows/docker.yml` has a `test` job (`ruff check .` then `pytest -q`, then a
-separate Playwright-browser-install step and `pytest -q -m playwright`) that gates
-`build-and-push` via `needs: test` — a failing lint or test blocks the image push.
+`.github/workflows/docker.yml` has a `test` job (`ruff check .`, then `pip-audit`, then
+`pytest -q`, then a separate Playwright-browser-install step and `pytest -q -m
+playwright`) that gates `build-and-push` via `needs: test` — a failing lint, audit or
+test blocks the image push. **`pip-audit` is scoped to the two `requirements.txt` files,
+not the installed environment**: it still resolves and audits their transitive
+dependencies (which is the point — `starlette` was transitive and unpinned until the
+PYSEC-2026-1942 bump), but an advisory in `pytest`/`ruff`/`playwright` must not block an
+image push for something that never ships in the image.
 Tests live in `tests/` and never touch real infrastructure: `tests/conftest.py` points
 `shared.database.DB_PATH` at a per-test `tmp_path` and monkeypatches
 `shared.garmin_client` to a fake client backed by canned fixtures in

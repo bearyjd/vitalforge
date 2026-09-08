@@ -281,13 +281,22 @@ async def index(request: Request):
 
 @app.get("/p/{slug}/")
 async def person_index(request: Request, slug: str, person_id: int = Depends(require_person("view"))):
-    return templates.TemplateResponse("index.html", {
-        "request": request,
-        "person_slug": slug,
-        "weight_url": os.environ.get("WEIGHT_URL", ""),
-        "default_unit": os.environ.get("DEFAULT_UNIT", "lbs"),
-        "tz": os.environ.get("TZ", ""),
-    })
+    # Signature is (request, name, context) -- starlette removed the old
+    # (name, {"request": ..., ...}) form. Under the new one those arguments
+    # bind as request="index.html" and name={...}, and the dict reaches
+    # Jinja2's template cache as a key: `TypeError: unhashable type: 'dict'`,
+    # a 500 on every page render. Caught only by the Playwright lane, since
+    # nothing else in the suite renders a template.
+    return templates.TemplateResponse(
+        request,
+        "index.html",
+        {
+            "person_slug": slug,
+            "weight_url": os.environ.get("WEIGHT_URL", ""),
+            "default_unit": os.environ.get("DEFAULT_UNIT", "lbs"),
+            "tz": os.environ.get("TZ", ""),
+        },
+    )
 
 
 @app.post("/p/{slug}/api/sync")

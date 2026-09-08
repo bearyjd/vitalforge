@@ -23,7 +23,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r vitalforge-weight/requirements.txt -r vitalforge-dashboard/requirements.txt
-          pip install pytest pytest-asyncio httpx ruff playwright pytest-playwright
+          pip install pytest pytest-asyncio httpx ruff playwright pytest-playwright pip-audit
           pip install -e .
 
       - name: Lint (ruff)
@@ -31,6 +31,26 @@ jobs:
 
       - name: Run tests
         run: pytest -q
+
+      # Nothing was auditing dependencies before this: the starlette advisory
+      # that prompted issue #37 surfaced from a one-off run during a code
+      # review, which is not a process. So this blocks the image push.
+      #
+      # It runs AFTER the tests on purpose. An advisory published upstream
+      # turns this red on a day nobody changed anything, and a red audit ahead
+      # of `pytest` would mask the test signal for whoever is mid-change.
+      #
+      # Scoped to the two requirements files rather than the whole installed
+      # environment, deliberately. pip-audit still resolves and audits their
+      # TRANSITIVE dependencies -- which is what matters here, since starlette
+      # was transitive until this commit -- but an advisory in pytest, ruff or
+      # playwright will not block an image push for a vulnerability that never
+      # ships in the image.
+      - name: Audit dependencies (pip-audit)
+        run: |
+          pip-audit --progress-spinner off \
+            -r vitalforge-weight/requirements.txt \
+            -r vitalforge-dashboard/requirements.txt
 
       - name: Install Playwright browser
         run: playwright install --with-deps chromium
