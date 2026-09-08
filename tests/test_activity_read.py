@@ -177,3 +177,25 @@ async def test_since_bare_date_selects_the_whole_day(client):
         f"{PERSON_PREFIX}/api/strength-sessions", params={"since": "2026-09-06"}
     )
     assert resp.json()["count"] == 1
+
+
+@pytest.mark.parametrize("since", ["20260906", "2026-W36-7"])
+async def test_since_normalises_non_calendar_iso_dates(client, since):
+    """Codex review finding, and a hole in exactly what this validator exists for.
+
+    date.fromisoformat() also accepts the compact ("20260906") and ISO-week
+    ("2026-W36-7") forms. Both are valid ISO 8601 dates for 2026-09-06, both
+    were ACCEPTED, and the raw string was then handed straight to a LEXICAL
+    comparison against stored "YYYY-MM-DDT..." values. "20260906" sorts ABOVE
+    every such timestamp ('0' > '-'), so `start_time_utc >= ?` matched nothing
+    and the caller got an empty list for a day they hold sessions on.
+
+    That is the silent-wrong-window failure the surrounding validator was
+    written to prevent, reached through a form it accepted rather than one it
+    rejected -- which is why normalising beats rejecting here: these are real
+    ISO dates and a caller sending one means the day, not nothing.
+    """
+    await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
+    resp = await client.get(f"{PERSON_PREFIX}/api/strength-sessions", params={"since": since})
+    assert resp.status_code == 200
+    assert resp.json()["count"] == 1, f"{since!r} silently returned an empty window"

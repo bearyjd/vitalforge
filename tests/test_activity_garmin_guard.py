@@ -216,3 +216,63 @@ async def test_override_is_echoed_on_a_later_read_of_an_overridden_row(client, s
     assert resp.status_code == 200
     assert resp.json()["garmin_target"] == "credential_person"
     assert len(fake_garmin_client.created_activities) == 1
+
+
+async def test_rename_between_push_and_retry_does_not_duplicate(
+    client, son, weight_app_module, fake_garmin_client, monkeypatch
+):
+    """An admin renaming the person must not turn a retry into a duplicate.
+
+    Codex review finding. The activity title is the ONLY handle reconciliation
+    has -- Garmin offers no idempotency key, so an ambiguous push is resolved
+    by looking activities up and matching the exact title that was sent. The
+    prefix came from persons.display_name, which is MUTABLE and was re-read on
+    every attempt. Rename the person between the ambiguous first push and the
+    re-POST and reconciliation searched for a name that was never sent,
+    concluded the activity did not exist, and filed a PERMANENT duplicate --
+    there is no delete path on Garmin.
+
+    The row now carries the prefix it was pushed under (garmin_name_prefix),
+    which is the same first-write-wins rule the stored payload already follows.
+    """
+    from httpx import ReadTimeout
+
+    state = {"failing": True}
+    real = weight_app_module.push_activity
+
+    def maybe_timing_out(**kwargs):
+        if state["failing"]:
+            raise ReadTimeout("timed out waiting for a response")
+        return real(**kwargs)
+
+    monkeypatch.setattr(weight_app_module, "push_activity", maybe_timing_out)
+
+    first = await client.post(
+        "/p/son/api/activity", json=body(push_to_garmin=True, garmin_target="credential_person")
+    )
+    assert first.json()["garmin_status"] == "unknown"
+
+    # Garmin does hold it, under the title the FIRST push sent.
+    fake_garmin_client.activities_by_date.append(
+        {"activityId": 4242, "activityName": "Cadence (Son) — Lower A [6-a3f9]"}
+    )
+
+    # An admin renames the person before the retry.
+    db = await get_db()
+    try:
+        await db.execute("UPDATE persons SET display_name = ? WHERE slug = ?", ("Sonny", "son"))
+        await db.commit()
+    finally:
+        await db.close()
+
+    state["failing"] = False
+    retry = await client.post(
+        "/p/son/api/activity", json=body(push_to_garmin=True, garmin_target="credential_person")
+    )
+
+    assert retry.json()["garmin_activity_id"] == "4242", (
+        "reconciliation searched under the NEW display name and missed the activity"
+    )
+    assert fake_garmin_client.created_activities == [], (
+        "filed a second, permanent Garmin activity for one session after a rename"
+    )

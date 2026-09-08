@@ -1092,7 +1092,7 @@ async def delete_weight(weight_id: int, person_id: int = Depends(require_person(
 _STRENGTH_SESSION_COLUMNS = (
     "id, person_id, session_id, session_label, start_time_utc, duration_seconds, exercises_json, "
     "notes, source, garmin_status, garmin_activity_id, garmin_error, garmin_target, "
-    "garmin_sets_status, garmin_claimed_at, created_at, updated_at"
+    "garmin_sets_status, garmin_claimed_at, garmin_name_prefix, created_at, updated_at"
 )
 
 # How many trailing characters of session_id go into the Garmin activity
@@ -1516,11 +1516,21 @@ def _normalise_since(since: str) -> str:
       exactly what the write path refuses to do for `start`.
     """
     try:
-        date.fromisoformat(since)
+        parsed_date = date.fromisoformat(since)
     except ValueError:
         pass
     else:
-        return since
+        # .isoformat(), not the raw input. date.fromisoformat() also accepts
+        # the compact ("20260906") and ISO-week ("2026-W01-1") forms, and both
+        # would be handed straight to a LEXICAL comparison against stored
+        # "YYYY-MM-DDT..." values. "20260906" sorts ABOVE every such timestamp
+        # ('0' > '-'), so `start_time_utc >= ?` would match nothing and the
+        # caller would get an empty list for a date they hold sessions on --
+        # exactly the silent-wrong-window failure this function exists to stop,
+        # reached through a form it was accepting rather than one it rejected.
+        # Normalising keeps every valid ISO 8601 date working and makes the
+        # prefix comparison sound.
+        return parsed_date.isoformat()
 
     try:
         parsed = datetime.fromisoformat(since)
@@ -1705,7 +1715,8 @@ async def post_activity(
             cursor = await db.execute(
                 "INSERT INTO strength_sessions (person_id, session_id, session_label, start_time_utc, "
                 "duration_seconds, exercises_json, notes, source, garmin_status, garmin_target, "
-                "garmin_claimed_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "garmin_claimed_at, garmin_name_prefix, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     person_id,
                     data.session_id,
@@ -1718,6 +1729,8 @@ async def post_activity(
                     "pending" if data.push_to_garmin else "skipped",
                     "credential_person" if override_applied else None,
                     now if data.push_to_garmin else None,
+                    # Captured at insert, read back on every retry. See below.
+                    override_display_name if override_applied else None,
                     now,
                     now,
                 ),
@@ -1829,9 +1842,24 @@ async def post_activity(
             # lookup. Two compositions that could drift would mean a
             # reconciliation searching for a name the push never sent, which
             # reports "not on Garmin" for something that is, and duplicates.
+            # The prefix comes from the STORED row when it has one, not from a
+            # fresh persons.display_name read. The name is the only handle
+            # reconciliation has -- Garmin offers no idempotency key, so an
+            # ambiguous push is resolved by matching the exact title that was
+            # sent. display_name is mutable, so an admin renaming the person
+            # between the first push and the re-POST would send reconciliation
+            # looking for a name that was never sent, it would conclude the
+            # activity does not exist, and the retry would file a PERMANENT
+            # duplicate (there is no delete path). Same first-write-wins rule
+            # the `stored` payload above follows, for the same reason.
+            effective_display_name = (
+                stored["garmin_name_prefix"]
+                if existing is not None and stored["garmin_name_prefix"] is not None
+                else (override_display_name if override_applied else None)
+            )
             activity_name = _activity_name(
                 stored["session_label"],
-                override_display_name if override_applied else None,
+                effective_display_name,
                 data.session_id,
             )
             if override_applied:
@@ -1840,7 +1868,7 @@ async def post_activity(
                 logger.warning(
                     "D-015 override: session %s for person_id=%s filed under Garmin credential "
                     "person_id=%s; activity name prefixed with display_name=%r",
-                    data.session_id, person_id, override_credential_person_id, override_display_name,
+                    data.session_id, person_id, override_credential_person_id, effective_display_name,
                 )
 
             if should_reconcile:

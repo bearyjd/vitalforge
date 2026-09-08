@@ -75,6 +75,11 @@ _WEIGHT_HISTORY_ADDITIVE_COLUMNS = [
 # finding). `DEFAULT 1` is a constant, not the non-constant-default case the
 # comment above warns about -- SQLite's ALTER TABLE ADD COLUMN with a
 # constant default is a fast, metadata-only change, not a table rewrite.
+_STRENGTH_SESSIONS_ADDITIVE_COLUMNS = [
+    # See the column comment in the strength_sessions CREATE TABLE below.
+    "garmin_name_prefix TEXT",
+]
+
 _USERS_ADDITIVE_COLUMNS = [
     "session_version INTEGER NOT NULL DEFAULT 1",
     "default_person_id INTEGER",
@@ -530,6 +535,19 @@ async def init_db():
                 -- claiming process died) and may be re-claimed, so a crash
                 -- mid-push cannot strand a session forever.
                 garmin_claimed_at  TEXT,
+                -- The persons.display_name used to build this session's Garmin
+                -- activity title, captured at first push. NULL unless the
+                -- D-015 cross-person override applied.
+                --
+                -- Persisted because display_name is MUTABLE and the title is
+                -- the only handle reconciliation has: Garmin offers no
+                -- idempotency key, so an ambiguous push is resolved by looking
+                -- activities up and matching the exact name that was sent. Re-
+                -- reading display_name on a retry would search for a name the
+                -- first push never sent if an admin renamed the person in
+                -- between, conclude the activity does not exist, and file a
+                -- permanent duplicate.
+                garmin_name_prefix TEXT,
                 created_at         TEXT NOT NULL,
                 updated_at         TEXT NOT NULL,
                 -- A PLAIN unique constraint, not the partial index
@@ -546,6 +564,14 @@ async def init_db():
             "CREATE INDEX IF NOT EXISTS idx_strength_sessions_person_start "
             "ON strength_sessions(person_id, start_time_utc)"
         )
+
+        # AFTER the CREATE TABLE above, deliberately: _add_columns only swallows
+        # "duplicate column name", so running it against a table that does not
+        # exist yet would raise "no such table" and kill init_db on every fresh
+        # database. strength_sessions shipped before this column existed, so it
+        # needs both paths -- CREATE TABLE for new databases, ALTER for the ones
+        # already running.
+        await _add_columns(db, "strength_sessions", _STRENGTH_SESSIONS_ADDITIVE_COLUMNS)
 
         # Durable one-time markers for shared/migrations.py's run_migration().
         await db.execute(SCHEMA_MIGRATIONS_TABLE_SQL)
