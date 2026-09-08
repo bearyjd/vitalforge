@@ -363,6 +363,56 @@ COMPOSITION_FIELDS = ("body_fat_pct", "body_water_pct", "muscle_pct", "bone_mass
 # (weight_history has no bmr/amr columns) and stay in COMPOSITION_FIELDS.
 ENRICHABLE_FIELDS = (*COMPOSITION_FIELDS, "bmi", "source")
 
+# The column list both existing-row SELECTs in post_weight need (the client_id
+# primary match and the timestamp+weight window fallback). Deduplicated after
+# a devil's-advocate review: two independently-maintained copies meant a
+# future ENRICHABLE_FIELDS addition updated in only one place would raise
+# IndexError/KeyError on `existing[field]` for whichever request path hit the
+# stale SELECT -- an uncaught exception mid-transaction, not a graceful
+# degraded response.
+_WEIGHT_LOG_EXISTING_ROW_COLUMNS = (
+    "id, weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin, "
+    "body_fat_pct, body_water_pct, muscle_pct, bone_mass_kg, bmi, bmr, amr, "
+    "source, client_id, garmin_claimed_at"
+)
+
+
+# How long a Garmin push claim stays authoritative. Past this the claimant is
+# presumed dead and the row may be re-claimed: a possible duplicate after a
+# crash beats a weigh-in stranded unpushable forever.
+#
+# This value is only safe while the push is SYNCHRONOUS. A claim going stale
+# underneath a still-running push would let a retry re-claim and duplicate --
+# the exact failure the claim exists to prevent. That cannot happen today
+# because push_weight blocks the event loop for its whole duration, so while a
+# push is in flight nothing else runs to re-claim anything. That is a property
+# of the current deployment, NOT something this code enforces, and it is the
+# same class of reasoning that made the original double push look impossible.
+# If push_weight ever moves to a thread or worker pool, this constant MUST be
+# bounded by a hard push timeout -- garminconnect sets none of its own.
+_GARMIN_CLAIM_TIMEOUT_SECONDS = 600
+
+
+def _garmin_claim_is_live(claimed_at: str | None, now: datetime) -> bool:
+    """Whether another request is currently pushing this row to Garmin.
+
+    An unreadable or naive claim timestamp is treated as STALE rather than
+    live. The claim exists to stop a double push; a value this cannot read is
+    no evidence that a push is happening, and believing it would strand the
+    row until it aged out.
+    """
+    if claimed_at is None:
+        return False
+    try:
+        claimed = datetime.fromisoformat(claimed_at)
+    except ValueError:
+        logger.warning("Unreadable garmin_claimed_at %r; treating the claim as stale", claimed_at)
+        return False
+    if claimed.tzinfo is None:
+        logger.warning("Naive garmin_claimed_at %r; treating the claim as stale", claimed_at)
+        return False
+    return (now - claimed) < timedelta(seconds=_GARMIN_CLAIM_TIMEOUT_SECONDS)
+
 
 def _push_composition(weight_grams: int, timestamp: datetime, composition: dict) -> str | None:
     """Push weight + composition to Garmin; returns an error string, or None
@@ -456,8 +506,7 @@ async def post_weight(data: WeightIn, person_id: int = Depends(require_person("m
         matched_by_client_id = False
         if data.client_id is not None:
             cursor = await db.execute(
-                "SELECT id, weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin, "
-                "body_fat_pct, body_water_pct, muscle_pct, bone_mass_kg, bmi, bmr, amr, source, client_id "
+                f"SELECT {_WEIGHT_LOG_EXISTING_ROW_COLUMNS} "
                 "FROM weight_log WHERE person_id = ? AND client_id = ?",
                 (person_id, data.client_id),
             )
@@ -523,8 +572,7 @@ async def post_weight(data: WeightIn, person_id: int = Depends(require_person("m
         sargable_cutoff = (dedup_anchor - timedelta(seconds=DEDUP_WINDOW_SECONDS + 1)).isoformat()
         if existing is None:
             cursor = await db.execute(
-                "SELECT id, weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin, "
-                "body_fat_pct, body_water_pct, muscle_pct, bone_mass_kg, bmi, bmr, amr, source, client_id "
+                f"SELECT {_WEIGHT_LOG_EXISTING_ROW_COLUMNS} "
                 "FROM weight_log "
                 "WHERE person_id = ? "
                 "AND timestamp >= ? "
@@ -621,8 +669,6 @@ async def post_weight(data: WeightIn, person_id: int = Depends(require_person("m
         if conflicts:
             logger.warning("Weight POST conflicts with stored row %s on fields: %s", row_id, conflicts)
 
-        await db.commit()
-
         # `updates` can now be source-only (ENRICHABLE_FIELDS includes
         # `source`, which has no Garmin analog) -- only an actual
         # composition change should trigger a re-push or touch
@@ -633,25 +679,91 @@ async def post_weight(data: WeightIn, person_id: int = Depends(require_person("m
         # the ENRICHABLE_FIELDS change above).
         composition_changed = any(field in COMPOSITION_FIELDS for field in updates)
 
-        # Push happens outside the transaction (see comment above); this
-        # connection stays open only to record the outcome afterward. By this
-        # point the row (and any enrichment) is already durably committed, so
-        # a failure here must never surface as a 500 over already-successful
-        # data -- it would tell the client the whole request failed when it
-        # didn't. _push_composition itself never raises; this guards the
-        # timestamp parse and the flag-update statement around it.
+        # The second clause closes a real gap a devil's-advocate review
+        # found: without it, a client_id-matched retry of a reading whose
+        # Garmin push had failed could never succeed -- nothing in
+        # ENRICHABLE_FIELDS changes on an exact resubmit (existing values
+        # match, so `updates` stays empty), so composition_changed alone
+        # would stay False forever, and no other branch here ever
+        # re-attempts the push. Before A6, a sufficiently delayed retry
+        # missed the 60s window and landed as a brand-new row instead,
+        # getting a fresh push attempt by accident -- client_id closes that
+        # window on purpose, so it needs to inherit the retry, not just the
+        # identity match. Scoped to client_id specifically (not the
+        # window-match path): a client_id resubmission is an explicit "this
+        # is the same reading," a stronger signal than an incidental window
+        # match, so retrying the push here and not there is deliberate, not
+        # an oversight. Named once and reused below (the synced_to_garmin
+        # persistence gate) rather than repeating the condition -- the two
+        # must never drift apart, or a retried push's outcome would compute
+        # correctly but never actually get saved.
+        should_attempt_garmin_push = composition_changed or (
+            matched_by_client_id and existing is not None and not existing["synced_to_garmin"]
+        )
+
+        # THE PUSH DECISION IS TAKEN AND CLAIMED INSIDE THIS TRANSACTION, and
+        # deliberately not after the commit below.
         #
-        # Note: push_weight is synchronous and this route awaits nothing
-        # during it, so it blocks the whole event loop -- which is also what
-        # makes the flag-update below race-free against another request
-        # reading this same row's synced_to_garmin mid-push. That's a
-        # property of the current single-worker deployment, not something
-        # this code enforces; moving the push to a thread/worker pool would
-        # reopen a stale-read window here.
+        # It used to be computed after. The comment that stood here argued the
+        # arrangement was safe because push_weight is synchronous and blocks
+        # the event loop for its whole duration, so no second request could
+        # interleave -- and noted that a reproduction had been attempted and
+        # had failed. That argument is wrong. The gap is not DURING the push,
+        # it is AFTER it: the winner writes synced_to_garmin through an
+        # `await db.execute(...)` / `await db.commit()` pair, and both of those
+        # yield. A second identical retry resumes in that window, opens its own
+        # transaction, reads synced_to_garmin still 0, judges the retry live,
+        # and pushes a second time. One uvicorn worker, a synchronous push,
+        # nothing exotic -- the reproduction just needs the scheduler to land
+        # in a narrow window. Measured at 5 failures in 50 runs of
+        # test_two_concurrent_identical_retries_push_to_garmin_once, which is
+        # the test that turned CI red on this branch.
+        #
+        # The claim is the mechanism strength_sessions uses for the same
+        # problem: taken inside the SAME BEGIN IMMEDIATE that reads or writes
+        # the row, so a blocked request sees it the instant it can see the row
+        # at all. What serializes the decision is the claim, not the status.
+        #
+        # This matters more than an ordinary duplicate row: there is no delete
+        # path here, so a duplicate weigh-in on Garmin is permanent and has to
+        # be removed by hand in Garmin Connect.
+        will_push_to_garmin = existing is None or should_attempt_garmin_push
+        if will_push_to_garmin:
+            if _garmin_claim_is_live(
+                existing["garmin_claimed_at"] if existing is not None else None, now
+            ):
+                # Another request is mid-push for this row. Stand down rather
+                # than duplicate it, and report the row as it stands -- the
+                # push is in flight and its outcome is not ours to report. A
+                # client that retries once the winner lands sees
+                # synced_to_garmin true and stops retrying.
+                will_push_to_garmin = False
+                logger.info(
+                    "Row %s is already claimed for a Garmin push; skipping the duplicate push",
+                    row_id,
+                )
+            else:
+                await db.execute(
+                    "UPDATE weight_log SET garmin_claimed_at = ? WHERE id = ?",
+                    (now.isoformat(), row_id),
+                )
+
+        await db.commit()
+
+        # Push happens outside the transaction -- it is synchronous and must
+        # not be held across the write lock (test_concurrent_writer_not_blocked
+        # _by_garmin_push pins that); the claim above is what makes doing so
+        # safe. This connection stays open only to record the outcome
+        # afterward. By this point the row (and any enrichment) is already
+        # durably committed, so a failure here must never surface as a 500 over
+        # already-successful data -- it would tell the client the whole request
+        # failed when it didn't. _push_composition itself never raises; this
+        # guards the timestamp parse and the flag-update statement around it.
+
         garmin_error = None
         synced = False
         try:
-            if existing is None:
+            if will_push_to_garmin and existing is None:
                 # dedup_anchor here can be an arbitrarily old captured_at
                 # (a replay of a months-old weigh-in) -- this is the first
                 # code path in this file able to push a backdated timestamp
@@ -678,7 +790,7 @@ async def post_weight(data: WeightIn, person_id: int = Depends(require_person("m
                     },
                 )
                 synced = garmin_error is None
-            elif composition_changed:
+            elif will_push_to_garmin:
                 merged = {field: updates.get(field, existing[field]) for field in COMPOSITION_FIELDS}
                 # Parsed locally, not left to the outer except below: a row
                 # whose timestamp SQLite's own julianday() accepted (so the
@@ -696,10 +808,27 @@ async def post_weight(data: WeightIn, person_id: int = Depends(require_person("m
                     garmin_error = _push_composition(existing["weight_grams"], original_ts, merged)
                     synced = garmin_error is None
             else:
-                synced = bool(existing["synced_to_garmin"])
+                # Nothing needed pushing, or another request holds the claim.
+                # `existing` is None only on the insert path, which always
+                # pushes -- a row this request just created inside its own
+                # transaction cannot already be claimed by anyone else -- so
+                # this branch always has a row. Guarded anyway rather than
+                # subscripting None if that ever stops being true.
+                synced = bool(existing["synced_to_garmin"]) if existing is not None else False
 
-            if existing is None or composition_changed:
-                await db.execute("UPDATE weight_log SET synced_to_garmin = ? WHERE id = ?", (int(synced), row_id))
+            if will_push_to_garmin:
+                # Releasing the claim is part of recording the outcome, and
+                # happens whether the push succeeded or failed: a failed push
+                # must be retryable immediately, not only once the claim ages
+                # out. If this statement itself fails, the claim is left behind
+                # and the row stays unpushable until it goes stale
+                # (_GARMIN_CLAIM_TIMEOUT_SECONDS) -- the same trade
+                # strength_sessions makes, and better than a permanent
+                # duplicate on Garmin.
+                await db.execute(
+                    "UPDATE weight_log SET synced_to_garmin = ?, garmin_claimed_at = NULL WHERE id = ?",
+                    (int(synced), row_id),
+                )
                 await db.commit()
         except Exception as e:
             logger.error("Post-commit sync-flag update failed for row %s: %s", row_id, e)
@@ -738,6 +867,17 @@ async def post_weight(data: WeightIn, person_id: int = Depends(require_person("m
         if conflicts:
             result["conflict"] = True
             result["conflict_fields"] = conflicts
+        # Echo the row's client_id on a dedup response too, not just a fresh
+        # insert -- otherwise the one response a *retrying* client actually
+        # receives never confirms the identity key it matched on, and a
+        # window-match client_id conflict never states which client_id
+        # actually won (devil's-advocate review). `updates.get(...)` rather
+        # than `existing["client_id"]` alone: `existing` is the PRE-update
+        # row, so a client_id that was just backfilled this request (existing
+        # was NULL) needs the post-update value, not the stale None.
+        final_client_id = updates.get("client_id", existing["client_id"])
+        if final_client_id is not None:
+            result["client_id"] = final_client_id
     if garmin_error:
         result["garmin_error"] = garmin_error
 

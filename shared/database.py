@@ -40,6 +40,21 @@ _WEIGHT_LOG_ADDITIVE_COLUMNS = [
     "bmi REAL",
     "bmr REAL",
     "amr REAL",
+    # UTC ISO instant at which some request claimed the right to push this row
+    # to Garmin, or NULL when no push is in flight. post_weight decides whether
+    # to push INSIDE its BEGIN IMMEDIATE but performs the push after the commit
+    # (the push is synchronous and must not be held across the write lock), and
+    # it writes synced_to_garmin only once that push returns -- through two
+    # awaits that yield. Without a claim, a concurrent identical retry resumes
+    # in that gap, reads synced_to_garmin still 0, and files a SECOND weigh-in.
+    # The claim is taken inside the same transaction that reads the row, so a
+    # blocked request sees it the instant it can see the row. Cleared when the
+    # outcome is recorded; a claim older than _GARMIN_CLAIM_TIMEOUT_SECONDS is
+    # treated as stale (the claiming process died) so a crash mid-push cannot
+    # strand a row unpushable forever. Additive, not a rebuild: weight_log is
+    # deployed, keeps its own `id` primary key, and so cannot go in
+    # migrations._REBUILD_TABLES.
+    "garmin_claimed_at TEXT",
 ]
 
 # Additive columns for weight_history's Garmin-sourced composition read path
