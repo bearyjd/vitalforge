@@ -29,6 +29,22 @@ jobs:
       - name: Lint (ruff)
         run: ruff check .
 
+      # #43 landed 11,576 lines of Codex stderr (.gstack/tmp/codex-err-*) on main
+      # via `git add -A`. Guards the CLASS -- tool output and scratch files that
+      # got tracked -- rather than a diff-size threshold: #42 was a legitimate
+      # 4,916-insertion PR, so a size limit would have cried wolf on real work
+      # while still missing a small stray log.
+      - name: No scratch or tool-output files tracked
+        run: |
+          tracked=$(git ls-files | grep -E '(^|/)\.gstack/|(^|/)\.omc/|\.log$|(^|/)tmp/|(^|/)\.venv/|(^|/)node_modules/' || true)
+          if [ -n "$tracked" ]; then
+            echo "::error::Scratch/tool-output files are tracked in git:"
+            echo "$tracked" | sed 's/^/  /'
+            echo "Remove with 'git rm --cached <path>' and add the pattern to .gitignore."
+            exit 1
+          fi
+          echo "No scratch or tool-output files tracked."
+
       - name: Run tests
         run: pytest -q
 
