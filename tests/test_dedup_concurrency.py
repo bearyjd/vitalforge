@@ -128,17 +128,27 @@ async def seed_failed_client_id_row(weight_grams: int, client_id: str) -> int:
 
 
 async def test_two_concurrent_identical_retries_push_to_garmin_once(client, fake_garmin_client):
-    """Devil's-advocate review, round 1: the client_id retry path
-    (should_attempt_garmin_push in post_weight) pushes outside the
-    transaction on a synced_to_garmin column not written until after that
-    push returns. Raised as a theoretical double-push risk under concurrent
-    identical retries; attempted to reproduce and could not -- this is safe
-    today only because push_weight is synchronous and this single-worker
-    deployment can't interleave two requests across it (see the comment on
-    should_attempt_garmin_push in app.py). Pinned as a regression guard: if
-    push_weight ever becomes async, or this service gains a second worker,
-    this is what would catch the double-push that comment says is currently
-    avoided only by deployment shape, not by design."""
+    """Two concurrent identical client_id retries must file ONE Garmin push.
+
+    Round 1 of the devil's-advocate review raised this as a theoretical risk,
+    tried to reproduce it, failed, and recorded it as safe-by-deployment-shape:
+    push_weight is synchronous, one worker, so no interleaving. That conclusion
+    was wrong and this test was right to exist. The race is real and this test
+    reproduces it about 10% of the time -- 5 failures in 50 runs -- which is
+    why one attempt missed it. It is what turned CI red on this branch.
+
+    The window is not DURING the push (that does block the loop) but AFTER it:
+    the winner writes synced_to_garmin through an `await db.execute(...)` /
+    `await db.commit()` pair, and both yield. The loser resumes there, reads
+    synced_to_garmin still 0, and pushes again.
+
+    post_weight now claims the push inside its BEGIN IMMEDIATE
+    (weight_log.garmin_claimed_at), so the decision is serialized by the claim
+    rather than by a status written too late. Disabling that claim check
+    restores the failure at 6/30; with it, 0/50.
+
+    Garmin has no delete path here, so the duplicate this guards against is
+    permanent and has to be removed by hand in Garmin Connect."""
     await seed_failed_client_id_row(84096, "reading-1")
 
     results = await asyncio.gather(
