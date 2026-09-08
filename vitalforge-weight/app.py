@@ -380,6 +380,16 @@ _WEIGHT_LOG_EXISTING_ROW_COLUMNS = (
 # How long a Garmin push claim stays authoritative. Past this the claimant is
 # presumed dead and the row may be re-claimed: a possible duplicate after a
 # crash beats a weigh-in stranded unpushable forever.
+#
+# This value is only safe while the push is SYNCHRONOUS. A claim going stale
+# underneath a still-running push would let a retry re-claim and duplicate --
+# the exact failure the claim exists to prevent. That cannot happen today
+# because push_weight blocks the event loop for its whole duration, so while a
+# push is in flight nothing else runs to re-claim anything. That is a property
+# of the current deployment, NOT something this code enforces, and it is the
+# same class of reasoning that made the original double push look impossible.
+# If push_weight ever moves to a thread or worker pool, this constant MUST be
+# bounded by a hard push timeout -- garminconnect sets none of its own.
 _GARMIN_CLAIM_TIMEOUT_SECONDS = 600
 
 

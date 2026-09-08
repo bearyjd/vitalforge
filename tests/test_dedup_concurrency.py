@@ -252,3 +252,95 @@ async def test_concurrent_writer_not_blocked_by_enrichment_push(client, weight_a
     assert write_duration["seconds"] < 0.5, (
         f"writer took {write_duration['seconds']:.2f}s -- the enrichment push path holds the lock too"
     )
+
+
+# --- the claim itself -------------------------------------------------------
+#
+# test_two_concurrent_identical_retries_push_to_garmin_once above proves the
+# claim works, but it proves it PROBABILISTICALLY -- it reproduces the race it
+# guards roughly 10% of the time. That is fine for a regression guard and no
+# good at all as coverage of the mechanism, so the three behaviours the claim
+# actually has are pinned deterministically here. The middle one matters most:
+# a claim that is never released is silent, and would leave a row that has
+# quietly stopped syncing behind a fully green suite.
+
+
+async def set_claim(row_id: int, claimed_at: str | None) -> None:
+    db = await get_db()
+    try:
+        await db.execute(
+            "UPDATE weight_log SET garmin_claimed_at = ? WHERE id = ?", (claimed_at, row_id)
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def read_row(row_id: int):
+    db = await get_db()
+    try:
+        return await (
+            await db.execute(
+                "SELECT synced_to_garmin, garmin_claimed_at FROM weight_log WHERE id = ?", (row_id,)
+            )
+        ).fetchone()
+    finally:
+        await db.close()
+
+
+async def test_a_live_claim_makes_a_retry_stand_down(client, fake_garmin_client):
+    """A row another request is mid-push on must not be pushed again."""
+    row_id = await seed_failed_client_id_row(84096, "reading-1")
+    await set_claim(row_id, datetime.now(timezone.utc).isoformat())
+
+    resp = await client.post(
+        f"{PERSON_PREFIX}/api/weight",
+        json={"weight": 185.4, "unit": "lbs", "client_id": "reading-1"},
+    )
+
+    assert resp.status_code == 200
+    assert fake_garmin_client.pushed_weights == [], "pushed a row already claimed by another request"
+    assert resp.json()["synced_to_garmin"] is False, (
+        "reported someone else's in-flight push as this request's success"
+    )
+
+
+async def test_the_claim_is_released_once_the_outcome_is_recorded(client, fake_garmin_client):
+    """The failure this guards is silent: a claim left set makes every later
+    retry stand down forever, so the row simply stops syncing and nothing
+    errors. Assert the push happened AND the claim was cleared behind it."""
+    row_id = await seed_failed_client_id_row(84096, "reading-1")
+
+    resp = await client.post(
+        f"{PERSON_PREFIX}/api/weight",
+        json={"weight": 185.4, "unit": "lbs", "client_id": "reading-1"},
+    )
+
+    assert resp.status_code == 200
+    assert len(fake_garmin_client.pushed_weights) == 1
+    row = await read_row(row_id)
+    assert row["garmin_claimed_at"] is None, "the claim outlived the push that took it"
+    assert row["synced_to_garmin"] == 1
+
+
+async def test_a_stale_claim_is_reclaimed(client, weight_app_module, fake_garmin_client):
+    """A claimant that died mid-push must not strand the row forever.
+
+    Reads the timeout off the module rather than hardcoding 600 so that
+    retuning the constant cannot silently stop this test exercising the
+    stale branch (a hardcoded 601 against a raised timeout would quietly
+    become a live-claim test that passes for the wrong reason)."""
+    row_id = await seed_failed_client_id_row(84096, "reading-1")
+    stale = datetime.now(timezone.utc) - timedelta(
+        seconds=weight_app_module._GARMIN_CLAIM_TIMEOUT_SECONDS + 1
+    )
+    await set_claim(row_id, stale.isoformat())
+
+    resp = await client.post(
+        f"{PERSON_PREFIX}/api/weight",
+        json={"weight": 185.4, "unit": "lbs", "client_id": "reading-1"},
+    )
+
+    assert resp.status_code == 200
+    assert len(fake_garmin_client.pushed_weights) == 1, "a dead claimant stranded the row"
+    assert (await read_row(row_id))["garmin_claimed_at"] is None
