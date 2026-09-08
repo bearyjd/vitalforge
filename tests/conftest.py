@@ -22,6 +22,8 @@ import aiosqlite
 import pytest
 import pytest_asyncio
 
+from shared.garmin_client import STRENGTH_ACTIVITY_TYPE_KEY
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "garmin"
 PRODUCTION_SCHEMA_SQL = Path(__file__).resolve().parent / "fixtures" / "production_schema.sql"
@@ -56,10 +58,44 @@ class FakeGarminClient:
 
     def __init__(self):
         self.pushed_weights = []
+        self.created_activities = []
+        self.pushed_exercise_sets = []
+        self.activities_by_date = []
+        self.activity_lookups = []
 
     def add_body_composition(self, timestamp, weight, **kwargs):
         self.pushed_weights.append({"timestamp": timestamp, "weight": weight, **kwargs})
         return {"success": True}
+
+    def create_manual_activity(self, **kwargs):
+        self.created_activities.append(kwargs)
+        activity_id = 19283746501 + len(self.created_activities) - 1
+        # A created activity becomes FINDABLE, the way a real one does. This
+        # is what makes reconciliation testable at all: a fake that creates
+        # activities but never returns them from a lookup would report "not
+        # on Garmin" for something it just created, and every reconciliation
+        # test would pass by pushing a duplicate.
+        self.activities_by_date.append(
+            {"activityId": activity_id, "activityName": kwargs.get("activity_name")}
+        )
+        return {"activityId": activity_id}
+
+    def set_activity_exercise_sets(self, activity_id, payload):
+        self.pushed_exercise_sets.append({"activity_id": activity_id, "payload": payload})
+        return {"success": True}
+
+    def get_activities_by_date(self, startdate, enddate=None, activitytype=None, sortorder=None):
+        """Reconciliation lookup for an ambiguous push.
+
+        Returns whatever a test put in `activities_by_date`, defaulting to
+        empty -- "Garmin has no such activity", the answer that makes a
+        re-push safe. A test proving reconciliation FINDS something appends
+        a {"activityId": ..., "activityName": ...} dict to that list.
+        """
+        self.activity_lookups.append(
+            {"startdate": startdate, "enddate": enddate, "activitytype": activitytype}
+        )
+        return list(self.activities_by_date)
 
     def get_sleep_data(self, date):
         return load_fixture("sleep_data")
@@ -303,7 +339,60 @@ def weight_app_module(initialized_db, fake_garmin_client, monkeypatch):
         )
 
     monkeypatch.setattr(module, "push_weight", fake_push_weight)
+
+    # Same direct-import situation for the activity push helpers: app.py does
+    # `from shared.garmin_client import push_activity, push_activity_sets`, so
+    # patching shared.garmin_client alone would leave the route calling the
+    # real client. Both forward into the same FakeGarminClient the weight
+    # fixture records against, so a test asserts on
+    # `fake_garmin_client.created_activities` / `.pushed_exercise_sets`.
+    def fake_push_activity(**kwargs):
+        return fake_garmin_client.create_manual_activity(**kwargs)
+
+    def fake_push_activity_sets(activity_id, payload):
+        return fake_garmin_client.set_activity_exercise_sets(activity_id, payload)
+
+    def fake_find_activities_by_date(start_date, end_date, activity_type=STRENGTH_ACTIVITY_TYPE_KEY):
+        # Mirrors shared.garmin_client.find_activities_by_date's own default,
+        # so a test can assert on the activity type the route actually asks
+        # Garmin for rather than on this fake's signature.
+        return fake_garmin_client.get_activities_by_date(start_date, end_date, activitytype=activity_type)
+
+    monkeypatch.setattr(module, "push_activity", fake_push_activity)
+    monkeypatch.setattr(module, "push_activity_sets", fake_push_activity_sets)
+    monkeypatch.setattr(module, "find_activities_by_date", fake_find_activities_by_date)
     return module
+
+
+@pytest.fixture
+def no_real_garmin_client(weight_app_module):
+    """Fail loudly if a test could reach the real Garmin client.
+
+    NOT autouse: opted into per module with
+    `pytestmark = pytest.mark.usefixtures("no_real_garmin_client")`, so it
+    costs nothing on the several hundred tests that never touch a push path.
+
+    The failure it guards is silent by construction. app.py binds Garmin
+    helpers into its own namespace with `from shared.garmin_client import
+    ...`, so patching `shared.garmin_client` alone leaves the route calling
+    the real function -- the test still passes, having quietly attempted a
+    network call against a live account with the deployment's shared
+    credential. Comparing identity against the real module attribute is what
+    distinguishes "patched" from "patched somewhere that does not matter".
+    """
+    from shared import garmin_client
+
+    for name in (
+        "authenticate", "push_weight", "push_activity", "push_activity_sets", "find_activities_by_date",
+    ):
+        assert getattr(weight_app_module, name) is not getattr(garmin_client, name), (
+            f"vitalforge-weight.app.{name} is still the real shared.garmin_client function; "
+            "patch the name in the app module's own namespace, not just the shared module"
+        )
+    assert isinstance(garmin_client._client, FakeGarminClient), (
+        "shared.garmin_client._client is not a FakeGarminClient -- this test could reach real Garmin"
+    )
+    yield
 
 
 @pytest.fixture

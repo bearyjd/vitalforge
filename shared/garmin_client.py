@@ -1,6 +1,6 @@
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from garminconnect import Garmin
@@ -8,6 +8,17 @@ from garminconnect import Garmin
 logger = logging.getLogger(__name__)
 
 GARTH_TOKEN_DIR = Path(os.getenv("GARTH_TOKEN_DIR", "/app/data/.garth"))
+
+# Confirmed as the strength WORKOUT sportTypeKey (garminconnect's
+# workout.py:293-299), NOT confirmed as an ACTIVITY typeKey -- the library
+# bundles no activity-type list and points at Garmin's external
+# activity_types.properties instead. One live get_activity_types() call
+# settles it; until then this is the best-supported guess and a failed push
+# is non-fatal by design (the row keeps garmin_status='failed' and the
+# client re-POSTs).
+STRENGTH_ACTIVITY_TYPE_KEY = "strength_training"
+
+GRAMS_PER_KG = 1000.0
 
 _client: Garmin | None = None
 
@@ -104,6 +115,144 @@ def push_weight(
     )
     logger.info("add_body_composition response: %s", result)
     logger.info("Weight pushed to Garmin successfully")
+
+
+def push_activity(
+    *,
+    start_datetime: str,
+    time_zone: str,
+    type_key: str,
+    distance_km: float,
+    duration_min: int,
+    activity_name: str,
+):
+    """Create a completed manual activity on Garmin Connect.
+
+    `start_datetime` must already be a LOCAL WALL-CLOCK string carrying no
+    offset ("2026-09-06T10:00:00.000") and `time_zone` the IANA name that
+    wall clock belongs to -- garminconnect's own documented contract. This
+    function deliberately does NOT do that conversion: the caller
+    (vitalforge-weight/app.py's _push_activity) owns it, because a test
+    monkeypatches THIS name in the app module's namespace and would
+    otherwise be asserting on a conversion the fake performed rather than
+    the one the app does.
+
+    Like push_weight, this does not catch -- the caller's never-raise
+    wrapper decides what a failure means for the stored row.
+    """
+    logger.info(
+        "Pushing activity to Garmin: %r at %s (%s), %s min",
+        activity_name, start_datetime, time_zone, duration_min,
+    )
+    result = get_client().create_manual_activity(
+        start_datetime=start_datetime,
+        time_zone=time_zone,
+        type_key=type_key,
+        distance_km=distance_km,
+        duration_min=duration_min,
+        activity_name=activity_name,
+    )
+    logger.info("create_manual_activity response: %s", result)
+    return result
+
+
+def push_activity_sets(activity_id: str, payload: dict):
+    """Attach per-exercise sets to an existing activity.
+
+    PUT semantics are REPLACE-ALL: the activity's existing exerciseSets
+    array is overwritten wholesale. Only ever called behind the
+    VITALFORGE_GARMIN_EXERCISE_SETS flag, which ships off -- see
+    build_exercise_sets_payload for why.
+    """
+    result = get_client().set_activity_exercise_sets(activity_id, payload)
+    logger.info("set_activity_exercise_sets response: %s", result)
+    return result
+
+
+def find_activities_by_date(start_date: str, end_date: str, activity_type: str = STRENGTH_ACTIVITY_TYPE_KEY):
+    """List activities in a date range, for reconciling an ambiguous push.
+
+    Dates are YYYY-MM-DD in the account's own local terms. Raising, like
+    every other push-side helper here: the caller decides what an
+    unreachable Garmin means for the row, and swallowing the error here
+    would make "no activities" and "could not ask" indistinguishable -- the
+    one distinction reconciliation depends on.
+    """
+    return get_client().get_activities_by_date(start_date, end_date, activitytype=activity_type)
+
+
+def extract_activity_id(response) -> str | None:
+    """Pull the new activity's id out of create_manual_activity's response.
+
+    Returns None rather than raising or guessing when the response is not a
+    dict, or carries none of the keys Garmin has been observed to use. The
+    caller treats that as "the activity was created but we cannot address
+    it", NOT as a failure -- the activity really is on Garmin.
+
+    Deliberately does NOT fall back to get_last_activity(): that read is
+    racy (any other device syncing at the same moment wins) and would
+    silently attach one session's exercise sets to a different activity.
+    """
+    if not isinstance(response, dict):
+        return None
+    for key in ("activityId", "activityid", "id"):
+        value = response.get(key)
+        if value is not None:
+            return str(value)
+    nested = response.get("activityIds")
+    if isinstance(nested, list) and nested:
+        return str(nested[0])
+    return None
+
+
+def build_exercise_sets_payload(exercises: list[dict], start_local: datetime) -> dict:
+    """Build the set_activity_exercise_sets request body, one entry per set.
+
+    THE FIELD NAMES HERE ARE UNVERIFIED. A grep for `repetitionCount`,
+    `setType` and `exerciseSets` across the whole installed garminconnect
+    0.3.11 tree returns only the two method definitions -- the JSON keys
+    appear nowhere in the package or its metadata. This shape is inferred
+    from the set_activity_exercise_sets docstring (which documents
+    `exercises[].category` / `exercises[].name` and Garmin's 400 "Invalid
+    Sub-Category Passed") and from Garmin's public FIT `set` message.
+    Weight is BELIEVED to be grams (matching workout.py:494's kg * 1000.0)
+    and `duration` seconds. That is why this whole path sits behind
+    VITALFORGE_GARMIN_EXERCISE_SETS, default off, and why the builder is one
+    function: JD's live probe against a real account
+    (get_activity_exercise_sets on an existing strength activity) settles
+    the shape, and changes land here and nowhere else.
+
+    An exercise with no `garmin_category` contributes NO entries. Guessing a
+    category to fill the gap would file the wrong movement under a real
+    Garmin exercise; the activity itself is created either way, which is the
+    part that matters.
+    """
+    entries: list[dict] = []
+    cursor = start_local
+    for exercise in exercises:
+        category = exercise.get("garmin_category")
+        if category is None:
+            continue
+        seconds = exercise.get("seconds")
+        weight_kg = exercise.get("weight_kg")
+        for _ in range(int(exercise["sets"])):
+            entry = {
+                "setType": "ACTIVE",
+                "startTime": cursor.strftime("%Y-%m-%dT%H:%M:%S.0"),
+                "repetitionCount": int(exercise["reps"]),
+                "exercises": [{"category": category, "name": exercise.get("garmin_exercise")}],
+            }
+            if seconds is not None:
+                entry["duration"] = float(seconds)
+            if weight_kg is not None:
+                entry["weight"] = float(weight_kg) * GRAMS_PER_KG
+            entries.append(entry)
+            # Sets are laid end to end from the session start. Nothing in the
+            # request carries a real per-set clock, and Garmin needs each set
+            # to have *a* start time; work + rest is the closest honest
+            # approximation available from what Cadence sends.
+            cursor += timedelta(seconds=(seconds or 0) + (exercise.get("rest_s") or 0))
+    return {"exerciseSets": entries}
 
 
 # ---------------------------------------------------------------------------

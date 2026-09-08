@@ -186,6 +186,14 @@ the original test-suite rationale (marked DONE).
   `PRIMARY KEY`/`UNIQUE`, so `ON CONFLICT` cannot be used — it is `UPDATE`, then `INSERT` if the
   `UPDATE` matched nothing (which is what happens when every row was deleted and the copy was
   empty). Any future rebuild of an `AUTOINCREMENT` table needs the same treatment.
+- **Two activity concepts share one database, deliberately.** `activities` holds FIT-file
+  imports and is read by the dashboard; `strength_sessions` holds completed Cadence strength
+  sessions and is written by the weight service (`POST /p/{slug}/api/activity`). They are
+  separate on purpose and must stay that way: `activities` is FIT-only by its own
+  `CHECK (source_format IN ('fit'))` and keyed on a `NOT NULL file_sha256` a manually-entered
+  session does not have, and SQLite cannot alter a CHECK constraint — so "unifying" them means
+  rebuilding a table two dashboard read routes already serve, changing their response shape.
+  Do not unify them.
 - **A `CREATE INDEX` in `init_db` cannot reference a column that only a migration adds.**
   The whole DDL block runs before any migration, so `activities`'s person-scoped index is
   guarded by a `PRAGMA table_info` check and re-created inside `_rebuild_activities` for the
