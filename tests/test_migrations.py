@@ -1351,3 +1351,64 @@ async def test_reattribution_leaves_correctly_attributed_rows_alone(production_s
         )
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_init_db_adds_garmin_name_prefix_to_a_deployed_strength_sessions(tmp_path, monkeypatch):
+    """The upgrade path production actually takes.
+
+    strength_sessions shipped in #42 and is already running WITHOUT
+    garmin_name_prefix. `CREATE TABLE IF NOT EXISTS` is a no-op against a table
+    that exists, so the column reaches those databases only via _add_columns --
+    and every other test here builds a fresh database, where the CREATE TABLE
+    supplies it and the ALTER path is never exercised. This builds the deployed
+    shape on purpose.
+    """
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "deployed.db")
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "deployed.db"))
+
+    db = await database.get_db()
+    try:
+        # The table as #42 shipped it: no garmin_name_prefix.
+        await db.execute("""
+            CREATE TABLE strength_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_id INTEGER NOT NULL,
+                session_id TEXT NOT NULL,
+                session_label TEXT,
+                start_time_utc TEXT NOT NULL,
+                duration_seconds INTEGER NOT NULL,
+                exercises_json TEXT NOT NULL,
+                notes TEXT,
+                source TEXT,
+                garmin_status TEXT NOT NULL DEFAULT 'pending',
+                garmin_activity_id TEXT,
+                garmin_error TEXT,
+                garmin_target TEXT,
+                garmin_sets_status TEXT NOT NULL DEFAULT 'not_attempted',
+                garmin_claimed_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (person_id, session_id)
+            )
+        """)
+        await db.commit()
+
+        cur = await db.execute("PRAGMA table_info(strength_sessions)")
+        before = {row[1] for row in await cur.fetchall()}
+        assert "garmin_name_prefix" not in before, "fixture must start from the deployed shape"
+    finally:
+        await db.close()
+
+    await database.init_db()
+
+    db = await database.get_db()
+    try:
+        cur = await db.execute("PRAGMA table_info(strength_sessions)")
+        after = {row[1] for row in await cur.fetchall()}
+        assert "garmin_name_prefix" in after, (
+            "a deployed strength_sessions never gained the column; retries would "
+            "recompose the Garmin title from a mutable display_name"
+        )
+    finally:
+        await db.close()
