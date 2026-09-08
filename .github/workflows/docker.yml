@@ -29,9 +29,16 @@ jobs:
       - name: Lint (ruff)
         run: ruff check .
 
+      - name: Run tests
+        run: pytest -q
+
       # Nothing was auditing dependencies before this: the starlette advisory
       # that prompted issue #37 surfaced from a one-off run during a code
-      # review, which is not a process.
+      # review, which is not a process. So this blocks the image push.
+      #
+      # It runs AFTER the tests on purpose. An advisory published upstream
+      # turns this red on a day nobody changed anything, and a red audit ahead
+      # of `pytest` would mask the test signal for whoever is mid-change.
       #
       # Scoped to the two requirements files rather than the whole installed
       # environment, deliberately. pip-audit still resolves and audits their
@@ -44,9 +51,6 @@ jobs:
           pip-audit --progress-spinner off \
             -r vitalforge-weight/requirements.txt \
             -r vitalforge-dashboard/requirements.txt
-
-      - name: Run tests
-        run: pytest -q
 
       - name: Install Playwright browser
         run: playwright install --with-deps chromium

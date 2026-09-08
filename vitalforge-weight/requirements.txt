@@ -17,4 +17,8 @@ aiosqlite==0.21.0
 # authenticate() against the new version's source, not just the changelog.
 garminconnect==0.3.11
 python-multipart==0.0.32
-itsdangerous>=2.1.0
+# Exact-pinned, not a range: this signs the vf_session cookie for BOTH
+# services off one shared secret. A range means the audited resolution and
+# the resolution baked into the image can differ, which makes a green
+# pip-audit a claim about something other than what ships.
+itsdangerous==2.2.0
