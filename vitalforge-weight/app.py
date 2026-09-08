@@ -507,6 +507,20 @@ _WEIGHT_LOG_EXISTING_ROW_COLUMNS = (
 # same class of reasoning that made the original double push look impossible.
 # If push_weight ever moves to a thread or worker pool, this constant MUST be
 # bounded by a hard push timeout -- garminconnect sets none of its own.
+#
+# Ten minutes is also short enough that a crashed process cannot strand a row
+# or session unpushable for a meaningful time. The claim is a mutual-exclusion
+# hint with an expiry, NOT a lock: for strength_sessions the correctness
+# backstop against double STORAGE is still UNIQUE (person_id, session_id); the
+# claim only guards the push.
+#
+# Shared by both push paths (weight_log and strength_sessions). They were
+# written separately on two branches and folded into one definition here. The
+# duplicate is worth a note because nothing would have caught it: git
+# auto-merged the two definitions cleanly (they landed in different regions of
+# the file), and ruff's F811 does not fire on a name that is USED between its
+# two definitions -- which this one was. The second would simply have shadowed
+# the first, silently, with both bodies identical so nothing behaved oddly.
 _GARMIN_CLAIM_TIMEOUT_SECONDS = 600
 
 
@@ -516,7 +530,9 @@ def _garmin_claim_is_live(claimed_at: str | None, now: datetime) -> bool:
     An unreadable or naive claim timestamp is treated as STALE rather than
     live. The claim exists to stop a double push; a value this cannot read is
     no evidence that a push is happening, and believing it would strand the
-    row until it aged out.
+    row unpushable until it aged out. Erring toward "not claimed" risks the
+    duplicate this guards against only where the row was already corrupt,
+    which the operator notices.
     """
     if claimed_at is None:
         return False
@@ -1079,15 +1095,6 @@ _STRENGTH_SESSION_COLUMNS = (
     "garmin_sets_status, garmin_claimed_at, created_at, updated_at"
 )
 
-# How long a Garmin push claim stays valid. Long enough that no honest
-# synchronous push is still running past it (garminconnect has no timeout of
-# its own, but a request that has been in flight ten minutes has taken the
-# whole worker with it), short enough that a crashed process cannot strand a
-# session unpushable for a meaningful time. The claim is a mutual-exclusion
-# hint with an expiry, NOT a lock: the correctness backstop for double-storage
-# is still UNIQUE (person_id, session_id).
-_GARMIN_CLAIM_TIMEOUT_SECONDS = 600
-
 # How many trailing characters of session_id go into the Garmin activity
 # title. Enough that two sessions the same person completed on one day cannot
 # realistically share one, short enough to stay readable in an activity list.
@@ -1213,29 +1220,6 @@ def _push_outcome_is_ambiguous(error: BaseException) -> bool:
     if names & _PRE_SEND_ERRORS:
         return False
     return bool(names & _AMBIGUOUS_TRANSPORT_ERRORS)
-
-
-def _garmin_claim_is_live(claimed_at: str | None, now: datetime) -> bool:
-    """Whether another request is currently pushing this row to Garmin.
-
-    An unreadable or naive claim timestamp is treated as STALE rather than
-    live. The claim exists to stop a double push; a value this cannot read is
-    no evidence that a push is happening, and believing it would strand the
-    session unpushable until it aged out. Erring toward "not claimed" risks
-    the duplicate this guards against only in the case where the row was
-    already corrupt, which the UNIQUE constraint and the operator both notice.
-    """
-    if claimed_at is None:
-        return False
-    try:
-        claimed = datetime.fromisoformat(claimed_at)
-    except ValueError:
-        logger.warning("Unreadable garmin_claimed_at %r; treating the claim as stale", claimed_at)
-        return False
-    if claimed.tzinfo is None:
-        logger.warning("Naive garmin_claimed_at %r; treating the claim as stale", claimed_at)
-        return False
-    return (now - claimed) < timedelta(seconds=_GARMIN_CLAIM_TIMEOUT_SECONDS)
 
 
 def _exercise_sets_enabled() -> bool:
