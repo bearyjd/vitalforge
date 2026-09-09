@@ -9,10 +9,12 @@ description = "VitalForge personal health metrics platform"
 requires-python = ">=3.12"
 
 [tool.setuptools]
-# `shared/` is the only installable package in this repo; the two
-# `vitalforge-*` service directories are run in place (hyphenated names,
-# not meant to be pip-installed) and stay off sys.path via `pyproject.toml`
-# `pythonpath` for tests / an explicit PYTHONPATH=. at runtime.
+# `shared/` is the only installable package in this repo. The two
+# `vitalforge_*` service directories are run in place, NOT pip-installed:
+# they resolve as namespace packages off the working directory (WORKDIR /app
+# in the images, `pythonpath = ["."]` for tests). Do not add them here --
+# each Dockerfile runs `pip install -e .` BEFORE copying its service
+# directory, so listing them makes the image build fail on a missing path.
 packages = ["shared"]
 
 [tool.pytest.ini_options]
@@ -48,7 +50,7 @@ dev = [
     "ruff>=0.8.0",
     "playwright>=1.48.0",
     "pytest-playwright>=0.5.2",
-    # Also pinned in vitalforge-dashboard/requirements.txt, where it's an
+    # Also pinned in vitalforge_dashboard/requirements.txt, where it's an
     # actual runtime dependency (FIT activity import) -- listed here too so
     # this group stays a complete picture of what the test suite needs.
     "fitparse==1.2.0",

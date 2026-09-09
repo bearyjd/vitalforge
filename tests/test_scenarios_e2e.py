@@ -206,7 +206,7 @@ async def test_full_composition_chain_and_duplicate_collapse(
     # was actually pushed above (see _weigh_ins_echoing_push) so the chain is
     # real end to end, rather than the static fixture (which is pinned at a
     # fixed 2020-06-01 by test_sync.py and carries unrelated values).
-    sync = import_service_module("vitalforge-dashboard.sync")
+    sync = import_service_module("vitalforge_dashboard.sync")
     sync_date = pushed["timestamp"].astimezone(timezone.utc).date().isoformat()
     monkeypatch.setattr(
         fake_garmin_client, "get_weigh_ins", lambda start, end: _weigh_ins_echoing_push(pushed)

@@ -15,7 +15,7 @@ not that it's the sole finding.
 import importlib
 from datetime import datetime, timedelta
 
-recommendations = importlib.import_module("vitalforge-dashboard.recommendations")
+recommendations = importlib.import_module("vitalforge_dashboard.recommendations")
 
 run_rules = recommendations.run_rules
 avg = recommendations.avg

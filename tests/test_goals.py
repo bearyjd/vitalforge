@@ -6,7 +6,7 @@ admin can override a non-owner's 403, an unauthenticated caller gets 401,
 and an unknown id gets 404 -- mirrors test_api_tokens.py's pattern for
 `shared/auth.py`'s existing token-ownership routes.
 
-`goals.py` is a sibling module of `vitalforge-dashboard/app.py` and needs
+`goals.py` is a sibling module of `vitalforge_dashboard/app.py` and needs
 that module's own `sys.path.insert` (for its bare `from recommendations
 import ...`) to have already run before it's importable — every test below
 therefore depends on `dashboard_app_module` (which imports `app.py`) even
@@ -39,7 +39,7 @@ async def _cookies_for(username: str) -> dict[str, str]:
 
 async def _seed_user_with_grant(username: str, password: str, role: str = "user") -> int:
     """`seed_user` plus the `view` grant every scoped goals route asks for
-    (`vitalforge-dashboard/app.py`, create/list/get/patch all take
+    (`vitalforge_dashboard/app.py`, create/list/get/patch all take
     `require_person("view")`).
 
     `view`, not `manage`: that is the level the routes actually require, and

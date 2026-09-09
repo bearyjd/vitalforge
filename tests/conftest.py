@@ -4,9 +4,9 @@ Isolates every test from real infrastructure:
 - SQLite DB lives in a per-test tmp_path, never `/app/data/fitness.db`.
 - Garmin Connect is never contacted; `shared.garmin_client` is monkeypatched
   to a FakeGarminClient returning canned, synthetic responses.
-- `vitalforge-weight` and `vitalforge-dashboard` are hyphenated directory
+- `vitalforge_weight` and `vitalforge_dashboard` are hyphenated directory
   names, so they're loaded via `importlib.import_module` (the same mechanism
-  uvicorn uses for the documented `uvicorn vitalforge-weight.app:app` command)
+  uvicorn uses for the documented `uvicorn vitalforge_weight.app:app` command)
   rather than a normal `import` statement.
 """
 
@@ -218,7 +218,7 @@ async def initialized_db(tmp_db_path):
 def import_service_module(dotted_path: str):
     """Import a module from a hyphenated service directory, e.g.
 
-    `import_service_module("vitalforge-weight.app")`.
+    `import_service_module("vitalforge_weight.app")`.
     """
     return importlib.import_module(dotted_path)
 
@@ -327,8 +327,8 @@ async def primary_person_id() -> int:
 
 @pytest.fixture
 def weight_app_module(initialized_db, fake_garmin_client, monkeypatch):
-    """The `vitalforge-weight` FastAPI app module, Garmin/DB fully faked."""
-    module = import_service_module("vitalforge-weight.app")
+    """The `vitalforge_weight` FastAPI app module, Garmin/DB fully faked."""
+    module = import_service_module("vitalforge_weight.app")
     # `authenticate`/`push_weight` were bound into app.py's namespace via
     # `from shared.garmin_client import ...`, so patching the shared module
     # alone doesn't reach them — patch the names the route handlers actually call.
@@ -387,7 +387,7 @@ def no_real_garmin_client(weight_app_module):
         "authenticate", "push_weight", "push_activity", "push_activity_sets", "find_activities_by_date",
     ):
         assert getattr(weight_app_module, name) is not getattr(garmin_client, name), (
-            f"vitalforge-weight.app.{name} is still the real shared.garmin_client function; "
+            f"vitalforge_weight.app.{name} is still the real shared.garmin_client function; "
             "patch the name in the app module's own namespace, not just the shared module"
         )
     assert isinstance(garmin_client._client, FakeGarminClient), (
@@ -398,16 +398,16 @@ def no_real_garmin_client(weight_app_module):
 
 @pytest.fixture
 def dashboard_app_module(initialized_db, fake_garmin_client, monkeypatch):
-    """The `vitalforge-dashboard` FastAPI app module, Garmin/DB fully faked."""
-    module = import_service_module("vitalforge-dashboard.app")
-    # Same direct-import situation as vitalforge-weight/app.py.
+    """The `vitalforge_dashboard` FastAPI app module, Garmin/DB fully faked."""
+    module = import_service_module("vitalforge_dashboard.app")
+    # Same direct-import situation as vitalforge_weight/app.py.
     monkeypatch.setattr(module, "authenticate", lambda: None)
     return module
 
 
 @pytest.fixture
 def weight_live_server(tmp_db_path, fake_garmin_client, monkeypatch):
-    """The `vitalforge-weight` app, served for real over HTTP for Playwright.
+    """The `vitalforge_weight` app, served for real over HTTP for Playwright.
 
     Deliberately does NOT depend on `initialized_db`/`weight_app_module`:
     both pull in an async fixture, and Playwright's sync API keeps its own
@@ -418,7 +418,7 @@ def weight_live_server(tmp_db_path, fake_garmin_client, monkeypatch):
     for the live server's own `lifespan` to call `init_db()` inside its
     dedicated server thread, where no such conflict exists.
     """
-    module = import_service_module("vitalforge-weight.app")
+    module = import_service_module("vitalforge_weight.app")
     monkeypatch.setattr(module, "authenticate", lambda: None)
 
     def fake_push_weight(weight_grams, timestamp=None, **kwargs):
@@ -436,7 +436,7 @@ def weight_live_server(tmp_db_path, fake_garmin_client, monkeypatch):
 
 @pytest.fixture
 def dashboard_live_server(tmp_db_path, fake_garmin_client, monkeypatch):
-    """The `vitalforge-dashboard` app, served for real over HTTP for Playwright.
+    """The `vitalforge_dashboard` app, served for real over HTTP for Playwright.
 
     See `weight_live_server` for why this avoids `initialized_db`/
     `dashboard_app_module`. The real lifespan also kicks off `scheduled_sync()`
@@ -444,7 +444,7 @@ def dashboard_live_server(tmp_db_path, fake_garmin_client, monkeypatch):
     stubbed out here since it's irrelevant to a UI smoke test and only adds
     noise/latency.
     """
-    module = import_service_module("vitalforge-dashboard.app")
+    module = import_service_module("vitalforge_dashboard.app")
     monkeypatch.setattr(module, "authenticate", lambda: None)
 
     async def _noop_scheduled_sync(lock, registry):

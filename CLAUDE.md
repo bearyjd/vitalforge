@@ -25,13 +25,13 @@ and out of scope for inspection beyond schema.
 ## Repo layout
 
 ```
-shared/                   # imported by BOTH services via sys.path.insert hack (no pyproject.toml)
+shared/                   # imported by BOTH services as a real installed package (pip install -e .)
   auth.py                 # cookie/HMAC session auth + login page HTML + FastAPI middleware
   database.py             # aiosqlite connection + schema; migrations.py runs one-shot schema
                           # migrations on top of it (001-person-id-rebuild, Phase 1)
   garmin_client.py        # thin wrapper over garminconnect.Garmin, module-level singleton `_client`
-vitalforge-weight/        # port 8085 — weight entry PWA, writes to Garmin + weight_log table
-vitalforge-dashboard/     # port 8086 — reads synced metrics, runs sync.py + recommendations.py
+vitalforge_weight/        # port 8085 — weight entry PWA, writes to Garmin + weight_log table
+vitalforge_dashboard/     # port 8086 — reads synced metrics, runs sync.py + recommendations.py
 nginx/nginx.conf          # optional reverse proxy for subdomain routing (not used by docker-compose*.yml directly)
 docker-compose.yml        # DEV — builds images from source (context: repo root, per-service Dockerfile)
 docker-compose.prod.yml   # PROD — pulls prebuilt images from Docker Hub / GHCR, no build step
@@ -41,16 +41,28 @@ docker-compose.prod.yml   # PROD — pulls prebuilt images from Docker Hub / GHC
 ## Human-judgment chokepoints (now codified)
 
 - **Which compose file to use:** `docker-compose.yml` builds from local source — use this any
-  time you've changed `shared/`, `vitalforge-weight/`, or `vitalforge-dashboard/` and need to
+  time you've changed `shared/`, `vitalforge_weight/`, or `vitalforge_dashboard/` and need to
   verify the change. `docker-compose.prod.yml` only pulls published images and is for
   deployment — it will silently ignore local edits. Never use `docker-compose.prod.yml` to
   validate a code change.
-- **`shared/` is a blast-radius module, not a library boundary.** It has no `pyproject.toml`,
-  no version, no independent tests, and is imported via `sys.path.insert(0, parent_dir)` in
-  both `app.py` files (see `vitalforge-weight/app.py:13`, `vitalforge-dashboard/app.py:12-13`,
-  `vitalforge-dashboard/sync.py:8`). Any change to `shared/auth.py`, `shared/database.py`, or
+- **`shared/` is a blast-radius module, not a library boundary.** It has no version and no
+  independent tests. It IS a real package: `pyproject.toml` declares `packages = ["shared"]`
+  and each Dockerfile runs `pip install -e .`, so both services import it with plain
+  `from shared.x import y` — there is no `sys.path` hack for `shared`, despite what this file
+  used to claim. Any change to `shared/auth.py`, `shared/database.py`, or
   `shared/garmin_client.py` affects both services simultaneously — always re-check both
-  `vitalforge-weight` and `vitalforge-dashboard` after touching `shared/`.
+  `vitalforge_weight` and `vitalforge_dashboard` after touching `shared/`.
+- **The service directories are `vitalforge_weight/` and `vitalforge_dashboard/` (underscores).**
+  They are NOT pip-installed; they resolve as namespace packages off the working directory
+  (`WORKDIR /app` in the images, `pythonpath = ["."]` for tests). Do not add them to
+  `pyproject.toml` `packages`: each Dockerfile runs `pip install -e .` BEFORE copying its
+  service directory, so listing them breaks the image build.
+- **`vitalforge_dashboard/app.py` still carries one real `sys.path` hack**, and it is for its
+  OWN siblings, not for `shared`: it does `sys.path.insert(0, Path(__file__).parent)` then
+  imports `fit_import`, `correlations`, `goals`, `readiness`, `recommendations`, `sync` as
+  flat top-level modules. That is why those names are importable at all. Now that the
+  directory has a valid identifier, those can become `from vitalforge_dashboard.goals import
+  ...` and the hack can go — a follow-up, deliberately not bundled into the rename.
 - **`VITALFORGE_SECRET` and the session cookie are shared across both services.** The same
   serializer secret and cookie name (`vf_session`) are used in both apps. This is intentional
   (single login covers both services when behind the same domain), not a bug — don't
@@ -81,20 +93,20 @@ curl http://localhost:8085/health   # {"status": "ok", "service": "vitalforge-we
 curl http://localhost:8086/health   # {"status": "ok", "service": "vitalforge-dashboard"}
 
 # Running a single service without Docker (matches Dockerfile CMD, from repo root):
-pip install -r vitalforge-weight/requirements.txt
+pip install -r vitalforge_weight/requirements.txt
 DB_PATH=/tmp/vf-test.db GARTH_TOKEN_DIR=/tmp/vf-garth \
-  uvicorn vitalforge-weight.app:app --host 0.0.0.0 --port 8085
+  uvicorn vitalforge_weight.app:app --host 0.0.0.0 --port 8085
 
 # Lint and test (repo root; mirrors .github/workflows/docker.yml's `test` job).
 # Use a venv, not the system/global Python — installing these into a shared interpreter
 # that other tools (e.g. an LLM proxy, MCP servers) also use WILL downgrade packages like
 # starlette/jinja2 out from under them:
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r vitalforge-weight/requirements.txt -r vitalforge-dashboard/requirements.txt
+pip install -r vitalforge_weight/requirements.txt -r vitalforge_dashboard/requirements.txt
 pip install pytest pytest-asyncio httpx ruff playwright pytest-playwright pip-audit
 pip install -e .
 ruff check .
-pip-audit -r vitalforge-weight/requirements.txt -r vitalforge-dashboard/requirements.txt
+pip-audit -r vitalforge_weight/requirements.txt -r vitalforge_dashboard/requirements.txt
 pytest -q
 
 # UI smoke tests (Playwright) — excluded from the default `pytest -q` run, see below:
@@ -148,7 +160,7 @@ the original test-suite rationale (marked DONE).
   Prefer adding hints to new/changed functions per the global Python style rule, but don't do a
   drive-by rewrite of untouched code just to add hints.
 - Table names in `shared/database.py` map to metric keys via `METRIC_TABLES` in
-  `vitalforge-dashboard/app.py:30-44` — when adding a new synced metric, you must update
+  `vitalforge_dashboard/app.py:30-44` — when adding a new synced metric, you must update
   `shared/database.py` (schema), `sync.py` (populate), and this `METRIC_TABLES` dict
   (expose via `/api/metrics/{name}`) together, or the metric silently won't be queryable.
   If the new metric table is created before a future schema rebuild ships, it must also be

@@ -281,7 +281,7 @@ async def test_pwa_toast_flattens_array_detail():
     from pathlib import Path
 
     template = (
-        Path(__file__).resolve().parent.parent / "vitalforge-weight" / "templates" / "index.html"
+        Path(__file__).resolve().parent.parent / "vitalforge_weight" / "templates" / "index.html"
     ).read_text()
     assert "Array.isArray(data.detail)" in template
 
@@ -336,7 +336,7 @@ async def test_composition_pushed_to_garmin_includes_bmr_amr_but_not_bmi(client,
     """Pins _push_composition's own field-to-kwarg mapping (data.bmr ->
     basal_met, data.amr -> active_met) at the app.py boundary, and that bmi
     is withheld (00-design.md SS3.4 -- Garmin derives its own bmi and
-    vitalforge-dashboard/sync.py reads it back; forwarding ours risks
+    vitalforge_dashboard/sync.py reads it back; forwarding ours risks
     overwriting Garmin's on the next sync).
 
     NOTE: weight_app_module fakes push_weight itself (conftest.py), so this

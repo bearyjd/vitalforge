@@ -688,7 +688,7 @@ async def import_activity(
     match for near-duplicates, both performed inside one `BEGIN IMMEDIATE`
     transaction so two concurrent uploads of the same file can never both
     pass the check before either commits -- mirrors the fix already applied
-    to `vitalforge-weight/app.py`'s weight_log dedup (see that file's
+    to `vitalforge_weight/app.py`'s weight_log dedup (see that file's
     `post_weight` for the full rationale)."""
     data = await _read_upload_capped(file, fit_import.MAX_UPLOAD_BYTES)
 
@@ -742,7 +742,7 @@ async def import_activity(
         if existing is not None:
             # Nothing to write -- commit() here is a no-op against the DB
             # but still releases the IMMEDIATE lock, mirroring
-            # vitalforge-weight/app.py's post_weight, which also commits
+            # vitalforge_weight/app.py's post_weight, which also commits
             # unconditionally after its dedup check-then-insert regardless
             # of which branch ran.
             await db.commit()

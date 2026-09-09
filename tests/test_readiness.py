@@ -20,7 +20,7 @@ from httpx import ASGITransport, AsyncClient
 
 from tests.conftest import PERSON_PREFIX
 
-readiness = importlib.import_module("vitalforge-dashboard.readiness")
+readiness = importlib.import_module("vitalforge_dashboard.readiness")
 
 score_readiness = readiness.score_readiness
 _hrv_score = readiness._hrv_score

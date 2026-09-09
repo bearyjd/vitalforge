@@ -186,7 +186,7 @@ async def init_db():
         await _add_columns(db, "weight_log", _WEIGHT_LOG_ADDITIVE_COLUMNS)
 
         # Belt-and-suspenders: the request-path BEGIN IMMEDIATE transaction
-        # (vitalforge-weight/app.py post_weight) already serializes the
+        # (vitalforge_weight/app.py post_weight) already serializes the
         # check-then-insert on client_id, so this index isn't load-bearing for
         # the race -- it's a hard DB-level guarantee of the same invariant, in
         # case a future write path (a script, a different endpoint) ever
@@ -358,11 +358,11 @@ async def init_db():
             )
         """)
 
-        # Per-user goal / target tracking (vitalforge-dashboard/goals.py).
+        # Per-user goal / target tracking (vitalforge_dashboard/goals.py).
         # `metric` is validated against METRIC_TABLES.keys() at the API
         # layer, not with a CHECK constraint here -- a DB-level enum would
         # be a second place that list can drift out of sync with the one in
-        # vitalforge-dashboard/app.py.
+        # vitalforge_dashboard/app.py.
         await db.execute("""
             CREATE TABLE IF NOT EXISTS goals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -476,7 +476,7 @@ async def init_db():
             )
 
         # Completed strength sessions posted by Cadence (POST
-        # /p/{slug}/api/activity, vitalforge-weight/app.py). Deliberately NOT
+        # /p/{slug}/api/activity, vitalforge_weight/app.py). Deliberately NOT
         # the `activities` table above: that one is FIT-import-only by its own
         # `CHECK (source_format IN ('fit'))` and keyed on `file_sha256 NOT
         # NULL`, neither of which a manually-entered session has -- and SQLite

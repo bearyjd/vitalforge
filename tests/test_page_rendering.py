@@ -101,7 +101,7 @@ async def test_the_person_page_renders_for_an_authenticated_grantee(service_modu
 #
 # This bump's whole justification is a Range-header DoS in starlette's
 # FileResponse, reachable unauthenticated through these mounts
-# (vitalforge-weight/app.py, vitalforge-dashboard/app.py -- `app.mount("/static",
+# (vitalforge_weight/app.py, vitalforge_dashboard/app.py -- `app.mount("/static",
 # StaticFiles(...))`). Nothing in the suite issued a single request to either
 # one: the only "/static/" strings in tests/ are a stub route on a throwaway app
 # in test_auth_middleware.py. Bumping a dependency to fix a path CI never

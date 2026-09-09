@@ -8,7 +8,7 @@ the jsDelivr CDN. Each service is also an installable PWA (manifest + service wo
 ## Page tree
 
 ```
-vitalforge-weight/templates/index.html        (440 lines, single page)
+vitalforge_weight/templates/index.html        (440 lines, single page)
   nav: "Weight" (active, only link)
   input-group: numeric weight input + lbs/kg unit-toggle buttons
   submit-btn -> POST /api/weight (sends `source: "pwa"`; no composition inputs in the
@@ -18,7 +18,7 @@ vitalforge-weight/templates/index.html        (440 lines, single page)
   trend-section (canvas#trendChart, Chart.js) <- GET /api/weight/trend
   toast (transient success/error message)
 
-vitalforge-dashboard/templates/index.html      (638 lines, single page)
+vitalforge_dashboard/templates/index.html      (638 lines, single page)
   nav: "Dashboard" (active, only link)
   header-right: syncInfo <- GET /api/sync/status, Sync button -> POST /api/sync,
                 unit-toggle (lbs/kg), range-toggle (7d/30d/90d)

@@ -86,11 +86,11 @@ def push_weight(
     basal_met/active_met are floored to 0.25 kcal (scale 4, FIT fields 7/9)
     -- coarser than the other four, not a uniform 0.01 across every kwarg.
     basal_met/active_met are kcal/day, matching garminconnect's own
-    convention -- callers (vitalforge-weight's WeightIn) already validate in
-    that unit, not kJ. NOTE: vitalforge-weight's _push_composition
+    convention -- callers (vitalforge_weight's WeightIn) already validate in
+    that unit, not kJ. NOTE: vitalforge_weight's _push_composition
     deliberately never passes bmi (00-design.md SS3.4 already rejects
     sending it -- Garmin derives its own from weight + profile height, and
-    vitalforge-dashboard/sync.py reads that value back); the kwarg exists
+    vitalforge_dashboard/sync.py reads that value back); the kwarg exists
     here because it's a real, valid add_body_composition parameter a future
     caller might have a legitimate reason to set explicitly, not because
     anything currently calls push_weight with it.
@@ -132,7 +132,7 @@ def push_activity(
     offset ("2026-09-06T10:00:00.000") and `time_zone` the IANA name that
     wall clock belongs to -- garminconnect's own documented contract. This
     function deliberately does NOT do that conversion: the caller
-    (vitalforge-weight/app.py's _push_activity) owns it, because a test
+    (vitalforge_weight/app.py's _push_activity) owns it, because a test
     monkeypatches THIS name in the app module's namespace and would
     otherwise be asserting on a conversion the fake performed rather than
     the one the app does.

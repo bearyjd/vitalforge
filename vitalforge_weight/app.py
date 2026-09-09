@@ -338,7 +338,7 @@ async def _reachable_persons(user_id: int | None) -> list[tuple[int, str]]:
     next request, or the redirect below would hand the browser a 404.
 
     Account-bound callers are grant-scoped, ADMINS INCLUDED, and this must
-    stay identical to vitalforge-dashboard's `_reachable_persons`. The two
+    stay identical to vitalforge_dashboard's `_reachable_persons`. The two
     services share one login, so a landing rule that differs between them
     sends the same person to different places depending on which port they
     opened.
@@ -362,7 +362,7 @@ async def _reachable_persons(user_id: int | None) -> list[tuple[int, str]]:
             )
         else:
             cursor = await db.execute(
-                # See the identical predicate in vitalforge-dashboard's
+                # See the identical predicate in vitalforge_dashboard's
                 # _reachable_persons: require_person denies an unrecognised
                 # grant value, so a join that accepts one would land the
                 # browser on a /p/{slug}/ that immediately 404s. The two
@@ -440,7 +440,7 @@ async def index(request: Request):
 async def person_index(request: Request, slug: str, person_id: int = Depends(require_person("view"))):
     # person_id is unused here -- the Depends IS the authorization, and
     # dropping it would make this page readable by anyone with an account.
-    # See the identical call in vitalforge-dashboard: the signature is
+    # See the identical call in vitalforge_dashboard: the signature is
     # (request, name, context), and the old (name, {"request": ...}) form is
     # gone in starlette 1.x -- it renders as `unhashable type: 'dict'` from
     # Jinja2's template cache, i.e. a 500 on every page load.
@@ -468,7 +468,7 @@ COMPOSITION_FIELDS = ("body_fat_pct", "body_water_pct", "muscle_pct", "bone_mass
 # client (Phase 4 adversarial review finding). `bmi` joined it for a
 # different reason (codex/devil's-advocate review on the bmi/bmr/amr PR):
 # 00-design.md SS3.4 already rejected sending bmi to Garmin -- Garmin derives
-# its own from weight + the profile's height, and vitalforge-dashboard/sync.py
+# its own from weight + the profile's height, and vitalforge_dashboard/sync.py
 # reads that Garmin-computed value back into weight_history.bmi on every
 # scheduled sync. Forwarding a second, independently-computed bmi risks
 # overwriting Garmin's own on the next push, which then round-trips back into

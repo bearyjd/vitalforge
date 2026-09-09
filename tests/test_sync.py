@@ -12,7 +12,7 @@ from tests.conftest import import_service_module
 async def test_sync_populates_composition_from_weigh_ins_fixture(initialized_db, fake_garmin_client):
     from shared.database import get_primary_person_id
 
-    sync = import_service_module("vitalforge-dashboard.sync")
+    sync = import_service_module("vitalforge_dashboard.sync")
 
     person_id = await get_primary_person_id()
     await sync.sync_weight_history("2020-05-01", "2020-06-30", person_id)
@@ -41,7 +41,7 @@ async def test_sync_populates_composition_from_weigh_ins_fixture(initialized_db,
 async def test_scheduled_sync_serializes_against_shared_lock(initialized_db, monkeypatch):
     """Phase 4 adversarial review finding: the background scheduler used to
     call run_sync() without acquiring the same lock /api/sync's manual
-    trigger holds (see vitalforge-dashboard/app.py's _sync_lock), so a
+    trigger holds (see vitalforge_dashboard/app.py's _sync_lock), so a
     manual sync and the initial 90-day backfill could interleave -- and
     since every write goes through upsert()'s last-writer-wins
     INSERT OR REPLACE, an older pull finishing after a newer one could
@@ -56,7 +56,7 @@ async def test_scheduled_sync_serializes_against_shared_lock(initialized_db, mon
     finding). Setting SYNC_INTERVAL_HOURS to 0 collapses that sleep to
     effectively-zero, letting a second call happen inside the test's
     timeout."""
-    sync = import_service_module("vitalforge-dashboard.sync")
+    sync = import_service_module("vitalforge_dashboard.sync")
     monkeypatch.setattr(sync, "SYNC_INTERVAL_HOURS", 0)
     lock = asyncio.Lock()
     seen = []
@@ -88,7 +88,7 @@ async def test_run_sync_preserves_backoff_until(initialized_db, fake_garmin_clie
     drop an active backoff on every sync and turn a rate limit into a ban."""
     from shared.database import get_primary_person_id
 
-    sync = import_service_module("vitalforge-dashboard.sync")
+    sync = import_service_module("vitalforge_dashboard.sync")
     person_id = await get_primary_person_id()
 
     db = await get_db()

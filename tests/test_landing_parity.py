@@ -25,7 +25,7 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parent.parent
-SERVICES = ["vitalforge-dashboard/app.py", "vitalforge-weight/app.py"]
+SERVICES = ["vitalforge_dashboard/app.py", "vitalforge_weight/app.py"]
 
 
 def _reachable_persons_source(service: str) -> str:
@@ -84,7 +84,7 @@ def test_landing_serves_open_access_mode(service):
     )
 
 
-@pytest.mark.parametrize("service_module", ["vitalforge-weight.app", "vitalforge-dashboard.app"])
+@pytest.mark.parametrize("service_module", ["vitalforge_weight.app", "vitalforge_dashboard.app"])
 async def test_landing_denies_an_unrecognised_grant_value(
     initialized_db, fake_garmin_client, monkeypatch, service_module
 ):

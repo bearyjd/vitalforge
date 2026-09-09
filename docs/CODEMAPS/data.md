@@ -39,8 +39,8 @@ separate sources of weight data — do not conflate when querying.
 
 - `shared/database.py::init_db()` — schema creation only, called from both services'
   lifespan startup.
-- `vitalforge-weight/app.py` — direct SQL against `weight_log` only.
-- `vitalforge-dashboard/sync.py::upsert()` — generic `INSERT OR REPLACE INTO [table]`
+- `vitalforge_weight/app.py` — direct SQL against `weight_log` only.
+- `vitalforge_dashboard/sync.py::upsert()` — generic `INSERT OR REPLACE INTO [table]`
   helper used for all 9 metric tables + `weight_history`; also writes `sync_status`.
 - `scripts/seed_db.py` — synthetic data generator for local testing without Garmin
   (writes the same 9 tables + `weight_history` via ad hoc SQL, mirroring `upsert()`'s
