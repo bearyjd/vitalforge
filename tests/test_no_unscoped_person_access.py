@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parent.parent
-SERVICES = ["vitalforge-dashboard/app.py", "vitalforge-weight/app.py"]
+SERVICES = ["vitalforge_dashboard/app.py", "vitalforge_weight/app.py"]
 
 # The only places get_primary_person_id() may legitimately survive. Both have
 # no request to authorize, so require_person cannot serve them.
@@ -27,7 +27,7 @@ SERVICES = ["vitalforge-dashboard/app.py", "vitalforge-weight/app.py"]
 #   shared/database.py        -- defines it, and ensure_primary_person_grant()
 #                                uses it as startup bootstrap before any admin
 #                                exists to own the person.
-#   vitalforge-dashboard/sync.py -- scheduled_sync has no request. Phase 4's
+#   vitalforge_dashboard/sync.py -- scheduled_sync has no request. Phase 4's
 #                                round-robin cursor replaces this; until then
 #                                the shim is the honest answer, and saying so
 #                                here is what stops Phase 4 leaking forward.
@@ -37,7 +37,7 @@ SERVICES = ["vitalforge-dashboard/app.py", "vitalforge-weight/app.py"]
 #                                default when it is omitted.
 _ALLOWED_SHIM_FILES = {
     "shared/database.py",
-    "vitalforge-dashboard/sync.py",
+    "vitalforge_dashboard/sync.py",
     "scripts/seed_db.py",
 }
 
@@ -56,7 +56,7 @@ _PERSON_ADMIN_PATHS = {
 
 
 def _python_sources():
-    for d in ("shared", "vitalforge-dashboard", "vitalforge-weight", "scripts"):
+    for d in ("shared", "vitalforge_dashboard", "vitalforge_weight", "scripts"):
         for p in sorted((REPO / d).rglob("*.py")):
             if "__pycache__" not in p.parts:
                 yield p.relative_to(REPO).as_posix(), p.read_text()
@@ -294,7 +294,7 @@ def test_no_frontend_code_calls_an_unscoped_api_path():
     not."""
     offenders = []
     pattern = re.compile(r"""(?:fetch|url|href)\s*[(=]\s*[`'"]/api/""", re.IGNORECASE)
-    for d in ("vitalforge-dashboard", "vitalforge-weight"):
+    for d in ("vitalforge_dashboard", "vitalforge_weight"):
         for ext in ("*.html", "*.js"):
             for p in sorted((REPO / d).rglob(ext)):
                 for i, line in enumerate(p.read_text().splitlines(), 1):
@@ -310,7 +310,7 @@ def test_service_worker_cache_names_were_bumped():
     fetch routes that now 404. Fresh browser profiles never reproduce it,
     which is exactly why it needs a test rather than manual checking."""
     stale = []
-    for d in ("vitalforge-dashboard", "vitalforge-weight"):
+    for d in ("vitalforge_dashboard", "vitalforge_weight"):
         sw = REPO / d / "static" / "sw.js"
         assert sw.exists(), f"{sw} is missing"
         m = re.search(r"""CACHE_NAME\s*=\s*['"]([^'"]+)['"]""", sw.read_text())

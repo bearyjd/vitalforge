@@ -1415,7 +1415,7 @@ def add_auth_routes(app):
             # (security-review finding, reproduced end to end). The second
             # request's BEGIN IMMEDIATE blocks until the first commits, so
             # it then sees the already-reduced count. Same pattern as
-            # vitalforge-weight/app.py's dedup transaction.
+            # vitalforge_weight/app.py's dedup transaction.
             await db.execute("BEGIN IMMEDIATE")
             target = await (await db.execute("SELECT role FROM users WHERE id = ?", (user_id,))).fetchone()
             if target is None:

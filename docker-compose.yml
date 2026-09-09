@@ -2,7 +2,7 @@ services:
   vitalforge-weight:
     build:
       context: .
-      dockerfile: vitalforge-weight/Dockerfile
+      dockerfile: vitalforge_weight/Dockerfile
     ports:
       - "8085:8085"
     volumes:
@@ -14,7 +14,7 @@ services:
   vitalforge-dashboard:
     build:
       context: .
-      dockerfile: vitalforge-dashboard/Dockerfile
+      dockerfile: vitalforge_dashboard/Dockerfile
     ports:
       - "8086:8086"
     volumes:

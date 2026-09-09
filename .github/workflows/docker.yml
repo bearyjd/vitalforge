@@ -22,7 +22,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r vitalforge-weight/requirements.txt -r vitalforge-dashboard/requirements.txt
+          pip install -r vitalforge_weight/requirements.txt -r vitalforge_dashboard/requirements.txt
           pip install pytest pytest-asyncio httpx ruff playwright pytest-playwright pip-audit
           pip install -e .
 
@@ -65,8 +65,8 @@ jobs:
       - name: Audit dependencies (pip-audit)
         run: |
           pip-audit --progress-spinner off \
-            -r vitalforge-weight/requirements.txt \
-            -r vitalforge-dashboard/requirements.txt
+            -r vitalforge_weight/requirements.txt \
+            -r vitalforge_dashboard/requirements.txt
 
       - name: Install Playwright browser
         run: playwright install --with-deps chromium
@@ -88,9 +88,9 @@ jobs:
       matrix:
         service:
           - name: vitalforge-weight
-            dockerfile: vitalforge-weight/Dockerfile
+            dockerfile: vitalforge_weight/Dockerfile
           - name: vitalforge-dashboard
-            dockerfile: vitalforge-dashboard/Dockerfile
+            dockerfile: vitalforge_dashboard/Dockerfile
 
     steps:
       - name: Checkout

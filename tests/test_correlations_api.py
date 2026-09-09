@@ -14,11 +14,11 @@ from httpx import ASGITransport, AsyncClient
 from shared.database import get_db, get_primary_person_id
 from tests.conftest import PERSON_PREFIX
 
-# `vitalforge-dashboard` is a hyphenated directory name, so `correlations.py`
+# `vitalforge_dashboard` is a hyphenated directory name, so `correlations.py`
 # is loaded via `importlib.import_module` (same mechanism `conftest.py`'s
-# `import_service_module` uses for `vitalforge-dashboard.app`) rather than a
+# `import_service_module` uses for `vitalforge_dashboard.app`) rather than a
 # normal `import` statement.
-_correlations = importlib.import_module("vitalforge-dashboard.correlations")
+_correlations = importlib.import_module("vitalforge_dashboard.correlations")
 align_series = _correlations.align_series
 compute_cell = _correlations.compute_cell
 pearson_r = _correlations.pearson_r

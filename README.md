@@ -113,11 +113,11 @@ vitalforge/
 │   ├── auth.py                # Cookie-session + bearer-token authentication
 │   ├── database.py            # SQLite connection and schema setup
 │   └── garmin_client.py       # Garmin Connect API wrapper (garminconnect)
-├── vitalforge-weight/         # Weight logging PWA service
+├── vitalforge_weight/         # Weight logging PWA service
 │   ├── app.py                 # FastAPI app — weight CRUD + Garmin push
 │   ├── templates/index.html   # Mobile-first weight entry UI
 │   └── static/                # PWA manifest, service worker, icons
-├── vitalforge-dashboard/      # Health dashboard service
+├── vitalforge_dashboard/      # Health dashboard service
 │   ├── app.py                 # FastAPI app — metrics API + sync
 │   ├── sync.py                # Garmin data sync (scheduled + manual)
 │   ├── recommendations.py     # Hybrid rules + LLM recommendation engine

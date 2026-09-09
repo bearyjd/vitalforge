@@ -353,7 +353,7 @@ async def scheduled_sync(lock: asyncio.Lock, registry: SyncRegistry):
     """Background loop that syncs every SYNC_INTERVAL_HOURS.
 
     Takes the same lock `/api/sync`'s manual trigger holds during `run_sync`
-    (see vitalforge-dashboard/app.py's `_sync_lock`) -- every write here goes
+    (see vitalforge_dashboard/app.py's `_sync_lock`) -- every write here goes
     through `upsert()`'s last-writer-wins INSERT OR REPLACE, so without
     shared serialization a manual sync and this backfill/scheduled loop can
     interleave and let an older pull silently overwrite a newer one.

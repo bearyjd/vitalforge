@@ -6,7 +6,7 @@
 | Service | Used by | Purpose | Failure mode |
 |---|---|---|---|
 | Garmin Connect (via `garminconnect`/`garth`) | `shared/garmin_client.py` | push weight entries, pull sleep/HRV/RHR/stress/body-battery/VO2/training-load/steps/calories/weight-history | caught + logged per-call; endpoints return `garmin_error`/skip rather than raising, except sync itself |
-| Anthropic API (`anthropic` SDK) | `vitalforge-dashboard/recommendations.py::get_llm_recommendations` | turns rules-engine findings into natural-language coaching text | optional — falls back to rules-only if `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL` unset, package missing, JSON parse fails, or the call errors |
+| Anthropic API (`anthropic` SDK) | `vitalforge_dashboard/recommendations.py::get_llm_recommendations` | turns rules-engine findings into natural-language coaching text | optional — falls back to rules-only if `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL` unset, package missing, JSON parse fails, or the call errors |
 | Docker Hub + GHCR | `.github/workflows/docker.yml` | image publishing on push to `main`/tags | n/a (CI only) |
 | jsDelivr CDN (`chart.js`) | both `templates/index.html` | trend/metric charts, loaded client-side | no local fallback bundled |
 
@@ -23,7 +23,7 @@ not a library boundary (see root `CLAUDE.md`).
 - `shared/garmin_client.py` — thin wrapper over `garminconnect.Garmin`, module-level
   `_client` singleton, token persistence to `GARTH_TOKEN_DIR`.
 
-`vitalforge-dashboard/sync.py` and `recommendations.py` are sibling modules of `app.py`,
+`vitalforge_dashboard/sync.py` and `recommendations.py` are sibling modules of `app.py`,
 not part of `shared` — imported by bare name via a `sys.path.insert` for that one
 directory (see `backend.md`).
 

@@ -4,7 +4,7 @@ symmetric-bounds rewrite: two timestamps exactly 60.000000s apart can compute
 60/86400 due to floating-point cancellation from subtracting two large,
 independently-rounded Julian day values (confirmed ~9% of random microsecond
 offsets over 200k trials) -- silently excluding a legitimate boundary
-duplicate from dedup. vitalforge-weight/app.py's dedup query was rewritten to
+duplicate from dedup. vitalforge_weight/app.py's dedup query was rewritten to
 compare against `julianday(now, '+-60 seconds')` (SQLite's own offset
 arithmetic) instead of subtracting two julianday() values, which cannot hit
 this failure mode.
@@ -25,7 +25,7 @@ DEDUP_WINDOW_SECONDS = 60
 
 
 async def _within_window(db, t1: str, t2: str, seconds: int) -> bool:
-    """The exact WHERE-clause fragment vitalforge-weight/app.py uses,
+    """The exact WHERE-clause fragment vitalforge_weight/app.py uses,
     parameterized (not string-built) so this is genuinely the same call
     shape as production, not a hand-rebuilt approximation of it."""
     cursor = await db.execute(
@@ -98,7 +98,7 @@ async def test_subtraction_form_can_miss_the_exact_60s_boundary():
         if failing_us is None:
             pytest.skip(
                 "this SQLite build's julianday() didn't reproduce the float-rounding "
-                "failure in a coarse sweep -- the fix in vitalforge-weight/app.py is "
+                "failure in a coarse sweep -- the fix in vitalforge_weight/app.py is "
                 "still correct (see test_symmetric_modifier_bounds_include_exact_60s_boundary), "
                 "but the pre-fix form's failure mode may be build-specific; revisit if "
                 "curious rather than treating this skip as a problem"

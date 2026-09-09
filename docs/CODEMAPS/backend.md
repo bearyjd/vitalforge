@@ -19,7 +19,7 @@ per-request connection via `shared.database.get_db()` / `try/finally: await db.c
    `VITALFORGE_API_TOKEN` environment value is imported once for the first admin after
    bootstrap, with a durable migration marker so revocation survives restarts.
 
-## vitalforge-weight (`vitalforge-weight/app.py`, :8085)
+## vitalforge-weight (`vitalforge_weight/app.py`, :8085)
 
 ```
 GET  /health                    -> {"status":"ok","service":"vitalforge-weight"}
@@ -53,7 +53,7 @@ transaction:
 lifespan: `init_db()` then `garmin_client.authenticate()` (failure logged, not fatal —
 retried on first `/api/weight` POST that reaches the Garmin push step).
 
-## vitalforge-dashboard (`vitalforge-dashboard/app.py`, :8086)
+## vitalforge-dashboard (`vitalforge_dashboard/app.py`, :8086)
 
 ```
 GET  /health                          -> {"status":"ok","service":"vitalforge-dashboard"}
@@ -83,7 +83,7 @@ package — see `dependencies.md`).
 | `recommendations.py::get_all_metrics` | direct SELECT (`_get_metric`) | same 9, minus `weight_history` duplication |
 | Garmin I/O | `shared.garmin_client` module-level `_client` singleton | n/a (external API) |
 
-`METRIC_TABLES` (`vitalforge-dashboard/app.py:31-45`) is the single source of truth for
+`METRIC_TABLES` (`vitalforge_dashboard/app.py:31-45`) is the single source of truth for
 which metric names are queryable — adding a new metric requires updating this dict,
 `shared/database.py` schema, and `sync.py` together (see root `CLAUDE.md`).
 
