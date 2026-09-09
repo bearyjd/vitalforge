@@ -21,6 +21,7 @@ from pathlib import Path
 import aiosqlite
 import pytest
 import pytest_asyncio
+from httpx import ReadTimeout
 
 from shared.garmin_client import STRENGTH_ACTIVITY_TYPE_KEY
 
@@ -457,3 +458,27 @@ def dashboard_live_server(tmp_db_path, fake_garmin_client, monkeypatch):
     server.start()
     yield server.base_url
     server.stop()
+
+
+def timing_out_until(weight_app_module, monkeypatch):
+    """Make the activity push time out, and return a switch that restores it.
+
+    Deliberately NOT monkeypatch.undo(): that would also unwind the fixtures'
+    patches of authenticate/push_activity/find_activities_by_date, leaving the
+    route pointed at the REAL Garmin client for the rest of the test. A local
+    toggle keeps the blast radius to this one behaviour.
+
+    Lives here rather than in one test module because two modules need it --
+    test_activity_unknown_outcome.py for the ambiguous-outcome matrix, and
+    test_activity_garmin_guard.py to reach the same state before a rename.
+    """
+    state = {"failing": True}
+    real = weight_app_module.push_activity
+
+    def maybe_timing_out(**kwargs):
+        if state["failing"]:
+            raise ReadTimeout("timed out waiting for a response")
+        return real(**kwargs)
+
+    monkeypatch.setattr(weight_app_module, "push_activity", maybe_timing_out)
+    return state

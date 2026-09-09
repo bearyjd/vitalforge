@@ -21,7 +21,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from shared.database import get_db
-from tests.conftest import PERSON_PREFIX, seed_person
+from tests.conftest import PERSON_PREFIX, seed_person, timing_out_until
 
 START = "2026-09-06T08:00:00+00:00"
 
@@ -235,17 +235,7 @@ async def test_rename_between_push_and_retry_does_not_duplicate(
     The row now carries the prefix it was pushed under (garmin_name_prefix),
     which is the same first-write-wins rule the stored payload already follows.
     """
-    from httpx import ReadTimeout
-
-    state = {"failing": True}
-    real = weight_app_module.push_activity
-
-    def maybe_timing_out(**kwargs):
-        if state["failing"]:
-            raise ReadTimeout("timed out waiting for a response")
-        return real(**kwargs)
-
-    monkeypatch.setattr(weight_app_module, "push_activity", maybe_timing_out)
+    state = timing_out_until(weight_app_module, monkeypatch)
 
     first = await client.post(
         "/p/son/api/activity", json=body(push_to_garmin=True, garmin_target="credential_person")

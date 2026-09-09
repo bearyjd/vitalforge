@@ -23,7 +23,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from shared.database import get_db, get_primary_person_id
-from tests.conftest import PERSON_PREFIX
+from tests.conftest import PERSON_PREFIX, timing_out_until
 
 START = "2026-09-06T08:00:00+00:00"
 
@@ -75,28 +75,6 @@ class ReadTimeout(Exception):
 
 class ConnectTimeout(Exception):
     """Pre-send: the connection was never established, so nothing was sent."""
-
-
-def timing_out_until(weight_app_module, monkeypatch):
-    """Make the push time out, and return a switch that restores it.
-
-    Deliberately NOT monkeypatch.undo(): that would also unwind the fixtures'
-    patches of authenticate/push_activity/find_activities_by_date, leaving the
-    route pointed at the REAL Garmin client for the rest of the test. A local
-    toggle keeps the blast radius to this one behaviour.
-    """
-    state = {"failing": True}
-    real = weight_app_module.push_activity
-
-    def maybe_timing_out(**kwargs):
-        if state["failing"]:
-            raise ReadTimeout("timed out waiting for a response")
-        return real(**kwargs)
-
-    monkeypatch.setattr(weight_app_module, "push_activity", maybe_timing_out)
-    return state
-
-
 # --- classification -----------------------------------------------------------
 
 
