@@ -53,7 +53,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname
 logger = logging.getLogger(__name__)
 
 LBS_PER_KG = 2.20462
-GRAMS_PER_LB = 453.592
 GRAMS_PER_KG = 1000
 
 # How far ahead of receipt time a client-supplied `captured_at` may be before
