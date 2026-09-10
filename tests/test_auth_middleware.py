@@ -11,7 +11,8 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from httpx import ASGITransport, AsyncClient, Headers
 
-from shared.auth import add_auth_routes, create_session_cookie
+from shared.auth import create_session_cookie
+from shared.auth_routes import add_auth_routes
 from tests.conftest import PERSON_PREFIX, seed_token, seed_user
 
 

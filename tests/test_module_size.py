@@ -16,13 +16,11 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 CEILING = 800
 
-# One module predates this guard. Recorded here rather than raising the ceiling
-# for everyone: a named exemption is visible and arguable, a higher global limit
-# is neither. Delete an entry when its module is split.
-
-GRANDFATHERED = {
-    "shared/auth.py",  # 1,518 lines
-}
+# Nothing is exempt any more. shared/auth.py was the last one (1,518 lines); it
+# is 694 now that its markup and route registration live in auth_pages.py and
+# auth_routes.py. Add an entry here only with a reason, never to make a red build
+# green -- a named exemption is visible and arguable, a raised ceiling is neither.
+GRANDFATHERED: set[str] = set()
 
 MODULES = sorted(
     str(p.relative_to(REPO))

@@ -9,7 +9,8 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from shared import auth as shared_auth
-from shared.auth import add_auth_routes, bootstrap_migrated_token, create_session_cookie
+from shared.auth import bootstrap_migrated_token, create_session_cookie
+from shared.auth_routes import add_auth_routes
 from shared.database import get_db
 from tests.conftest import seed_token, seed_user
 

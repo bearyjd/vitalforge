@@ -25,7 +25,8 @@ import pytest
 from fastapi import Depends, FastAPI
 from httpx import ASGITransport, AsyncClient
 
-from shared.auth import add_auth_routes, create_session_cookie, require_person
+from shared.auth import create_session_cookie, require_person
+from shared.auth_routes import add_auth_routes
 from shared.database import get_db
 from shared.persons_admin import add_person_routes
 from tests.conftest import grant_person, primary_person_id, seed_person, seed_user
