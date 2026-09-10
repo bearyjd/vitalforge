@@ -14,7 +14,8 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from shared import auth as shared_auth
-from shared.auth import add_auth_routes, create_session_cookie
+from shared.auth import create_session_cookie
+from shared.auth_routes import add_auth_routes
 from shared.database import get_db
 from tests.conftest import grant_person, primary_person_id, seed_user
 

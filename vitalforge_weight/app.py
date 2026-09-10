@@ -17,12 +17,12 @@ from fastapi.templating import Jinja2Templates
 # sentinel, and GET / below must keep working in the empty-users-table mode
 # CLAUDE.md documents.
 from shared.auth import (
-    add_auth_routes,
     bootstrap_first_admin,
     bootstrap_migrated_token,
     get_current_identity,
     require_person,
 )
+from shared.auth_routes import add_auth_routes
 from shared.database import (
     ensure_primary_person_grant,
     get_db,
