@@ -78,11 +78,11 @@ class ConnectTimeout(Exception):
 # --- classification -----------------------------------------------------------
 
 
-async def test_timeout_after_send_is_unknown_not_failed(client, weight_app_module, monkeypatch):
+async def test_timeout_after_send_is_unknown_not_failed(client, weight_app_module, monkeypatch, activity_garmin_module):
     def timing_out(**kwargs):
         raise ReadTimeout("timed out waiting for a response")
 
-    monkeypatch.setattr(weight_app_module, "push_activity", timing_out)
+    monkeypatch.setattr(activity_garmin_module, "push_activity", timing_out)
 
     resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
     assert resp.status_code == 202
@@ -94,20 +94,20 @@ async def test_timeout_after_send_is_unknown_not_failed(client, weight_app_modul
     assert row["garmin_activity_id"] is None
 
 
-async def test_pre_send_failure_stays_failed(client, weight_app_module, monkeypatch):
+async def test_pre_send_failure_stays_failed(client, weight_app_module, monkeypatch, activity_garmin_module):
     """A connection that was never established sent nothing, so the ordinary
     retryable 'failed' is correct and costs no reconciliation."""
     def refused(**kwargs):
         raise ConnectTimeout("could not connect")
 
-    monkeypatch.setattr(weight_app_module, "push_activity", refused)
+    monkeypatch.setattr(activity_garmin_module, "push_activity", refused)
 
     resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
     assert resp.json()["garmin_status"] == "failed"
     assert (await fetch_row())["garmin_status"] == "failed"
 
 
-async def test_wrapped_cause_is_classified(client, weight_app_module, monkeypatch):
+async def test_wrapped_cause_is_classified(client, weight_app_module, monkeypatch, activity_garmin_module):
     """requests wraps urllib3 wraps http.client, so the name that matters is
     routinely two levels down in __cause__, not on the exception raised."""
     def wrapped(**kwargs):
@@ -116,7 +116,7 @@ async def test_wrapped_cause_is_classified(client, weight_app_module, monkeypatc
         except ReadTimeout as inner:
             raise RuntimeError("outer wrapper") from inner
 
-    monkeypatch.setattr(weight_app_module, "push_activity", wrapped)
+    monkeypatch.setattr(activity_garmin_module, "push_activity", wrapped)
 
     resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
     assert resp.json()["garmin_status"] == "unknown"
@@ -173,7 +173,7 @@ async def test_reconciliation_finds_nothing_and_pushes_once(client, weight_app_m
     assert (await fetch_row())["garmin_status"] == "synced"
 
 
-async def test_failed_lookup_stays_unknown(client, weight_app_module, fake_garmin_client, monkeypatch):
+async def test_failed_lookup_stays_unknown(client, weight_app_module, fake_garmin_client, monkeypatch, activity_garmin_module):
     """A lookup that FAILS must not collapse into "not found" -- that is
     precisely the mistake that turns one session into two activities."""
     person_id = await get_primary_person_id()
@@ -193,7 +193,7 @@ async def test_failed_lookup_stays_unknown(client, weight_app_module, fake_garmi
     def unreachable(start_date, end_date, activity_type=None):
         raise ReadTimeout("lookup timed out too")
 
-    monkeypatch.setattr(weight_app_module, "find_activities_by_date", unreachable)
+    monkeypatch.setattr(activity_garmin_module, "find_activities_by_date", unreachable)
 
     resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
     assert resp.status_code == 200

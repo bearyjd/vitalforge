@@ -329,17 +329,23 @@ async def primary_person_id() -> int:
 def weight_app_module(initialized_db, fake_garmin_client, monkeypatch):
     """The `vitalforge_weight` FastAPI app module, Garmin/DB fully faked."""
     module = import_service_module("vitalforge_weight.app")
-    # `authenticate`/`push_weight` were bound into app.py's namespace via
-    # `from shared.garmin_client import ...`, so patching the shared module
-    # alone doesn't reach them — patch the names the route handlers actually call.
-    monkeypatch.setattr(module, "authenticate", lambda: None)
+    # The Garmin helpers are bound into each module's own namespace via
+    # `from shared.garmin_client import ...`, so patching the shared module alone
+    # doesn't reach them -- patch the names the handlers actually call. Since the
+    # app.py split those bindings live in three places, and patching only app.py
+    # would leave the routes calling the real client while every test still passed.
+    weight_routes = import_service_module("vitalforge_weight.weight_routes")
+    activity_garmin = import_service_module("vitalforge_weight.activity_garmin")
+    for m in (module, weight_routes, activity_garmin):
+        if hasattr(m, "authenticate"):
+            monkeypatch.setattr(m, "authenticate", lambda: None)
 
     def fake_push_weight(weight_grams, timestamp=None, **kwargs):
         fake_garmin_client.pushed_weights.append(
             {"weight_grams": weight_grams, "timestamp": timestamp, **kwargs}
         )
 
-    monkeypatch.setattr(module, "push_weight", fake_push_weight)
+    monkeypatch.setattr(weight_routes, "push_weight", fake_push_weight)
 
     # Same direct-import situation for the activity push helpers: app.py does
     # `from shared.garmin_client import push_activity, push_activity_sets`, so
@@ -359,9 +365,9 @@ def weight_app_module(initialized_db, fake_garmin_client, monkeypatch):
         # Garmin for rather than on this fake's signature.
         return fake_garmin_client.get_activities_by_date(start_date, end_date, activitytype=activity_type)
 
-    monkeypatch.setattr(module, "push_activity", fake_push_activity)
-    monkeypatch.setattr(module, "push_activity_sets", fake_push_activity_sets)
-    monkeypatch.setattr(module, "find_activities_by_date", fake_find_activities_by_date)
+    monkeypatch.setattr(activity_garmin, "push_activity", fake_push_activity)
+    monkeypatch.setattr(activity_garmin, "push_activity_sets", fake_push_activity_sets)
+    monkeypatch.setattr(activity_garmin, "find_activities_by_date", fake_find_activities_by_date)
     return module
 
 
@@ -383,13 +389,26 @@ def no_real_garmin_client(weight_app_module):
     """
     from shared import garmin_client
 
-    for name in (
-        "authenticate", "push_weight", "push_activity", "push_activity_sets", "find_activities_by_date",
-    ):
-        assert getattr(weight_app_module, name) is not getattr(garmin_client, name), (
-            f"vitalforge_weight.app.{name} is still the real shared.garmin_client function; "
-            "patch the name in the app module's own namespace, not just the shared module"
-        )
+    # Checked per OWNING module. After the app.py split, `push_weight` lives in
+    # weight_routes and the activity helpers in activity_garmin; asserting only
+    # against app.py would pass while the routes called the real client.
+    owners = {
+        "vitalforge_weight.weight_routes": ("authenticate", "push_weight"),
+        "vitalforge_weight.activity_garmin": (
+            "authenticate", "push_activity", "push_activity_sets", "find_activities_by_date",
+        ),
+    }
+    for dotted, names in owners.items():
+        module = import_service_module(dotted)
+        for name in names:
+            assert hasattr(module, name), (
+                f"{dotted} no longer binds {name} -- a Garmin helper moved and this guard "
+                "was not updated with it, so nothing is checking that module any more"
+            )
+            assert getattr(module, name) is not getattr(garmin_client, name), (
+                f"{dotted}.{name} is still the real shared.garmin_client function; "
+                "patch the name in the owning module's namespace, not just the shared module"
+            )
     assert isinstance(garmin_client._client, FakeGarminClient), (
         "shared.garmin_client._client is not a FakeGarminClient -- this test could reach real Garmin"
     )
@@ -419,12 +438,18 @@ def weight_live_server(tmp_db_path, fake_garmin_client, monkeypatch):
     dedicated server thread, where no such conflict exists.
     """
     module = import_service_module("vitalforge_weight.app")
-    monkeypatch.setattr(module, "authenticate", lambda: None)
+    # Same owning-module rule as weight_app_module: after the app.py split the
+    # Garmin bindings live in weight_routes / activity_garmin, so patching app.py
+    # alone would leave the live server calling the real client.
+    weight_routes = import_service_module("vitalforge_weight.weight_routes")
+    for m in (module, weight_routes):
+        if hasattr(m, "authenticate"):
+            monkeypatch.setattr(m, "authenticate", lambda: None)
 
     def fake_push_weight(weight_grams, timestamp=None, **kwargs):
         fake_garmin_client.pushed_weights.append({"weight_grams": weight_grams, "timestamp": timestamp, **kwargs})
 
-    monkeypatch.setattr(module, "push_weight", fake_push_weight)
+    monkeypatch.setattr(weight_routes, "push_weight", fake_push_weight)
 
     from tests.live_server import LiveServer
 
@@ -472,13 +497,49 @@ def timing_out_until(weight_app_module, monkeypatch):
     test_activity_unknown_outcome.py for the ambiguous-outcome matrix, and
     test_activity_garmin_guard.py to reach the same state before a rename.
     """
+    activity_garmin = import_service_module("vitalforge_weight.activity_garmin")
     state = {"failing": True}
-    real = weight_app_module.push_activity
+    real = activity_garmin.push_activity
 
     def maybe_timing_out(**kwargs):
         if state["failing"]:
             raise ReadTimeout("timed out waiting for a response")
         return real(**kwargs)
 
-    monkeypatch.setattr(weight_app_module, "push_activity", maybe_timing_out)
+    monkeypatch.setattr(activity_garmin, "push_activity", maybe_timing_out)
     return state
+
+
+@pytest.fixture
+def activity_garmin_module(weight_app_module):
+    """The module that owns the activity Garmin bindings after the app.py split.
+
+    Depends on weight_app_module so the fakes are already patched in. Tests that
+    monkeypatch push_activity or _record_activity_garmin_outcome must target THIS
+    module -- patching app.py would land on a binding no route reads.
+    """
+    return import_service_module("vitalforge_weight.activity_garmin")
+
+
+@pytest.fixture
+def weight_routes_module(weight_app_module):
+    """The module that owns push_weight after the app.py split. See above."""
+    return import_service_module("vitalforge_weight.weight_routes")
+
+
+@pytest.fixture
+def garmin_claim_module(weight_app_module):
+    """The module that owns the Garmin claim timeout after the app.py split."""
+    return import_service_module("vitalforge_weight.garmin_claim")
+
+
+@pytest.fixture
+def activity_routes_module(weight_app_module):
+    """The module whose route bodies CALL the activity helpers.
+
+    Distinct from activity_garmin_module on purpose. activity_routes imports
+    `_record_activity_garmin_outcome` and friends BY VALUE, so patching them on
+    activity_garmin (where they are defined) does not reach the binding the route
+    actually calls. Patch the caller, not the definer.
+    """
+    return import_service_module("vitalforge_weight.activity_routes")

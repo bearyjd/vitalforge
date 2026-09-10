@@ -129,7 +129,7 @@ async def test_two_concurrent_distinct_sessions_both_stored(client, fake_garmin_
 
 async def test_second_request_does_not_duplicate_a_push_already_in_flight(
     client, weight_app_module, fake_garmin_client, monkeypatch
-):
+, activity_garmin_module):
     """The reviewer's probe, and the reason garmin_claimed_at exists.
 
     The two gather-based tests above pass even against the broken gate,
@@ -154,14 +154,14 @@ async def test_second_request_does_not_duplicate_a_push_already_in_flight(
     sees the claim at the instant it can see the row at all.
     """
     push_started = threading.Event()
-    real = weight_app_module.push_activity
+    real = activity_garmin_module.push_activity
 
     def slow_push(**kwargs):
         push_started.set()
         time.sleep(1.0)
         return real(**kwargs)
 
-    monkeypatch.setattr(weight_app_module, "push_activity", slow_push)
+    monkeypatch.setattr(activity_garmin_module, "push_activity", slow_push)
 
     second: dict = {}
 
@@ -195,7 +195,7 @@ async def test_second_request_does_not_duplicate_a_push_already_in_flight(
     assert second["resp"].json()["garmin_status"] == "pending"
 
 
-async def test_stale_claim_is_reclaimed(client, weight_app_module, fake_garmin_client, monkeypatch):
+async def test_stale_claim_is_reclaimed(client, weight_app_module, fake_garmin_client, monkeypatch, garmin_claim_module):
     """A claim outlives the process that took it only until it ages out.
 
     Without an expiry, a worker killed mid-push would leave the row claimed
@@ -206,7 +206,7 @@ async def test_stale_claim_is_reclaimed(client, weight_app_module, fake_garmin_c
     """
     stale = (
         datetime.now(timezone.utc)
-        - timedelta(seconds=weight_app_module._GARMIN_CLAIM_TIMEOUT_SECONDS + 60)
+        - timedelta(seconds=garmin_claim_module._GARMIN_CLAIM_TIMEOUT_SECONDS + 60)
     ).isoformat()
 
     await client.post(f"{PERSON_PREFIX}/api/activity", json={**BODY, "push_to_garmin": False})

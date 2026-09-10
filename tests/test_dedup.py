@@ -221,13 +221,13 @@ async def test_enrichment_uses_original_timestamp(client, fake_garmin_client):
     assert pushed_ts == datetime.fromisoformat(ts)
 
 
-async def test_enrichment_push_failure_sets_synced_to_garmin_zero(client, weight_app_module, monkeypatch):
+async def test_enrichment_push_failure_sets_synced_to_garmin_zero(client, weight_app_module, monkeypatch, weight_routes_module):
     row_id, ts = await seed_row(84096, seconds_ago=5, synced_to_garmin=1)
 
     def failing_push(weight_grams, timestamp=None, **kwargs):
         raise RuntimeError("synthetic Garmin outage")
 
-    monkeypatch.setattr(weight_app_module, "push_weight", failing_push)
+    monkeypatch.setattr(weight_routes_module, "push_weight", failing_push)
 
     resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 185.4, "unit": "lbs", "body_fat_pct": 18.4})
     body = resp.json()

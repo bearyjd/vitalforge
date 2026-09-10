@@ -57,11 +57,11 @@ async def test_invalid_unit_still_returns_400_not_422(client):
     assert resp.status_code == 400
 
 
-async def test_post_weight_garmin_failure_still_saves_locally(client, weight_app_module, monkeypatch):
+async def test_post_weight_garmin_failure_still_saves_locally(client, weight_app_module, monkeypatch, weight_routes_module):
     def failing_push(weight_grams, timestamp=None):
         raise RuntimeError("synthetic Garmin outage")
 
-    monkeypatch.setattr(weight_app_module, "push_weight", failing_push)
+    monkeypatch.setattr(weight_routes_module, "push_weight", failing_push)
 
     resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 170.0, "unit": "lbs"})
     assert resp.status_code == 200

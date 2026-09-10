@@ -52,11 +52,11 @@ async def fetch_row():
         await db.close()
 
 
-async def test_garmin_failure_still_returns_202(client, weight_app_module, monkeypatch):
+async def test_garmin_failure_still_returns_202(client, weight_app_module, monkeypatch, activity_garmin_module):
     def boom(**kwargs):
         raise RuntimeError("garmin is down")
 
-    monkeypatch.setattr(weight_app_module, "push_activity", boom)
+    monkeypatch.setattr(activity_garmin_module, "push_activity", boom)
 
     resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
     assert resp.status_code == 202
@@ -69,7 +69,7 @@ async def test_garmin_failure_still_returns_202(client, weight_app_module, monke
     assert "garmin is down" in row["garmin_error"]
 
 
-async def test_sets_failure_leaves_activity_synced(client, weight_app_module, monkeypatch):
+async def test_sets_failure_leaves_activity_synced(client, weight_app_module, monkeypatch, activity_garmin_module):
     """Only garmin_sets_status degrades. Flipping garmin_status to 'failed'
     here would make the client re-POST and create a SECOND activity for a
     session Garmin already has."""
@@ -78,7 +78,7 @@ async def test_sets_failure_leaves_activity_synced(client, weight_app_module, mo
     def boom(activity_id, payload):
         raise RuntimeError("exerciseSets rejected")
 
-    monkeypatch.setattr(weight_app_module, "push_activity_sets", boom)
+    monkeypatch.setattr(activity_garmin_module, "push_activity_sets", boom)
 
     resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
     assert resp.status_code == 202
@@ -92,13 +92,13 @@ async def test_sets_failure_leaves_activity_synced(client, weight_app_module, mo
     assert row["garmin_activity_id"] == "19283746501"
 
 
-async def test_post_commit_update_failure_does_not_500(client, weight_app_module, monkeypatch):
+async def test_post_commit_update_failure_does_not_500(client, weight_app_module, monkeypatch, activity_garmin_module, activity_routes_module):
     """The row is committed before the push is attempted, so a failure while
     RECORDING the outcome must be logged and swallowed."""
     async def boom(db, row_id, outcome):
         raise RuntimeError("disk I/O error")
 
-    monkeypatch.setattr(weight_app_module, "_record_activity_garmin_outcome", boom)
+    monkeypatch.setattr(activity_routes_module, "_record_activity_garmin_outcome", boom)
 
     resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
     assert resp.status_code == 202
@@ -121,17 +121,17 @@ async def test_post_commit_update_failure_does_not_500(client, weight_app_module
     assert resp.json()["garmin_status"] == "unknown"
 
 
-async def test_no_activity_id_returned_is_synced_not_failed(client, weight_app_module, monkeypatch):
+async def test_no_activity_id_returned_is_synced_not_failed(client, weight_app_module, monkeypatch, activity_garmin_module):
     """The activity really is on Garmin; there is just no id to address it
     by. Never index a response blindly, and never fall back to
     get_last_activity() -- that read is racy and would attach one session's
     sets to a different activity."""
     monkeypatch.setenv("VITALFORGE_GARMIN_EXERCISE_SETS", "1")
-    monkeypatch.setattr(weight_app_module, "push_activity", lambda **kwargs: {"messages": []})
+    monkeypatch.setattr(activity_garmin_module, "push_activity", lambda **kwargs: {"messages": []})
 
     called = []
     monkeypatch.setattr(
-        weight_app_module, "push_activity_sets", lambda activity_id, payload: called.append(activity_id)
+        activity_garmin_module, "push_activity_sets", lambda activity_id, payload: called.append(activity_id)
     )
 
     resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
@@ -255,7 +255,7 @@ async def test_corrupt_exercises_does_not_reach_garmin(client, fake_garmin_clien
     assert fake_garmin_client.created_activities == []
 
 
-async def test_garmin_error_redacts_email_and_token(client, weight_app_module, monkeypatch):
+async def test_garmin_error_redacts_email_and_token(client, weight_app_module, monkeypatch, activity_garmin_module):
     """garmin_error is stored AND returned to the client, so it is the one
     place a raw garminconnect exception string crosses a trust boundary.
     Those strings quote the request being made: a login failure carries the
@@ -267,7 +267,7 @@ async def test_garmin_error_redacts_email_and_token(client, weight_app_module, m
             f"401 for user jd@beary.us using Bearer {secret_token} at /activity-service"
         )
 
-    monkeypatch.setattr(weight_app_module, "push_activity", leaky)
+    monkeypatch.setattr(activity_garmin_module, "push_activity", leaky)
 
     resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
     error = resp.json()["garmin_error"]
@@ -280,7 +280,7 @@ async def test_garmin_error_redacts_email_and_token(client, weight_app_module, m
     assert secret_token not in (await fetch_row())["garmin_error"]
 
 
-async def test_garmin_error_is_truncated(client, weight_app_module, monkeypatch):
+async def test_garmin_error_is_truncated(client, weight_app_module, monkeypatch, activity_garmin_module):
     """An unbounded exception string would be stored per row and echoed on
     every status poll. 300 characters is enough to identify the failure."""
     # Deliberately NOT one long run of word characters: the token redactor
@@ -289,7 +289,7 @@ async def test_garmin_error_is_truncated(client, weight_app_module, monkeypatch)
     def verbose(**kwargs):
         raise RuntimeError("Garmin refused the request. " * 200)
 
-    monkeypatch.setattr(weight_app_module, "push_activity", verbose)
+    monkeypatch.setattr(activity_garmin_module, "push_activity", verbose)
 
     resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
     error = resp.json()["garmin_error"]
@@ -298,19 +298,19 @@ async def test_garmin_error_is_truncated(client, weight_app_module, monkeypatch)
     assert error.startswith("Garmin refused the request.")
 
 
-async def test_short_error_is_left_intact(client, weight_app_module, monkeypatch):
+async def test_short_error_is_left_intact(client, weight_app_module, monkeypatch, activity_garmin_module):
     """The sanitiser must not mangle an ordinary message -- an operator
     reading 'failed' rows needs them legible."""
     def plain(**kwargs):
         raise RuntimeError("Garmin returned 503 Service Unavailable")
 
-    monkeypatch.setattr(weight_app_module, "push_activity", plain)
+    monkeypatch.setattr(activity_garmin_module, "push_activity", plain)
 
     resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
     assert resp.json()["garmin_error"] == "Garmin returned 503 Service Unavailable"
 
 
-async def test_long_alphanumeric_run_is_redacted_not_just_truncated(client, weight_app_module, monkeypatch):
+async def test_long_alphanumeric_run_is_redacted_not_just_truncated(client, weight_app_module, monkeypatch, activity_garmin_module):
     """The token pattern is deliberately blunt: any run of 24+ word
     characters goes, because a bearer token, a session id and a signed URL
     fragment all look like that and none of them may be stored. A legitimate
@@ -318,7 +318,7 @@ async def test_long_alphanumeric_run_is_redacted_not_just_truncated(client, weig
     def leaky(**kwargs):
         raise RuntimeError("failed with correlation abcdefghijklmnopqrstuvwxyz012345")
 
-    monkeypatch.setattr(weight_app_module, "push_activity", leaky)
+    monkeypatch.setattr(activity_garmin_module, "push_activity", leaky)
 
     resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
     assert resp.json()["garmin_error"] == "failed with correlation [redacted]"

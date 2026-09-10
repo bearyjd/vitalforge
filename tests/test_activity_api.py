@@ -122,13 +122,13 @@ async def test_repeat_post_does_not_create_second_garmin_activity(client, fake_g
 # --- 5-6: the retry gate ------------------------------------------------------
 
 
-async def test_repeat_post_retries_a_previously_failed_push(client, weight_app_module, monkeypatch, fake_garmin_client):
+async def test_repeat_post_retries_a_previously_failed_push(client, weight_app_module, monkeypatch, fake_garmin_client, activity_garmin_module):
     """A session whose Garmin push failed must be re-pushable by re-POSTing
     the same session_id -- that is the ONLY retry mechanism this codebase has
     (there is no background worker, for anything). Without it a transient
     Garmin outage would strand the session as 'failed' forever."""
     calls = {"n": 0}
-    real = weight_app_module.push_activity
+    real = activity_garmin_module.push_activity
 
     def flaky(**kwargs):
         calls["n"] += 1
@@ -136,7 +136,7 @@ async def test_repeat_post_retries_a_previously_failed_push(client, weight_app_m
             raise RuntimeError("garmin exploded")
         return real(**kwargs)
 
-    monkeypatch.setattr(weight_app_module, "push_activity", flaky)
+    monkeypatch.setattr(activity_garmin_module, "push_activity", flaky)
 
     first = await client.post(f"{PERSON_PREFIX}/api/activity", json=body(push_to_garmin=True))
     assert first.status_code == 202

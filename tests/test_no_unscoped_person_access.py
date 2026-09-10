@@ -19,7 +19,16 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parent.parent
-SERVICES = ["vitalforge_dashboard/app.py", "vitalforge_weight/app.py"]
+# Every module that defines person-scoped routes. The weight service's routes
+# moved out of app.py when it was split, and this sweep asserts it finds a
+# non-zero number per file -- so a module missing from this list fails loudly
+# rather than silently scanning nothing.
+SERVICES = [
+    "vitalforge_dashboard/app.py",
+    "vitalforge_weight/app.py",
+    "vitalforge_weight/weight_routes.py",
+    "vitalforge_weight/activity_routes.py",
+]
 
 # The only places get_primary_person_id() may legitimately survive. Both have
 # no request to authorize, so require_person cannot serve them.
@@ -164,17 +173,56 @@ def test_every_person_scoped_route_declares_require_person(service):
     # every time one is added, which turns into a reflex rather than a check.
     # Exhaustiveness is guaranteed by
     # test_every_person_scoped_route_is_mounted_under_a_slug instead.
-    _NOT_VACUOUS = 4
-    assert seen >= _NOT_VACUOUS, (
-        f"{service}: found only {seen} routes under /p/{{slug}}/api/. This test cannot "
-        "pass by finding nothing -- either the sweep is incomplete or the route-matching "
-        "above stopped recognising them."
-    )
+    #
+    # The floor moved to test_the_route_sweep_is_not_vacuous below, which applies
+    # it ACROSS all service files rather than to each one. Per-file it was wrong
+    # after the weight service was split: app.py legitimately has zero
+    # /p/{slug}/api/ routes now (they live in weight_routes and activity_routes),
+    # and activity_routes legitimately has three. A per-file floor would have to
+    # be re-tuned on every split, which is the reflex the original comment warned
+    # against. The guarantee it exists for -- that this sweep cannot pass over an
+    # empty set -- is unchanged, and it caught this refactor exactly as designed.
+    del seen
 
     assert not missing, (
         f"{service}: {missing} sit under /p/{{slug}}/ but do not Depends on require_person. "
         "The path is routing; the dependency is authorization. A route with the former and "
         "not the latter reads a slug it never checks."
+    )
+
+
+def test_the_route_sweep_is_not_vacuous():
+    """A FLOOR, not a count, applied across every service file.
+
+    Its only job is to stop the require_person sweep passing vacuously over an
+    empty set -- which is what it did before that sweep landed, and would do
+    again if a refactor moved every route out from under the prefix or the
+    matching stopped recognising them. Deliberately not the exact number: that
+    would need bumping every time a route is added, which turns into a reflex
+    rather than a check.
+    """
+    total = 0
+    for service in SERVICES:
+        src = (REPO / service).read_text()
+        for node in ast.walk(ast.parse(src)):
+            if not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+                continue
+            for dec in node.decorator_list:
+                if not (isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute)):
+                    continue
+                if dec.func.attr not in {"get", "post", "patch", "put", "delete"}:
+                    continue
+                if not (dec.args and isinstance(dec.args[0], ast.Constant)):
+                    continue
+                path = dec.args[0].value
+                if isinstance(path, str) and path.startswith("/p/{slug}/api/"):
+                    total += 1
+
+    _NOT_VACUOUS = 4
+    assert total >= _NOT_VACUOUS, (
+        f"found only {total} routes under /p/{{slug}}/api/ across {SERVICES}. This sweep "
+        "cannot pass by finding nothing -- either a service file is missing from SERVICES "
+        "or the route-matching stopped recognising them."
     )
 
 
