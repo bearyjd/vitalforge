@@ -10,9 +10,9 @@ already expects.
 from datetime import datetime, timedelta, timezone
 
 from pydantic import BaseModel, ConfigDict
-from recommendations import get_metric, trend_slope
 
 from shared.database import get_db
+from vitalforge_dashboard.recommendations import get_metric, trend_slope
 
 
 class GoalCreate(BaseModel):

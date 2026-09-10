@@ -14,17 +14,9 @@ composite renormalizes weights across whichever components ARE available
 rather than crashing or silently zeroing missing inputs out of the average.
 """
 
-import sys
-from pathlib import Path
 
-# `recommendations.py` lives next to this file and is imported by bare name
-# below. app.py already puts this directory on sys.path before importing
-# either sibling module, but this module also needs to be importable
-# standalone (e.g. `importlib.import_module` from a test), so it carries the
-# same sys.path hack itself rather than relying on app.py having run first.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from recommendations import avg, get_all_metrics, trend_slope
+from vitalforge_dashboard.recommendations import avg, get_all_metrics, trend_slope
 
 MIN_BASELINE_DAYS = 5
 RECENT_WINDOW_DAYS = 3

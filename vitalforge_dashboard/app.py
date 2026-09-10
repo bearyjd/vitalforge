@@ -4,7 +4,6 @@ import io
 import json
 import logging
 import os
-import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,30 +13,6 @@ from fastapi.requests import Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-
-# `shared` is installed as a proper package (see pyproject.toml), so only the
-# sibling-module import below still needs a sys.path hack: `sync.py`,
-# `recommendations.py`, and `fit_import.py` live next to this file and are
-# imported by bare name.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import fit_import
-from correlations import compute_cell
-from goals import (
-    GoalCreate,
-    GoalOut,
-    GoalProgress,
-    GoalUpdate,
-    compute_progress,
-    create_goal,
-    delete_goal,
-    get_goal,
-    list_goals,
-    update_goal,
-)
-from readiness import compute_readiness
-from recommendations import get_recommendations, get_rules_only
-from sync import SyncRegistry, run_sync, scheduled_sync
 
 from shared.auth import (
     add_auth_routes,
@@ -55,6 +30,23 @@ from shared.database import (
 )
 from shared.garmin_client import authenticate
 from shared.persons_admin import add_person_routes
+from vitalforge_dashboard import fit_import
+from vitalforge_dashboard.correlations import compute_cell
+from vitalforge_dashboard.goals import (
+    GoalCreate,
+    GoalOut,
+    GoalProgress,
+    GoalUpdate,
+    compute_progress,
+    create_goal,
+    delete_goal,
+    get_goal,
+    list_goals,
+    update_goal,
+)
+from vitalforge_dashboard.readiness import compute_readiness
+from vitalforge_dashboard.recommendations import get_recommendations, get_rules_only
+from vitalforge_dashboard.sync import SyncRegistry, run_sync, scheduled_sync
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
