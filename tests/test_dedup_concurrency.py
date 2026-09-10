@@ -160,7 +160,7 @@ async def test_two_concurrent_identical_retries_push_to_garmin_once(client, fake
     assert await row_count() == 1
 
 
-async def test_concurrent_writer_not_blocked_by_garmin_push(client, weight_app_module, monkeypatch):
+async def test_concurrent_writer_not_blocked_by_garmin_push(client, weight_app_module, monkeypatch, weight_routes_module):
     """Proves the push is genuinely outside the transaction: a sync.py-style
     writer on a completely separate connection/thread must succeed quickly
     while a (mocked, slow) Garmin push is in flight, not wait for it."""
@@ -170,7 +170,7 @@ async def test_concurrent_writer_not_blocked_by_garmin_push(client, weight_app_m
         push_started.set()
         time.sleep(1.0)
 
-    monkeypatch.setattr(weight_app_module, "push_weight", slow_push)
+    monkeypatch.setattr(weight_routes_module, "push_weight", slow_push)
 
     db_path = str(database.DB_PATH)
     person_id = await get_primary_person_id()
@@ -206,7 +206,7 @@ async def test_concurrent_writer_not_blocked_by_garmin_push(client, weight_app_m
     )
 
 
-async def test_concurrent_writer_not_blocked_by_enrichment_push(client, weight_app_module, monkeypatch):
+async def test_concurrent_writer_not_blocked_by_enrichment_push(client, weight_app_module, monkeypatch, weight_routes_module):
     """Same property as above, for the enrichment branch specifically -- it's
     a separate code path (a different `if` arm calling _push_composition at
     the same nesting level), not exercised by the insert-path test."""
@@ -218,7 +218,7 @@ async def test_concurrent_writer_not_blocked_by_enrichment_push(client, weight_a
         push_started.set()
         time.sleep(1.0)
 
-    monkeypatch.setattr(weight_app_module, "push_weight", slow_push)
+    monkeypatch.setattr(weight_routes_module, "push_weight", slow_push)
 
     db_path = str(database.DB_PATH)
     person_id = await get_primary_person_id()
@@ -323,7 +323,7 @@ async def test_the_claim_is_released_once_the_outcome_is_recorded(client, fake_g
     assert row["synced_to_garmin"] == 1
 
 
-async def test_a_stale_claim_is_reclaimed(client, weight_app_module, fake_garmin_client):
+async def test_a_stale_claim_is_reclaimed(client, weight_app_module, fake_garmin_client, garmin_claim_module):
     """A claimant that died mid-push must not strand the row forever.
 
     Reads the timeout off the module rather than hardcoding 600 so that
@@ -332,7 +332,7 @@ async def test_a_stale_claim_is_reclaimed(client, weight_app_module, fake_garmin
     become a live-claim test that passes for the wrong reason)."""
     row_id = await seed_failed_client_id_row(84096, "reading-1")
     stale = datetime.now(timezone.utc) - timedelta(
-        seconds=weight_app_module._GARMIN_CLAIM_TIMEOUT_SECONDS + 1
+        seconds=garmin_claim_module._GARMIN_CLAIM_TIMEOUT_SECONDS + 1
     )
     await set_claim(row_id, stale.isoformat())
 

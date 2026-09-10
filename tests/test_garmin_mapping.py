@@ -90,12 +90,12 @@ def test_no_composition_values_in_log_output(fake_garmin_client, caplog):
     assert "3.2" not in caplog.text
 
 
-async def test_muscle_pct_derives_muscle_mass_kg(client, weight_app_module, fake_garmin_client, monkeypatch):
+async def test_muscle_pct_derives_muscle_mass_kg(client, weight_app_module, fake_garmin_client, monkeypatch, weight_routes_module):
     # weight_app_module fakes push_weight wholesale by default (for tests that
     # don't care about Garmin-side mapping). Restore the real function here so
     # the route's muscle_mass_kg derivation reaches push_weight's own kwarg
     # mapping instead of being bypassed by the double.
-    monkeypatch.setattr(weight_app_module, "push_weight", garmin_client.push_weight)
+    monkeypatch.setattr(weight_routes_module, "push_weight", garmin_client.push_weight)
 
     # weight=80kg, muscle_pct=40% -> 32.0kg. Deliberately not 100kg: at 100kg
     # the conversion (weight_kg * pct/100) is numerically the identity map on
@@ -116,11 +116,11 @@ async def test_weight_only_push_sends_no_composition_values(client, fake_garmin_
     assert pushed.get("bone_mass") is None
 
 
-async def test_garmin_failure_still_stores_composition_locally(client, weight_app_module, monkeypatch):
+async def test_garmin_failure_still_stores_composition_locally(client, weight_app_module, monkeypatch, weight_routes_module):
     def failing_push(weight_grams, timestamp=None, **kwargs):
         raise RuntimeError("synthetic Garmin outage")
 
-    monkeypatch.setattr(weight_app_module, "push_weight", failing_push)
+    monkeypatch.setattr(weight_routes_module, "push_weight", failing_push)
 
     resp = await client.post(
         f"{PERSON_PREFIX}/api/weight",

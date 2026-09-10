@@ -148,7 +148,7 @@ async def test_synced_is_never_repushed_however_many_times_it_is_posted(client, 
     assert row["garmin_status"] == "synced"
 
 
-async def test_failed_pushes_again_then_stops(client, weight_app_module, fake_garmin_client, monkeypatch):
+async def test_failed_pushes_again_then_stops(client, weight_app_module, fake_garmin_client, monkeypatch, activity_garmin_module):
     """The full retry arc in one test: fail, retry, succeed, then STOP.
 
     Split across two tests elsewhere. Together they are one property -- a
@@ -157,7 +157,7 @@ async def test_failed_pushes_again_then_stops(client, weight_app_module, fake_ga
     replay forever.
     """
     calls = {"n": 0}
-    real = weight_app_module.push_activity
+    real = activity_garmin_module.push_activity
 
     def flaky(**kwargs):
         calls["n"] += 1
@@ -165,7 +165,7 @@ async def test_failed_pushes_again_then_stops(client, weight_app_module, fake_ga
             raise RuntimeError("garmin is down")
         return real(**kwargs)
 
-    monkeypatch.setattr(weight_app_module, "push_activity", flaky)
+    monkeypatch.setattr(activity_garmin_module, "push_activity", flaky)
 
     for _ in range(4):
         await client.post(f"{PERSON_PREFIX}/api/activity", json=body(push_to_garmin=True))
@@ -180,7 +180,7 @@ async def test_failed_pushes_again_then_stops(client, weight_app_module, fake_ga
 
 async def test_pending_row_with_live_claim_is_not_pushed_again(
     client, weight_app_module, fake_garmin_client, monkeypatch
-):
+, activity_garmin_module, activity_routes_module):
     """A row stranded at 'pending' is NOT re-pushed while its claim is live.
 
     This test was written as a strict xfail demonstrating a real defect, and
@@ -212,14 +212,14 @@ async def test_pending_row_with_live_claim_is_not_pushed_again(
     so a crash mid-push cannot strand a session unpushable forever --
     test_stale_claim_is_reclaimed covers that side.
     """
-    real_record = weight_app_module._record_activity_garmin_outcome
+    real_record = activity_routes_module._record_activity_garmin_outcome
 
     async def failing_record(db, row_id, outcome):
         raise RuntimeError("disk I/O error")
 
     # POST 1: the Garmin push SUCCEEDS; only recording its outcome fails, so
     # the row is left at 'pending' over an activity Garmin already has.
-    monkeypatch.setattr(weight_app_module, "_record_activity_garmin_outcome", failing_record)
+    monkeypatch.setattr(activity_routes_module, "_record_activity_garmin_outcome", failing_record)
     first = await client.post(f"{PERSON_PREFIX}/api/activity", json=body(push_to_garmin=True))
     assert first.status_code == 202
     assert len(fake_garmin_client.created_activities) == 1
@@ -230,7 +230,7 @@ async def test_pending_row_with_live_claim_is_not_pushed_again(
 
     # POST 2 is an ordinary client retry of the same session_id -- exactly
     # what PRP §5.2 tells Cadence to do, and what D-016 bounds.
-    monkeypatch.setattr(weight_app_module, "_record_activity_garmin_outcome", real_record)
+    monkeypatch.setattr(activity_routes_module, "_record_activity_garmin_outcome", real_record)
     second = await client.post(f"{PERSON_PREFIX}/api/activity", json=body(push_to_garmin=True))
     assert second.status_code == 200
 
