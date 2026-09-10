@@ -211,8 +211,8 @@ async def test_malformed_session_field_rejected_not_500(client):
     assert await activity_count() == 0
 
 
-async def test_oversized_file_rejected(client, dashboard_app_module, monkeypatch):
-    monkeypatch.setattr(dashboard_app_module.fit_import, "MAX_UPLOAD_BYTES", 100)
+async def test_oversized_file_rejected(client, dashboard_app_module, monkeypatch, dashboard_fit_module):
+    monkeypatch.setattr(dashboard_fit_module.fit_import, "MAX_UPLOAD_BYTES", 100)
     oversized = make_fit_bytes() + b"\x00" * 500
 
     resp = await client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("run.fit", oversized)})
