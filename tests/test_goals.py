@@ -6,12 +6,15 @@ admin can override a non-owner's 403, an unauthenticated caller gets 401,
 and an unknown id gets 404 -- mirrors test_api_tokens.py's pattern for
 `shared/auth.py`'s existing token-ownership routes.
 
-`goals.py` is a sibling module of `vitalforge_dashboard/app.py` and needs
-that module's own `sys.path.insert` (for its bare `from recommendations
-import ...`) to have already run before it's importable — every test below
-therefore depends on `dashboard_app_module` (which imports `app.py`) even
-when only exercising `goals.compute_progress` directly, and imports `goals`
-lazily inside the test body rather than at module top level.
+`goals` is imported normally at module level. It used to need
+`vitalforge_dashboard/app.py`'s `sys.path.insert` to have run first — for its
+own bare `from recommendations import ...` — so every test below imported it
+lazily inside the test body and depended on `dashboard_app_module` purely to
+force that ordering. The service directory is a real package now and the hack
+is gone, so the import is ordinary.
+
+The tests still take `dashboard_app_module`, but for the database it sets up,
+not for import ordering.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -23,6 +26,7 @@ from shared import auth as shared_auth
 from shared.auth import create_session_cookie
 from shared.database import get_db, get_primary_person_id
 from tests.conftest import PERSON_PREFIX, grant_person, primary_person_id, seed_user
+from vitalforge_dashboard import goals
 
 
 @pytest.fixture
@@ -237,7 +241,6 @@ async def test_users_only_list_their_own_goals(client):
 
 
 async def test_compute_progress_projects_eta_when_trending_toward_target(dashboard_app_module):
-    import goals
 
     rows = [(days_ago(4 - i), 100.0 * (i + 1)) for i in range(5)]  # 100, 200, ..., 500 ascending
     await seed_metric("steps", "value", rows)
@@ -252,7 +255,6 @@ async def test_compute_progress_projects_eta_when_trending_toward_target(dashboa
 
 
 async def test_compute_progress_no_eta_when_trending_away_from_target(dashboard_app_module):
-    import goals
 
     rows = [(days_ago(4 - i), 500.0 - 100.0 * i) for i in range(5)]  # 500, 400, ..., 100 descending
     await seed_metric("steps", "value", rows)
@@ -266,7 +268,6 @@ async def test_compute_progress_no_eta_when_trending_away_from_target(dashboard_
 
 
 async def test_compute_progress_insufficient_data_returns_none_slope(dashboard_app_module):
-    import goals
 
     await seed_metric("steps", "value", [(days_ago(0), 100.0)])
     person_id = await get_primary_person_id()
@@ -278,7 +279,6 @@ async def test_compute_progress_insufficient_data_returns_none_slope(dashboard_a
 
 
 async def test_compute_progress_already_at_target(dashboard_app_module):
-    import goals
 
     rows = [(days_ago(4 - i), 1000.0) for i in range(5)]
     await seed_metric("steps", "value", rows)
@@ -290,7 +290,6 @@ async def test_compute_progress_already_at_target(dashboard_app_module):
 
 
 async def test_compute_progress_on_track_relative_to_target_date(dashboard_app_module):
-    import goals
 
     rows = [(days_ago(4 - i), 100.0 * (i + 1)) for i in range(5)]  # +100/day
     await seed_metric("steps", "value", rows)
@@ -313,7 +312,6 @@ async def test_compute_progress_on_track_relative_to_target_date(dashboard_app_m
 
 
 async def test_compute_progress_no_data_returns_all_none(dashboard_app_module):
-    import goals
 
     person_id = await get_primary_person_id()
     progress = await goals.compute_progress("steps", "value", person_id, target_value=1000, target_date=None)
