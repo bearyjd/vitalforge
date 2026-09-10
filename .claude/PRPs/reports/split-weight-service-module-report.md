@@ -1,4 +1,4 @@
-# Implementation Report: Split vitalforge-weight/app.py — Phase A (rename)
+# Implementation Report: Split vitalforge-weight/app.py
 
 ## Summary
 Renamed both service directories to valid Python identifiers
@@ -106,3 +106,73 @@ Verified in CI job output: `build-and-push (vitalforge-weight, vitalforge_weight
       `activity_routes.py`, `garmin_claim.py` (plan section "Phase B")
 - [ ] Follow-up (not blocking): delete the dashboard's `sys.path` hack now that
       `from vitalforge_dashboard.goals import ...` is possible
+
+
+---
+
+# Phase B (the split)
+
+## Summary
+`vitalforge_weight/app.py` went from 2,056 lines to 247, split into six modules, none
+over the repo's 800-line ceiling. Route table and OpenAPI schema are byte-identical
+before and after.
+
+| Module | Lines |
+|---|--:|
+| `models.py` | 216 |
+| `garmin_claim.py` | 68 |
+| `activity_garmin.py` | 443 |
+| `activity_routes.py` | 607 |
+| `weight_routes.py` | 607 |
+| `app.py` | 247 |
+
+## Validation Results
+
+| Level | Status | Notes |
+|---|---|---|
+| Static Analysis | Pass | `ruff check .` clean |
+| Unit Tests | Pass | 897 passed, 2 skipped (was 870; +new module-size and aggregate-floor tests) |
+| Playwright | Pass | 4 passed — caught a live-server fixture the unit lane did not |
+| Route parity | Pass | **Byte-identical**, 37 routes |
+| OpenAPI parity | Pass | **Byte-identical**, 35,746 bytes |
+| Integration | Pass | Deployed; all six modules import in the container; 37 routes registered |
+
+## Deviations from Plan
+
+1. **Six modules, not four.** The plan specified `weight_routes` / `activity_routes` /
+   `garmin_claim`. Measured after partitioning, activity came to ~931 lines — still over
+   the ceiling — so the Garmin push machinery split out into `activity_garmin.py`. And
+   `models.py` was added because `CAPTURED_AT_FUTURE_TOLERANCE_SECONDS` and the unit
+   constants are used by BOTH `WeightIn` and `ActivityIn`; leaving them in the weight
+   domain made `models` and `weight_routes` import each other.
+
+2. **A second fixture trap the plan did not anticipate.** The plan warned that Garmin
+   helpers are bound per-module. True, and handled. But `activity_routes` also imports
+   `_record_activity_garmin_outcome` BY VALUE from `activity_garmin`, so patching it
+   where it is *defined* never reaches the binding the route *calls*. Tests must patch
+   the caller. `activity_routes_module` exists to make that distinction explicit.
+
+3. **A security guard fired and was rescoped, not weakened.**
+   `test_no_unscoped_person_access`'s per-file "not vacuous" floor failed because
+   `app.py` now has zero `/p/{slug}/api/` routes. Its own comment predicted exactly this.
+   The floor became an aggregate across all service files: same guarantee, correct scope.
+
+4. **Added `tests/test_module_size.py`** (not in the plan). The ceiling was breached for
+   a long time because a line count is something everyone can see and nobody owns.
+   `shared/auth.py` (1,518) and `vitalforge_dashboard/app.py` (945) are named exemptions.
+
+## Issues Encountered
+
+- Two generator bugs, both caught by assertions rather than by tests: overlapping node
+  boundaries duplicated definitions (`LBS_PER_KG`, `_ERROR_EMAIL_RE`) and produced
+  unbalanced parens. Fixed with a hard non-overlap clamp plus a post-generation
+  duplicate-definition assertion. Worth noting because a silent duplicate definition is
+  the same failure class as the shadowed `_garmin_claim_is_live` found in PR #46.
+- ~25 test failures from fixtures patching modules that no longer own the bindings.
+  All loud (`AttributeError`), never silent — which is the behaviour the plan predicted.
+
+## Next Steps
+- [x] Phase A merged (#47) and deployed
+- [x] Phase B merged (#48) and deployed
+- [ ] Split `vitalforge_dashboard/app.py` (945 lines) — unblocked, separate plan
+- [ ] Delete the dashboard's `sys.path` hack now that package imports are possible
