@@ -16,16 +16,12 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 CEILING = 800
 
-# Two modules predate this guard. Recorded here rather than raising the ceiling
+# One module predates this guard. Recorded here rather than raising the ceiling
 # for everyone: a named exemption is visible and arguable, a higher global limit
 # is neither. Delete an entry when its module is split.
-#
-# vitalforge_dashboard/app.py is the next one to go -- the rename in PR #47 made
-# it splittable the same way the weight service just was, and it still carries
-# the sys.path hack for its six sibling modules.
+
 GRANDFATHERED = {
-    "shared/auth.py",             # 1,518 lines
-    "vitalforge_dashboard/app.py",  # 945 lines
+    "shared/auth.py",  # 1,518 lines
 }
 
 MODULES = sorted(

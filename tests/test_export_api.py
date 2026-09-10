@@ -137,7 +137,7 @@ async def test_export_empty_table_returns_empty_json_array_without_crashing(clie
     assert resp.json() == []
 
 
-async def test_export_mid_stream_db_failure_is_logged(client, dashboard_app_module, monkeypatch, caplog):
+async def test_export_mid_stream_db_failure_is_logged(client, dashboard_app_module, monkeypatch, caplog, dashboard_export_module):
     """A DB error partway through the streamed export must be logged server-side.
 
     `StreamingResponse` has already sent a 200 and headers by the time
@@ -165,7 +165,7 @@ async def test_export_mid_stream_db_failure_is_logged(client, dashboard_app_modu
     async def fake_get_db():
         return FailingDB(await real_get_db())
 
-    monkeypatch.setattr(dashboard_app_module, "get_db", fake_get_db)
+    monkeypatch.setattr(dashboard_export_module, "get_db", fake_get_db)
 
     caplog.set_level(logging.ERROR)
 

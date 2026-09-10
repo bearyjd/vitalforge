@@ -543,3 +543,20 @@ def activity_routes_module(weight_app_module):
     actually calls. Patch the caller, not the definer.
     """
     return import_service_module("vitalforge_weight.activity_routes")
+
+
+@pytest.fixture
+def dashboard_export_module(dashboard_app_module):
+    """The module that owns the export route's `get_db` binding after the split.
+
+    Same owning-module rule as the weight service: export_routes imports get_db
+    into its own namespace, so patching it on app.py reaches a binding the route
+    does not read.
+    """
+    return import_service_module("vitalforge_dashboard.export_routes")
+
+
+@pytest.fixture
+def dashboard_fit_module(dashboard_app_module):
+    """The module that owns the `fit_import` binding after the split."""
+    return import_service_module("vitalforge_dashboard.fit_activity_routes")

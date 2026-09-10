@@ -1,16 +1,12 @@
 import asyncio
-import csv
-import io
-import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.requests import Request
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -30,8 +26,9 @@ from shared.database import (
 )
 from shared.garmin_client import authenticate
 from shared.persons_admin import add_person_routes
-from vitalforge_dashboard import fit_import
 from vitalforge_dashboard.correlations import compute_cell
+from vitalforge_dashboard.export_routes import add_export_routes
+from vitalforge_dashboard.fit_activity_routes import add_fit_activity_routes
 from vitalforge_dashboard.goals import (
     GoalCreate,
     GoalOut,
@@ -44,11 +41,13 @@ from vitalforge_dashboard.goals import (
     list_goals,
     update_goal,
 )
+from vitalforge_dashboard.metrics import METRIC_TABLES
 from vitalforge_dashboard.readiness import compute_readiness
 from vitalforge_dashboard.recommendations import get_recommendations, get_rules_only
 from vitalforge_dashboard.sync import SyncRegistry, run_sync, scheduled_sync
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+
 logger = logging.getLogger(__name__)
 
 # Track whether a sync is currently running
@@ -72,25 +71,6 @@ _syncing_person_ids = SyncRegistry()
 # Strong references to the detached sync tasks. asyncio keeps only a weak one,
 # so a task nobody holds can be garbage-collected part-way through a sync.
 _inflight_sync_tasks: set[asyncio.Task] = set()
-
-METRIC_TABLES = {
-    "sleep_duration": ("sleep", "duration_seconds"),
-    "sleep_score": ("sleep", "sleep_score"),
-    "resting_hr": ("resting_hr", "value"),
-    "hrv": ("hrv", "last_night_avg"),
-    "body_battery": ("body_battery", "highest"),
-    "body_battery_low": ("body_battery", "lowest"),
-    "stress": ("stress", "avg_level"),
-    "vo2max": ("vo2max", "vo2max_value"),
-    "weight": ("weight_history", "weight_grams"),
-    "body_fat": ("weight_history", "body_fat"),
-    "body_water": ("weight_history", "body_water"),
-    "bone_mass": ("weight_history", "bone_mass_g"),
-    "muscle_mass": ("weight_history", "muscle_mass_g"),
-    "training_load": ("training_load", "acute_load"),
-    "steps": ("steps", "value"),
-    "active_calories": ("active_calories", "value"),
-}
 
 
 @asynccontextmanager
@@ -118,25 +98,23 @@ async def lifespan(app: FastAPI):
     yield
     sync_task.cancel()
 
-
 app = FastAPI(title="VitalForge Dashboard", lifespan=lifespan)
 
 # Auth routes and middleware (must be added before other routes)
 add_auth_routes(app)
-# Person-collection admin (/api/persons, /auth/admin/persons). Registered on
+
 # BOTH services for the same reason add_auth_routes is: one login covers both,
 # so an admin who opened the weight service should not have to switch ports to
 # add someone.
 add_person_routes(app)
 
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
-templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
 
+templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
 
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "vitalforge-dashboard"}
-
 
 # Shown by GET / when the caller can reach no person at all. Static text on
 # purpose -- nothing from the request or the database is interpolated into it,
@@ -162,7 +140,6 @@ exists, this page will take you straight to that person's dashboard.</p>
 </body>
 </html>
 """
-
 
 async def _reachable_persons(request: Request) -> tuple[list[tuple[int, str]], int | None]:
     """Every active person the caller may open, as (id, slug) lowest id first,
@@ -233,7 +210,6 @@ async def _reachable_persons(request: Request) -> tuple[list[tuple[int, str]], i
 
     return [(row["id"], row["slug"]) for row in rows], default_person_id
 
-
 @app.get("/")
 async def index(request: Request):
     """Send the caller to their own person's dashboard.
@@ -270,7 +246,6 @@ async def index(request: Request):
 
     return RedirectResponse(f"/p/{persons[0][1]}/", status_code=302)
 
-
 @app.get("/p/{slug}/")
 async def person_index(request: Request, slug: str, person_id: int = Depends(require_person("view"))):
     # Signature is (request, name, context) -- starlette removed the old
@@ -289,7 +264,6 @@ async def person_index(request: Request, slug: str, person_id: int = Depends(req
             "tz": os.environ.get("TZ", ""),
         },
     )
-
 
 @app.post("/p/{slug}/api/sync")
 async def trigger_sync(
@@ -357,7 +331,6 @@ async def trigger_sync(
     task.add_done_callback(_inflight_sync_tasks.discard)
     return {"status": "started", "days": days}
 
-
 @app.get("/p/{slug}/api/sync/status")
 async def sync_status(person_id: int = Depends(require_person("view"))):
     """Return last sync time and result."""
@@ -386,7 +359,6 @@ async def sync_status(person_id: int = Depends(require_person("view"))):
         "last_sync_days": row["last_sync_days"],
         "syncing": syncing,
     }
-
 
 @app.get("/p/{slug}/api/metrics/{metric_name}")
 async def get_metrics(
@@ -433,7 +405,6 @@ async def get_metrics(
         "data": data,
     }
 
-
 @app.get("/p/{slug}/api/readiness")
 async def api_readiness(person_id: int = Depends(require_person("view"))):
     """Get the composite readiness/recovery score (0-100)."""
@@ -442,116 +413,6 @@ async def api_readiness(person_id: int = Depends(require_person("view"))):
     except Exception as e:
         logger.error("Readiness scoring failed: %s", e)
         raise HTTPException(status_code=500, detail="Failed to compute readiness score")
-
-
-async def _export_rows(person_id: int, metrics: list[str], days: int):
-    """Yield (metric_name, date, value) tuples for the given metrics.
-
-    Reuses get_metrics()'s exact query pattern (same WHERE/ORDER BY clause,
-    same NULL-value filtering, same person_id scoping) against one shared DB
-    connection for the whole export, rather than opening/closing a
-    connection per metric. `table`/`column` are always looked up from
-    METRIC_TABLES (never taken from the raw request), so the f-string
-    interpolation into the SQL identifier positions below is safe.
-
-    `person_id` is a parameter rather than something resolved in here: this
-    generator is consumed by StreamingResponse after export_data() has
-    returned, so there is no request scope left to authorize against.
-    export_data() takes it from require_person and threads it down.
-    """
-    db = await get_db()
-    try:
-        for metric_name in metrics:
-            table, column = METRIC_TABLES[metric_name]
-            cursor = await db.execute(
-                f"SELECT date, [{column}] as value FROM [{table}] "
-                f"WHERE person_id = ? AND date >= date('now', ?) ORDER BY date ASC",
-                (person_id, f"-{days} days"),
-            )
-            rows = await cursor.fetchall()
-            for row in rows:
-                if row["value"] is not None:
-                    yield metric_name, row["date"], row["value"]
-    except Exception:
-        # The StreamingResponse has already sent a 200 and headers by the time
-        # a failure happens here, so the client just sees a truncated
-        # download with no indication anything went wrong. Log server-side
-        # before re-raising so the failure isn't silently lost.
-        logger.exception("Export failed mid-stream (metrics=%s, days=%s)", metrics, days)
-        raise
-    finally:
-        await db.close()
-
-
-async def _export_csv(person_id: int, metrics: list[str], days: int, include_metric_column: bool):
-    """Stream export rows as CSV text chunks."""
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-
-    writer.writerow(["metric", "date", "value"] if include_metric_column else ["date", "value"])
-    yield buf.getvalue()
-    buf.seek(0)
-    buf.truncate(0)
-
-    async for metric_name, date, value in _export_rows(person_id, metrics, days):
-        writer.writerow([metric_name, date, value] if include_metric_column else [date, value])
-        yield buf.getvalue()
-        buf.seek(0)
-        buf.truncate(0)
-
-
-async def _export_json(person_id: int, metrics: list[str], days: int, include_metric_column: bool):
-    """Stream export rows as a JSON array, one object per row."""
-    first = True
-    yield "["
-    async for metric_name, date, value in _export_rows(person_id, metrics, days):
-        if not first:
-            yield ","
-        first = False
-        record = {"date": date, "value": value}
-        if include_metric_column:
-            record = {"metric": metric_name, **record}
-        yield json.dumps(record)
-    yield "]"
-
-
-@app.get("/p/{slug}/api/export")
-async def export_data(
-    metric: str = Query(default="all"),
-    days: int = Query(default=30, ge=1, le=365),
-    format: str = Query(default="csv"),
-    person_id: int = Depends(require_person("view")),
-):
-    """Stream metric data as a CSV or JSON file download.
-
-    `metric=all` streams long/tidy `metric,date,value` rows across every
-    known metric; a single metric name streams just `date,value`.
-    """
-    if metric != "all" and metric not in METRIC_TABLES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown metric '{metric}'. Valid: all, {', '.join(sorted(METRIC_TABLES))}",
-        )
-    if format not in {"csv", "json"}:
-        raise HTTPException(status_code=400, detail=f"Unknown format '{format}'. Valid: csv, json")
-
-    metrics_to_export = sorted(METRIC_TABLES) if metric == "all" else [metric]
-    include_metric_column = metric == "all"
-    filename = f"vitalforge-export-{metric}-{days}d.{format}"
-
-    if format == "csv":
-        generator = _export_csv(person_id, metrics_to_export, days, include_metric_column)
-        media_type = "text/csv"
-    else:
-        generator = _export_json(person_id, metrics_to_export, days, include_metric_column)
-        media_type = "application/json"
-
-    return StreamingResponse(
-        generator,
-        media_type=media_type,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
-
 
 @app.get("/p/{slug}/api/recommendations")
 async def api_recommendations(
@@ -565,12 +426,10 @@ async def api_recommendations(
         logger.error("Recommendations failed: %s", e)
         raise HTTPException(status_code=500, detail="Failed to generate recommendations")
 
-
 @app.get("/p/{slug}/api/recommendations/rules-only")
 async def api_rules_only(person_id: int = Depends(require_person("view"))):
     """Get rules engine output without LLM."""
     return await get_rules_only(person_id)
-
 
 @app.get("/p/{slug}/api/correlations")
 async def api_correlations(
@@ -633,195 +492,6 @@ async def api_correlations(
     }
 
 
-# How close two uploads' (sport, start_time_utc) must be to be treated as
-# the same activity re-imported (e.g. the same watch export processed
-# twice, landing a few seconds apart in wall-clock terms even though the
-# file bytes differ slightly). This is the second dedup stage -- the first
-# is the exact `file_sha256` match below.
-ACTIVITY_NEAR_DUPLICATE_WINDOW_SECONDS = 120
-
-_ACTIVITY_COLUMNS = (
-    "id", "start_time_utc", "sport", "duration_seconds", "distance_m", "calories",
-    "avg_hr", "max_hr", "elevation_gain_m", "source_format", "file_sha256", "imported_at",
-)
-
-
-def _activity_row_to_dict(row) -> dict:
-    return {col: row[col] for col in _ACTIVITY_COLUMNS}
-
-
-async def _read_upload_capped(file: UploadFile, max_bytes: int) -> bytes:
-    """Read an UploadFile in bounded chunks, rejecting anything over
-    `max_bytes` before it's fully buffered in memory -- trusting
-    `Content-Length` alone isn't enough since a client can omit or lie
-    about it."""
-    chunk_size = 1024 * 1024
-    chunks = []
-    total = 0
-    while True:
-        chunk = await file.read(chunk_size)
-        if not chunk:
-            break
-        total += len(chunk)
-        if total > max_bytes:
-            raise HTTPException(status_code=413, detail=f"file exceeds {max_bytes} byte upload limit")
-        chunks.append(chunk)
-    return b"".join(chunks)
-
-
-@app.post("/p/{slug}/api/import/activity")
-async def import_activity(
-    file: UploadFile = File(...),
-    person_id: int = Depends(require_person("manage")),
-):
-    """Import a local FIT activity file. FIT-only for this first slice --
-    TCX/GPX are explicitly deferred. Dedup is two-stage and race-free: an
-    exact `file_sha256` match, then a (sport, start_time_utc) time-window
-    match for near-duplicates, both performed inside one `BEGIN IMMEDIATE`
-    transaction so two concurrent uploads of the same file can never both
-    pass the check before either commits -- mirrors the fix already applied
-    to `vitalforge_weight/app.py`'s weight_log dedup (see that file's
-    `post_weight` for the full rationale)."""
-    data = await _read_upload_capped(file, fit_import.MAX_UPLOAD_BYTES)
-
-    try:
-        record = fit_import.parse_fit_bytes(data)
-    except fit_import.FitImportError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    file_hash = fit_import.compute_file_hash(data)
-    imported_at = datetime.now(timezone.utc).isoformat()
-    raw_summary_json = json.dumps(record.raw_summary, default=str)
-
-    columns_sql = ", ".join(_ACTIVITY_COLUMNS)
-
-    db = await get_db()
-    try:
-        # Atomic: the exact-hash check, the near-duplicate check, and the
-        # insert (if neither matches) all happen inside one transaction, so
-        # two concurrent uploads of the same file can never both observe
-        # "no duplicate" and both insert.
-        await db.execute("BEGIN IMMEDIATE")
-
-        cursor = await db.execute(
-            f"SELECT {columns_sql} FROM activities WHERE person_id = ? AND file_sha256 = ?",
-            (person_id, file_hash),
-        )
-        existing = await cursor.fetchone()
-        duplicate_reason = "exact_duplicate" if existing is not None else None
-
-        if existing is None:
-            cursor = await db.execute(
-                f"SELECT {columns_sql} FROM activities "
-                "WHERE person_id = ? "
-                "AND sport IS ? "
-                "AND julianday(start_time_utc) >= julianday(?, ?) "
-                "AND julianday(start_time_utc) <= julianday(?, ?) "
-                "ORDER BY start_time_utc DESC LIMIT 1",
-                (
-                    person_id,
-                    record.sport,
-                    record.start_time_utc,
-                    f"-{ACTIVITY_NEAR_DUPLICATE_WINDOW_SECONDS} seconds",
-                    record.start_time_utc,
-                    f"+{ACTIVITY_NEAR_DUPLICATE_WINDOW_SECONDS} seconds",
-                ),
-            )
-            existing = await cursor.fetchone()
-            if existing is not None:
-                duplicate_reason = "near_duplicate"
-
-        if existing is not None:
-            # Nothing to write -- commit() here is a no-op against the DB
-            # but still releases the IMMEDIATE lock, mirroring
-            # vitalforge_weight/app.py's post_weight, which also commits
-            # unconditionally after its dedup check-then-insert regardless
-            # of which branch ran.
-            await db.commit()
-            row = existing
-        else:
-            insert_cursor = await db.execute(
-                "INSERT INTO activities (person_id, start_time_utc, sport, duration_seconds, distance_m, calories, "
-                "avg_hr, max_hr, elevation_gain_m, source_format, file_sha256, imported_at, raw_summary_json) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    person_id,
-                    record.start_time_utc,
-                    record.sport,
-                    record.duration_seconds,
-                    record.distance_m,
-                    record.calories,
-                    record.avg_hr,
-                    record.max_hr,
-                    record.elevation_gain_m,
-                    record.source_format,
-                    file_hash,
-                    imported_at,
-                    raw_summary_json,
-                ),
-            )
-            row_id = insert_cursor.lastrowid
-            await db.commit()
-            cursor = await db.execute(
-                f"SELECT {columns_sql} FROM activities WHERE id = ? AND person_id = ?",
-                (row_id, person_id),
-            )
-            row = await cursor.fetchone()
-    finally:
-        await db.close()
-
-    result = _activity_row_to_dict(row)
-    if duplicate_reason is not None:
-        result["duplicate"] = True
-        result["duplicate_reason"] = duplicate_reason
-    return result
-
-
-@app.get("/p/{slug}/api/activities")
-async def list_activities(
-    limit: int = Query(default=50, ge=1, le=200),
-    person_id: int = Depends(require_person("view")),
-):
-    """List imported activities, most recent first."""
-    columns_sql = ", ".join(_ACTIVITY_COLUMNS)
-    db = await get_db()
-    try:
-        cursor = await db.execute(
-            f"SELECT {columns_sql} FROM activities "
-            "WHERE person_id = ? ORDER BY start_time_utc DESC LIMIT ?",
-            (person_id, limit),
-        )
-        rows = await cursor.fetchall()
-    finally:
-        await db.close()
-
-    return {"count": len(rows), "activities": [_activity_row_to_dict(row) for row in rows]}
-
-
-@app.get("/p/{slug}/api/activities/{activity_id}")
-async def get_activity(activity_id: int, person_id: int = Depends(require_person("view"))):
-    """A single imported activity, including its full raw FIT session
-    summary."""
-    columns_sql = ", ".join(_ACTIVITY_COLUMNS)
-    db = await get_db()
-    try:
-        cursor = await db.execute(
-            f"SELECT {columns_sql}, raw_summary_json FROM activities "
-            "WHERE id = ? AND person_id = ?",
-            (activity_id, person_id),
-        )
-        row = await cursor.fetchone()
-    finally:
-        await db.close()
-
-    if row is None:
-        raise HTTPException(status_code=404, detail="activity not found")
-
-    result = _activity_row_to_dict(row)
-    result["raw_summary"] = json.loads(row["raw_summary_json"]) if row["raw_summary_json"] else None
-    return result
-
-
 # ---------------------------------------------------------------------------
 # Goal / target tracking
 #
@@ -840,7 +510,6 @@ def _validate_goal_metric(metric: str | None):
             detail=f"Unknown metric '{metric}'. Valid: {', '.join(sorted(METRIC_TABLES))}",
         )
 
-
 async def _goal_progress(goal: dict, person_id: int) -> GoalProgress | None:
     mapping = METRIC_TABLES.get(goal["metric"])
     if mapping is None:
@@ -850,10 +519,8 @@ async def _goal_progress(goal: dict, person_id: int) -> GoalProgress | None:
     table, column = mapping
     return await compute_progress(table, column, person_id, goal["target_value"], goal["target_date"])
 
-
 async def _goal_out(goal: dict, person_id: int) -> GoalOut:
     return GoalOut(**goal, progress=await _goal_progress(goal, person_id))
-
 
 async def _owned_goal_or_404(request: Request, goal_id: int) -> dict:
     """404 if the goal doesn't exist, 403 if it exists but belongs to
@@ -886,7 +553,6 @@ async def _owned_goal_or_404(request: Request, goal_id: int) -> dict:
         raise HTTPException(status_code=403, detail="Not your goal")
     return goal
 
-
 @app.post("/p/{slug}/api/goals", status_code=201)
 async def create_goal_route(
     data: GoalCreate,
@@ -899,19 +565,16 @@ async def create_goal_route(
     goal = await get_goal(goal_id)
     return await _goal_out(goal, person_id)
 
-
 @app.get("/p/{slug}/api/goals")
 async def list_goals_route(request: Request, person_id: int = Depends(require_person("view"))):
     identity = await require_account_identity(request)
     goals = await list_goals(identity.user_id)
     return [await _goal_out(goal, person_id) for goal in goals]
 
-
 @app.get("/p/{slug}/api/goals/{goal_id}")
 async def get_goal_route(goal_id: int, request: Request, person_id: int = Depends(require_person("view"))):
     goal = await _owned_goal_or_404(request, goal_id)
     return await _goal_out(goal, person_id)
-
 
 @app.patch("/p/{slug}/api/goals/{goal_id}")
 async def patch_goal_route(
@@ -925,7 +588,6 @@ async def patch_goal_route(
     updated = await update_goal(goal_id, data)
     return await _goal_out(updated, person_id)
 
-
 # Account-scoped, and therefore the one goals route that does NOT move under
 # /p/{slug}/: deleting a goal takes no person_id at all (the person only ever
 # fed progress computation on the routes above), so there is nothing here for
@@ -935,3 +597,7 @@ async def delete_goal_route(goal_id: int, request: Request):
     await _owned_goal_or_404(request, goal_id)
     await delete_goal(goal_id)
     return {"success": True}
+
+# Routes defined outside this module, registered here in their original order.
+add_fit_activity_routes(app)
+add_export_routes(app)
