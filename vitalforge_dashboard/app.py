@@ -504,10 +504,10 @@ async def api_correlations(
 # owning account.
 # ---------------------------------------------------------------------------
 
-def _validate_goal_metric(metric: str | None):
+def _validate_goal_metric(metric: str | None) -> None:
     """422 for a metric goals.py cannot compute progress for.
 
-    Which names are acceptable belongs to goals.py; the status code and message
+    Which names are acceptable belongs to goals.py; the status code and wording
     belong here. Keep it that way -- goals.py does not import fastapi.
     """
     if metric is not None and not is_valid_metric(metric):

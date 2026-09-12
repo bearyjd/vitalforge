@@ -2,14 +2,12 @@
 
 This module owns which metric names a goal may use: `is_valid_metric` and
 `valid_metrics` answer from METRIC_TABLES, and `progress_for_goal` resolves a
-stored row's metric itself. That knowledge used to sit in app.py because
-METRIC_TABLES lived there and importing app from this sibling would have been
-circular; metrics.py exists precisely to break that cycle.
+stored row's metric itself.
 
 Raising the rejection stays in the route layer -- this module deliberately does
 not import fastapi, so app.py asks `is_valid_metric` and owns the HTTP status
-and message. compute_progress() still takes an already resolved (table, column)
-pair, the same shape recommendations.get_metric expects.
+and message. compute_progress() takes an already resolved (table, column) pair,
+the same shape recommendations.get_metric expects.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -74,9 +72,15 @@ def is_valid_metric(metric: str) -> bool:
 
 
 def valid_metrics() -> list[str]:
-    """Every acceptable metric name, sorted, for callers building an error
-    message. Sorted here rather than at each call site so the ordering a client
-    sees cannot drift between routes."""
+    """Every acceptable metric name, sorted, for callers naming the
+    alternatives in an error.
+
+    Companion to `is_valid_metric` -- the same METRIC_TABLES membership,
+    enumerated rather than tested. It makes no promise about the other routes'
+    wording: app.py's /api/metrics and /api/correlations answer "readable as a
+    series" and export_routes answers "exportable", which coincide with this
+    list today only because all three derive from one dict.
+    """
     return sorted(METRIC_TABLES)
 
 
@@ -184,9 +188,11 @@ async def progress_for_goal(goal: dict, person_id: int) -> GoalProgress | None:
     """Progress for a stored goal row, resolving its metric to (table, column).
 
     Returns None -- not an error -- when the row's metric is absent from
-    METRIC_TABLES. Only reachable if the metric predates a since-removed entry,
-    and a goal that outlived its metric should read back as "no progress"
-    rather than 500 the whole list route.
+    METRIC_TABLES. Not reachable through the API: create and patch both reject
+    unknown metrics, so such a row comes from this module or from a metric
+    removed after the row was written. Either way a goal that outlived its
+    metric should read back as "no progress" rather than 500 the whole list
+    route, which builds its response in a comprehension over every goal.
     """
     mapping = METRIC_TABLES.get(goal["metric"])
     if mapping is None:
