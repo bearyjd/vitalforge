@@ -14,7 +14,8 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from shared.database import get_db, get_primary_person_id
-from tests.conftest import PERSON_PREFIX, import_service_module, seed_person
+from tests.conftest import PERSON_PREFIX, seed_person
+from vitalforge_dashboard import sync as sync_module
 
 
 def days_ago(n: int) -> str:
@@ -194,7 +195,6 @@ async def test_the_scheduled_backfill_registers_itself_as_syncing(
     writing yet -- and the manual trigger, still blocked by the lock, would
     have created no task.
     """
-    sync_module = import_service_module("vitalforge_dashboard.sync")
 
     registry = dashboard_app_module.SyncRegistry()
     monkeypatch.setattr(dashboard_app_module, "_syncing_person_ids", registry)

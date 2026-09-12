@@ -6,13 +6,12 @@ Isolates every test from real infrastructure:
   to a FakeGarminClient returning canned, synthetic responses.
 - `vitalforge_weight` and `vitalforge_dashboard` resolve as namespace packages
   off the repo root (`pythonpath = ["."]` in pyproject); only `shared/` is
-  pip-installed. A plain `from vitalforge_dashboard.x import y` works here --
-  `import_service_module` is for fixtures that need the module *object* to
-  patch, not a workaround for anything.
+  pip-installed. Plain imports work. Fixtures that need a module *object* to
+  patch import it inside the fixture body (`from vitalforge_weight import
+  weight_routes`) and return it.
 """
 
 import hashlib
-import importlib
 import json
 import secrets
 import sys
@@ -216,19 +215,6 @@ async def initialized_db(tmp_db_path):
     return tmp_db_path
 
 
-def import_service_module(dotted_path: str):
-    """Return the module OBJECT for a service module, e.g.
-
-    `import_service_module("vitalforge_weight.app")`.
-
-    A thin alias for `importlib.import_module`. Reach for it only when a test
-    needs the module object itself -- which the owner fixtures below do, since
-    `monkeypatch.setattr` needs something to set the attribute on. For a plain
-    value, import it directly; nothing here requires indirection.
-    """
-    return importlib.import_module(dotted_path)
-
-
 async def seed_user(username: str, password: str = "irrelevant-for-this-test", role: str = "user") -> int:
     """Insert a user row directly via SQL, bypassing the route layer --
     mirrors test_dedup.py's seed_row for auth-related tests that need a
@@ -334,14 +320,14 @@ async def primary_person_id() -> int:
 @pytest.fixture
 def weight_app_module(initialized_db, fake_garmin_client, monkeypatch):
     """The `vitalforge_weight` FastAPI app module, Garmin/DB fully faked."""
-    module = import_service_module("vitalforge_weight.app")
+    from vitalforge_weight import activity_garmin, weight_routes
+    from vitalforge_weight import app as module
+
     # The Garmin helpers are bound into each module's own namespace via
     # `from shared.garmin_client import ...`, so patching the shared module alone
     # doesn't reach them -- patch the names the handlers actually call. Since the
     # app.py split those bindings live in three places, and patching only app.py
     # would leave the routes calling the real client while every test still passed.
-    weight_routes = import_service_module("vitalforge_weight.weight_routes")
-    activity_garmin = import_service_module("vitalforge_weight.activity_garmin")
     for m in (module, weight_routes, activity_garmin):
         if hasattr(m, "authenticate"):
             monkeypatch.setattr(m, "authenticate", lambda: None)
@@ -394,18 +380,17 @@ def no_real_garmin_client(weight_app_module):
     distinguishes "patched" from "patched somewhere that does not matter".
     """
     from shared import garmin_client
+    from vitalforge_weight import activity_garmin, weight_routes
 
     # Checked per OWNING module. After the app.py split, `push_weight` lives in
     # weight_routes and the activity helpers in activity_garmin; asserting only
     # against app.py would pass while the routes called the real client.
     owners = {
-        "vitalforge_weight.weight_routes": ("authenticate", "push_weight"),
-        "vitalforge_weight.activity_garmin": (
-            "authenticate", "push_activity", "push_activity_sets", "find_activities_by_date",
-        ),
+        weight_routes: ("authenticate", "push_weight"),
+        activity_garmin: ("authenticate", "push_activity", "push_activity_sets", "find_activities_by_date"),
     }
-    for dotted, names in owners.items():
-        module = import_service_module(dotted)
+    for module, names in owners.items():
+        dotted = module.__name__
         for name in names:
             assert hasattr(module, name), (
                 f"{dotted} no longer binds {name} -- a Garmin helper moved and this guard "
@@ -424,7 +409,8 @@ def no_real_garmin_client(weight_app_module):
 @pytest.fixture
 def dashboard_app_module(initialized_db, fake_garmin_client, monkeypatch):
     """The `vitalforge_dashboard` FastAPI app module, Garmin/DB fully faked."""
-    module = import_service_module("vitalforge_dashboard.app")
+    from vitalforge_dashboard import app as module
+
     # Same direct-import situation as vitalforge_weight/app.py.
     monkeypatch.setattr(module, "authenticate", lambda: None)
     return module
@@ -443,11 +429,12 @@ def weight_live_server(tmp_db_path, fake_garmin_client, monkeypatch):
     for the live server's own `lifespan` to call `init_db()` inside its
     dedicated server thread, where no such conflict exists.
     """
-    module = import_service_module("vitalforge_weight.app")
+    from vitalforge_weight import app as module
+    from vitalforge_weight import weight_routes
+
     # Same owning-module rule as weight_app_module: after the app.py split the
     # Garmin bindings live in weight_routes / activity_garmin, so patching app.py
     # alone would leave the live server calling the real client.
-    weight_routes = import_service_module("vitalforge_weight.weight_routes")
     for m in (module, weight_routes):
         if hasattr(m, "authenticate"):
             monkeypatch.setattr(m, "authenticate", lambda: None)
@@ -475,7 +462,8 @@ def dashboard_live_server(tmp_db_path, fake_garmin_client, monkeypatch):
     stubbed out here since it's irrelevant to a UI smoke test and only adds
     noise/latency.
     """
-    module = import_service_module("vitalforge_dashboard.app")
+    from vitalforge_dashboard import app as module
+
     monkeypatch.setattr(module, "authenticate", lambda: None)
 
     async def _noop_scheduled_sync(lock, registry):
@@ -503,7 +491,8 @@ def timing_out_until(weight_app_module, monkeypatch):
     test_activity_unknown_outcome.py for the ambiguous-outcome matrix, and
     test_activity_garmin_guard.py to reach the same state before a rename.
     """
-    activity_garmin = import_service_module("vitalforge_weight.activity_garmin")
+    from vitalforge_weight import activity_garmin
+
     state = {"failing": True}
     real = activity_garmin.push_activity
 
@@ -524,19 +513,25 @@ def activity_garmin_module(weight_app_module):
     monkeypatch push_activity or _record_activity_garmin_outcome must target THIS
     module -- patching app.py would land on a binding no route reads.
     """
-    return import_service_module("vitalforge_weight.activity_garmin")
+    from vitalforge_weight import activity_garmin
+
+    return activity_garmin
 
 
 @pytest.fixture
 def weight_routes_module(weight_app_module):
     """The module that owns push_weight after the app.py split. See above."""
-    return import_service_module("vitalforge_weight.weight_routes")
+    from vitalforge_weight import weight_routes
+
+    return weight_routes
 
 
 @pytest.fixture
 def garmin_claim_module(weight_app_module):
     """The module that owns the Garmin claim timeout after the app.py split."""
-    return import_service_module("vitalforge_weight.garmin_claim")
+    from vitalforge_weight import garmin_claim
+
+    return garmin_claim
 
 
 @pytest.fixture
@@ -548,7 +543,9 @@ def activity_routes_module(weight_app_module):
     activity_garmin (where they are defined) does not reach the binding the route
     actually calls. Patch the caller, not the definer.
     """
-    return import_service_module("vitalforge_weight.activity_routes")
+    from vitalforge_weight import activity_routes
+
+    return activity_routes
 
 
 @pytest.fixture
@@ -559,10 +556,14 @@ def dashboard_export_module(dashboard_app_module):
     into its own namespace, so patching it on app.py reaches a binding the route
     does not read.
     """
-    return import_service_module("vitalforge_dashboard.export_routes")
+    from vitalforge_dashboard import export_routes
+
+    return export_routes
 
 
 @pytest.fixture
 def dashboard_fit_module(dashboard_app_module):
     """The module that owns the `fit_import` binding after the split."""
-    return import_service_module("vitalforge_dashboard.fit_activity_routes")
+    from vitalforge_dashboard import fit_activity_routes
+
+    return fit_activity_routes

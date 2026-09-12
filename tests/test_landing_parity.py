@@ -103,13 +103,16 @@ async def test_landing_denies_an_unrecognised_grant_value(
     the predicate while leaving the words in a comment above it passed. A guard
     a comment can satisfy is not a guard.
     """
+    import importlib
+
     from httpx import ASGITransport, AsyncClient
 
     from shared.auth import create_session_cookie
     from shared.database import get_db
-    from tests.conftest import import_service_module, seed_person, seed_user
+    from tests.conftest import seed_person, seed_user
 
-    module = import_service_module(service_module)
+    # Parametrised by dotted name, so this is a real dynamic import.
+    module = importlib.import_module(service_module)
     monkeypatch.setattr(module, "authenticate", lambda: None)
     if hasattr(module, "scheduled_sync"):
 

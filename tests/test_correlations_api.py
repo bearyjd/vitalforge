@@ -5,7 +5,6 @@ only reads the local metric tables populated by `sync.py`, so every test
 seeds those tables directly.
 """
 
-import importlib
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -13,15 +12,7 @@ from httpx import ASGITransport, AsyncClient
 
 from shared.database import get_db, get_primary_person_id
 from tests.conftest import PERSON_PREFIX
-
-# `vitalforge_dashboard` is a hyphenated directory name, so `correlations.py`
-# is loaded via `importlib.import_module` (same mechanism `conftest.py`'s
-# `import_service_module` uses for `vitalforge_dashboard.app`) rather than a
-# normal `import` statement.
-_correlations = importlib.import_module("vitalforge_dashboard.correlations")
-align_series = _correlations.align_series
-compute_cell = _correlations.compute_cell
-pearson_r = _correlations.pearson_r
+from vitalforge_dashboard.correlations import align_series, compute_cell, pearson_r
 
 
 def date_n_days_ago(n: int) -> str:

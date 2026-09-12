@@ -18,11 +18,11 @@ from shared.database import get_primary_person_id
 from tests.conftest import (
     PERSON_PREFIX,
     grant_person,
-    import_service_module,
     primary_person_id,
     seed_token,
     seed_user,
 )
+from vitalforge_dashboard import sync
 
 FULL_PAYLOAD = {
     "weight": 180.0,
@@ -206,7 +206,6 @@ async def test_full_composition_chain_and_duplicate_collapse(
     # was actually pushed above (see _weigh_ins_echoing_push) so the chain is
     # real end to end, rather than the static fixture (which is pinned at a
     # fixed 2020-06-01 by test_sync.py and carries unrelated values).
-    sync = import_service_module("vitalforge_dashboard.sync")
     sync_date = pushed["timestamp"].astimezone(timezone.utc).date().isoformat()
     monkeypatch.setattr(
         fake_garmin_client, "get_weigh_ins", lambda start, end: _weigh_ins_echoing_push(pushed)
