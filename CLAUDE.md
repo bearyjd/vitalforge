@@ -78,8 +78,8 @@ docker-compose.prod.yml   # PROD — pulls prebuilt images from Docker Hub / GHC
   `POST /api/sync` (dashboard) and `POST /api/weight` (weight service, via
   `shared/garmin_client.push_weight`). This means most dashboard bugs can be reproduced by
   seeding the local DB directly — no live Garmin account needed (see roadmap item 2).
-- **`DB_PATH` and `GARTH_TOKEN_DIR` are env-overridable** (`shared/database.py:6`,
-  `shared/garmin_client.py:10`), defaulting to `/app/data/...`. Point these at a scratch
+- **`DB_PATH` and `GARTH_TOKEN_DIR` are env-overridable** (`shared/database.py`,
+  `shared/garmin_client.py`), defaulting to `/app/data/...`. Point these at a scratch
   directory to run either service against an isolated database without touching the real
   `/app/data` volume.
 
@@ -160,7 +160,7 @@ the original test-suite rationale (marked DONE).
   Prefer adding hints to new/changed functions per the global Python style rule, but don't do a
   drive-by rewrite of untouched code just to add hints.
 - Table names in `shared/database.py` map to metric keys via `METRIC_TABLES` in
-  `vitalforge_dashboard/app.py:30-44` — when adding a new synced metric, you must update
+  `vitalforge_dashboard/metrics.py` — when adding a new synced metric, you must update
   `shared/database.py` (schema), `sync.py` (populate), and this `METRIC_TABLES` dict
   (expose via `/api/metrics/{name}`) together, or the metric silently won't be queryable.
   If the new metric table is created before a future schema rebuild ships, it must also be
