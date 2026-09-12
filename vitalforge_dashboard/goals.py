@@ -1,10 +1,15 @@
 """Goal / target tracking: CRUD over the `goals` table plus a trend-based ETA.
 
-Metric name validation against METRIC_TABLES.keys() happens in app.py, not
-here -- METRIC_TABLES lives in app.py, and importing app from this sibling
-module would be circular. compute_progress() instead takes the already
-resolved (table, column) pair, the same shape recommendations.get_metric
-already expects.
+This module owns which metric names a goal may use: `is_valid_metric` and
+`valid_metrics` answer from METRIC_TABLES, and `progress_for_goal` resolves a
+stored row's metric itself. That knowledge used to sit in app.py because
+METRIC_TABLES lived there and importing app from this sibling would have been
+circular; metrics.py exists precisely to break that cycle.
+
+Raising the rejection stays in the route layer -- this module deliberately does
+not import fastapi, so app.py asks `is_valid_metric` and owns the HTTP status
+and message. compute_progress() still takes an already resolved (table, column)
+pair, the same shape recommendations.get_metric expects.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -12,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pydantic import BaseModel, ConfigDict
 
 from shared.database import get_db
+from vitalforge_dashboard.metrics import METRIC_TABLES
 from vitalforge_dashboard.recommendations import get_metric, trend_slope
 
 
@@ -55,6 +61,23 @@ class GoalOut(BaseModel):
 
 
 _SELECT_COLUMNS = "id, user_id, metric, target_value, target_date, created_at"
+
+
+def is_valid_metric(metric: str) -> bool:
+    """Whether a goal may be stored against `metric`.
+
+    The gate is "can progress be computed for it", so METRIC_TABLES membership
+    is the whole definition -- a metric absent from it has no (table, column) to
+    read, which is the same reason `progress_for_goal` degrades to None.
+    """
+    return metric in METRIC_TABLES
+
+
+def valid_metrics() -> list[str]:
+    """Every acceptable metric name, sorted, for callers building an error
+    message. Sorted here rather than at each call site so the ordering a client
+    sees cannot drift between routes."""
+    return sorted(METRIC_TABLES)
 
 
 async def create_goal(user_id: int, data: GoalCreate) -> int:
@@ -155,3 +178,18 @@ async def compute_progress(
         on_track = eta_date <= target_date if target_date else True
 
     return GoalProgress(latest_value=latest_value, trend_slope=slope, eta_date=eta_date, on_track=on_track)
+
+
+async def progress_for_goal(goal: dict, person_id: int) -> GoalProgress | None:
+    """Progress for a stored goal row, resolving its metric to (table, column).
+
+    Returns None -- not an error -- when the row's metric is absent from
+    METRIC_TABLES. Only reachable if the metric predates a since-removed entry,
+    and a goal that outlived its metric should read back as "no progress"
+    rather than 500 the whole list route.
+    """
+    mapping = METRIC_TABLES.get(goal["metric"])
+    if mapping is None:
+        return None
+    table, column = mapping
+    return await compute_progress(table, column, person_id, goal["target_value"], goal["target_date"])

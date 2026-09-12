@@ -27,6 +27,7 @@ from shared.auth import create_session_cookie
 from shared.database import get_db, get_primary_person_id
 from tests.conftest import PERSON_PREFIX, grant_person, primary_person_id, seed_user
 from vitalforge_dashboard import goals
+from vitalforge_dashboard.metrics import METRIC_TABLES
 
 
 @pytest.fixture
@@ -218,6 +219,50 @@ async def test_patch_rejects_unknown_metric(client):
     # Rejected metric never landed.
     unchanged = await client.get(f"{PERSON_PREFIX}/api/goals/{goal_id}", cookies=cookies)
     assert unchanged.json()["metric"] == "steps"
+
+
+async def test_unknown_metric_detail_lists_every_valid_metric(client):
+    """Pins the 422 *body*, not just the status code.
+
+    The two tests above would still pass if the rejection were reworded or
+    stopped naming the valid metrics -- that message is the only thing telling a
+    client what to send instead. Derived from METRIC_TABLES rather than
+    hardcoded so adding a metric does not fail this test spuriously.
+    """
+    await _seed_user_with_grant("alice", password="alice-pw")
+    resp = await client.post(
+        f"{PERSON_PREFIX}/api/goals",
+        json={"metric": "not-a-real-metric", "target_value": 1},
+        cookies=await _cookies_for("alice"),
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == f"Unknown metric 'not-a-real-metric'. Valid: {', '.join(sorted(METRIC_TABLES))}"
+
+
+async def test_goal_with_retired_metric_reads_back_as_null_progress(client):
+    """A goals row whose metric is no longer in METRIC_TABLES must degrade to
+    `progress: null`, not 500.
+
+    Unreachable through the API -- create and patch both reject unknown metrics
+    -- so the row is inserted directly, which is exactly the state removing a
+    METRIC_TABLES entry would leave behind in an existing database.
+    """
+    user_id = await _seed_user_with_grant("alice", password="alice-pw")
+    assert "retired_metric" not in METRIC_TABLES
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            "INSERT INTO goals (user_id, metric, target_value, target_date, created_at) VALUES (?, ?, ?, ?, ?)",
+            (user_id, "retired_metric", 1.0, None, "2026-01-01T00:00:00Z"),
+        )
+        goal_id = cursor.lastrowid
+        await db.commit()
+    finally:
+        await db.close()
+
+    resp = await client.get(f"{PERSON_PREFIX}/api/goals/{goal_id}", cookies=await _cookies_for("alice"))
+    assert resp.status_code == 200
+    assert resp.json()["progress"] is None
 
 
 async def test_users_only_list_their_own_goals(client):

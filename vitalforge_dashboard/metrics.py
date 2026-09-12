@@ -1,10 +1,10 @@
 """The metric-key -> table mapping.
 
-Its own module because app.py, export_routes.py and (in principle) goals.py all
-need it, and app.py imports the route modules -- so anything they share cannot
-live in app.py without a cycle. goals.py's docstring notes it validates metric
-names in app.py rather than here precisely because "importing app from this
-sibling" was circular; this is the seam that fixes that, whenever goals wants it.
+Its own module because app.py, export_routes.py and goals.py all need it, and
+app.py imports the route modules -- so anything they share cannot live in app.py
+without a cycle. goals.py used to validate metric names in app.py precisely
+because "importing app from this sibling" was circular; it now imports from here
+instead, which is what this module exists for.
 """
 
 METRIC_TABLES = {
