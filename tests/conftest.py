@@ -4,10 +4,11 @@ Isolates every test from real infrastructure:
 - SQLite DB lives in a per-test tmp_path, never `/app/data/fitness.db`.
 - Garmin Connect is never contacted; `shared.garmin_client` is monkeypatched
   to a FakeGarminClient returning canned, synthetic responses.
-- `vitalforge_weight` and `vitalforge_dashboard` are hyphenated directory
-  names, so they're loaded via `importlib.import_module` (the same mechanism
-  uvicorn uses for the documented `uvicorn vitalforge_weight.app:app` command)
-  rather than a normal `import` statement.
+- `vitalforge_weight` and `vitalforge_dashboard` resolve as namespace packages
+  off the repo root (`pythonpath = ["."]` in pyproject); only `shared/` is
+  pip-installed. A plain `from vitalforge_dashboard.x import y` works here --
+  `import_service_module` is for fixtures that need the module *object* to
+  patch, not a workaround for anything.
 """
 
 import hashlib
@@ -216,9 +217,14 @@ async def initialized_db(tmp_db_path):
 
 
 def import_service_module(dotted_path: str):
-    """Import a module from a hyphenated service directory, e.g.
+    """Return the module OBJECT for a service module, e.g.
 
     `import_service_module("vitalforge_weight.app")`.
+
+    A thin alias for `importlib.import_module`. Reach for it only when a test
+    needs the module object itself -- which the owner fixtures below do, since
+    `monkeypatch.setattr` needs something to set the attribute on. For a plain
+    value, import it directly; nothing here requires indirection.
     """
     return importlib.import_module(dotted_path)
 

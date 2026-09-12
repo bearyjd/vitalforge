@@ -1,10 +1,13 @@
 """Goal / target tracking: CRUD over the `goals` table plus a trend-based ETA.
 
-Metric name validation against METRIC_TABLES.keys() happens in app.py, not
-here -- METRIC_TABLES lives in app.py, and importing app from this sibling
-module would be circular. compute_progress() instead takes the already
-resolved (table, column) pair, the same shape recommendations.get_metric
-already expects.
+This module owns which metric names a goal may use: `is_valid_metric` and
+`valid_metrics` answer from METRIC_TABLES, and `progress_for_goal` resolves a
+stored row's metric itself.
+
+Raising the rejection stays in the route layer -- this module deliberately does
+not import fastapi, so app.py asks `is_valid_metric` and owns the HTTP status
+and message. compute_progress() takes an already resolved (table, column) pair,
+the same shape recommendations.get_metric expects.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -12,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from pydantic import BaseModel, ConfigDict
 
 from shared.database import get_db
+from vitalforge_dashboard.metrics import METRIC_TABLES
 from vitalforge_dashboard.recommendations import get_metric, trend_slope
 
 
@@ -55,6 +59,29 @@ class GoalOut(BaseModel):
 
 
 _SELECT_COLUMNS = "id, user_id, metric, target_value, target_date, created_at"
+
+
+def is_valid_metric(metric: str) -> bool:
+    """Whether a goal may be stored against `metric`.
+
+    The gate is "can progress be computed for it", so METRIC_TABLES membership
+    is the whole definition -- a metric absent from it has no (table, column) to
+    read, which is the same reason `progress_for_goal` degrades to None.
+    """
+    return metric in METRIC_TABLES
+
+
+def valid_metrics() -> list[str]:
+    """Every acceptable metric name, sorted, for callers naming the
+    alternatives in an error.
+
+    Companion to `is_valid_metric` -- the same METRIC_TABLES membership,
+    enumerated rather than tested. It makes no promise about the other routes'
+    wording: app.py's /api/metrics and /api/correlations answer "readable as a
+    series" and export_routes answers "exportable", which coincide with this
+    list today only because all three derive from one dict.
+    """
+    return sorted(METRIC_TABLES)
 
 
 async def create_goal(user_id: int, data: GoalCreate) -> int:
@@ -155,3 +182,20 @@ async def compute_progress(
         on_track = eta_date <= target_date if target_date else True
 
     return GoalProgress(latest_value=latest_value, trend_slope=slope, eta_date=eta_date, on_track=on_track)
+
+
+async def progress_for_goal(goal: dict, person_id: int) -> GoalProgress | None:
+    """Progress for a stored goal row, resolving its metric to (table, column).
+
+    Returns None -- not an error -- when the row's metric is absent from
+    METRIC_TABLES. Not reachable through the API: create and patch both reject
+    unknown metrics, so such a row comes from this module or from a metric
+    removed after the row was written. Either way a goal that outlived its
+    metric should read back as "no progress" rather than 500 the whole list
+    route, which builds its response in a comprehension over every goal.
+    """
+    mapping = METRIC_TABLES.get(goal["metric"])
+    if mapping is None:
+        return None
+    table, column = mapping
+    return await compute_progress(table, column, person_id, goal["target_value"], goal["target_date"])

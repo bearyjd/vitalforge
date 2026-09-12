@@ -27,6 +27,7 @@ from shared.auth import create_session_cookie
 from shared.database import get_db, get_primary_person_id
 from tests.conftest import PERSON_PREFIX, grant_person, primary_person_id, seed_user
 from vitalforge_dashboard import goals
+from vitalforge_dashboard.metrics import METRIC_TABLES
 
 
 @pytest.fixture
@@ -218,6 +219,59 @@ async def test_patch_rejects_unknown_metric(client):
     # Rejected metric never landed.
     unchanged = await client.get(f"{PERSON_PREFIX}/api/goals/{goal_id}", cookies=cookies)
     assert unchanged.json()["metric"] == "steps"
+
+
+async def test_unknown_metric_detail_lists_every_valid_metric(client):
+    """Pins the 422 *body*, not just the status code.
+
+    The two tests above would still pass if the rejection were reworded or
+    stopped naming the valid metrics -- that message is the only thing telling a
+    client what to send instead. Derived from METRIC_TABLES rather than
+    hardcoded so adding a metric does not fail this test spuriously.
+    """
+    await _seed_user_with_grant("alice", password="alice-pw")
+    resp = await client.post(
+        f"{PERSON_PREFIX}/api/goals",
+        json={"metric": "not-a-real-metric", "target_value": 1},
+        cookies=await _cookies_for("alice"),
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == f"Unknown metric 'not-a-real-metric'. Valid: {', '.join(sorted(METRIC_TABLES))}"
+
+
+async def test_goal_with_retired_metric_reads_back_as_null_progress(client):
+    """A goals row whose metric is no longer in METRIC_TABLES must degrade to
+    `progress: null`, not 500.
+
+    Unreachable through the API -- create and patch both reject unknown metrics
+    -- so the row is made through `goals.create_goal`, whose GoalCreate.metric is
+    a bare str with no validator. That is exactly the state removing a
+    METRIC_TABLES entry would leave behind, and it beats a hand-written INSERT:
+    a future NOT NULL column on `goals` would break raw SQL with an opaque
+    IntegrityError inside a test about progress degradation, while create_goal
+    travels with the schema.
+
+    Checked against the list route with a healthy goal alongside, because that
+    is where the blast radius is: `list_goals_route` builds
+    `[await _goal_out(g, person_id) for g in goals]`, so one unresolvable row
+    would 500 the whole collection. Degrading per-row rather than per-request is
+    the property worth pinning, and a contained single-goal 500 would not have
+    justified the guard in the first place.
+    """
+    user_id = await _seed_user_with_grant("alice", password="alice-pw")
+    assert "retired_metric" not in METRIC_TABLES
+    good_id = await goals.create_goal(user_id, goals.GoalCreate(metric="steps", target_value=10000))
+    retired_id = await goals.create_goal(user_id, goals.GoalCreate(metric="retired_metric", target_value=1.0))
+    await seed_metric("steps", "value", [(days_ago(1), 5000.0), (days_ago(0), 6000.0)])
+
+    listed = await client.get(f"{PERSON_PREFIX}/api/goals", cookies=await _cookies_for("alice"))
+    assert listed.status_code == 200
+    by_id = {g["id"]: g for g in listed.json()}
+    assert by_id[retired_id]["progress"] is None
+    # Not merely non-null: the healthy goal resolved its metric and read the
+    # seeded rows. `progress is not None` alone would pass with no data at all,
+    # since a valid metric yields a GoalProgress of all-Nones rather than None.
+    assert by_id[good_id]["progress"]["latest_value"] == 6000.0
 
 
 async def test_users_only_list_their_own_goals(client):

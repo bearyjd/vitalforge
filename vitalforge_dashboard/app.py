@@ -32,14 +32,15 @@ from vitalforge_dashboard.fit_activity_routes import add_fit_activity_routes
 from vitalforge_dashboard.goals import (
     GoalCreate,
     GoalOut,
-    GoalProgress,
     GoalUpdate,
-    compute_progress,
     create_goal,
     delete_goal,
     get_goal,
+    is_valid_metric,
     list_goals,
+    progress_for_goal,
     update_goal,
+    valid_metrics,
 )
 from vitalforge_dashboard.metrics import METRIC_TABLES
 from vitalforge_dashboard.readiness import compute_readiness
@@ -503,24 +504,20 @@ async def api_correlations(
 # owning account.
 # ---------------------------------------------------------------------------
 
-def _validate_goal_metric(metric: str | None):
-    if metric is not None and metric not in METRIC_TABLES:
+def _validate_goal_metric(metric: str | None) -> None:
+    """422 for a metric goals.py cannot compute progress for.
+
+    Which names are acceptable belongs to goals.py; the status code and wording
+    belong here. Keep it that way -- goals.py does not import fastapi.
+    """
+    if metric is not None and not is_valid_metric(metric):
         raise HTTPException(
             status_code=422,
-            detail=f"Unknown metric '{metric}'. Valid: {', '.join(sorted(METRIC_TABLES))}",
+            detail=f"Unknown metric '{metric}'. Valid: {', '.join(valid_metrics())}",
         )
 
-async def _goal_progress(goal: dict, person_id: int) -> GoalProgress | None:
-    mapping = METRIC_TABLES.get(goal["metric"])
-    if mapping is None:
-        # Only reachable if a row's metric predates a since-removed
-        # METRIC_TABLES entry -- degrade to no progress rather than 500.
-        return None
-    table, column = mapping
-    return await compute_progress(table, column, person_id, goal["target_value"], goal["target_date"])
-
 async def _goal_out(goal: dict, person_id: int) -> GoalOut:
-    return GoalOut(**goal, progress=await _goal_progress(goal, person_id))
+    return GoalOut(**goal, progress=await progress_for_goal(goal, person_id))
 
 async def _owned_goal_or_404(request: Request, goal_id: int) -> dict:
     """404 if the goal doesn't exist, 403 if it exists but belongs to
