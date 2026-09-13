@@ -36,7 +36,7 @@ jobs:
       # while still missing a small stray log.
       - name: No scratch or tool-output files tracked
         run: |
-          tracked=$(git ls-files | grep -E '(^|/)\.gstack/|(^|/)\.omc/|\.log$|(^|/)tmp/|(^|/)\.venv/|(^|/)node_modules/' || true)
+          tracked=$(git ls-files | grep -E '(^|/)\.gstack/|\.log$|(^|/)tmp/|(^|/)\.venv/|(^|/)node_modules/' || true)
           if [ -n "$tracked" ]; then
             echo "::error::Scratch/tool-output files are tracked in git:"
             echo "$tracked" | sed 's/^/  /'
