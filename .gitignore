@@ -24,6 +24,8 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
+# Local OMC session state
+.omc/
 
 # Code-review artifacts stay local. Note this is deliberately narrower than
 # .claude/ -- .claude/PRPs/plans/ and .claude/PRPs/reports/ ARE tracked.

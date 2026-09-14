@@ -35,7 +35,7 @@ vitalforge_dashboard/     # port 8086 — reads synced metrics, runs sync.py + r
 nginx/nginx.conf          # optional reverse proxy for subdomain routing (not used by docker-compose*.yml directly)
 docker-compose.yml        # DEV — builds images from source (context: repo root, per-service Dockerfile)
 docker-compose.prod.yml   # PROD — pulls prebuilt images from Docker Hub / GHCR, no build step
-.github/workflows/docker.yml  # CI: builds + pushes images on push to main / tags. No test step exists.
+.github/workflows/docker.yml  # CI: tests, then builds + pushes images on push to main / tags
 ```
 
 ## Human-judgment chokepoints (now codified)
@@ -106,8 +106,8 @@ pip install -r vitalforge_weight/requirements.txt -r vitalforge_dashboard/requir
 pip install pytest pytest-asyncio httpx ruff playwright pytest-playwright pip-audit
 pip install -e .
 ruff check .
-pip-audit -r vitalforge_weight/requirements.txt -r vitalforge_dashboard/requirements.txt
 pytest -q
+pip-audit -r vitalforge_weight/requirements.txt -r vitalforge_dashboard/requirements.txt
 
 # UI smoke tests (Playwright) — excluded from the default `pytest -q` run, see below:
 playwright install --with-deps chromium   # `--with-deps` needs apt; on non-apt systems
@@ -129,8 +129,8 @@ the same session (`RuntimeError: Runner.run() cannot be called from a running ev
 loop`). Never remove that `addopts` line or merge the two suites into one `pytest`
 invocation — run `pytest -q -m playwright` as a genuinely separate process instead (see
 `tests/live_server.py` and `tests/test_smoke_ui.py`).
-`.github/workflows/docker.yml` has a `test` job (`ruff check .`, then `pip-audit`, then
-`pytest -q`, then a separate Playwright-browser-install step and `pytest -q -m
+`.github/workflows/docker.yml` has a `test` job (`ruff check .`, then `pytest -q`, then
+`pip-audit`, then a separate Playwright-browser-install step and `pytest -q -m
 playwright`) that gates `build-and-push` via `needs: test` — a failing lint, audit or
 test blocks the image push. **`pip-audit` is scoped to the two `requirements.txt` files,
 not the installed environment**: it still resolves and audits their transitive
