@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "vitalforge"
 version = "0.1.0"
 description = "VitalForge personal health metrics platform"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
 
 [tool.setuptools]
 # `shared/` is the only installable package in this repo. The two

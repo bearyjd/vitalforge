@@ -101,7 +101,7 @@ DB_PATH=/tmp/vf-test.db GARTH_TOKEN_DIR=/tmp/vf-garth \
 # Use a venv, not the system/global Python — installing these into a shared interpreter
 # that other tools (e.g. an LLM proxy, MCP servers) also use WILL downgrade packages like
 # starlette/jinja2 out from under them:
-python3 -m venv .venv && source .venv/bin/activate
+python3.12 -m venv .venv && source .venv/bin/activate
 pip install -r vitalforge_weight/requirements.txt -r vitalforge_dashboard/requirements.txt
 pip install pytest pytest-asyncio httpx ruff playwright pytest-playwright pip-audit
 pip install -e .
