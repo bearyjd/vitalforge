@@ -18,6 +18,11 @@ from tests.conftest import PERSON_PREFIX, seed_person
 from vitalforge_dashboard import sync as sync_module
 
 
+async def usable_garmin_link(_person_id: int) -> bool:
+    """Keep task/locking tests focused on their stated concern."""
+    return True
+
+
 def days_ago(n: int) -> str:
     """A synthetic date string N days before now, for seeding within the
     dashboard's default lookback window."""
@@ -58,6 +63,26 @@ async def test_sync_status_never_synced(client):
     body = resp.json()
     assert body["last_sync_time"] is None
     assert body["last_sync_result"] == "never"
+
+
+async def test_manual_sync_without_a_link_is_explicitly_store_only(
+    client, dashboard_app_module, monkeypatch
+):
+    """An unlinked person must not queue work against deployment credentials."""
+    called = []
+
+    async def unexpected_run_sync(**_kwargs):
+        called.append(True)
+
+    monkeypatch.setattr(dashboard_app_module, "run_sync", unexpected_run_sync)
+
+    response = await client.post(f"{PERSON_PREFIX}/api/sync", json={"days": 1})
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "link_required"
+    assert response.json()["store_only"] is True
+    assert called == []
+    assert await get_primary_person_id() not in dashboard_app_module._syncing_person_ids
 
 
 async def test_sync_status_does_not_leak_another_persons_sync(
@@ -108,6 +133,7 @@ async def test_starting_a_sync_is_not_blocked_by_another_persons_sync(
         return "ok"
 
     monkeypatch.setattr(dashboard_app_module, "run_sync", _noop_run_sync)
+    monkeypatch.setattr(dashboard_app_module, "has_usable_garmin_link", usable_garmin_link)
 
     resp = await client.post(f"{PERSON_PREFIX}/api/sync", json={"days": 1})
     assert resp.json()["status"] == "started"
@@ -142,6 +168,7 @@ async def test_a_sync_task_cancelled_before_it_starts_still_clears_the_flag(
         return "ok"
 
     monkeypatch.setattr(dashboard_app_module, "run_sync", _noop_run_sync)
+    monkeypatch.setattr(dashboard_app_module, "has_usable_garmin_link", usable_garmin_link)
     person_id = await get_primary_person_id()
 
     # The window this guards is one event-loop iteration wide -- by the time
@@ -209,6 +236,7 @@ async def test_the_scheduled_backfill_registers_itself_as_syncing(
         await release.wait()
 
     monkeypatch.setattr(sync_module, "run_sync", _slow_run_sync)
+    monkeypatch.setattr(sync_module, "has_usable_garmin_link", usable_garmin_link)
     task = asyncio.create_task(
         sync_module.scheduled_sync(dashboard_app_module._sync_lock, registry)
     )
@@ -242,6 +270,7 @@ async def test_a_failed_sync_does_not_leave_the_person_marked_as_syncing(
         raise RuntimeError("garmin exploded")
 
     monkeypatch.setattr(dashboard_app_module, "run_sync", _boom)
+    monkeypatch.setattr(dashboard_app_module, "has_usable_garmin_link", usable_garmin_link)
     person_id = await get_primary_person_id()
     assert person_id not in dashboard_app_module._syncing_person_ids
 

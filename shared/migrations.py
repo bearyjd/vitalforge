@@ -43,7 +43,12 @@ SCHEMA_MIGRATIONS_TABLE_SQL = """
 # a database that already committed the 001 marker skips 001 entirely on the
 # next boot, so anything added to 001 after the fact silently never runs and
 # leaves the schema half-changed while the app code assumes otherwise.
-_KNOWN_MIGRATIONS = ("001-person-id-rebuild", "002-activities-person-id")
+_KNOWN_MIGRATIONS = (
+    "001-person-id-rebuild",
+    "002-activities-person-id",
+    "003-strength-sessions-remove-garmin-target",
+    "004-strength-sessions-redact-garmin-errors",
+)
 
 _PERSON_ID_REBUILD_SNAPSHOT_NAME = "fitness.pre-001-person-id.db"
 
@@ -56,6 +61,23 @@ _REBUILD_TABLES = [
     "sleep", "resting_hr", "hrv", "body_battery", "stress",
     "vo2max", "weight_history", "training_load", "steps", "active_calories",
 ]
+
+_LEGACY_GARMIN_TARGET_RETIRED_ERROR = "legacy_target_retired"
+_SAFE_STRENGTH_GARMIN_ERRORS = (
+    "auth_failed",
+    "link_required",
+    "rate_limited",
+    "network",
+    "unknown",
+    _LEGACY_GARMIN_TARGET_RETIRED_ERROR,
+    "activity_preparation_failed",
+    "activity_push_failed",
+    "activity_push_outcome_unknown",
+    "activity_sets_upload_failed",
+    "activity_reconciliation_failed",
+    "activity_reconciliation_pending",
+    "activity_outcome_record_failed",
+)
 
 
 def now_iso() -> str:
@@ -290,6 +312,114 @@ async def _apply_activities_person_id(db) -> None:
     if await _has_column(db, "activities", "person_id"):
         return  # fresh DB: init_db's DDL already created the new shape.
     await _rebuild_activities(db, await _ensure_primary_person(db))
+
+
+async def _apply_strength_sessions_remove_garmin_target(db) -> None:
+    """Migration 003: remove the retired global-Garmin target column.
+
+    The strength-session table owns an AUTOINCREMENT id and CHECK/UNIQUE
+    constraints, so it cannot use the generic `(person_id, date)` rebuild.
+    Rebuild it longhand and preserve its sequence, just as activities does.
+    The column is absent on fresh databases, making this a deliberate no-op
+    there while still removing it from databases that ran the old global
+    credential-owner implementation.
+    """
+    if not await _has_column(db, "strength_sessions", "garmin_target"):
+        return
+
+    # The old override filed a target person's session in somebody else's
+    # global Garmin account. A pending/failed/unknown row may therefore have
+    # reached that old account. Retrying or reconciling it through the new
+    # target person's link could create a duplicate in a different account.
+    # Preserve only the bounded reason that blocks future provider calls;
+    # never preserve or revive the old account identity.
+    await db.execute(
+        "UPDATE strength_sessions SET garmin_status = 'unknown', garmin_error = ?, "
+        "garmin_claimed_at = NULL "
+        "WHERE garmin_target IS NOT NULL "
+        "AND garmin_status IN ('pending', 'failed', 'unknown')",
+        (_LEGACY_GARMIN_TARGET_RETIRED_ERROR,),
+    )
+
+    await db.execute("""
+        CREATE TABLE [strength_sessions__new] (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            person_id          INTEGER NOT NULL,
+            session_id         TEXT NOT NULL,
+            session_label      TEXT,
+            start_time_utc     TEXT NOT NULL,
+            duration_seconds   INTEGER NOT NULL,
+            exercises_json     TEXT NOT NULL,
+            notes              TEXT,
+            source             TEXT,
+            garmin_status      TEXT NOT NULL DEFAULT 'skipped'
+                               CHECK (garmin_status IN ('skipped','pending','synced','failed','unknown')),
+            garmin_activity_id TEXT,
+            garmin_error       TEXT,
+            garmin_sets_status TEXT NOT NULL DEFAULT 'not_attempted'
+                               CHECK (garmin_sets_status IN ('not_attempted','synced','failed')),
+            garmin_claimed_at  TEXT,
+            garmin_name_prefix TEXT,
+            created_at         TEXT NOT NULL,
+            updated_at         TEXT NOT NULL,
+            UNIQUE (person_id, session_id)
+        )
+    """)
+    seq_row = await (
+        await db.execute("SELECT seq FROM sqlite_sequence WHERE name = 'strength_sessions'")
+    ).fetchone()
+    old_seq = seq_row["seq"] if seq_row is not None else None
+
+    await db.execute("""
+        INSERT INTO [strength_sessions__new] (
+            id, person_id, session_id, session_label, start_time_utc,
+            duration_seconds, exercises_json, notes, source, garmin_status,
+            garmin_activity_id, garmin_error, garmin_sets_status,
+            garmin_claimed_at, garmin_name_prefix, created_at, updated_at
+        )
+        SELECT
+            id, person_id, session_id, session_label, start_time_utc,
+            duration_seconds, exercises_json, notes, source, garmin_status,
+            garmin_activity_id, garmin_error, garmin_sets_status,
+            garmin_claimed_at, garmin_name_prefix, created_at, updated_at
+        FROM strength_sessions
+    """)
+    await db.execute("DROP TABLE strength_sessions")
+    await db.execute("ALTER TABLE [strength_sessions__new] RENAME TO strength_sessions")
+
+    if old_seq is not None:
+        cursor = await db.execute(
+            "UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = 'strength_sessions'",
+            (old_seq,),
+        )
+        if cursor.rowcount == 0:
+            await db.execute(
+                "INSERT INTO sqlite_sequence (name, seq) VALUES ('strength_sessions', ?)",
+                (old_seq,),
+            )
+
+    await db.execute(
+        "CREATE INDEX idx_strength_sessions_person_start "
+        "ON strength_sessions(person_id, start_time_utc)"
+    )
+
+
+async def _apply_strength_sessions_redact_garmin_errors(db) -> None:
+    """Migration 004: replace historic provider text with a safe code.
+
+    Earlier releases stored sanitised-but-still-provider-derived exception
+    strings in ``garmin_error``.  They can contain credentials through formats
+    the old regex did not anticipate, and are returned by activity read routes.
+    This data-only migration is immutable and idempotent: table shape stays
+    untouched, while all non-whitelisted historic values become ``unknown``.
+    """
+    placeholders = ", ".join("?" for _ in _SAFE_STRENGTH_GARMIN_ERRORS)
+    await db.execute(
+        "UPDATE strength_sessions SET garmin_error = 'unknown' "
+        "WHERE garmin_error IS NOT NULL "
+        f"AND garmin_error NOT IN ({placeholders})",
+        _SAFE_STRENGTH_GARMIN_ERRORS,
+    )
 
 
 async def _apply_person_id_rebuild(db) -> None:

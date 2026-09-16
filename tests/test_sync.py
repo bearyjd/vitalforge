@@ -5,7 +5,9 @@
 import asyncio
 from contextlib import suppress
 
-from shared.database import get_db
+import pytest
+
+from shared.database import get_db, get_primary_person_id
 from vitalforge_dashboard import sync
 
 
@@ -66,6 +68,11 @@ async def test_scheduled_sync_serializes_against_shared_lock(initialized_db, mon
 
     monkeypatch.setattr(sync, "run_sync", fake_run_sync)
 
+    async def usable_garmin_link(_person_id: int) -> bool:
+        return True
+
+    monkeypatch.setattr(sync, "has_usable_garmin_link", usable_garmin_link)
+
     task = asyncio.create_task(sync.scheduled_sync(lock, sync.SyncRegistry()))
     try:
         await asyncio.wait_for(second_call.wait(), timeout=5.0)
@@ -76,6 +83,52 @@ async def test_scheduled_sync_serializes_against_shared_lock(initialized_db, mon
 
     assert seen == [(90, True), (3, True)]
     assert not lock.locked()
+
+
+@pytest.mark.parametrize("state", ("linked", "legacy_bound"))
+async def test_usable_garmin_link_accepts_linked_and_legacy_bound(initialized_db, state):
+    person_id = await get_primary_person_id()
+    db = await get_db()
+    try:
+        await db.execute(
+            """
+            INSERT INTO garmin_links
+                (person_id, state, garmin_email, generation, linked_at, updated_at)
+            VALUES (?, ?, 'owner@example.test', 1, '2026-09-14T00:00:00Z', '2026-09-14T00:00:00Z')
+            """,
+            (person_id, state),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+    assert await sync.has_usable_garmin_link(person_id) is True
+
+
+async def test_scheduled_sync_skips_an_unlinked_primary(initialized_db, monkeypatch):
+    """The scheduler must not fall back to deployment-wide credentials."""
+    calls = []
+    reached_sleep = asyncio.Event()
+    keep_sleeping = asyncio.Event()
+
+    async def unexpected_run_sync(**_kwargs):
+        calls.append(True)
+
+    async def block_after_initial_skip(_seconds):
+        reached_sleep.set()
+        await keep_sleeping.wait()
+
+    monkeypatch.setattr(sync, "run_sync", unexpected_run_sync)
+    monkeypatch.setattr(sync.asyncio, "sleep", block_after_initial_skip)
+
+    task = asyncio.create_task(sync.scheduled_sync(asyncio.Lock(), sync.SyncRegistry()))
+    try:
+        await asyncio.wait_for(reached_sleep.wait(), timeout=5)
+        assert calls == []
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
 
 
 async def test_run_sync_preserves_backoff_until(initialized_db, fake_garmin_client):

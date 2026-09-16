@@ -240,19 +240,12 @@ ADMIN_PERSONS_PAGE_HTML = """<!DOCTYPE html>
         }
 
         async function promotePerson(p) {
-            // The wording matches the API's own refusal, because this dialog
-            // is a courtesy and the API is the guard: a promotion without
-            // acknowledge_garmin_reassignment is refused server-side.
             if (!confirm(
-                `Make ${p.display_name} the primary person?\\n\\n` +
-                `The primary person is also whose Garmin account this deployment is taken to ` +
-                `hold. After this, scheduled syncs will file that account's sleep, HRV and ` +
-                `weight under ${p.display_name}. If the Garmin account should change too, ` +
-                `update GARMIN_EMAIL/GARMIN_PASSWORD and clear the .garth token directory.`
+                `Make ${p.display_name} the primary person?`
             )) return;
             patchPerson(
                 p.id,
-                {is_primary: true, acknowledge_garmin_reassignment: true},
+                {is_primary: true},
                 "Primary person changed.",
                 "Failed to promote."
             );

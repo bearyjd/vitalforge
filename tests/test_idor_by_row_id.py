@@ -147,50 +147,42 @@ async def test_activity_detail_cannot_reach_another_persons_activity(dashboard_c
     assert "their-hash" not in resp.text
 
 
-# --- the data SOURCE is not person-scoped, only the destination is -----------
+# --- a sync's source and destination are both person-scoped ------------------
 
 
-async def test_sync_refuses_a_person_the_garmin_account_does_not_describe(
+async def test_sync_queues_the_authorized_person_without_a_global_credential_guard(
     dashboard_app_module, dashboard_client, two_persons, monkeypatch
 ):
-    """require_person authorizes the caller for a TARGET PERSON. It cannot
-    authorize them for a DATA SOURCE, and there is exactly one: a module-level
-    Garmin client on deployment-wide credentials.
+    """A manager may sync their linked person, regardless of another
+    person's Garmin link.
 
-    Found by security review, then reproduced: a caller holding `manage` on
-    their own person triggered a pull of the PRIMARY person's sleep, HRV and
-    heart rate, had it written under theirs, and read it back at 200. Every
-    SQL statement on that path is correctly person-scoped, which is exactly
-    why a scoping audit could not see it -- the destination was right and the
-    source was wrong.
-
-    INSERT OR REPLACE on (person_id, date) makes it silent data loss too: a
-    real measurement the victim already had for those dates is overwritten.
-
-    Patches run_sync on the APP module, not on sync: app.py does
-    `from sync import run_sync`, which binds the name at import time, so
-    patching sync.run_sync leaves the route calling the real one -- which
-    reaches for Garmin and hangs.
+    Phase 3 removed the deployment-wide Garmin account guard: the requested
+    person's token store is both the source and destination.  Keep this
+    separate from the row-ID tests above: ``require_person`` must still
+    authorize the requested slug, while the sync itself must receive that
+    exact person id.
     """
     _mine, theirs = two_persons
     cookies = await _authorized_as("mallory3", theirs, access="manage")
 
     called = []
 
-    async def _must_not_run(*args, **kwargs):
+    async def _record(*args, **kwargs):
         called.append(kwargs.get("person_id"))
 
-    monkeypatch.setattr(dashboard_app_module, "run_sync", _must_not_run)
+    async def _linked(_person_id):
+        return True
+
+    monkeypatch.setattr(dashboard_app_module, "run_sync", _record)
+    monkeypatch.setattr(dashboard_app_module, "has_usable_garmin_link", _linked)
 
     resp = await dashboard_client.post("/p/bryn/api/sync?days=1", cookies=cookies)
 
-    assert resp.status_code == 409, (
-        f"sync into a person the Garmin credentials do not describe returned "
-        f"{resp.status_code}; it must refuse before pulling"
-    )
-    assert not called, (
-        f"run_sync ran for person {called} despite the refusal -- the global Garmin "
-        "account's data would be filed under the wrong person"
+    assert resp.status_code == 200, f"person-scoped sync was refused: {resp.text}"
+    assert resp.json()["status"] == "started"
+    assert called == [theirs], (
+        f"run_sync ran for {called}, expected the requested person {theirs}; "
+        "a global credential-owner guard or wrong person id would corrupt the data source"
     )
 
 
@@ -209,6 +201,26 @@ async def test_sync_still_works_for_the_person_the_credentials_describe(
     mine, _theirs = two_persons
     cookies = await _authorized_as("realowner", mine, access="manage")
 
+    # A sync is permitted from the requested person's own durable link.  Do
+    # not mock this guard: the route must consult the person-scoped link row,
+    # rather than a deployment-wide credential owner.
+    from shared.database import get_db
+
+    db = await get_db()
+    try:
+        await db.execute(
+            """
+            INSERT INTO garmin_links
+                (person_id, state, garmin_email, generation, linked_at, updated_at)
+            VALUES (?, 'linked', 'realowner@example.test', 1,
+                    '2026-09-14T00:00:00Z', '2026-09-14T00:00:00Z')
+            """,
+            (mine,),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
     ran = []
 
     async def _record(*args, **kwargs):
@@ -217,8 +229,8 @@ async def test_sync_still_works_for_the_person_the_credentials_describe(
     monkeypatch.setattr(dashboard_app_module, "run_sync", _record)
 
     resp = await dashboard_client.post(f"{PERSON_PREFIX}/api/sync?days=1", cookies=cookies)
-    assert resp.status_code == 200, f"sync refused for the credential owner: {resp.text}"
+    assert resp.status_code == 200, f"sync refused for the linked person: {resp.text}"
     assert ran == [mine], (
-        f"run_sync ran for {ran}, expected the credential owner {mine}. A 200 alone does "
+        f"run_sync ran for {ran}, expected the linked person {mine}. A 200 alone does "
         "not prove the sync happened, or happened for the right person."
     )

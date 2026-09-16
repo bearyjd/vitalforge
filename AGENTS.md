@@ -95,7 +95,7 @@ curl http://localhost:8086/health   # {"status": "ok", "service": "vitalforge-da
 # Running a single service without Docker (matches Dockerfile CMD, from repo root):
 pip install -r vitalforge_weight/requirements.txt
 DB_PATH=/tmp/vf-test.db GARTH_TOKEN_DIR=/tmp/vf-garth \
-  uvicorn vitalforge_weight.app:app --host 0.0.0.0 --port 8085
+  uvicorn vitalforge_weight.app:app --host 0.0.0.0 --port 8085 --no-proxy-headers
 
 # Lint and test (repo root; mirrors .github/workflows/docker.yml's `test` job).
 # Use a venv, not the system/global Python — installing these into a shared interpreter

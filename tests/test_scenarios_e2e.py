@@ -136,15 +136,15 @@ def _weigh_ins_echoing_push(pushed: dict) -> dict:
     above it -- passing regardless of what the weight service actually
     computed, which defeats the point of an end-to-end chain test (Phase 4
     review finding)."""
-    ts: datetime = pushed["timestamp"]
-    bone_mass_kg = pushed.get("bone_mass_kg")
-    muscle_mass_kg = pushed.get("muscle_mass_kg")
+    ts = datetime.fromisoformat(pushed["timestamp"]).replace(tzinfo=timezone.utc)
+    bone_mass_kg = pushed.get("bone_mass")
+    muscle_mass_kg = pushed.get("muscle_mass")
     return {
         "dailyWeightSummaries": [
             {
                 "summaryDate": ts.strftime("%Y-%m-%d"),
                 "latestWeight": {
-                    "weight": pushed["weight_grams"],
+                    "weight": round(pushed["weight"] * 1000),
                     "bodyFat": pushed.get("percent_fat"),
                     "bodyWater": pushed.get("percent_hydration"),
                     "boneMass": round(bone_mass_kg * 1000) if bone_mass_kg is not None else None,
@@ -184,8 +184,8 @@ async def test_full_composition_chain_and_duplicate_collapse(
         pushed = fake_garmin_client.pushed_weights[-1]
         assert pushed["percent_fat"] == 18.4
         assert pushed["percent_hydration"] == 55.2
-        assert pushed["muscle_mass_kg"] == pytest.approx(32.0)  # 80kg * 40% -- distinguishable from a raw 40.0
-        assert pushed["bone_mass_kg"] == 3.2
+        assert pushed["muscle_mass"] == pytest.approx(32.0)  # 80kg * 40% -- distinguishable from a raw 40.0
+        assert pushed["bone_mass"] == 3.2
 
         first_id = (await wc.get(f"{PERSON_PREFIX}/api/weight/recent")).json()[0]["id"]
 
@@ -206,7 +206,7 @@ async def test_full_composition_chain_and_duplicate_collapse(
     # was actually pushed above (see _weigh_ins_echoing_push) so the chain is
     # real end to end, rather than the static fixture (which is pinned at a
     # fixed 2020-06-01 by test_sync.py and carries unrelated values).
-    sync_date = pushed["timestamp"].astimezone(timezone.utc).date().isoformat()
+    sync_date = datetime.fromisoformat(pushed["timestamp"]).date().isoformat()
     monkeypatch.setattr(
         fake_garmin_client, "get_weigh_ins", lambda start, end: _weigh_ins_echoing_push(pushed)
     )

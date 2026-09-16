@@ -1384,7 +1384,6 @@ async def test_init_db_adds_garmin_name_prefix_to_a_deployed_strength_sessions(t
                 garmin_status TEXT NOT NULL DEFAULT 'pending',
                 garmin_activity_id TEXT,
                 garmin_error TEXT,
-                garmin_target TEXT,
                 garmin_sets_status TEXT NOT NULL DEFAULT 'not_attempted',
                 garmin_claimed_at TEXT,
                 created_at TEXT NOT NULL,
@@ -1410,5 +1409,92 @@ async def test_init_db_adds_garmin_name_prefix_to_a_deployed_strength_sessions(t
             "a deployed strength_sessions never gained the column; retries would "
             "recompose the Garmin title from a mutable display_name"
         )
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_003_removes_legacy_global_target_and_terminalizes_its_retry(tmp_path, monkeypatch):
+    """A historical cross-account push must never be retried through a new link."""
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "legacy-target.db")
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "legacy-target.db"))
+
+    db = await database.get_db()
+    try:
+        await db.execute("""
+            CREATE TABLE strength_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_id INTEGER NOT NULL,
+                session_id TEXT NOT NULL,
+                session_label TEXT,
+                start_time_utc TEXT NOT NULL,
+                duration_seconds INTEGER NOT NULL,
+                exercises_json TEXT NOT NULL,
+                notes TEXT,
+                source TEXT,
+                garmin_status TEXT NOT NULL DEFAULT 'pending',
+                garmin_activity_id TEXT,
+                garmin_error TEXT,
+                garmin_target TEXT,
+                garmin_sets_status TEXT NOT NULL DEFAULT 'not_attempted',
+                garmin_claimed_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (person_id, session_id)
+            )
+        """)
+        await db.execute(
+            "INSERT INTO strength_sessions (person_id, session_id, start_time_utc, duration_seconds, "
+            "exercises_json, garmin_status, garmin_target, garmin_claimed_at, created_at, updated_at) "
+            "VALUES (1, 'legacy-global', '2026-09-06T08:00:00+00:00', 60, '[]', "
+            "'failed', 'credential_person', '2026-09-06T08:00:00+00:00', "
+            "'2026-09-06T08:00:00+00:00', '2026-09-06T08:00:00+00:00')"
+        )
+        # Leave sqlite_sequence above MAX(id), which is the shape a real
+        # deletion creates and the rebuild must not reset.
+        await db.execute(
+            "INSERT INTO strength_sessions (person_id, session_id, start_time_utc, duration_seconds, "
+            "exercises_json, created_at, updated_at) "
+            "VALUES (1, 'deleted-before-upgrade', '2026-09-06T08:00:00+00:00', 60, '[]', "
+            "'2026-09-06T08:00:00+00:00', '2026-09-06T08:00:00+00:00')"
+        )
+        await db.execute("DELETE FROM strength_sessions WHERE session_id = 'deleted-before-upgrade'")
+        await db.commit()
+    finally:
+        await db.close()
+
+    await database.init_db()
+
+    db = await database.get_db()
+    try:
+        columns = {
+            row["name"] for row in await (await db.execute("PRAGMA table_info(strength_sessions)")).fetchall()
+        }
+        assert "garmin_target" not in columns
+        row = await (
+            await db.execute(
+                "SELECT id, garmin_status, garmin_error, garmin_claimed_at "
+                "FROM strength_sessions WHERE session_id = 'legacy-global'"
+            )
+        ).fetchone()
+        assert dict(row) == {
+            "id": 1,
+            "garmin_status": "unknown",
+            "garmin_error": "legacy_target_retired",
+            "garmin_claimed_at": None,
+        }
+        marker = await (
+            await db.execute(
+                "SELECT 1 FROM schema_migrations WHERE name = '003-strength-sessions-remove-garmin-target'"
+            )
+        ).fetchone()
+        assert marker is not None
+        cursor = await db.execute(
+            "INSERT INTO strength_sessions (person_id, session_id, start_time_utc, duration_seconds, "
+            "exercises_json, created_at, updated_at) "
+            "VALUES (1, 'after-upgrade', '2026-09-06T08:00:00+00:00', 60, '[]', "
+            "'2026-09-06T08:00:00+00:00', '2026-09-06T08:00:00+00:00')"
+        )
+        assert cursor.lastrowid == 3, "the rebuild reset strength_sessions AUTOINCREMENT"
     finally:
         await db.close()

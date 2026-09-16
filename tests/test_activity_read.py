@@ -13,6 +13,7 @@ Cross-person isolation for both lives in tests/test_activity_auth.py.
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from shared.database import get_db, get_primary_person_id
 from tests.conftest import PERSON_PREFIX
 
 START = "2026-09-06T08:00:00+00:00"
@@ -72,6 +73,33 @@ async def test_get_activity_by_session_id(client):
 async def test_get_unknown_session_id_404(client):
     resp = await client.get(f"{PERSON_PREFIX}/api/activity/never-stored")
     assert resp.status_code == 404
+
+
+async def test_read_routes_redact_historic_garmin_error_text(client):
+    """A row written before migration 004 cannot leak on either read shape."""
+    person_id = await get_primary_person_id()
+    raw_error = "Bearer activity-read-sentinel-abcdefghijklmnopqrstuvwxyz"
+    db = await get_db()
+    try:
+        await db.execute(
+            "INSERT INTO strength_sessions (person_id, session_id, start_time_utc, duration_seconds, "
+            "exercises_json, garmin_status, garmin_error, created_at, updated_at) "
+            "VALUES (?, 'historic-provider-error', ?, 60, '[]', 'failed', ?, ?, ?)",
+            (person_id, START, raw_error, START, START),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+    single = await client.get(f"{PERSON_PREFIX}/api/activity/historic-provider-error")
+    listed = await client.get(f"{PERSON_PREFIX}/api/strength-sessions")
+
+    assert single.status_code == 200
+    assert single.json()["garmin_error"] == "unknown"
+    assert raw_error not in single.text
+    assert listed.status_code == 200
+    assert listed.json()["sessions"][0]["garmin_error"] == "unknown"
+    assert raw_error not in listed.text
 
 
 async def test_list_strength_sessions_shape(client):

@@ -9,7 +9,8 @@ import json
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from tests.conftest import PERSON_PREFIX
+from shared import garmin_registry
+from tests.conftest import PERSON_PREFIX, seed_person
 
 
 @pytest.fixture
@@ -74,6 +75,46 @@ async def test_post_weight_garmin_failure_still_saves_locally(client, weight_app
     assert recent.status_code == 200
     assert len(recent.json()) == 1
     assert recent.json()[0]["synced_to_garmin"] is False
+
+
+async def test_unlinked_weight_is_stored_without_cross_person_garmin_fallback(
+    client, initialized_db, fake_garmin_client, monkeypatch
+):
+    """A person's unlinked reading remains local and never selects another link."""
+    son = await seed_person("son", "Son")
+    requested_person_ids: list[int] = []
+
+    async def unlinked(person_id, operation):
+        requested_person_ids.append(person_id)
+        raise garmin_registry.GarminNotLinked(person_id)
+
+    monkeypatch.setattr(garmin_registry, "call", unlinked)
+
+    resp = await client.post("/p/son/api/weight", json={"weight": 170.0, "unit": "lbs"})
+
+    assert resp.status_code == 200
+    assert resp.json()["success"] is True
+    assert resp.json()["synced_to_garmin"] is False
+    assert resp.json()["garmin_error"] == "link_required"
+    assert requested_person_ids == [son]
+    assert fake_garmin_client.pushed_weights == []
+
+    recent = await client.get("/p/son/api/weight/recent")
+    assert recent.status_code == 200
+    assert recent.json()[0]["synced_to_garmin"] is False
+
+
+async def test_linked_secondary_person_weight_uses_only_their_registry_client(
+    client, initialized_db, fake_garmin_client
+):
+    son = await seed_person("son", "Son")
+
+    resp = await client.post("/p/son/api/weight", json={"weight": 170.0, "unit": "lbs"})
+
+    assert resp.status_code == 200
+    assert resp.json()["synced_to_garmin"] is True
+    assert fake_garmin_client.registry_calls == [(son, 1)]
+    assert len(fake_garmin_client.pushed_weights) == 1
 
 
 async def test_get_recent_weights_orders_newest_first(client):

@@ -3,12 +3,24 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 
-from shared import garmin_client
+from shared import garmin_registry
 from shared.database import get_db
 
 logger = logging.getLogger(__name__)
 
 SYNC_INTERVAL_HOURS = int(os.getenv("SYNC_INTERVAL_HOURS", "2"))
+
+
+async def has_usable_garmin_link(person_id: int) -> bool:
+    """Whether this person can be synced without borrowing another account."""
+    db = await get_db()
+    try:
+        row = await (
+            await db.execute("SELECT state FROM garmin_links WHERE person_id = ?", (person_id,))
+        ).fetchone()
+    finally:
+        await db.close()
+    return row is not None and row["state"] in {"linked", "legacy_bound"}
 
 
 async def get_synced_dates(table: str, person_id: int) -> set[str]:
@@ -56,7 +68,7 @@ async def sync_date(date_str: str, person_id: int):
     """Pull all metrics from Garmin for a single date and store them."""
 
     # --- Sleep ---
-    sleep = garmin_client.get_sleep_data(date_str)
+    sleep = await garmin_registry.call_paced(person_id, lambda client: client.get_sleep_data(date_str))
     if sleep and isinstance(sleep, dict):
         # garminconnect wraps sleep data under dailySleepDTO
         dto = sleep.get("dailySleepDTO", sleep)
@@ -74,7 +86,7 @@ async def sync_date(date_str: str, person_id: int):
             )
 
     # --- User summary (steps, calories, RHR) ---
-    summary = garmin_client.get_user_summary(date_str)
+    summary = await garmin_registry.call_paced(person_id, lambda client: client.get_user_summary(date_str))
     if summary and isinstance(summary, dict):
         rhr = summary.get("restingHeartRate")
         if rhr:
@@ -89,7 +101,7 @@ async def sync_date(date_str: str, person_id: int):
             await upsert("active_calories", date_str, person_id, value=active_cal)
 
     # --- HRV ---
-    hrv = garmin_client.get_hrv_data(date_str)
+    hrv = await garmin_registry.call_paced(person_id, lambda client: client.get_hrv_data(date_str))
     if hrv and isinstance(hrv, dict):
         hrv_summary = hrv.get("hrvSummary", hrv)
         if isinstance(hrv_summary, dict):
@@ -104,7 +116,7 @@ async def sync_date(date_str: str, person_id: int):
                 )
 
     # --- Body Battery ---
-    bb = garmin_client.get_body_battery(date_str)
+    bb = await garmin_registry.call_paced(person_id, lambda client: client.get_body_battery(date_str))
     if bb:
         entry = bb[0] if isinstance(bb, list) and bb else bb
         if isinstance(entry, dict):
@@ -134,7 +146,7 @@ async def sync_date(date_str: str, person_id: int):
                 )
 
     # --- Stress ---
-    stress = garmin_client.get_stress_data(date_str)
+    stress = await garmin_registry.call_paced(person_id, lambda client: client.get_stress_data(date_str))
     if stress and isinstance(stress, dict):
         # garminconnect uses avgStressLevel / overallStressLevel
         avg_stress = stress.get("avgStressLevel") or stress.get("overallStressLevel")
@@ -150,7 +162,7 @@ async def sync_date(date_str: str, person_id: int):
             )
 
     # --- VO2 Max (from training status, since get_max_metrics often returns null) ---
-    training = garmin_client.get_training_status(date_str)
+    training = await garmin_registry.call_paced(person_id, lambda client: client.get_training_status(date_str))
     if training and isinstance(training, dict):
         # Extract VO2 Max from training status
         most_recent = training.get("mostRecentVO2Max", {})
@@ -201,7 +213,9 @@ async def sync_date(date_str: str, person_id: int):
 
 async def sync_weight_history(start_date: str, end_date: str, person_id: int):
     """Pull weight data from Garmin and store in weight_history table."""
-    data = garmin_client.get_weight_range(start_date, end_date)
+    data = await garmin_registry.call_paced(
+        person_id, lambda client: client.get_weigh_ins(start_date, end_date)
+    )
     if not data:
         return
 
@@ -240,8 +254,6 @@ async def run_sync(days: int = 7, *, person_id: int):
     result = "success"
     errors = 0
 
-    garmin_client.authenticate()
-
     today = datetime.now(timezone.utc).date()
     dates = [(today - timedelta(days=i)).isoformat() for i in range(days)]
 
@@ -266,19 +278,28 @@ async def run_sync(days: int = 7, *, person_id: int):
 
         try:
             await sync_date(date_str, person_id)
+        except garmin_registry.GarminNotLinked:
+            # A scheduled run can race an unlink after its initial link check.
+            # Record the expected state rather than leaking a provider error or
+            # retrying every metric for every requested date.
+            result = "link_required"
+            break
         except Exception:
             logger.exception("Error syncing date %s", date_str)
             errors += 1
 
     # Weight history — fetch as a range
-    try:
-        start_date = (today - timedelta(days=days)).isoformat()
-        await sync_weight_history(start_date, today_str, person_id)
-    except Exception as e:
-        logger.error("Error syncing weight history: %s", e)
-        errors += 1
+    if result != "link_required":
+        try:
+            start_date = (today - timedelta(days=days)).isoformat()
+            await sync_weight_history(start_date, today_str, person_id)
+        except garmin_registry.GarminNotLinked:
+            result = "link_required"
+        except Exception as e:
+            logger.error("Error syncing weight history: %s", e)
+            errors += 1
 
-    if errors:
+    if errors and result != "link_required":
         result = f"completed with {errors} errors"
 
     # Update sync status
@@ -367,12 +388,15 @@ async def scheduled_sync(lock: asyncio.Lock, registry: SyncRegistry):
     logger.info("Running initial 90-day backfill...")
     try:
         person_id = await get_primary_person_id()
-        registry.acquire(person_id)
-        try:
-            async with lock:
-                await run_sync(days=90, person_id=person_id)
-        finally:
-            registry.release(person_id)
+        if not await has_usable_garmin_link(person_id):
+            logger.info("Skipping initial sync: primary person has no Garmin link")
+        else:
+            registry.acquire(person_id)
+            try:
+                async with lock:
+                    await run_sync(days=90, person_id=person_id)
+            finally:
+                registry.release(person_id)
     except Exception as e:
         logger.error("Initial backfill failed: %s", e)
 
@@ -380,6 +404,9 @@ async def scheduled_sync(lock: asyncio.Lock, registry: SyncRegistry):
         await asyncio.sleep(SYNC_INTERVAL_HOURS * 3600)
         try:
             person_id = await get_primary_person_id()
+            if not await has_usable_garmin_link(person_id):
+                logger.info("Skipping scheduled sync: primary person has no Garmin link")
+                continue
             logger.info("Running scheduled sync...")
             registry.acquire(person_id)
             try:

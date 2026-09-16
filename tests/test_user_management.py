@@ -429,6 +429,54 @@ async def test_deleting_a_user_cascade_deletes_their_goals(client):
     assert goal_count_after == 0
 
 
+async def test_deleting_a_user_clears_garmin_link_attempts_and_link_actor(client):
+    """SQLite foreign keys are disabled, so Phase 3 cleanup is explicit.
+
+    The durable attempt window must not be inherited by a later account, and
+    an actor id must not be silently reinterpreted as that later account.
+    """
+    await seed_user("root", role="admin")
+    bob_id = await seed_user("bob", role="user")
+    person_id = await primary_person_id()
+    now = datetime.now(timezone.utc).isoformat()
+    db = await get_db()
+    try:
+        await db.execute(
+            "INSERT INTO garmin_links "
+            "(person_id, state, garmin_email, generation, linked_at, linked_by, updated_at) "
+            "VALUES (?, 'linked', 'owner@example.test', 1, ?, ?, ?)",
+            (person_id, now, bob_id, now),
+        )
+        await db.execute(
+            """
+            INSERT INTO garmin_link_attempts
+                (user_id, window_started_at, attempt_count, attempted_at_1)
+            VALUES (?, 0, 1, 0)
+            """,
+            (bob_id,),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+    response = await client.delete(f"/auth/admin/users/{bob_id}", cookies=await _cookies_for("root"))
+    assert response.status_code == 200
+
+    db = await get_db()
+    try:
+        attempt = await (
+            await db.execute("SELECT 1 FROM garmin_link_attempts WHERE user_id = ?", (bob_id,))
+        ).fetchone()
+        link = await (
+            await db.execute("SELECT linked_by FROM garmin_links WHERE person_id = ?", (person_id,))
+        ).fetchone()
+    finally:
+        await db.close()
+
+    assert attempt is None
+    assert link["linked_by"] is None
+
+
 async def test_deleting_a_user_cascade_deletes_their_person_grants(client):
     """users.id is AUTOINCREMENT, so an orphaned grant left behind here would
     hand the NEXT account created with a reused id this account's access to

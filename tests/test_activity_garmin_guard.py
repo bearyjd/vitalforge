@@ -1,34 +1,19 @@
-"""The cross-person Garmin guard and its D-015 override.
+"""Strength-session Garmin routing is always scoped to the path person.
 
-This is what protects the kid's data. The deployment holds ONE Garmin
-credential, belonging to the primary person, and whatever it accepts is that
-one human's data no matter which person_id the caller named. require_person
-authorizes a caller FOR A TARGET PERSON; it cannot authorize them for a DATA
-SOURCE, so `manage` on the son is not permission to write into the parent's
-Garmin account.
-
-D-015 makes that possible ON PURPOSE and only on purpose: the caller must ask
-for it by name with `garmin_target: "credential_person"`, the activity is
-titled with the target person's display name so the parent can see whose
-session it was, and the override is logged at WARNING and recorded on the row.
-
-Every test here runs in open-access mode (empty users table), so
-require_person grants everything and the ONLY thing under test is the
-credential-person comparison.
+Phase 3 gives every person an independent Garmin link. There is no longer a
+credential-owner override: a request either uses the addressed person's link,
+or stays in VitalForge with a bounded ``link_required`` outcome.
 """
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from shared import garmin_registry
 from shared.database import get_db
-from tests.conftest import PERSON_PREFIX, seed_person, timing_out_until
+from tests.conftest import PERSON_PREFIX, seed_person
 
 START = "2026-09-06T08:00:00+00:00"
 
-
-# Every test in this module must be unable to reach real Garmin: app.py binds
-# the push helpers into its own namespace, so patching shared.garmin_client
-# alone would leave the routes calling the live client and the tests passing.
 pytestmark = pytest.mark.usefixtures("no_real_garmin_client")
 
 
@@ -41,7 +26,6 @@ async def client(weight_app_module):
 
 @pytest.fixture
 async def son(initialized_db):
-    """A second person, who is NOT the Garmin-credential person."""
     return await seed_person("son", "Son")
 
 
@@ -67,210 +51,95 @@ async def fetch_row(session_id: str = "cadence-2026-09-06-a3f9"):
         await db.close()
 
 
-async def test_cross_person_push_returns_409(client, son, fake_garmin_client):
-    """409, not 404: the caller demonstrably holds `manage` on this person,
-    so naming the reason leaks nothing. And NOT a silent downgrade to
-    store-only -- an explicit push_to_garmin: true that quietly does nothing
-    is worse than an error."""
+async def test_unlinked_push_is_stored_with_bounded_link_required(
+    client, son, fake_garmin_client, monkeypatch
+):
+    """An unlinked person's explicit push never reaches another person's Garmin."""
+    requested_person_ids: list[int] = []
+
+    async def unlinked(person_id, operation):
+        requested_person_ids.append(person_id)
+        raise garmin_registry.GarminNotLinked(person_id)
+
+    monkeypatch.setattr(garmin_registry, "call", unlinked)
+
     resp = await client.post("/p/son/api/activity", json=body(push_to_garmin=True))
-    assert resp.status_code == 409
-    assert "Garmin" in resp.json()["detail"]
-    assert "garmin_target" in resp.json()["detail"]
-    assert len(fake_garmin_client.created_activities) == 0
-    # Rejected whole: nothing stored, so no row is left stuck at 'pending'
-    # 409ing on every retry, and no row's status can become 'synced'.
+
+    assert resp.status_code == 202
+    assert resp.json()["garmin_status"] == "failed"
+    assert resp.json()["garmin_error"] == "link_required"
+    assert requested_person_ids == [son]
+    assert fake_garmin_client.created_activities == []
+
+    row = await fetch_row()
+    assert row["person_id"] == son
+    assert row["garmin_status"] == "failed"
+    assert row["garmin_error"] == "link_required"
+
+
+async def test_linked_person_pushes_only_to_their_own_registry_client(client, son, fake_garmin_client):
+    resp = await client.post("/p/son/api/activity", json=body(push_to_garmin=True))
+
+    assert resp.status_code == 202
+    assert resp.json()["garmin_status"] == "synced"
+    assert fake_garmin_client.registry_calls == [(son, 1)]
+    assert fake_garmin_client.created_activities[0]["activity_name"] == "Cadence — Lower A [6-a3f9]"
+
+    row = await fetch_row()
+    assert row["person_id"] == son
+    assert all(not key.endswith("_target") for key in row.keys())
+    assert all(not key.endswith("_target") for key in resp.json())
+
+
+async def test_terminalized_legacy_global_row_never_calls_the_new_person_link(
+    client, son, fake_garmin_client
+):
+    """The migration's bounded marker blocks both retry and reconciliation."""
+    db = await get_db()
+    try:
+        await db.execute(
+            "INSERT INTO strength_sessions (person_id, session_id, session_label, start_time_utc, "
+            "duration_seconds, exercises_json, garmin_status, garmin_error, created_at, updated_at) "
+            "VALUES (?, ?, 'Lower A', ?, 2520, '[]', 'unknown', 'legacy_target_retired', ?, ?)",
+            (son, "cadence-legacy-global", START, START, START),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+    resp = await client.post(
+        "/p/son/api/activity", json=body(session_id="cadence-legacy-global", push_to_garmin=True)
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["garmin_status"] == "unknown"
+    assert resp.json()["garmin_error"] == "legacy_target_retired"
+    assert fake_garmin_client.registry_calls == []
+    assert fake_garmin_client.created_activities == []
+
+
+async def test_unknown_provider_target_field_is_rejected(client, son, fake_garmin_client):
+    resp = await client.post(
+        "/p/son/api/activity", json=body(push_to_garmin=True, legacy_provider_target="another_person")
+    )
+
+    assert resp.status_code == 422
+    assert fake_garmin_client.created_activities == []
     assert await fetch_row() is None
 
 
-async def test_cross_person_push_with_override_succeeds(client, son, fake_garmin_client):
-    resp = await client.post(
-        "/p/son/api/activity", json=body(push_to_garmin=True, garmin_target="credential_person")
-    )
-    assert resp.status_code == 202
-    assert resp.json()["garmin_status"] == "synced"
-    assert resp.json()["garmin_target"] == "credential_person"
-    assert len(fake_garmin_client.created_activities) == 1
+async def test_store_only_is_available_without_a_garmin_link(client, son, fake_garmin_client):
+    resp = await client.post("/p/son/api/activity", json=body())
 
-    row = await fetch_row()
-    # The row keeps the TARGET person. Only the Garmin filing goes under the
-    # credential owner, and garmin_target is what makes that auditable after
-    # the fact rather than log-only.
-    assert row["person_id"] == son
-    assert row["garmin_target"] == "credential_person"
-
-
-async def test_override_prefixes_activity_name_with_display_name(client, son, fake_garmin_client):
-    """The exact string from D-015. display_name is read from persons for the
-    TARGET person, never from the request body -- a body-supplied name could
-    label the parent's Garmin activity as anyone at all."""
-    await client.post(
-        "/p/son/api/activity", json=body(push_to_garmin=True, garmin_target="credential_person")
-    )
-    assert fake_garmin_client.created_activities[0]["activity_name"] == "Cadence (Son) — Lower A [6-a3f9]"
-
-
-async def test_override_logs_a_warning(client, son, caplog):
-    """Both person_ids must appear, in their own positions.
-
-    A bare `f"person_id={son}" in caplog.text` is not enough: the format
-    string contains "person_id=%s" TWICE, so that assertion passes even if
-    the two ids were swapped -- which is exactly the confusion this log line
-    exists to resolve (whose session went into whose account). Anchoring on
-    the surrounding words pins each id to its own slot.
-    """
-    from shared.database import get_primary_person_id
-
-    credential_person = await get_primary_person_id()
-    assert credential_person != son, "the fixture must not make the son the credential person"
-
-    with caplog.at_level("WARNING"):
-        await client.post(
-            "/p/son/api/activity", json=body(push_to_garmin=True, garmin_target="credential_person")
-        )
-    assert "D-015 override" in caplog.text
-    assert f"for person_id={son} filed under" in caplog.text
-    assert f"Garmin credential person_id={credential_person}" in caplog.text
-    assert "display_name='Son'" in caplog.text
-
-
-async def test_override_is_ignored_when_push_false(client, son, fake_garmin_client):
-    """garmin_target is inert on its own: it is consulted ONLY when
-    push_to_garmin is true AND the target differs from the credential person.
-    A misconfigured client that sends it on every session must not thereby
-    start filing sessions on Garmin."""
-    resp = await client.post("/p/son/api/activity", json=body(garmin_target="credential_person"))
     assert resp.status_code == 202
     assert resp.json()["garmin_status"] == "skipped"
-    assert len(fake_garmin_client.created_activities) == 0
-    row = await fetch_row()
-    assert row is not None
-    assert row["garmin_target"] is None
-
-
-async def test_same_person_push_needs_no_override(client, fake_garmin_client):
-    """The credential person pushing their own session is the ordinary path
-    and must not require the override."""
-    resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=body(push_to_garmin=True))
-    assert resp.status_code == 202
-    assert resp.json()["garmin_status"] == "synced"
-    assert "garmin_target" not in resp.json()
-    assert fake_garmin_client.created_activities[0]["activity_name"] == "Cadence — Lower A [6-a3f9]"
+    assert fake_garmin_client.created_activities == []
 
 
 async def test_no_session_label_defaults_to_strength(client, fake_garmin_client):
     resp = await client.post(
         f"{PERSON_PREFIX}/api/activity", json=body(push_to_garmin=True, session_label=None)
     )
+
     assert resp.status_code == 202
     assert fake_garmin_client.created_activities[0]["activity_name"] == "Cadence — Strength [6-a3f9]"
-
-
-async def test_cross_person_store_only_is_the_normal_path(client, son, fake_garmin_client):
-    """push_to_garmin defaults to false, which stores with
-    garmin_status='skipped' and is the normal path for the kid profile."""
-    resp = await client.post("/p/son/api/activity", json=body())
-    assert resp.status_code == 202
-    assert resp.json()["garmin_status"] == "skipped"
-    assert len(fake_garmin_client.created_activities) == 0
-
-
-async def test_garmin_target_rejects_unknown_value(client, son):
-    """The field is a Literal, so "yes"/"true"/a typo is a 422 rather than a
-    quietly-not-an-override that 409s with a confusing message."""
-    resp = await client.post(
-        "/p/son/api/activity", json=body(push_to_garmin=True, garmin_target="parent")
-    )
-    assert resp.status_code == 422
-
-
-async def test_override_not_echoed_when_no_push_happens(client, son, fake_garmin_client, caplog):
-    """A re-POST of a 'skipped' row with the override pushes nothing --
-    'skipped' is not retryable. Echoing garmin_target there would tell the
-    client its session had been filed under the credential owner's account
-    when nothing was filed at all, and a D-015 WARNING for a push that never
-    happened trains the reader to ignore the line that matters."""
-    await client.post("/p/son/api/activity", json=body())
-    assert (await fetch_row())["garmin_status"] == "skipped"
-
-    with caplog.at_level("WARNING"):
-        resp = await client.post(
-            "/p/son/api/activity", json=body(push_to_garmin=True, garmin_target="credential_person")
-        )
-
-    assert resp.status_code == 200
-    assert "garmin_target" not in resp.json()
-    assert "D-015 override" not in caplog.text
-    assert fake_garmin_client.created_activities == []
-
-
-async def test_override_is_echoed_on_a_later_read_of_an_overridden_row(client, son, fake_garmin_client):
-    """The converse: a row that really WAS filed under the credential owner
-    keeps saying so on every later dedup response, even though that request
-    pushed nothing itself."""
-    await client.post(
-        "/p/son/api/activity", json=body(push_to_garmin=True, garmin_target="credential_person")
-    )
-    resp = await client.post(
-        "/p/son/api/activity", json=body(push_to_garmin=True, garmin_target="credential_person")
-    )
-    assert resp.status_code == 200
-    assert resp.json()["garmin_target"] == "credential_person"
-    assert len(fake_garmin_client.created_activities) == 1
-
-
-async def test_rename_between_push_and_retry_does_not_duplicate(
-    client, son, weight_app_module, fake_garmin_client, monkeypatch
-):
-    """An admin renaming the person must not turn a retry into a duplicate.
-
-    Codex review finding. The activity title is the ONLY handle reconciliation
-    has -- Garmin offers no idempotency key, so an ambiguous push is resolved
-    by looking activities up and matching the exact title that was sent. The
-    prefix came from persons.display_name, which is MUTABLE and was re-read on
-    every attempt. Rename the person between the ambiguous first push and the
-    re-POST and reconciliation searched for a name that was never sent,
-    concluded the activity did not exist, and filed a PERMANENT duplicate --
-    there is no delete path on Garmin.
-
-    The row now carries the prefix it was pushed under (garmin_name_prefix),
-    which is the same first-write-wins rule the stored payload already follows.
-    """
-    state = timing_out_until(weight_app_module, monkeypatch)
-
-    first = await client.post(
-        "/p/son/api/activity", json=body(push_to_garmin=True, garmin_target="credential_person")
-    )
-    assert first.json()["garmin_status"] == "unknown"
-
-    # Garmin holds the real one under the title the FIRST push sent, and a
-    # DECOY under the title a re-derived (post-rename) prefix would produce.
-    # Both are present so the assertion discriminates on WHICH name was
-    # searched: asserting only that reconciliation "found something" would
-    # pass just as well against the wrong lookup.
-    fake_garmin_client.activities_by_date.append(
-        {"activityId": 4242, "activityName": "Cadence (Son) — Lower A [6-a3f9]"}
-    )
-    fake_garmin_client.activities_by_date.append(
-        {"activityId": 9999, "activityName": "Cadence (Sonny) — Lower A [6-a3f9]"}
-    )
-
-    # An admin renames the person before the retry.
-    db = await get_db()
-    try:
-        await db.execute("UPDATE persons SET display_name = ? WHERE slug = ?", ("Sonny", "son"))
-        await db.commit()
-    finally:
-        await db.close()
-
-    state["failing"] = False
-    retry = await client.post(
-        "/p/son/api/activity", json=body(push_to_garmin=True, garmin_target="credential_person")
-    )
-
-    assert retry.json()["garmin_activity_id"] == "4242", (
-        "reconciliation matched the post-rename title (9999) instead of the one the "
-        "first push actually sent (4242)"
-    )
-    assert fake_garmin_client.created_activities == [], (
-        "filed a second, permanent Garmin activity for one session after a rename"
-    )

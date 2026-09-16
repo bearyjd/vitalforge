@@ -198,7 +198,7 @@ async def test_failed_lookup_stays_unknown(client, weight_app_module, fake_garmi
     resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
     assert resp.status_code == 200
     assert resp.json()["garmin_status"] == "unknown"
-    assert "reconciliation pending" in resp.json()["garmin_error"]
+    assert resp.json()["garmin_error"] == "activity_reconciliation_failed"
     assert fake_garmin_client.created_activities == []
     assert (await fetch_row())["garmin_status"] == "unknown"
 

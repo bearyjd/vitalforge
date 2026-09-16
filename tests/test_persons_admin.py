@@ -19,12 +19,14 @@ by test_open_access_mode_cannot_reach_the_person_admin_surface below, but it
 means a test that forgets to seed an admin fails for the wrong reason.
 """
 
+import logging
 import re
 
 import pytest
 from fastapi import Depends, FastAPI
 from httpx import ASGITransport, AsyncClient
 
+from shared import garmin_client, garmin_registry
 from shared.auth import create_session_cookie, require_person
 from shared.auth_routes import add_auth_routes
 from shared.database import get_db
@@ -48,7 +50,11 @@ def _build_app() -> FastAPI:
 
 
 @pytest.fixture
-async def client(initialized_db):
+async def client(initialized_db, monkeypatch, tmp_path):
+    # archive_person uses the real registry flock even though its route tests
+    # never contact Garmin. Keep that lock and any synthetic token tree out of
+    # the deployment's credential root.
+    monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", tmp_path / "garth")
     transport = ASGITransport(app=_build_app())
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
@@ -63,6 +69,33 @@ async def _fetchone(sql: str, params: tuple = ()):
     db = await get_db()
     try:
         return await (await db.execute(sql, params)).fetchone()
+    finally:
+        await db.close()
+
+
+async def _seed_garmin_link(person_id: int, state: str, generation: int = 1) -> None:
+    """Create only non-secret link metadata for archive lifecycle tests."""
+    now = "2026-09-14T00:00:00Z"
+    db = await get_db()
+    try:
+        if state == "legacy_disabled":
+            await db.execute(
+                """
+                INSERT INTO garmin_links (person_id, state, generation, updated_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (person_id, state, generation, now),
+            )
+        else:
+            await db.execute(
+                """
+                INSERT INTO garmin_links
+                    (person_id, state, garmin_email, generation, linked_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (person_id, state, f"archive-{person_id}@example.test", generation, now, now),
+            )
+        await db.commit()
     finally:
         await db.close()
 
@@ -287,43 +320,6 @@ async def test_patch_cannot_change_the_slug(client):
     assert row["slug"] == "bryn"
 
 
-async def test_promotion_is_refused_without_acknowledging_the_garmin_handover(client):
-    """`is_primary` is ALSO what garmin_credential_person_id() returns, i.e.
-    which person this deployment's single Garmin account is taken to describe.
-    Promoting therefore reassigns that account, and the next scheduled sync
-    files the original human's sleep, HRV and weight under the new primary.
-
-    The contamination is invisible until someone reads the data and believes
-    it, so the acknowledgement is enforced by the API rather than by the admin
-    page's confirm() -- a scripted PATCH bypasses the dialog entirely.
-    """
-    _, cookies = await _as("root", role="admin")
-    old_primary = await primary_person_id()
-    created = (
-        await client.post("/api/persons", json={"display_name": "Bryn"}, cookies=cookies)
-    ).json()
-
-    resp = await client.patch(
-        f"/api/persons/{created['id']}", json={"is_primary": True}, cookies=cookies
-    )
-    assert resp.status_code == 409
-    assert "Garmin" in resp.json()["detail"]
-    assert await primary_person_id() == old_primary, "the promotion happened anyway"
-
-
-async def test_renaming_does_not_require_the_garmin_acknowledgement(client):
-    """The flag gates promotion specifically. A display-name change touches
-    nothing Garmin-related and must not be made harder."""
-    _, cookies = await _as("root", role="admin")
-    created = (
-        await client.post("/api/persons", json={"display_name": "Bryn"}, cookies=cookies)
-    ).json()
-    resp = await client.patch(
-        f"/api/persons/{created['id']}", json={"display_name": "Bryn W."}, cookies=cookies
-    )
-    assert resp.status_code == 200
-
-
 async def test_patch_promotes_a_person_to_primary_and_demotes_the_old_one(client):
     _, cookies = await _as("root", role="admin")
     old_primary = await primary_person_id()
@@ -333,7 +329,7 @@ async def test_patch_promotes_a_person_to_primary_and_demotes_the_old_one(client
 
     resp = await client.patch(
         f"/api/persons/{created['id']}",
-        json={"is_primary": True, "acknowledge_garmin_reassignment": True},
+        json={"is_primary": True},
         cookies=cookies,
     )
     assert resp.status_code == 200, resp.text
@@ -344,6 +340,47 @@ async def test_patch_promotes_a_person_to_primary_and_demotes_the_old_one(client
     assert (await _fetchone("SELECT is_primary FROM persons WHERE id = ?", (old_primary,)))[
         "is_primary"
     ] == 0
+
+
+async def test_promotion_keeps_each_persons_garmin_link(client):
+    """Primary status schedules work; it does not own Garmin credentials."""
+    _, cookies = await _as("root", role="admin")
+    old_primary = await primary_person_id()
+    created = (
+        await client.post("/api/persons", json={"display_name": "Bryn"}, cookies=cookies)
+    ).json()
+    db = await get_db()
+    try:
+        await db.executemany(
+            "INSERT INTO garmin_links "
+            "(person_id, state, garmin_email, generation, linked_at, updated_at) "
+            "VALUES (?, 'linked', ?, ?, '2026-09-15T00:00:00Z', '2026-09-15T00:00:00Z')",
+            [
+                (old_primary, "primary@example.test", 3),
+                (created["id"], "bryn@example.test", 7),
+            ],
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+    response = await client.patch(
+        f"/api/persons/{created['id']}", json={"is_primary": True}, cookies=cookies
+    )
+    assert response.status_code == 200, response.text
+    db = await get_db()
+    try:
+        rows = await (
+            await db.execute(
+                "SELECT person_id, garmin_email, generation FROM garmin_links ORDER BY person_id"
+            )
+        ).fetchall()
+    finally:
+        await db.close()
+    assert [tuple(row) for row in rows] == [
+        (old_primary, "primary@example.test", 3),
+        (created["id"], "bryn@example.test", 7),
+    ]
 
 
 async def test_promoting_the_already_primary_person_is_a_no_op(client):
@@ -375,18 +412,14 @@ async def test_patch_refuses_to_promote_an_archived_person(client):
 
     resp = await client.patch(
         f"/api/persons/{created['id']}",
-        json={"is_primary": True, "acknowledge_garmin_reassignment": True},
+        json={"is_primary": True},
         cookies=cookies,
     )
     assert resp.status_code == 409
-    # The archived check must win over the Garmin acknowledgement check, or
-    # this test would pass for the wrong reason.
     assert "archived" in resp.json()["detail"].lower()
 
 
-async def test_promoting_a_nonexistent_person_is_404_not_the_garmin_409(client):
-    """Order of checks: existence first. Otherwise a typo'd id gets a lecture
-    about Garmin credentials instead of "no such person"."""
+async def test_promoting_a_nonexistent_person_returns_404(client):
     _, cookies = await _as("root", role="admin")
     resp = await client.patch(
         "/api/persons/999999", json={"is_primary": True}, cookies=cookies
@@ -444,7 +477,7 @@ async def test_the_primary_person_can_be_archived_after_promoting_another(client
     ).json()
     await client.patch(
         f"/api/persons/{created['id']}",
-        json={"is_primary": True, "acknowledge_garmin_reassignment": True},
+        json={"is_primary": True},
         cookies=cookies,
     )
 
@@ -461,6 +494,81 @@ async def test_archiving_is_idempotent(client):
     first = (await client.post(f"/api/persons/{created['id']}/archive", cookies=cookies)).json()
     second = (await client.post(f"/api/persons/{created['id']}/archive", cookies=cookies)).json()
     assert first["archived_at"] == second["archived_at"]
+
+
+async def test_archiving_deletes_a_normal_garmin_link_and_its_owned_token_store(client):
+    """Archive has the same cache-and-filesystem boundary as unlink."""
+    _, cookies = await _as("root", role="admin")
+    person = (
+        await client.post("/api/persons", json={"display_name": "Bryn"}, cookies=cookies)
+    ).json()
+    person_id = person["id"]
+    await _seed_garmin_link(person_id, "linked")
+    token_dir = garmin_registry._generation_token_dir(person_id, 1)
+    token_dir.mkdir(parents=True, mode=0o700)
+    (token_dir / "garmin_tokens.json").touch()
+    garmin_client._clients[(person_id, 1)] = object()
+
+    response = await client.post(f"/api/persons/{person_id}/archive", cookies=cookies)
+
+    assert response.status_code == 200
+    assert await _fetchone("SELECT 1 FROM garmin_links WHERE person_id = ?", (person_id,)) is None
+    assert not garmin_registry._person_token_root(person_id).exists()
+    assert not any(key[0] == person_id for key in garmin_client._clients)
+
+
+async def test_archiving_tombstones_a_legacy_garmin_link_without_deleting_flat_store(client):
+    """The legacy root is shared infrastructure, so its tombstone is the revoke."""
+    _, cookies = await _as("root", role="admin")
+    person = (
+        await client.post("/api/persons", json={"display_name": "Bryn"}, cookies=cookies)
+    ).json()
+    person_id = person["id"]
+    await _seed_garmin_link(person_id, "legacy_bound", generation=3)
+    root = garmin_registry.GARTH_TOKEN_DIR
+    root.mkdir(mode=0o700, exist_ok=True)
+    flat_token = root / "garmin_tokens.json"
+    flat_token.touch()
+    stale_person_dir = garmin_registry._generation_token_dir(person_id, 3)
+    stale_person_dir.mkdir(parents=True, mode=0o700)
+    garmin_client._clients[(person_id, 3)] = object()
+
+    response = await client.post(f"/api/persons/{person_id}/archive", cookies=cookies)
+
+    assert response.status_code == 200
+    row = await _fetchone(
+        "SELECT state, garmin_email, generation, linked_at FROM garmin_links WHERE person_id = ?",
+        (person_id,),
+    )
+    assert tuple(row) == ("legacy_disabled", None, 3, None)
+    assert flat_token.is_file(), "the flat legacy store must not be recursively removed"
+    assert not garmin_registry._person_token_root(person_id).exists()
+    assert not any(key[0] == person_id for key in garmin_client._clients)
+
+
+async def test_archiving_logs_sanitized_cleanup_failure_after_durable_unlink(client, monkeypatch, caplog):
+    """A failed deletion may leave an artifact, never an active durable link."""
+    _, cookies = await _as("root", role="admin")
+    person = (
+        await client.post("/api/persons", json={"display_name": "Bryn"}, cookies=cookies)
+    ).json()
+    person_id = person["id"]
+    await _seed_garmin_link(person_id, "linked")
+    garmin_client._clients[(person_id, 1)] = object()
+
+    def cleanup_failure(_person_id: int) -> None:
+        raise OSError("sensitive-person-token-path-must-not-be-logged")
+
+    monkeypatch.setattr(garmin_registry, "_remove_person_token_root", cleanup_failure)
+    caplog.set_level(logging.WARNING, logger="shared.persons_admin")
+
+    response = await client.post(f"/api/persons/{person_id}/archive", cookies=cookies)
+
+    assert response.status_code == 200
+    assert await _fetchone("SELECT 1 FROM garmin_links WHERE person_id = ?", (person_id,)) is None
+    assert not any(key[0] == person_id for key in garmin_client._clients)
+    assert "Archived person's Garmin token cleanup did not complete" in caplog.messages
+    assert "sensitive-person-token-path-must-not-be-logged" not in caplog.text
 
 
 async def test_archiving_clears_a_default_person_id_pointing_at_it(client):

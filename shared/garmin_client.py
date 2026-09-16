@@ -1,13 +1,10 @@
 import logging
-import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from garminconnect import Garmin
 
 logger = logging.getLogger(__name__)
-
-GARTH_TOKEN_DIR = Path(os.getenv("GARTH_TOKEN_DIR", "/app/data/.garth"))
 
 # Confirmed as the strength WORKOUT sportTypeKey (garminconnect's
 # workout.py:293-299), NOT confirmed as an ACTIVITY typeKey -- the library
@@ -20,41 +17,78 @@ STRENGTH_ACTIVITY_TYPE_KEY = "strength_training"
 
 GRAMS_PER_KG = 1000.0
 
-_client: Garmin | None = None
+_clients: dict[tuple[int, int], Garmin] = {}
 
 
-def authenticate():
-    """Authenticate with Garmin Connect using garminconnect."""
-    global _client
+def _ensure_token_dir(token_dir: Path) -> Path:
+    """Create a token-store directory and its parent with private modes.
 
-    GARTH_TOKEN_DIR.mkdir(parents=True, exist_ok=True)
-    token_path = str(GARTH_TOKEN_DIR)
+    The asynchronous registry chooses ``token_dir`` after checking the
+    person-scoped link.  Keeping this filesystem-only helper here means this
+    module never needs a database import.  ``exist_ok`` does not tighten an
+    existing directory, therefore both levels are chmod'ed explicitly.
+    """
+    token_dir.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    token_dir.parent.chmod(0o700)
+    token_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+    token_dir.chmod(0o700)
+    return token_dir
 
-    # garminconnect>=0.3 dropped the `garth` library it used to wrap -- there
-    # is no `.garth` attribute anymore, and login(tokenstore=path) now
-    # resumes from saved tokens AND persists fresh ones internally in one
-    # call (falling back to self.username/self.password when nothing valid
-    # is on disk). The 2026-08-22 upgrade to ==0.3.11 (for
-    # add_body_composition) kept the old separate resume/`.garth.dump()`
-    # code here, which silently broke resume on every request and forced a
-    # real credential login every time, triggering a Garmin 429 (see
-    # docs/prp/03-live-validation.md's "2026-08-22 incident" section).
-    # tests/test_garmin_client_api.py guards this API surface -- re-run it
-    # (and read this function against the new source) before ever bumping
-    # this pin again.
-    email = os.environ["GARMIN_EMAIL"]
-    password = os.environ["GARMIN_PASSWORD"]
+
+def authenticate(
+    person_id: int,
+    generation: int,
+    token_dir: Path,
+    email: str,
+    password: str | None,
+) -> Garmin:
+    """Authenticate and cache exactly one person's credential generation.
+
+    ``person_id`` and ``generation`` have no defaults: selecting an account
+    is a security boundary.  The caller is the registry, which owns link
+    lookup, rate admission, and the cross-process person lock.  ``password``
+    is only supplied by the link flow; ordinary resume passes ``None``.
+    """
+    token_dir = _ensure_token_dir(token_dir)
     client = Garmin(email=email, password=password)
-    client.login(tokenstore=token_path)
-    _client = client
-    logger.info("Garmin authenticated; tokens persisted to %s", GARTH_TOKEN_DIR)
+    client.login(tokenstore=str(token_dir))
+    _clients[(person_id, generation)] = client
+    logger.info("Garmin client authenticated for person %s generation %s", person_id, generation)
+    return client
 
 
-def get_client() -> Garmin:
-    """Return the authenticated Garmin client, authenticating if needed."""
-    if _client is None:
-        authenticate()
-    return _client
+def is_authenticated(person_id: int, generation: int) -> bool:
+    """Whether this process has the exact durable link generation cached."""
+    return (person_id, generation) in _clients
+
+
+def get_client(person_id: int, generation: int) -> Garmin:
+    """Return an already-authenticated, generation-specific client.
+
+    Authentication is deliberately never implicit here: resolving a token
+    directory requires async database work, which belongs to the registry.
+    """
+    try:
+        return _clients[(person_id, generation)]
+    except KeyError as exc:
+        raise RuntimeError("Garmin client is not authenticated") from exc
+
+
+def forget(person_id: int, generation: int | None = None) -> None:
+    """Evict one generation, or every cached generation for a person."""
+    if generation is not None:
+        _clients.pop((person_id, generation), None)
+        return
+    for key in tuple(_clients):
+        if key[0] == person_id:
+            _clients.pop(key, None)
+
+
+def forget_stale_generations(person_id: int, generation: int) -> None:
+    """Retain only the client matching the durable generation just read."""
+    for key in tuple(_clients):
+        if key[0] == person_id and key[1] != generation:
+            _clients.pop(key, None)
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +96,36 @@ def get_client() -> Garmin:
 # ---------------------------------------------------------------------------
 
 def push_weight(
+    person_id: int,
+    generation: int,
+    weight_grams: int,
+    timestamp: datetime | None = None,
+    *,
+    percent_fat: float | None = None,
+    percent_hydration: float | None = None,
+    muscle_mass_kg: float | None = None,
+    bone_mass_kg: float | None = None,
+    bmi: float | None = None,
+    basal_met: float | None = None,
+    active_met: float | None = None,
+):
+    """Push a weight measurement through a cached person/generation client."""
+    return push_weight_to_client(
+        get_client(person_id, generation),
+        weight_grams,
+        timestamp,
+        percent_fat=percent_fat,
+        percent_hydration=percent_hydration,
+        muscle_mass_kg=muscle_mass_kg,
+        bone_mass_kg=bone_mass_kg,
+        bmi=bmi,
+        basal_met=basal_met,
+        active_met=active_met,
+    )
+
+
+def push_weight_to_client(
+    client: Garmin,
     weight_grams: int,
     timestamp: datetime | None = None,
     *,
@@ -102,7 +166,7 @@ def push_weight(
     ts_str = timestamp.strftime("%Y-%m-%dT%H:%M:%S")
 
     logger.info("Pushing weight to Garmin: %.1f kg (%.0f g) at %s", weight_kg, weight_grams, ts_str)
-    result = get_client().add_body_composition(
+    client.add_body_composition(
         timestamp=ts_str,
         weight=weight_kg,
         percent_fat=percent_fat,
@@ -113,11 +177,12 @@ def push_weight(
         basal_met=basal_met,
         active_met=active_met,
     )
-    logger.info("add_body_composition response: %s", result)
     logger.info("Weight pushed to Garmin successfully")
 
 
 def push_activity(
+    person_id: int,
+    generation: int,
     *,
     start_datetime: str,
     time_zone: str,
@@ -144,7 +209,7 @@ def push_activity(
         "Pushing activity to Garmin: %r at %s (%s), %s min",
         activity_name, start_datetime, time_zone, duration_min,
     )
-    result = get_client().create_manual_activity(
+    result = get_client(person_id, generation).create_manual_activity(
         start_datetime=start_datetime,
         time_zone=time_zone,
         type_key=type_key,
@@ -152,11 +217,10 @@ def push_activity(
         duration_min=duration_min,
         activity_name=activity_name,
     )
-    logger.info("create_manual_activity response: %s", result)
     return result
 
 
-def push_activity_sets(activity_id: str, payload: dict):
+def push_activity_sets(person_id: int, generation: int, activity_id: str, payload: dict):
     """Attach per-exercise sets to an existing activity.
 
     PUT semantics are REPLACE-ALL: the activity's existing exerciseSets
@@ -164,12 +228,17 @@ def push_activity_sets(activity_id: str, payload: dict):
     VITALFORGE_GARMIN_EXERCISE_SETS flag, which ships off -- see
     build_exercise_sets_payload for why.
     """
-    result = get_client().set_activity_exercise_sets(activity_id, payload)
-    logger.info("set_activity_exercise_sets response: %s", result)
+    result = get_client(person_id, generation).set_activity_exercise_sets(activity_id, payload)
     return result
 
 
-def find_activities_by_date(start_date: str, end_date: str, activity_type: str = STRENGTH_ACTIVITY_TYPE_KEY):
+def find_activities_by_date(
+    person_id: int,
+    generation: int,
+    start_date: str,
+    end_date: str,
+    activity_type: str = STRENGTH_ACTIVITY_TYPE_KEY,
+):
     """List activities in a date range, for reconciling an ambiguous push.
 
     Dates are YYYY-MM-DD in the account's own local terms. Raising, like
@@ -178,7 +247,7 @@ def find_activities_by_date(start_date: str, end_date: str, activity_type: str =
     would make "no activities" and "could not ask" indistinguishable -- the
     one distinction reconciliation depends on.
     """
-    return get_client().get_activities_by_date(start_date, end_date, activitytype=activity_type)
+    return get_client(person_id, generation).get_activities_by_date(start_date, end_date, activitytype=activity_type)
 
 
 def extract_activity_id(response) -> str | None:
@@ -259,73 +328,41 @@ def build_exercise_sets_payload(exercises: list[dict], start_local: datetime) ->
 # Pull methods — each returns raw JSON from Garmin Connect
 # ---------------------------------------------------------------------------
 
-def get_sleep_data(date: str) -> dict | None:
+def get_sleep_data(person_id: int, generation: int, date: str) -> dict | None:
     """Get daily sleep data. date: YYYY-MM-DD."""
-    try:
-        return get_client().get_sleep_data(date)
-    except Exception as e:
-        logger.warning("Failed to get sleep data for %s: %s", date, e)
-        return None
+    return get_client(person_id, generation).get_sleep_data(date)
 
 
-def get_user_summary(date: str) -> dict | None:
+def get_user_summary(person_id: int, generation: int, date: str) -> dict | None:
     """Get daily user summary (steps, calories, RHR, stress, etc.). date: YYYY-MM-DD."""
-    try:
-        return get_client().get_user_summary(date)
-    except Exception as e:
-        logger.warning("Failed to get user summary for %s: %s", date, e)
-        return None
+    return get_client(person_id, generation).get_user_summary(date)
 
 
-def get_hrv_data(date: str) -> dict | None:
+def get_hrv_data(person_id: int, generation: int, date: str) -> dict | None:
     """Get HRV data for a given date. date: YYYY-MM-DD."""
-    try:
-        return get_client().get_hrv_data(date)
-    except Exception as e:
-        logger.warning("Failed to get HRV data for %s: %s", date, e)
-        return None
+    return get_client(person_id, generation).get_hrv_data(date)
 
 
-def get_body_battery(date: str) -> list | None:
+def get_body_battery(person_id: int, generation: int, date: str) -> list | None:
     """Get body battery report for a single day. date: YYYY-MM-DD."""
-    try:
-        return get_client().get_body_battery(date)
-    except Exception as e:
-        logger.warning("Failed to get body battery for %s: %s", date, e)
-        return None
+    return get_client(person_id, generation).get_body_battery(date)
 
 
-def get_stress_data(date: str) -> dict | None:
+def get_stress_data(person_id: int, generation: int, date: str) -> dict | None:
     """Get daily stress data. date: YYYY-MM-DD."""
-    try:
-        return get_client().get_stress_data(date)
-    except Exception as e:
-        logger.warning("Failed to get stress data for %s: %s", date, e)
-        return None
+    return get_client(person_id, generation).get_stress_data(date)
 
 
-def get_max_metrics(date: str) -> list | None:
+def get_max_metrics(person_id: int, generation: int, date: str) -> list | None:
     """Get VO2 Max and fitness metrics. date: YYYY-MM-DD."""
-    try:
-        return get_client().get_max_metrics(date)
-    except Exception as e:
-        logger.warning("Failed to get max metrics for %s: %s", date, e)
-        return None
+    return get_client(person_id, generation).get_max_metrics(date)
 
 
-def get_weight_range(start_date: str, end_date: str) -> dict | None:
+def get_weight_range(person_id: int, generation: int, start_date: str, end_date: str) -> dict | None:
     """Get weight history for a date range. Dates: YYYY-MM-DD."""
-    try:
-        return get_client().get_weigh_ins(start_date, end_date)
-    except Exception as e:
-        logger.warning("Failed to get weight range %s to %s: %s", start_date, end_date, e)
-        return None
+    return get_client(person_id, generation).get_weigh_ins(start_date, end_date)
 
 
-def get_training_status(date: str) -> dict | None:
+def get_training_status(person_id: int, generation: int, date: str) -> dict | None:
     """Get training status/load. date: YYYY-MM-DD."""
-    try:
-        return get_client().get_training_status(date)
-    except Exception as e:
-        logger.warning("Failed to get training status for %s: %s", date, e)
-        return None
+    return get_client(person_id, generation).get_training_status(date)

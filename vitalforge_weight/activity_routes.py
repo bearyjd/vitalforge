@@ -16,7 +16,6 @@ from shared.auth import (
     require_person,
 )
 from shared.database import (
-    garmin_credential_person_id,
     get_db,
 )
 from vitalforge_weight.activity_garmin import (
@@ -27,6 +26,7 @@ from vitalforge_weight.activity_garmin import (
     _read_activity_outcome,
     _reconcile_activity,
     _record_activity_garmin_outcome,
+    bounded_garmin_error,
 )
 from vitalforge_weight.garmin_claim import _garmin_claim_is_live
 from vitalforge_weight.models import ActivityIn
@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 # response.
 _STRENGTH_SESSION_COLUMNS = (
     "id, person_id, session_id, session_label, start_time_utc, duration_seconds, exercises_json, "
-    "notes, source, garmin_status, garmin_activity_id, garmin_error, garmin_target, "
+    "notes, source, garmin_status, garmin_activity_id, garmin_error, "
     "garmin_sets_status, garmin_claimed_at, garmin_name_prefix, created_at, updated_at"
 )
 
@@ -68,17 +68,7 @@ _ACTIVITY_CONFLICT_FIELDS = (
 # should_attempt_garmin_push's shape for weight. A client that wants a
 # session on Garmin must say so on the FIRST post of that session_id.
 _RETRYABLE_GARMIN_STATUSES = ("pending", "failed")
-
-
-async def _person_display_name(person_id: int) -> str | None:
-    db = await get_db()
-    try:
-        row = await (
-            await db.execute("SELECT display_name FROM persons WHERE id = ?", (person_id,))
-        ).fetchone()
-    finally:
-        await db.close()
-    return row["display_name"] if row is not None else None
+_LEGACY_GARMIN_TARGET_RETIRED_ERROR = "legacy_target_retired"
 
 
 def _normalise_since(since: str) -> str:
@@ -162,8 +152,7 @@ def _serialize_strength_session(row) -> dict:
         "source": row["source"],
         "garmin_status": row["garmin_status"],
         "garmin_activity_id": row["garmin_activity_id"],
-        "garmin_error": row["garmin_error"],
-        "garmin_target": row["garmin_target"],
+        "garmin_error": bounded_garmin_error(row["garmin_error"]),
         "garmin_sets_status": row["garmin_sets_status"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
@@ -209,50 +198,6 @@ def add_activity_routes(app):
             "garmin_name_prefix": None,
         }
 
-        # BEFORE anything is stored. The deployment holds ONE Garmin credential,
-        # belonging to the primary person, and whatever it accepts is that one
-        # human's data no matter which person_id the caller named. require_person
-        # authorizes a caller FOR A TARGET PERSON; it cannot authorize them for a
-        # DATA SOURCE. Rejecting before the insert is deliberate: storing the row
-        # and answering 409 would leave it 'pending' forever while every retry
-        # 409s too, and the caller would have no way to tell a stored session
-        # from a rejected one.
-        # An explicit flag rather than `override_display_name is not None`:
-        # display_name is NOT NULL in persons, but overloading its presence to
-        # also mean "the D-015 override fired" makes three separate decisions
-        # (the name prefix, the garmin_target column, the response echo) depend
-        # on a lookup that has nothing to do with any of them.
-        override_applied = False
-        override_display_name = None
-        override_credential_person_id = None
-        if data.push_to_garmin:
-            source_person_id = await garmin_credential_person_id()
-            if person_id != source_person_id:
-                if data.garmin_target != "credential_person":
-                    # 409, not 404: the caller demonstrably holds `manage` on this
-                    # person, so naming the reason leaks nothing. And never a
-                    # silent downgrade to store-only -- an explicit
-                    # push_to_garmin: true that quietly does nothing is worse than
-                    # an error.
-                    raise HTTPException(status_code=409, detail=(
-                        "This person has no Garmin account of their own. The deployment holds one "
-                        "set of Garmin credentials, which belong to a different person, and pushing "
-                        "would file this session under theirs. Per-person Garmin linking arrives in "
-                        "Phase 3. Send garmin_target=\"credential_person\" to file it under the "
-                        "credential owner's account with this person's name in the activity title."
-                    ))
-                override_applied = True
-                override_credential_person_id = source_person_id
-                override_display_name = await _person_display_name(person_id)
-                # Captured into the payload that becomes the row, so a fresh insert
-                # and a retry read the effective name from the same key.
-                incoming["garmin_name_prefix"] = override_display_name
-                # Deliberately NOT logged here. Reaching this point only means the
-                # override was ASKED FOR and accepted; whether it has any effect
-                # depends on what the transaction below decides, and a WARNING for
-                # a re-POST that pushes nothing trains the reader to ignore the
-                # line that matters.
-
         # Atomic: the duplicate lookup and the insert happen inside one
         # transaction, so two concurrent requests can never both observe "no
         # duplicate". The Garmin push happens after COMMIT, outside the lock, for
@@ -276,9 +221,9 @@ def add_activity_routes(app):
                 # instant it can see the row at all.
                 cursor = await db.execute(
                     "INSERT INTO strength_sessions (person_id, session_id, session_label, start_time_utc, "
-                    "duration_seconds, exercises_json, notes, source, garmin_status, garmin_target, "
+                    "duration_seconds, exercises_json, notes, source, garmin_status, "
                     "garmin_claimed_at, garmin_name_prefix, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         person_id,
                         data.session_id,
@@ -289,7 +234,6 @@ def add_activity_routes(app):
                         data.notes,
                         data.source,
                         "pending" if data.push_to_garmin else "skipped",
-                        "credential_person" if override_applied else None,
                         now if data.push_to_garmin else None,
                         # One source for this value: the same key the retry path
                         # reads off `stored`, so insert and re-read cannot drift.
@@ -330,13 +274,26 @@ def add_activity_routes(app):
                 # activity for the same session. Both the read and the claim have
                 # to happen inside this one BEGIN IMMEDIATE for the decision to be
                 # serialized.
-                should_push = data.push_to_garmin and outcome.garmin_status in _RETRYABLE_GARMIN_STATUSES
+                # Migration 003 terminalizes a row that may have reached the
+                # retired global Garmin account. It must never be retried or
+                # reconciled via this person's independent link: either action
+                # could create a duplicate in a different account.
+                is_retired_global_target = outcome.garmin_error == _LEGACY_GARMIN_TARGET_RETIRED_ERROR
+                should_push = (
+                    data.push_to_garmin
+                    and not is_retired_global_target
+                    and outcome.garmin_status in _RETRYABLE_GARMIN_STATUSES
+                )
                 # 'unknown' is NOT in _RETRYABLE_GARMIN_STATUSES and never becomes
                 # retryable, however old its claim gets: the push may already have
                 # landed, so the only safe next step is to ASK Garmin. That
                 # reconciliation still needs the claim, so two concurrent
                 # re-POSTs cannot both fall through the lookup and both push.
-                should_reconcile = data.push_to_garmin and outcome.garmin_status == "unknown"
+                should_reconcile = (
+                    data.push_to_garmin
+                    and not is_retired_global_target
+                    and outcome.garmin_status == "unknown"
+                )
 
                 if (should_push or should_reconcile) and _garmin_claim_is_live(
                     existing["garmin_claimed_at"], now_dt
@@ -415,35 +372,22 @@ def add_activity_routes(app):
                 # activity does not exist, and the retry would file a PERMANENT
                 # duplicate (there is no delete path). Same first-write-wins rule
                 # the `stored` payload above follows, for the same reason.
-                # Total, not best-effort, and with no fallback to a fresh
-                # persons.display_name read -- that fallback WAS the bug, still
-                # reachable. NULL here means "no override", which is exactly the
-                # None this needs: a cross-person push cannot produce a NULL-prefix
-                # row, because a cross-person POST without garmin_target is refused
-                # with 409 before anything is stored, so any row that WAS overridden
-                # carries its prefix. The one shape that could have broken that (a
-                # row written after the table shipped but before this column did)
-                # never existed -- the deployment held 0 strength_sessions rows at
-                # the upgrade -- so the window is closed, not merely narrow.
+                # Current per-person Garmin links always receive the target
+                # person's own session. New rows leave the legacy prefix NULL.
+                # Migration 003 terminalizes old cross-account rows before they
+                # can reach this path, so retaining a historical prefix cannot
+                # revive the former provider routing.
                 effective_display_name = stored["garmin_name_prefix"]
                 activity_name = _activity_name(
                     stored["session_label"],
                     effective_display_name,
                     data.session_id,
                 )
-                if override_applied:
-                    # Logged HERE, not at the guard: this is the point at which
-                    # the override actually decides where someone's session goes.
-                    logger.warning(
-                        "D-015 override: session %s for person_id=%s filed under Garmin credential "
-                        "person_id=%s; activity name prefixed with display_name=%r",
-                        data.session_id, person_id, override_credential_person_id, effective_display_name,
-                    )
-
                 if should_reconcile:
                     # ASK before pushing. The stored status is 'unknown', meaning
                     # the previous attempt may already have created this activity.
-                    reconciled = _reconcile_activity(
+                    reconciled = await _reconcile_activity(
+                        person_id=person_id,
                         start_time_utc=stored["start_time_utc"], activity_name=activity_name
                     )
                 else:
@@ -454,7 +398,8 @@ def add_activity_routes(app):
                     # lookup itself failed (still 'unknown'). Either way, no push.
                     outcome = reconciled
                 else:
-                    outcome = _push_activity(
+                    outcome = await _push_activity(
+                        person_id=person_id,
                         start_time_utc=stored["start_time_utc"],
                         duration_min=stored["duration_seconds"] // 60,
                         activity_name=activity_name,
@@ -463,24 +408,17 @@ def add_activity_routes(app):
 
                 try:
                     await _record_activity_garmin_outcome(db, row_id, outcome)
-                except Exception as e:
+                except Exception:
                     # The row is already durably committed by this point. A
                     # failure here must never surface as a 500 over
                     # already-successful data -- that would tell the client the
                     # whole request failed when it did not, and send it into a
                     # retry that re-pushes an activity Garmin already has.
                     #
-                    # The full outcome goes in the log line, garmin_activity_id
-                    # included: if the push SUCCEEDED and only this write failed,
-                    # that id is the sole surviving record of an activity now
-                    # orphaned on Garmin with no row pointing at it. Without it
-                    # the only way to reconcile is to hunt through Garmin by
-                    # timestamp.
                     logger.error(
-                        "Post-commit Garmin outcome update failed for row %s (session %s): %s. "
-                        "Unrecorded outcome: status=%s activity_id=%s sets_status=%s error=%s",
-                        row_id, data.session_id, e, outcome.garmin_status, outcome.garmin_activity_id,
-                        outcome.garmin_sets_status, outcome.garmin_error,
+                        "Post-commit Garmin outcome update failed for row %s (session %s); "
+                        "recording a bounded unknown outcome.",
+                        row_id, data.session_id,
                     )
                     if outcome.garmin_status in ("synced", "unknown"):
                         # An activity may exist on Garmin that this row does not
@@ -491,12 +429,12 @@ def add_activity_routes(app):
                         # just failed and has a real chance of landing; if it does
                         # not, the log line above is the only record.
                         try:
-                            await _mark_activity_outcome_unknown(db, row_id, str(e))
-                        except Exception as mark_error:
+                            await _mark_activity_outcome_unknown(db, row_id)
+                        except Exception:
                             logger.error(
-                                "Could not even mark row %s 'unknown' after a failed outcome write: %s. "
-                                "This row may be retried and duplicate Garmin activity %s.",
-                                row_id, mark_error, outcome.garmin_activity_id,
+                                "Could not mark row %s 'unknown' after a failed outcome write; "
+                                "this row may require manual reconciliation.",
+                                row_id,
                             )
                     # Report what is DURABLE, not what this request hoped to
                     # write. Answering with the in-memory outcome would tell the
@@ -504,9 +442,8 @@ def add_activity_routes(app):
                     # the client would stop retrying a session nothing recorded.
                     try:
                         outcome = await _read_activity_outcome(db, row_id) or outcome
-                    except Exception as read_error:
-                        logger.error("Could not re-read row %s after a failed outcome write: %s",
-                                     row_id, read_error)
+                    except Exception:
+                        logger.error("Could not re-read row %s after a failed outcome write", row_id)
         finally:
             await db.close()
 
@@ -531,17 +468,9 @@ def add_activity_routes(app):
         # 'unknown' carries an error too: it is the only signal telling the client
         # why the session is neither confirmed nor retryable, and that a re-POST
         # reconciles rather than duplicates.
-        if outcome.garmin_status in ("failed", "unknown") and outcome.garmin_error:
-            result["garmin_error"] = outcome.garmin_error
-        # Echoed when the override actually decided where this push went, or when
-        # the stored row records that an earlier one did. NOT merely because the
-        # caller sent the field: a re-POST of a 'skipped' row pushes nothing, and
-        # echoing garmin_target there would tell the client its session had been
-        # filed under the credential owner when nothing was filed at all.
-        if (override_applied and (should_push or should_reconcile)) or (
-            existing is not None and existing["garmin_target"] == "credential_person"
-        ):
-            result["garmin_target"] = "credential_person"
+        safe_garmin_error = bounded_garmin_error(outcome.garmin_error)
+        if outcome.garmin_status in ("failed", "unknown") and safe_garmin_error:
+            result["garmin_error"] = safe_garmin_error
         return result
 
     @app.get("/p/{slug}/api/activity/{session_id}")

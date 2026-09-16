@@ -96,6 +96,8 @@ Visit `http://localhost:8085` for weight logging and `http://localhost:8086` for
 | `VITALFORGE_API_TOKEN` | No | Upgrade compatibility only: imported once as a named token owned by the first admin. Leave empty on new installs and create per-user tokens at `/auth/account` |
 | `WEIGHT_URL` | No | Public URL for weight service (e.g. `https://weight.yourdomain.com`) |
 | `DASHBOARD_URL` | No | Public URL for dashboard service (e.g. `https://health.yourdomain.com`) |
+| `VITALFORGE_ALLOW_INSECURE_GARMIN_LINKS` | No | Development-only escape hatch for local HTTP: permits Garmin link/relink/unlink password submissions when set to `1`; never enable it in a deployed or network-reachable environment |
+| `VITALFORGE_TRUSTED_PROXY_IPS` | No | Comma-separated source IPs of reverse proxies allowed to assert `X-Forwarded-Proto: https` for Garmin credential changes; leave unset for direct connections. The service launchers disable Uvicorn's implicit proxy-header handling, so this setting is the sole trust boundary for those routes. |
 | `DEFAULT_UNIT` | No | Default weight unit: `lbs` or `kg` (default: `lbs`) |
 | `TZ` | No | IANA timezone for timestamps (e.g. `America/New_York`). Omit for browser default |
 
@@ -223,9 +225,9 @@ A few behaviours are deliberate and worth knowing before they surprise you:
   dashboard, and `/p/{slug}/` stops resolving. **Slugs are never reused**, archived ones
   included — a freed slug would let an old bookmark open a different person's health data.
   For the same reason a slug cannot be renamed after creation.
-- **Exactly one person is primary**, and scheduled Garmin syncs follow them (per-person
-  Garmin linking arrives in a later phase). The primary person cannot be archived; promote
-  someone else first.
+- **Exactly one person is primary**, and scheduled Garmin syncs follow them. Garmin links are
+  managed per person, so promotion does not move or change a person's Garmin link. The primary
+  person cannot be archived; promote someone else first.
 - **A person can end up with zero grants** — by revoking the last one, or by deleting the
   only account that held it. That is allowed on purpose: any administrator can still reach
   them and restore access, and the alternative would make deleting an *account* fail for

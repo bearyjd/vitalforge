@@ -101,10 +101,19 @@ _serializer = URLSafeTimedSerializer(_SECRET)
 
 
 class _Identity(NamedTuple):
+    """An authenticated principal plus the credential source that resolved it.
+
+    ``source`` deliberately has no default.  New identity construction sites
+    must classify their credential explicitly, so a future path cannot
+    accidentally acquire cookie-only authority merely by returning an
+    otherwise account-bound identity.
+    """
+
     username: str
     user_id: int | None
     session_version: int | None
     role: str | None
+    source: Literal["anonymous", "bearer", "cookie"]
 
 
 def _request_is_https(request: Request) -> bool:
@@ -200,7 +209,7 @@ async def _get_current_identity(request: Request) -> _Identity | None:
     old account's cookie.
     """
     if not await _is_auth_configured():
-        return _Identity("anonymous", None, None, None)
+        return _Identity("anonymous", None, None, None, "anonymous")
     bearer_identity = await _resolve_bearer_token(request)
     if bearer_identity is not None:
         return bearer_identity
@@ -221,7 +230,7 @@ async def _get_current_identity(request: Request) -> _Identity | None:
         ).fetchone()
     finally:
         await db.close()
-    return _Identity(username, user_id, session_version, row["role"]) if row is not None else None
+    return _Identity(username, user_id, session_version, row["role"], "cookie") if row is not None else None
 
 
 async def get_current_user(request: Request) -> str | None:
@@ -309,6 +318,24 @@ async def require_account_identity(request: Request) -> Identity:
 
 
 _require_account_identity = require_account_identity
+
+
+async def require_cookie_session_identity(request: Request) -> Identity:
+    """Require an account identity established specifically by a cookie session.
+
+    Garmin link management accepts a password in its request body.  It is a
+    browser/operator flow, so it must not be reachable with a long-lived API
+    bearer token or in unauthenticated development mode.  Keep the rejection
+    for valid non-cookie identities indistinguishable from a person the caller
+    cannot reach: this dependency is used below a person-scoped route and a
+    401/403 distinction would become a person-existence oracle.
+    """
+    identity = await _get_current_identity(request)
+    if identity is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if identity.source != "cookie" or identity.user_id is None:
+        raise HTTPException(status_code=404, detail="Person not found")
+    return identity
 
 
 # Public alias for _get_current_identity, for callers that must handle "no
@@ -476,17 +503,22 @@ def require_person(level: str):
 
 async def _require_step_up(identity: _Identity, current_password: str):
     verified = await _authenticate_credentials(identity.username, current_password)
-    if verified is None or verified[0] != identity.user_id:
+    if (
+        verified is None
+        or verified[0] != identity.user_id
+        or verified[1] != identity.session_version
+    ):
         raise HTTPException(status_code=401, detail="Current password incorrect")
 
 
 async def _authenticate_credentials(username: str, password: str) -> tuple[int, int] | None:
     """Verify credentials and return identity from the exact row verified.
 
-    Fetching the password hash, account id, and session version together
-    prevents username deletion/recreation between password verification and
-    session issuance. If that row is later deleted or changed, the returned
-    id/version can only produce a cookie that fails closed.
+    The second read is intentional.  Scrypt runs outside SQLite, so a password
+    reset can commit after the first read but before verification completes.
+    In that case an old password must not become a successful step-up or issue
+    an old-version session.  The verified row must still have the same id,
+    password hash, and session version before this returns success.
     """
     db = await get_db()
     try:
@@ -502,7 +534,24 @@ async def _authenticate_credentials(username: str, password: str) -> tuple[int, 
     verified = _verify_password(password, stored_hash)
     if row is None or not verified:
         return None
-    return row["id"], row["session_version"]
+    db = await get_db()
+    try:
+        current = await (
+            await db.execute(
+                "SELECT id, password_hash, session_version FROM users WHERE id = ? AND username = ?",
+                (row["id"], username),
+            )
+        ).fetchone()
+    finally:
+        await db.close()
+    if (
+        current is None
+        or current["id"] != row["id"]
+        or current["password_hash"] != row["password_hash"]
+        or current["session_version"] != row["session_version"]
+    ):
+        return None
+    return current["id"], current["session_version"]
 
 
 async def check_credentials(username: str, password: str) -> bool:
@@ -648,7 +697,9 @@ async def _resolve_bearer_token(request: Request) -> _Identity | None:
             await db.commit()
         except Exception as e:
             logger.warning("Failed to update last_used_at for token id %s: %s", row["token_id"], e)
-        return _Identity(row["username"], row["user_id"], row["session_version"], row["role"])
+        return _Identity(
+            row["username"], row["user_id"], row["session_version"], row["role"], "bearer"
+        )
     finally:
         await db.close()
 

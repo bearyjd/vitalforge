@@ -20,11 +20,11 @@ from shared.auth import (
 from shared.auth_routes import add_auth_routes
 from shared.database import (
     ensure_primary_person_grant,
-    garmin_credential_person_id,
     get_db,
     init_db,
 )
-from shared.garmin_client import authenticate
+from shared.garmin_registry import bootstrap_legacy_token_store
+from shared.garmin_routes import add_garmin_routes
 from shared.persons_admin import add_person_routes
 from vitalforge_dashboard.correlations import compute_cell
 from vitalforge_dashboard.export_routes import add_export_routes
@@ -45,7 +45,7 @@ from vitalforge_dashboard.goals import (
 from vitalforge_dashboard.metrics import METRIC_TABLES
 from vitalforge_dashboard.readiness import compute_readiness
 from vitalforge_dashboard.recommendations import get_recommendations, get_rules_only
-from vitalforge_dashboard.sync import SyncRegistry, run_sync, scheduled_sync
+from vitalforge_dashboard.sync import SyncRegistry, has_usable_garmin_link, run_sync, scheduled_sync
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
@@ -88,12 +88,7 @@ async def lifespan(app: FastAPI):
     # exists to own it. See ensure_primary_person_grant()'s docstring.
     await ensure_primary_person_grant()
     await bootstrap_migrated_token()
-    logger.info("Authenticating with Garmin Connect...")
-    try:
-        authenticate()
-    except Exception as e:
-        logger.warning("Garmin authentication failed (will retry on first sync): %s", e)
-
+    await bootstrap_legacy_token_store()
     # Start background sync scheduler
     sync_task = asyncio.create_task(scheduled_sync(_sync_lock, _syncing_person_ids))
     yield
@@ -108,6 +103,7 @@ add_auth_routes(app)
 # so an admin who opened the weight service should not have to switch ports to
 # add someone.
 add_person_routes(app)
+add_garmin_routes(app)
 
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 
@@ -272,31 +268,15 @@ async def trigger_sync(
     person_id: int = Depends(require_person("manage")),
 ):
     """Trigger a manual data sync."""
-    # require_person authorized this caller FOR THIS PERSON. It cannot
-    # authorize them for the DATA SOURCE, and there is only one: a single
-    # module-level Garmin client on deployment-wide credentials. Without this
-    # check, a caller holding `manage` on their own person triggers a pull of
-    # the primary person's sleep, HRV and heart rate, writes it under theirs,
-    # and reads it back at 200 -- every SQL statement correctly person-scoped
-    # the whole way. INSERT OR REPLACE on (person_id, date) means it also
-    # silently overwrites any real measurement they already had for those
-    # dates.
-    #
-    # 409, not 404: the caller demonstrably holds `manage` on this person, so
-    # naming the reason leaks nothing -- the same reasoning that makes the
-    # ingest token/slug mismatch a 403 rather than a 404.
-    source_person_id = await garmin_credential_person_id()
-    if person_id != source_person_id:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "This person has no Garmin account of their own. The deployment holds one "
-                "set of Garmin credentials, which belong to a different person, and syncing "
-                "would file their measurements under this one. Per-person Garmin linking "
-                "arrives in Phase 3."
-            ),
-        )
-
+    # A person-scoped sync is never redirected to the deployment primary's
+    # credentials.  Without a link it is an explicit local/store-only state;
+    # do not enqueue a task merely to discover that after the response.
+    if not await has_usable_garmin_link(person_id):
+        return {
+            "status": "link_required",
+            "store_only": True,
+            "message": "Link Garmin before syncing this person's data",
+        }
     # THIS person's sync, not _sync_lock.locked(): the lock is module-level, so
     # answering from it told a caller "already running" because somebody ELSE
     # was syncing -- the same cross-person observable that used to leak out of

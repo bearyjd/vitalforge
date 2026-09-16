@@ -367,8 +367,8 @@ async def test_captured_at_is_used_as_the_garmin_push_timestamp_on_fresh_insert(
         json={"weight": 185.4, "unit": "lbs", "body_fat_pct": 18.4, "captured_at": captured_at.isoformat()},
     )
     assert resp.json()["synced_to_garmin"] is True
-    pushed_ts = fake_garmin_client.pushed_weights[-1]["timestamp"]
-    assert pushed_ts == captured_at
+    route_timestamp = fake_garmin_client.route_weight_calls[-1]["timestamp"]
+    assert route_timestamp == captured_at
 
 
 async def test_captured_at_without_client_id_still_anchors_the_window(client):

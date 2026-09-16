@@ -66,7 +66,7 @@ async def test_garmin_failure_still_returns_202(client, weight_app_module, monke
     row = await fetch_row()
     assert row is not None
     assert row["garmin_status"] == "failed"
-    assert "garmin is down" in row["garmin_error"]
+    assert row["garmin_error"] == "activity_push_failed"
 
 
 async def test_sets_failure_leaves_activity_synced(client, weight_app_module, monkeypatch, activity_garmin_module):
@@ -255,70 +255,57 @@ async def test_corrupt_exercises_does_not_reach_garmin(client, fake_garmin_clien
     assert fake_garmin_client.created_activities == []
 
 
-async def test_garmin_error_redacts_email_and_token(client, weight_app_module, monkeypatch, activity_garmin_module):
-    """garmin_error is stored AND returned to the client, so it is the one
-    place a raw garminconnect exception string crosses a trust boundary.
-    Those strings quote the request being made: a login failure carries the
-    account email, and a data call can carry a URL with a token in it."""
+async def test_garmin_error_uses_a_bounded_code_without_logging_provider_secrets(
+    client, monkeypatch, activity_garmin_module, fake_garmin_client, caplog
+):
+    """Provider exception text must reach neither logs, response, nor SQLite."""
     secret_token = "eyJhbGciOiJIUzI1NiJ9abcdefghijklmnop"
+    secret_email = "jd@beary.us"
 
     def leaky(**kwargs):
         raise RuntimeError(
-            f"401 for user jd@beary.us using Bearer {secret_token} at /activity-service"
+            f"401 for user {secret_email} using Bearer {secret_token} at /activity-service"
         )
 
-    monkeypatch.setattr(activity_garmin_module, "push_activity", leaky)
+    async def direct_registry_call(_person_id, operation):
+        return operation(fake_garmin_client)
 
-    resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
+    monkeypatch.setattr(activity_garmin_module, "push_activity", leaky)
+    monkeypatch.setattr(activity_garmin_module.garmin_registry, "call", direct_registry_call)
+
+    with caplog.at_level("ERROR"):
+        resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
     error = resp.json()["garmin_error"]
-    assert "jd@beary.us" not in error
+    assert error == "activity_push_failed"
+    assert secret_email not in error
     assert secret_token not in error
-    assert "[redacted]" in error
-    # The row is sanitised too, not just the response -- it is read back by
-    # the status route and by anyone querying the database directly.
-    assert "jd@beary.us" not in (await fetch_row())["garmin_error"]
-    assert secret_token not in (await fetch_row())["garmin_error"]
+    row = await fetch_row()
+    assert row["garmin_error"] == "activity_push_failed"
+    assert secret_email not in row["garmin_error"]
+    assert secret_token not in row["garmin_error"]
+    assert secret_email not in caplog.text
+    assert secret_token not in caplog.text
 
 
-async def test_garmin_error_is_truncated(client, weight_app_module, monkeypatch, activity_garmin_module):
-    """An unbounded exception string would be stored per row and echoed on
-    every status poll. 300 characters is enough to identify the failure."""
-    # Deliberately NOT one long run of word characters: the token redactor
-    # would collapse that to "[redacted]" before truncation ever applied, and
-    # the test would pass without exercising the length bound at all.
-    def verbose(**kwargs):
-        raise RuntimeError("Garmin refused the request. " * 200)
+async def test_garmin_response_is_not_logged_verbatim(client, monkeypatch, activity_garmin_module, fake_garmin_client, caplog):
+    secret_response = "provider-response-sentinel-abcdefghijklmnopqrstuvwxyz"
 
-    monkeypatch.setattr(activity_garmin_module, "push_activity", verbose)
+    def secret_without_activity_id(**kwargs):
+        return {"detail": secret_response}
 
-    resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
-    error = resp.json()["garmin_error"]
-    assert len(error) <= 300
-    assert error.endswith("…")
-    assert error.startswith("Garmin refused the request.")
+    async def direct_registry_call(_person_id, operation):
+        return operation(fake_garmin_client)
 
+    monkeypatch.setattr(activity_garmin_module, "push_activity", secret_without_activity_id)
+    monkeypatch.setattr(activity_garmin_module.garmin_registry, "call", direct_registry_call)
 
-async def test_short_error_is_left_intact(client, weight_app_module, monkeypatch, activity_garmin_module):
-    """The sanitiser must not mangle an ordinary message -- an operator
-    reading 'failed' rows needs them legible."""
-    def plain(**kwargs):
-        raise RuntimeError("Garmin returned 503 Service Unavailable")
+    with caplog.at_level("WARNING"):
+        response = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
 
-    monkeypatch.setattr(activity_garmin_module, "push_activity", plain)
-
-    resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
-    assert resp.json()["garmin_error"] == "Garmin returned 503 Service Unavailable"
-
-
-async def test_long_alphanumeric_run_is_redacted_not_just_truncated(client, weight_app_module, monkeypatch, activity_garmin_module):
-    """The token pattern is deliberately blunt: any run of 24+ word
-    characters goes, because a bearer token, a session id and a signed URL
-    fragment all look like that and none of them may be stored. A legitimate
-    long identifier being redacted is the accepted cost."""
-    def leaky(**kwargs):
-        raise RuntimeError("failed with correlation abcdefghijklmnopqrstuvwxyz012345")
-
-    monkeypatch.setattr(activity_garmin_module, "push_activity", leaky)
-
-    resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
-    assert resp.json()["garmin_error"] == "failed with correlation [redacted]"
+    assert response.status_code == 202
+    assert response.json()["garmin_status"] == "synced"
+    assert secret_response not in response.text
+    assert secret_response not in caplog.text
+    row = await fetch_row()
+    assert row["garmin_error"] is None
+    assert secret_response not in str(dict(row))
