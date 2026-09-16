@@ -135,6 +135,67 @@ async def reserve_link_attempt(user_id: int) -> None:
         await db.close()
 
 
+async def check_link_attempt_quota(user_id: int) -> None:
+    """Reject an already-exhausted window before spending a Garmin permit.
+
+    Reservation remains the authority immediately before credential use; this
+    preflight only prevents a known fourth attempt from starving unrelated
+    Garmin work while preserving that race-safe final reservation.
+    """
+    registry = _registry()
+    user_id = int(user_id)
+    if user_id < 1:
+        raise ValueError("user_id must be a positive integer")
+    db = await get_db()
+    try:
+        row = await (
+            await db.execute(
+                """
+                SELECT attempted_at_1, attempted_at_2, attempted_at_3
+                FROM garmin_link_attempts WHERE user_id = ?
+                """,
+                (user_id,),
+            )
+        ).fetchone()
+        if row is None:
+            return
+        now = registry.time.time()
+        retained = [
+            float(value)
+            for value in (row["attempted_at_1"], row["attempted_at_2"], row["attempted_at_3"])
+            if value is not None and float(value) >= now - registry._LINK_ATTEMPT_WINDOW_SECONDS
+        ]
+        if len(retained) >= registry._LINK_ATTEMPT_LIMIT:
+            oldest = min(retained)
+            raise registry.GarminLinkAttemptRateLimited(
+                min(
+                    registry._LINK_ATTEMPT_WINDOW_SECONDS,
+                    max(1, math.ceil(oldest + registry._LINK_ATTEMPT_WINDOW_SECONDS - now)),
+                )
+            )
+    finally:
+        await db.close()
+
+
+async def actor_has_effective_manage(db, actor_id: int, session_version: int, person_id: int) -> bool:
+    """Check the same active admin/manage authority the route used initially."""
+    actor = await (
+        await db.execute(
+            """
+            SELECT u.role,
+                   EXISTS(
+                       SELECT 1 FROM person_grants g
+                       WHERE g.person_id = ? AND g.user_id = u.id
+                         AND g.access IN ('manage', 'own')
+                   ) AS can_manage
+            FROM users u WHERE u.id = ? AND u.session_version = ?
+            """,
+            (person_id, actor_id, session_version),
+        )
+    ).fetchone()
+    return actor is not None and (actor["role"] == "admin" or bool(actor["can_manage"]))
+
+
 async def _load_link(person_id: int):
     db = await get_db()
     try:

@@ -33,6 +33,18 @@ async def _link(person_id: int, generation: int = 1, state: str = "linked") -> N
         await db.close()
 
 
+async def _grant_manage(person_id: int, user_id: int) -> None:
+    db = await get_db()
+    try:
+        await db.execute(
+            "INSERT INTO person_grants (person_id, user_id, access, granted_at) VALUES (?, ?, 'manage', ?)",
+            (person_id, user_id, "2026-09-15T00:00:00Z"),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
 @pytest.fixture(autouse=True)
 def _clear_clients(monkeypatch, tmp_path):
     garmin_client._clients.clear()
@@ -654,7 +666,7 @@ async def test_person_token_directories_are_distinct_and_private(monkeypatch, tm
 
 async def test_link_publishes_canonical_email_generation_and_staged_store(initialized_db, monkeypatch):
     person_id = await get_primary_person_id()
-    actor_id = await seed_user("link-actor")
+    actor_id = await seed_user("link-actor", role="admin")
     calls: list[tuple[int, int]] = []
     monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _lifecycle_auth(calls))
     monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
@@ -688,7 +700,7 @@ async def test_link_publishes_canonical_email_generation_and_staged_store(initia
 
 async def test_failed_relink_preserves_existing_link_and_token_store(initialized_db, monkeypatch):
     person_id = await get_primary_person_id()
-    actor_id = await seed_user("relink-actor")
+    actor_id = await seed_user("relink-actor", role="admin")
     await _link(person_id, generation=1)
     db = await get_db()
     try:
@@ -723,7 +735,7 @@ async def test_failed_relink_preserves_existing_link_and_token_store(initialized
 async def test_failed_publication_removes_new_generation_and_preserves_old_store(initialized_db, monkeypatch):
     """A post-login re-link failure never makes the new store reachable."""
     person_id = await get_primary_person_id()
-    actor_id = await seed_user("swap-recovery-actor")
+    actor_id = await seed_user("swap-recovery-actor", role="admin")
     await _link(person_id, generation=1)
     db = await get_db()
     try:
@@ -767,10 +779,10 @@ async def test_failed_publication_removes_new_generation_and_preserves_old_store
 async def test_link_rejects_an_account_already_linked_to_another_person(initialized_db, monkeypatch):
     first_person = await get_primary_person_id()
     second_person = await seed_person("other-link-person")
-    actor_id = await seed_user("conflict-actor")
+    actor_id = await seed_user("conflict-actor", role="admin")
     calls: list[tuple[int, int]] = []
     monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _lifecycle_auth(calls))
-    moments = iter((100.0, 100.0, 102.0, 102.0))
+    moments = iter((100.0, 100.0, 100.0, 102.0, 102.0, 102.0))
     monkeypatch.setattr(garmin_registry.time, "time", lambda: next(moments))
 
     await garmin_registry.link(first_person, actor_id, 1, "same@example.test", "transient-password")
@@ -794,7 +806,7 @@ async def test_link_rejects_an_account_already_linked_to_another_person(initiali
 
 async def test_link_requires_current_actor_session_at_atomic_publish(initialized_db, monkeypatch):
     person_id = await get_primary_person_id()
-    actor_id = await seed_user("stale-session-actor")
+    actor_id = await seed_user("stale-session-actor", role="admin")
     calls: list[tuple[int, int]] = []
     monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _lifecycle_auth(calls))
     monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
@@ -816,7 +828,7 @@ async def test_link_requires_current_actor_session_at_atomic_publish(initialized
 
 
 async def test_link_rejects_a_removed_person_before_garmin_login(initialized_db, monkeypatch):
-    actor_id = await seed_user("removed-target-actor")
+    actor_id = await seed_user("removed-target-actor", role="admin")
     calls: list[tuple[int, int]] = []
     monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _lifecycle_auth(calls))
     monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
@@ -826,6 +838,50 @@ async def test_link_rejects_a_removed_person_before_garmin_login(initialized_db,
 
     assert calls == []
     assert not list(garmin_registry.GARTH_TOKEN_DIR.glob("*.staging"))
+
+
+async def test_link_rechecks_manage_grant_revoked_while_login_is_in_flight(initialized_db, monkeypatch):
+    person_id = await get_primary_person_id()
+    actor_id = await seed_user("revoked-link-grant")
+    await _grant_manage(person_id, actor_id)
+    auth_started = threading.Event()
+    release_auth = threading.Event()
+
+    def authenticate(person, generation, token_dir, _email, _password):
+        token_dir.mkdir(mode=0o700, exist_ok=True)
+        (token_dir / "garmin_tokens.json").touch()
+        auth_started.set()
+        assert release_auth.wait(timeout=5)
+        client = _FakeClient(generation)
+        garmin_client._clients[(person, generation)] = client
+        return client
+
+    monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", authenticate)
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
+    task = asyncio.create_task(
+        garmin_registry.link(person_id, actor_id, 1, "owner@example.test", "transient-password")
+    )
+    assert await asyncio.to_thread(auth_started.wait, 5)
+    db = await get_db()
+    try:
+        await db.execute(
+            "DELETE FROM person_grants WHERE person_id = ? AND user_id = ?", (person_id, actor_id)
+        )
+        await db.commit()
+    finally:
+        await db.close()
+    release_auth.set()
+    with pytest.raises(garmin_registry.GarminSessionExpired):
+        await task
+    db = await get_db()
+    try:
+        row = await (
+            await db.execute("SELECT 1 FROM garmin_links WHERE person_id = ?", (person_id,))
+        ).fetchone()
+    finally:
+        await db.close()
+    assert row is None
+    assert (person_id, 1) not in garmin_client._clients
 
 
 async def test_link_and_atomic_publish_refuse_an_archived_person_after_authorization(
@@ -839,7 +895,7 @@ async def test_link_and_atomic_publish_refuse_an_archived_person_after_authoriza
     second check that closes the later credential-login-to-commit interval.
     """
     person_id = await seed_person("archived-link-target")
-    actor_id = await seed_user("archived-link-actor")
+    actor_id = await seed_user("archived-link-actor", role="admin")
     db = await get_db()
     try:
         await db.execute(
@@ -876,7 +932,7 @@ async def test_concurrent_links_cannot_claim_one_canonical_account_twice(initial
     """The uniqueness query and publication are one BEGIN IMMEDIATE transaction."""
     first_person = await get_primary_person_id()
     second_person = await seed_person("simultaneous-link-person")
-    actor_id = await seed_user("simultaneous-link-actor")
+    actor_id = await seed_user("simultaneous-link-actor", role="admin")
     calls: list[tuple[int, int]] = []
     calls_lock = threading.Lock()
     both_authentications_started = threading.Event()
@@ -926,7 +982,7 @@ async def test_concurrent_links_cannot_claim_one_canonical_account_twice(initial
 
 async def test_unlink_removes_normal_link_after_commit_and_keeps_generation_ledger(initialized_db, monkeypatch):
     person_id = await get_primary_person_id()
-    actor_id = await seed_user("unlink-actor")
+    actor_id = await seed_user("unlink-actor", role="admin")
     await _link(person_id, generation=1)
     db = await get_db()
     try:
@@ -957,7 +1013,7 @@ async def test_unlink_removes_normal_link_after_commit_and_keeps_generation_ledg
 
 async def test_unlink_tombstones_legacy_bound_link_without_removing_generation(initialized_db):
     person_id = await get_primary_person_id()
-    actor_id = await seed_user("legacy-unlink-actor")
+    actor_id = await seed_user("legacy-unlink-actor", role="admin")
     await _link(person_id, generation=3, state="legacy_bound")
     db = await get_db()
     try:
@@ -981,7 +1037,7 @@ async def test_unlink_tombstones_legacy_bound_link_without_removing_generation(i
 
 async def test_unlink_rejects_stale_actor_session_without_mutating_or_cleaning(initialized_db):
     person_id = await get_primary_person_id()
-    actor_id = await seed_user("stale-unlink-actor")
+    actor_id = await seed_user("stale-unlink-actor", role="admin")
     await _link(person_id, generation=1)
     token_dir = garmin_registry._generation_token_dir(person_id, 1)
     token_dir.mkdir(parents=True, mode=0o700)
@@ -1001,6 +1057,62 @@ async def test_unlink_rejects_stale_actor_session_without_mutating_or_cleaning(i
     assert tuple(row) == ("linked", 1)
     assert token_dir.exists()
     assert (person_id, 1) in garmin_client._clients
+
+
+async def test_unlink_rechecks_manage_grant_revoked_while_waiting_for_its_flock(initialized_db):
+    person_id = await get_primary_person_id()
+    actor_id = await seed_user("revoked-unlink-grant")
+    await _grant_manage(person_id, actor_id)
+    await _link(person_id)
+    token_dir = garmin_registry._generation_token_dir(person_id, 1)
+    token_dir.mkdir(parents=True, mode=0o700)
+    (token_dir / "garmin_tokens.json").touch()
+    garmin_client._clients[(person_id, 1)] = _FakeClient(1)
+
+    async with garmin_registry.person_flock(person_id):
+        task = asyncio.create_task(garmin_registry.unlink(person_id, actor_id, 1))
+        await asyncio.sleep(0)
+        db = await get_db()
+        try:
+            await db.execute(
+                "DELETE FROM person_grants WHERE person_id = ? AND user_id = ?", (person_id, actor_id)
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+    with pytest.raises(garmin_registry.GarminSessionExpired):
+        await task
+    db = await get_db()
+    try:
+        row = await (
+            await db.execute("SELECT 1 FROM garmin_links WHERE person_id = ?", (person_id,))
+        ).fetchone()
+    finally:
+        await db.close()
+    assert row is not None
+    assert token_dir.exists()
+    assert (person_id, 1) in garmin_client._clients
+
+
+async def test_exhausted_link_attempt_preflight_does_not_spend_global_call_budget(initialized_db, monkeypatch):
+    person_id = await get_primary_person_id()
+    actor_id = await seed_user("exhausted-link-attempt", role="admin")
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
+    for _ in range(3):
+        await garmin_registry.reserve_link_attempt(actor_id)
+
+    with pytest.raises(garmin_registry.GarminLinkAttemptRateLimited):
+        await garmin_registry.link(person_id, actor_id, 1, "owner@example.test", "transient-password")
+
+    db = await get_db()
+    try:
+        row = await (
+            await db.execute("SELECT next_allowed_at FROM garmin_call_budget WHERE singleton = 1")
+        ).fetchone()
+    finally:
+        await db.close()
+    assert row["next_allowed_at"] == 0
 
 
 async def test_call_cleans_post_publication_crash_stale_generation_directory(initialized_db, monkeypatch):

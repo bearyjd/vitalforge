@@ -31,7 +31,9 @@ from shared.garmin_registry_runtime import (
     _record_auth_failure,
     _record_auth_success,
     _wait_for_call_permit,
+    actor_has_effective_manage,
     bootstrap_legacy_token_store,  # noqa: F401 - public facade export
+    check_link_attempt_quota,
     reserve_call_permit,
     reserve_link_attempt,
     resolve_token_dir,
@@ -437,12 +439,7 @@ async def _publish_link(
     db = await get_db(isolation_level=None)
     try:
         await db.execute("BEGIN IMMEDIATE")
-        actor = await (
-            await db.execute(
-                "SELECT 1 FROM users WHERE id = ? AND session_version = ?", (actor_id, session_version)
-            )
-        ).fetchone()
-        if actor is None:
+        if not await actor_has_effective_manage(db, actor_id, session_version, person_id):
             await db.rollback()
             raise GarminSessionExpired()
         person = await (
@@ -536,6 +533,10 @@ async def link(
     canonical_email = _canonical_email(email)
 
     try:
+        # A known exhausted attempt window must not consume the deployment-wide
+        # Garmin budget. The final durable reservation below remains the
+        # concurrency authority before any credential reaches Garmin.
+        await check_link_attempt_quota(actor_id)
         # Reserve before taking the lifecycle flock.  BEGIN IMMEDIATE must
         # never wait behind a flock holder that will itself need SQLite; this
         # order keeps the two cross-process authorities deadlock-free.
@@ -641,13 +642,7 @@ async def unlink(person_id: int, actor_id: int, session_version: int) -> bool:
             db = await get_db(isolation_level=None)
             try:
                 await db.execute("BEGIN IMMEDIATE")
-                actor = await (
-                    await db.execute(
-                        "SELECT 1 FROM users WHERE id = ? AND session_version = ?",
-                        (actor_id, session_version),
-                    )
-                ).fetchone()
-                if actor is None:
+                if not await actor_has_effective_manage(db, actor_id, session_version, person_id):
                     await db.rollback()
                     raise GarminSessionExpired()
                 row = await (
