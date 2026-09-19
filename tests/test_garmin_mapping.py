@@ -29,9 +29,10 @@ def test_real_client_signature_accepts_our_kwargs():
     import garminconnect
 
     params = set(inspect.signature(garminconnect.Garmin.add_body_composition).parameters)
-    # bmi is deliberately excluded here -- push_weight accepts it, but no
-    # production call site forwards it (00-design.md SS3.4), so it isn't
-    # something a garminconnect rename could silently break for us today.
+    # bmi is deliberately excluded here -- push_weight_to_client accepts it,
+    # but no production call site forwards it (00-design.md SS3.4), so it
+    # isn't something a garminconnect rename could silently break for us
+    # today.
     assert params >= {
         "percent_fat", "percent_hydration", "bone_mass", "muscle_mass", "basal_met", "active_met",
     }
@@ -74,11 +75,6 @@ def test_omitted_composition_passed_as_none(fake_garmin_client):
     assert pushed["percent_hydration"] is None
     assert pushed["muscle_mass"] is None
     assert pushed["bone_mass"] is None
-
-
-def test_push_weight_positional_call_still_works(fake_garmin_client):
-    garmin_client.push_weight_to_client(fake_garmin_client, 81600, None)
-    assert len(fake_garmin_client.pushed_weights) == 1
 
 
 def test_no_composition_values_in_log_output(fake_garmin_client, caplog):

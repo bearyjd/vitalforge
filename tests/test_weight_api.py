@@ -381,7 +381,7 @@ async def test_composition_pushed_to_garmin_includes_bmr_amr_but_not_bmi(client,
     overwriting Garmin's on the next sync).
 
     NOTE: weight_app_module fakes push_weight itself (conftest.py), so this
-    does not reach the real shared.garmin_client.push_weight or
+    does not reach the real shared.garmin_client.push_weight_to_client or
     add_body_composition -- that wire-level coverage lives in
     tests/test_garmin_mapping.py (test_bmr_maps_to_basal_met,
     test_amr_maps_to_active_met, and F5's signature guard)."""

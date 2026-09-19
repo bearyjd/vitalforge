@@ -133,7 +133,7 @@ def push_weight_to_client(
     vitalforge_dashboard/sync.py reads that value back); the kwarg exists
     here because it's a real, valid add_body_composition parameter a future
     caller might have a legitimate reason to set explicitly, not because
-    anything currently calls push_weight with it.
+    anything currently calls push_weight_to_client with it.
     """
     if timestamp is None:
         timestamp = datetime.now(timezone.utc)
