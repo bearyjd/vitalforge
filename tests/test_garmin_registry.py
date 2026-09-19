@@ -16,13 +16,13 @@ from garminconnect import (
 from garminconnect.exceptions import GarminConnectNotFoundError
 from httpx import ASGITransport, AsyncClient
 
-from shared import garmin_client, garmin_registry, garmin_registry_locks, garmin_registry_runtime
+from shared import garmin_client, garmin_registry, garmin_registry_legacy
 from shared.auth import create_session_cookie
 from shared.database import get_db, get_primary_person_id
 from shared.persons_admin import add_person_routes
 from tests.conftest import seed_person, seed_user
 
-_LEGACY_ADOPTION_MARKER = garmin_registry_runtime._LEGACY_ADOPTION_MARKER
+_LEGACY_ADOPTION_MARKER = garmin_registry_legacy._LEGACY_ADOPTION_MARKER
 
 
 class _FakeClient:
@@ -574,14 +574,14 @@ async def test_bootstrap_adopts_a_verified_flat_store_once_by_moving_it(
     # _ensure_token_dir's ancestor walk skips whatever already exists.
     person_root = root / f"person-{person_id}"
     person_root.mkdir(mode=0o755)
-    caplog.set_level(logging.INFO, logger="shared.garmin_registry_runtime")
+    caplog.set_level(logging.INFO, logger="shared.garmin_registry_legacy")
 
-    assert await garmin_registry.bootstrap_legacy_token_store() is True
+    assert await garmin_registry_legacy.bootstrap_legacy_token_store() is True
     adopted_line = f"Adopted the legacy Garmin token store for person {person_id} as generation 1"
     assert caplog.text.count(adopted_line) == 1
     caplog.clear()
 
-    assert await garmin_registry.bootstrap_legacy_token_store() is False
+    assert await garmin_registry_legacy.bootstrap_legacy_token_store() is False
     assert adopted_line not in caplog.text
     assert "marker already recorded" in caplog.text
     assert calls == [(person_id, 1)]
@@ -620,9 +620,9 @@ async def test_bootstrap_logs_the_skip_reason_when_no_flat_store_exists(
     monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _fake_auth(calls))
     monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
     monkeypatch.setenv("GARMIN_EMAIL", f"person-{person_id}@example.test")
-    caplog.set_level(logging.INFO, logger="shared.garmin_registry_runtime")
+    caplog.set_level(logging.INFO, logger="shared.garmin_registry_legacy")
 
-    assert await garmin_registry.bootstrap_legacy_token_store() is False
+    assert await garmin_registry_legacy.bootstrap_legacy_token_store() is False
 
     assert calls == []
     assert "no flat token store is present" in caplog.text
@@ -635,9 +635,9 @@ async def test_bootstrap_logs_the_skip_reason_when_garmin_email_is_unset(
     root = _flat_store(tmp_path)
     monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", root)
     monkeypatch.delenv("GARMIN_EMAIL", raising=False)
-    caplog.set_level(logging.INFO, logger="shared.garmin_registry_runtime")
+    caplog.set_level(logging.INFO, logger="shared.garmin_registry_legacy")
 
-    assert await garmin_registry.bootstrap_legacy_token_store() is False
+    assert await garmin_registry_legacy.bootstrap_legacy_token_store() is False
 
     assert "GARMIN_EMAIL is not set" in caplog.text
 
@@ -653,7 +653,7 @@ async def test_first_call_after_adoption_resumes_from_the_moved_store(initialize
     monkeypatch.setattr(garmin_registry.time, "time", lambda: next(moments))
     monkeypatch.setenv("GARMIN_EMAIL", f"person-{person_id}@example.test")
 
-    assert await garmin_registry.bootstrap_legacy_token_store() is True
+    assert await garmin_registry_legacy.bootstrap_legacy_token_store() is True
     assert await garmin_registry.call(person_id, lambda client: client.generation) == 1
 
     assert calls == [(person_id, 1), (person_id, 1)]
@@ -676,13 +676,13 @@ async def test_bootstrap_never_re_adopts_after_unlink_even_if_the_flat_store_ret
     monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
     monkeypatch.setenv("GARMIN_EMAIL", f"person-{person_id}@example.test")
 
-    assert await garmin_registry.bootstrap_legacy_token_store() is True
+    assert await garmin_registry_legacy.bootstrap_legacy_token_store() is True
     assert await garmin_registry.unlink(person_id, actor_id, 1) is True
     assert not garmin_registry._person_token_root(person_id).exists()
     # A restored backup (or a stray copy) reappears at the flat root.
     (root / "garmin_tokens.json").write_text("{}", encoding="ascii")
 
-    assert await garmin_registry.bootstrap_legacy_token_store() is False
+    assert await garmin_registry_legacy.bootstrap_legacy_token_store() is False
     assert calls == [(person_id, 1)], "the flat store must never be verified again"
     assert await _link_row(person_id) is None
     assert (root / "garmin_tokens.json").is_file(), "an un-adoptable store is left where it was"
@@ -706,7 +706,7 @@ async def test_bootstrap_completes_an_interrupted_adoption_without_moving_again(
     monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
     monkeypatch.setenv("GARMIN_EMAIL", f"person-{person_id}@example.test")
 
-    assert await garmin_registry.bootstrap_legacy_token_store() is True
+    assert await garmin_registry_legacy.bootstrap_legacy_token_store() is True
 
     assert calls == [(person_id, 1)]
     assert token_dirs == [durable]
@@ -730,12 +730,12 @@ async def test_bootstrap_restores_the_flat_store_when_publication_fails(
 
     monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", root)
     monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _fake_auth(calls))
-    monkeypatch.setattr(garmin_registry_runtime, "_publish_legacy_adoption", failed_publish)
+    monkeypatch.setattr(garmin_registry_legacy, "_publish_legacy_adoption", failed_publish)
     monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
     monkeypatch.setenv("GARMIN_EMAIL", f"person-{person_id}@example.test")
-    caplog.set_level(logging.WARNING, logger="shared.garmin_registry_runtime")
+    caplog.set_level(logging.WARNING, logger="shared.garmin_registry_legacy")
 
-    assert await garmin_registry.bootstrap_legacy_token_store() is False
+    assert await garmin_registry_legacy.bootstrap_legacy_token_store() is False
 
     assert calls == [(person_id, 1)]
     assert (root / "garmin_tokens.json").read_text(encoding="ascii") == "{}"
@@ -755,7 +755,7 @@ async def test_bootstrap_cancelled_after_publication_leaves_the_moved_store_in_p
     root = _flat_store(tmp_path)
     person_id = await get_primary_person_id()
     calls: list[tuple[int, int]] = []
-    real_publish = garmin_registry_runtime._publish_legacy_adoption
+    real_publish = garmin_registry_legacy._publish_legacy_adoption
 
     async def publish_then_cancel(*args):
         assert await real_publish(*args) is True
@@ -763,12 +763,12 @@ async def test_bootstrap_cancelled_after_publication_leaves_the_moved_store_in_p
 
     monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", root)
     monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _fake_auth(calls))
-    monkeypatch.setattr(garmin_registry_runtime, "_publish_legacy_adoption", publish_then_cancel)
+    monkeypatch.setattr(garmin_registry_legacy, "_publish_legacy_adoption", publish_then_cancel)
     monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
     monkeypatch.setenv("GARMIN_EMAIL", f"person-{person_id}@example.test")
 
     with pytest.raises(asyncio.CancelledError):
-        await garmin_registry.bootstrap_legacy_token_store()
+        await garmin_registry_legacy.bootstrap_legacy_token_store()
 
     assert calls == [(person_id, 1)]
     durable = garmin_registry._generation_token_dir(person_id, 1)
@@ -811,7 +811,7 @@ async def test_bootstrap_skips_a_primary_the_new_lifecycle_already_touched(
     monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
     monkeypatch.setenv("GARMIN_EMAIL", f"person-{person_id}@example.test")
 
-    assert await garmin_registry.bootstrap_legacy_token_store() is False
+    assert await garmin_registry_legacy.bootstrap_legacy_token_store() is False
 
     assert calls == []
     assert (root / "garmin_tokens.json").is_file()
@@ -848,9 +848,9 @@ async def test_concurrent_startups_adopt_a_verified_flat_store_exactly_once(
     monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
     monkeypatch.setenv("GARMIN_EMAIL", f"person-{person_id}@example.test")
 
-    first = asyncio.create_task(garmin_registry.bootstrap_legacy_token_store())
+    first = asyncio.create_task(garmin_registry_legacy.bootstrap_legacy_token_store())
     assert await asyncio.wait_for(asyncio.to_thread(auth_started.wait, 5), timeout=5)
-    second = asyncio.create_task(garmin_registry.bootstrap_legacy_token_store())
+    second = asyncio.create_task(garmin_registry_legacy.bootstrap_legacy_token_store())
     await asyncio.sleep(0)
     assert calls == [(person_id, 1)], "the second startup entered provider authentication"
 
@@ -891,7 +891,7 @@ async def test_bootstrap_does_not_bind_a_flat_store_that_fails_verification(
     monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
     monkeypatch.setenv("GARMIN_EMAIL", f"person-{person_id}@example.test")
 
-    assert await garmin_registry.bootstrap_legacy_token_store() is False
+    assert await garmin_registry_legacy.bootstrap_legacy_token_store() is False
     assert sensitive_detail not in caplog.text
     assert (person_id, 1) not in garmin_client._clients
     assert (root / "garmin_tokens.json").is_file()
@@ -939,7 +939,7 @@ async def test_adoption_holds_the_person_flock_so_a_concurrent_link_waits(
     monkeypatch.setattr(garmin_registry.time, "time", lambda: clock["now"])
     monkeypatch.setenv("GARMIN_EMAIL", "legacy@example.test")
 
-    adoption = asyncio.create_task(garmin_registry.bootstrap_legacy_token_store())
+    adoption = asyncio.create_task(garmin_registry_legacy.bootstrap_legacy_token_store())
     assert await asyncio.to_thread(verify_started.wait, 5)
     clock["now"] = 200.0
     link = asyncio.create_task(
@@ -1014,7 +1014,7 @@ async def test_adoption_re_checks_under_the_person_flock_after_a_link_wins(
     )
     await asyncio.wait_for(link_holds_flock.wait(), timeout=5)
     clock["now"] = 200.0
-    adoption = asyncio.create_task(garmin_registry.bootstrap_legacy_token_store())
+    adoption = asyncio.create_task(garmin_registry_legacy.bootstrap_legacy_token_store())
     await asyncio.sleep(0.05)
     assert not adoption.done(), "adoption must wait for the person flock"
     assert calls == []
@@ -1047,7 +1047,7 @@ async def test_marker_blocks_re_adoption_for_a_different_primary(initialized_db,
     monkeypatch.setattr(garmin_registry.time, "time", lambda: clock["now"])
     monkeypatch.setenv("GARMIN_EMAIL", "legacy@example.test")
 
-    assert await garmin_registry.bootstrap_legacy_token_store() is True
+    assert await garmin_registry_legacy.bootstrap_legacy_token_store() is True
     assert await _adoption_marker_recorded()
 
     db = await get_db()
@@ -1071,7 +1071,7 @@ async def test_marker_blocks_re_adoption_for_a_different_primary(initialized_db,
     # A free call permit: only the marker may refuse this second adoption.
     clock["now"] = 200.0
 
-    assert await garmin_registry.bootstrap_legacy_token_store() is False
+    assert await garmin_registry_legacy.bootstrap_legacy_token_store() is False
 
     assert calls == [(first_primary, 1, None)], "the new primary's adoption reached Garmin"
     assert await _link_row(second) is None
@@ -1100,7 +1100,7 @@ async def test_bootstrap_waits_for_a_busy_permit_instead_of_deferring(initialize
     monkeypatch.setenv("GARMIN_EMAIL", f"person-{person_id}@example.test")
     await _set_next_allowed_at(102.0)
 
-    assert await garmin_registry.bootstrap_legacy_token_store() is True
+    assert await garmin_registry_legacy.bootstrap_legacy_token_store() is True
 
     assert sleeps == [2]
     assert calls == [(person_id, 1)]
@@ -1132,9 +1132,9 @@ async def test_bootstrap_warns_about_a_moved_store_the_primary_change_orphaned(
     calls: list[tuple[int, int, str | None]] = []
     monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _recording_auth(calls))
     monkeypatch.setenv("GARMIN_EMAIL", "legacy@example.test")
-    caplog.set_level(logging.WARNING, logger="shared.garmin_registry_runtime")
+    caplog.set_level(logging.WARNING, logger="shared.garmin_registry_legacy")
 
-    assert await garmin_registry.bootstrap_legacy_token_store() is False
+    assert await garmin_registry_legacy.bootstrap_legacy_token_store() is False
 
     assert calls == []
     assert f"for person {orphaned} was never published" in caplog.text
@@ -1150,7 +1150,7 @@ async def test_token_root_or_flock_setup_error_is_sanitized(initialized_db, monk
     def cannot_prepare_lock(_person_id):
         raise OSError(f"permission denied: {sentinel_path}")
 
-    monkeypatch.setattr(garmin_registry_locks, "_person_lock_path", cannot_prepare_lock)
+    monkeypatch.setattr(garmin_registry, "_person_lock_path", cannot_prepare_lock)
 
     with pytest.raises(garmin_registry.GarminOperationError) as exc_info:
         await garmin_registry.call(1, lambda _client: pytest.fail("must not run"))
@@ -2347,7 +2347,7 @@ async def test_unbounded_failure_is_logged_by_type_name_only(initialized_db, mon
     def cannot_prepare_lock(_person_id):
         raise OSError(f"permission denied: {sentinel_path}")
 
-    monkeypatch.setattr(garmin_registry_locks, "_person_lock_path", cannot_prepare_lock)
+    monkeypatch.setattr(garmin_registry, "_person_lock_path", cannot_prepare_lock)
     caplog.set_level(logging.WARNING, logger="shared.garmin_registry")
 
     with pytest.raises(garmin_registry.GarminOperationError):
