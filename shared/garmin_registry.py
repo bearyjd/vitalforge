@@ -509,38 +509,44 @@ async def _install_and_publish(
     staging: Path,
     target: Path,
 ) -> GarminLink:
-    """Publish the staged store durably, then drop the link-time client."""
+    """Publish the staged store durably, then drop the link-time client.
+
+    The eviction is unconditional (``finally``): the link-time client's SDK
+    persistence path is the staging directory that gets renamed away, so a
+    cached copy would dump a refreshed token into a path no durable link
+    resolves.  That holds on every exit -- success, a refused publication,
+    or a request cancelled at the publication's post-commit ``db.close()``.
+    Every generation goes, and the first call() cold-loads from ``target``:
+    one extra login, never a silently lost token.
+    """
     try:
-        await asyncio.to_thread(_install_staged_token_dir, staging, target)
-    except Exception as exc:
-        logger.warning(
-            "Garmin token store for person %s could not be installed (%s)", person_id, type(exc).__name__
-        )
-        garmin_client.forget(person_id, generation)
-        raise GarminOperationError("unknown") from None
-    try:
-        published = await _publish_link(person_id, actor_id, session_version, canonical_email, generation)
-    except Exception:
-        garmin_client.forget(person_id, generation)
         try:
-            await asyncio.to_thread(_remove_token_dir, target)
+            await asyncio.to_thread(_install_staged_token_dir, staging, target)
         except Exception as exc:
             logger.warning(
-                "Unpublished Garmin generation cleanup for person %s did not complete (%s)",
-                person_id,
-                type(exc).__name__,
+                "Garmin token store for person %s could not be installed (%s)", person_id, type(exc).__name__
             )
-        raise
-    # The link-time client's SDK persistence path is the staging directory
-    # that was just renamed away; a cached copy would dump a refreshed token
-    # into a path no durable link resolves.  Evict every generation and let
-    # the first call() cold-load from ``target`` -- one extra login, never a
-    # silently lost token.
-    garmin_client.forget(person_id)
-    return published
+            raise GarminOperationError("unknown") from None
+        try:
+            return await _publish_link(person_id, actor_id, session_version, canonical_email, generation)
+        except Exception:
+            try:
+                await asyncio.to_thread(_remove_token_dir, target)
+            except Exception as exc:
+                logger.warning(
+                    "Unpublished Garmin generation cleanup for person %s did not complete (%s)",
+                    person_id,
+                    type(exc).__name__,
+                )
+            raise
+    finally:
+        garmin_client.forget(person_id)
 
 
 async def _remove_superseded_generation(person_id: int, generation: int) -> None:
+    """Best effort: the new generation is already durable, so a directory
+    that will not go is residue for the next call() to sweep, not an error
+    to answer the successful link with."""
     try:
         await asyncio.to_thread(_remove_token_dir, _generation_token_dir(person_id, generation))
     except Exception as exc:
@@ -549,7 +555,6 @@ async def _remove_superseded_generation(person_id: int, generation: int) -> None
             person_id,
             type(exc).__name__,
         )
-        raise GarminOperationError("unknown") from None
 
 
 async def relink(

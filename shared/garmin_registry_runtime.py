@@ -386,7 +386,10 @@ async def bootstrap_legacy_token_store() -> bool:
         async with registry.legacy_store_flock():
             return await _adopt_legacy_store_locked(root, canonical_email)
     except registry.GarminRateLimited:
-        logger.info("Legacy Garmin token-store adoption deferred by the global call limiter")
+        logger.info(
+            "Legacy Garmin token-store adoption could not get a Garmin call permit; "
+            "it is retried at the next boot"
+        )
         return False
     except Exception as exc:
         logger.warning("Legacy Garmin token-store adoption was not completed (%s)", type(exc).__name__)
@@ -396,9 +399,13 @@ async def bootstrap_legacy_token_store() -> bool:
 async def _adopt_legacy_store_locked(root: Path, canonical_email: str) -> bool:
     """The adoption decision tree; the caller holds ``legacy_store_flock``.
 
-    The moved-store branch exists for a process killed between the file move
-    and the database commit: the flat store is already under ``generation-1``
-    and only the publication is missing.
+    Lock order is ``legacy_store_flock`` -> ``person_flock``, and nothing
+    takes them the other way round: ``link()``, ``unlink()``, ``call()`` and
+    the archive route hold only ``person_flock``.  The person flock is what
+    keeps a route-driven link for the same person from publishing its own
+    ``generation-1`` while the flat store is being verified and moved; the
+    primary is therefore re-checked once the flock is held, since a link may
+    have reserved its generation in the meantime.
     """
     registry = _registry()
     if await _legacy_adoption_recorded():
@@ -406,14 +413,63 @@ async def _adopt_legacy_store_locked(root: Path, canonical_email: str) -> bool:
     person_id = await _adoptable_primary_person(canonical_email)
     if person_id is None:
         return False
+    async with registry.person_flock(person_id):
+        if await _adoptable_primary_person(canonical_email) != person_id:
+            return False
+        return await _adopt_for_person_locked(person_id, canonical_email, root)
+
+
+async def _adopt_for_person_locked(person_id: int, canonical_email: str, root: Path) -> bool:
+    """Both flocks are held.  The moved-store branch exists for a process
+    killed between the file move and the database commit: the flat store is
+    already under ``generation-1`` and only the publication is missing."""
+    registry = _registry()
     durable = registry._generation_token_dir(person_id, _LEGACY_GENERATION)
     if _looks_like_legacy_token_store(durable):
         if not await _verify_token_store(person_id, canonical_email, durable):
             return False
         return await _publish_legacy_adoption(person_id, canonical_email)
+    await _warn_about_orphaned_moved_stores(root, person_id)
     if not _looks_like_legacy_token_store(root):
         return False
     return await _adopt_flat_store(person_id, canonical_email, root, durable)
+
+
+def _moved_store_person_ids(root: Path) -> list[int]:
+    """Person ids owning a ``generation-1`` token file, from names alone."""
+    person_ids: list[int] = []
+    for token_path in root.glob("person-*/generation-1/garmin_tokens.json"):
+        suffix = token_path.parent.parent.name.removeprefix("person-")
+        if suffix.isdigit():
+            person_ids.append(int(suffix))
+    return person_ids
+
+
+async def _warn_about_orphaned_moved_stores(root: Path, primary_id: int) -> None:
+    """Log-only: name a moved store that a change of primary orphaned.
+
+    A crash between the move and the commit leaves the flat store under the
+    then-primary's ``generation-1`` with no ledger row.  If a different person
+    is primary by the next boot, the recovery branch never looks there again;
+    an operator has to decide what that file is, so it is named, never read
+    or deleted.
+    """
+    candidates = [pid for pid in await asyncio.to_thread(_moved_store_person_ids, root) if pid != primary_id]
+    if not candidates:
+        return
+    db = await get_db()
+    try:
+        for person_id in candidates:
+            ledger = await (
+                await db.execute("SELECT 1 FROM garmin_link_generations WHERE person_id = ?", (person_id,))
+            ).fetchone()
+            if ledger is None:
+                logger.warning(
+                    "Legacy Garmin token store moved for person %s was never published; leaving it in place",
+                    person_id,
+                )
+    finally:
+        await db.close()
 
 
 async def _adopt_flat_store(person_id: int, canonical_email: str, root: Path, durable: Path) -> bool:
@@ -441,7 +497,10 @@ async def _verify_token_store(person_id: int, canonical_email: str, token_dir: P
     durable directory instead.
     """
     registry = _registry()
-    await registry.reserve_call_permit()
+    # A busy permit is worth a short wait rather than a whole boot cycle.
+    # This sleeps while holding both the legacy-store and the primary's
+    # person flock, so the bound is deliberately a few intervals, not open.
+    await _wait_for_call_permit(deadline_seconds=3 * registry._call_interval_seconds())
     try:
         await asyncio.to_thread(
             garmin_client.authenticate, person_id, _LEGACY_GENERATION, token_dir, canonical_email, None
@@ -457,8 +516,15 @@ async def _verify_token_store(person_id: int, canonical_email: str, token_dir: P
 
 
 def _move_token_file(source: Path, target: Path) -> None:
-    """Move the flat store into its private generation directory atomically."""
+    """Move the flat store into its private generation directory atomically.
+
+    Like :func:`shared.garmin_registry._install_staged_token_dir` it never
+    replaces an existing file: a token file already at ``target`` belongs to
+    a published generation, and the flat store is then residue.
+    """
     garmin_client._ensure_token_dir(target.parent)
+    if target.exists() or target.is_symlink():
+        raise FileExistsError("generation token file already exists")
     os.replace(source, target)
 
 
