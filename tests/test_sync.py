@@ -182,6 +182,53 @@ async def test_run_sync_stops_at_the_first_authentication_failure(initialized_db
     assert (await _sync_status(person_id))["last_sync_result"] == "auth_failed"
 
 
+@pytest.mark.parametrize("code", ("auth_failed", "rate_limited"))
+async def test_run_sync_stops_at_a_terminal_operation_error(initialized_db, monkeypatch, code):
+    """A rejected session or a throttled account fails every later read the
+    same way; skipping the metric and carrying on would spend one doomed
+    call per metric per date against an account already being rate
+    limited.  Stop, record the code, and skip weight history."""
+    person_id = await get_primary_person_id()
+    calls: list[int] = []
+
+    async def terminal(person_id, operation):
+        calls.append(person_id)
+        raise garmin_registry.GarminOperationError(code)
+
+    monkeypatch.setattr(sync.garmin_registry, "call_paced", terminal)
+
+    result = await sync.run_sync(days=3, person_id=person_id)
+
+    assert result == code
+    assert calls == [person_id], "no further metric, date, or weight-history read after a terminal error"
+    assert (await _sync_status(person_id))["last_sync_result"] == code
+
+
+@pytest.mark.parametrize("code", ("auth_failed", "rate_limited"))
+async def test_run_sync_records_a_terminal_error_from_weight_history(
+    initialized_db, fake_garmin_client, monkeypatch, code
+):
+    """Weight history reads through call_paced directly, not _fetch_metric,
+    so it needs the same terminal handling rather than an error count."""
+    person_id = await get_primary_person_id()
+    real_call_paced = fake_garmin_client.registry_call
+
+    async def throttled_weight_history(person_id, operation):
+        # The weight-history read is the one lambda that names get_weigh_ins.
+        if "get_weigh_ins" in operation.__code__.co_names:
+            raise garmin_registry.GarminOperationError(code)
+        return await real_call_paced(person_id, operation)
+
+    monkeypatch.setattr(sync.garmin_registry, "call_paced", throttled_weight_history)
+
+    result = await sync.run_sync(days=1, person_id=person_id)
+
+    assert result == code
+    assert (await _sync_status(person_id))["last_sync_result"] == code
+    assert await _row_count("weight_history", person_id) == 0
+    assert await _row_count("resting_hr", person_id) == 1, "the dates before it still synced"
+
+
 async def test_run_sync_records_link_required_when_the_link_disappears(initialized_db, monkeypatch):
     person_id = await get_primary_person_id()
     calls: list[int] = []

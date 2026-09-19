@@ -9,9 +9,13 @@ from shared.database import get_db
 logger = logging.getLogger(__name__)
 
 SYNC_INTERVAL_HOURS = int(os.getenv("SYNC_INTERVAL_HOURS", "2"))
-# Results that end a sync early; neither is an error count, and neither
-# should be overwritten by one.
-_STOPPED_RESULTS = frozenset({"link_required", "auth_failed"})
+# Operation errors that make every further read of this run pointless: a
+# rejected session fails each of them the same way, and a throttled account
+# (a provider 429) gets worse with every extra call.
+_TERMINAL_OPERATION_CODES = frozenset({"auth_failed", "rate_limited"})
+# Results that end a sync early; none is an error count, and none should be
+# overwritten by one.
+_STOPPED_RESULTS = frozenset({"link_required", "auth_failed", "rate_limited"})
 
 
 async def has_usable_garmin_link(person_id: int) -> bool:
@@ -67,21 +71,37 @@ def _extract_sleep_score(dto: dict, sleep: dict) -> int | None:
     return dto.get("overallSleepScoreValue") or sleep.get("overallSleepScoreValue")
 
 
+def _stop_reason(exc: Exception) -> str | None:
+    """The result a failure ends the whole run with, or None to carry on.
+
+    No usable link, a token store that no longer resumes, and an operation
+    the provider rejected as unauthenticated or throttled all make every
+    further read pointless (or, for a throttle, actively harmful).
+    """
+    if isinstance(exc, garmin_registry.GarminNotLinked):
+        return "link_required"
+    if isinstance(exc, garmin_registry.GarminAuthenticationError):
+        return "auth_failed"
+    if isinstance(exc, garmin_registry.GarminOperationError) and exc.code in _TERMINAL_OPERATION_CODES:
+        return exc.code
+    return None
+
+
 async def _fetch_metric(person_id: int, label: str, op, skipped: list[str]):
     """Read one metric; a failed read is skipped so the rest of the date syncs.
 
-    Only the two failures that make every further read pointless propagate:
-    no usable link, and a link whose token store no longer resumes (which
-    would otherwise cost one failed login per remaining metric and date).
-    Anything else is logged by bounded code or type name -- never provider
-    text -- and the metric is left for the next sync.
+    Only a failure that makes every further read pointless propagates (see
+    :func:`_stop_reason`).  Anything else is logged by bounded code or type
+    name -- never provider text -- and the metric is left for the next sync.
     """
     try:
         return await garmin_registry.call_paced(person_id, op)
+    except garmin_registry.GarminOperationError as exc:
+        if _stop_reason(exc) is not None:
+            raise
+        logger.warning("Skipping %s for person %s: Garmin operation failed (%s)", label, person_id, exc.code)
     except (garmin_registry.GarminNotLinked, garmin_registry.GarminAuthenticationError):
         raise
-    except garmin_registry.GarminOperationError as exc:
-        logger.warning("Skipping %s for person %s: Garmin operation failed (%s)", label, person_id, exc.code)
     except Exception as exc:
         logger.warning("Skipping %s for person %s (%s)", label, person_id, type(exc).__name__)
     skipped.append(label)
@@ -313,33 +333,38 @@ async def run_sync(days: int = 7, *, person_id: int):
 
         try:
             errors += await sync_date(date_str, person_id)
-        except garmin_registry.GarminNotLinked:
-            # A scheduled run can race an unlink after its initial link check.
-            # Record the expected state rather than leaking a provider error or
-            # retrying every metric for every requested date.
-            result = "link_required"
-            break
-        except garmin_registry.GarminAuthenticationError as exc:
-            # The token store no longer resumes.  Every further read would
-            # repeat the same failed login, so stop here and let the status
-            # say why; a re-link is the only fix.
-            logger.warning("Stopping sync for person %s: Garmin authentication failed (%s)", person_id, exc.code)
-            result = "auth_failed"
+        except garmin_registry.GarminRegistryError as exc:
+            # A scheduled run can race an unlink after its initial link
+            # check; a token store can stop resuming; the provider can reject
+            # or throttle the session mid-run.  Record the bounded state
+            # rather than retrying every metric for every requested date --
+            # against a throttled account that would only deepen the ban.
+            stop = _stop_reason(exc)
+            if stop is None:
+                logger.warning("Error syncing date %s for person %s (%s)", date_str, person_id, type(exc).__name__)
+                errors += 1
+                continue
+            logger.warning("Stopping sync for person %s: %s", person_id, stop)
+            result = stop
             break
         except Exception:
             logger.exception("Error syncing date %s", date_str)
             errors += 1
 
-    # Weight history — fetch as a range
+    # Weight history — fetch as a range.  It reads through call_paced
+    # directly, not _fetch_metric, so the terminal codes are handled here.
     if result not in _STOPPED_RESULTS:
         try:
             start_date = (today - timedelta(days=days)).isoformat()
             await sync_weight_history(start_date, today_str, person_id)
-        except garmin_registry.GarminNotLinked:
-            result = "link_required"
-        except garmin_registry.GarminAuthenticationError as exc:
-            logger.warning("Weight history skipped for person %s: Garmin authentication failed (%s)", person_id, exc.code)
-            result = "auth_failed"
+        except garmin_registry.GarminRegistryError as exc:
+            stop = _stop_reason(exc)
+            if stop is None:
+                logger.warning("Error syncing weight history for person %s (%s)", person_id, type(exc).__name__)
+                errors += 1
+            else:
+                logger.warning("Weight history skipped for person %s: %s", person_id, stop)
+                result = stop
         except Exception as e:
             logger.error("Error syncing weight history: %s", e)
             errors += 1

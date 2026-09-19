@@ -1935,8 +1935,24 @@ def _with_response(exc: Exception, status_code: int) -> Exception:
         (GarminConnectAuthenticationError("Login failed: bad credentials"), "auth_failed"),
         (GarminConnectConnectionError("API Error 429"), "rate_limited"),
         (GarminConnectConnectionError("API Error 401 - Unauthorized"), "auth_failed"),
-        (GarminConnectConnectionError("API Error 403 - Forbidden"), "auth_failed"),
-        (GarminConnectConnectionError("Mobile login: HTTP 403 (Cloudflare bot challenge) — next"), "auth_failed"),
+        # A 403 is a transient block (Cloudflare challenge, IP reputation), not
+        # a rejected credential: "auth_failed" would evict a good session and
+        # tell the user to re-link for something a retry fixes.
+        (GarminConnectConnectionError("API Error 403 - Forbidden"), "network"),
+        (
+            GarminConnectConnectionError(
+                "Mobile login: HTTP 403 (Cloudflare bot challenge) — falling through to next strategy"
+            ),
+            "network",
+        ),
+        (
+            GarminConnectConnectionError(
+                "Portal login: HTTP 403 (Cloudflare bot challenge) — falling through to next strategy"
+            ),
+            "network",
+        ),
+        (_with_response(RuntimeError("blocked"), 403), "network"),
+        (_with_response(RuntimeError("rejected"), 401), "auth_failed"),
         (GarminConnectConnectionError("Mobile login failed (non-JSON): HTTP 502"), "network"),
         (GarminConnectConnectionError("Widget embed returned 503"), "network"),
         (GarminConnectConnectionError("curl_cffi not available"), "network"),
@@ -1948,6 +1964,33 @@ def _with_response(exc: Exception, status_code: int) -> Exception:
 )
 def test_error_code_classifies_real_garminconnect_exceptions(exc, code):
     assert garmin_registry._error_code(exc) == code
+
+
+async def test_a_403_from_an_operation_keeps_the_cached_client_and_link_health(initialized_db):
+    """Only a real credential rejection may evict the session and stamp the
+    link; a Cloudflare block on one request is neither."""
+    person_id = await get_primary_person_id()
+    await _link(person_id)
+    cached = _FakeClient(1)
+    garmin_client._clients[(person_id, 1)] = cached
+    await garmin_registry._record_auth_success(person_id, 1)
+
+    def blocked_op(_client):
+        raise GarminConnectConnectionError("API Error 403 - Forbidden")
+
+    with pytest.raises(garmin_registry.GarminOperationError) as exc_info:
+        await garmin_registry.call(person_id, blocked_op)
+
+    assert exc_info.value.code == "network"
+    assert garmin_client._clients[(person_id, 1)] is cached
+    db = await get_db()
+    try:
+        row = await (
+            await db.execute("SELECT last_auth_error FROM garmin_links WHERE person_id = ?", (person_id,))
+        ).fetchone()
+    finally:
+        await db.close()
+    assert row["last_auth_error"] is None
 
 
 async def test_rate_limited_operation_keeps_the_cached_client_and_status(initialized_db):

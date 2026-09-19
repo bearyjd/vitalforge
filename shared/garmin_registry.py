@@ -732,9 +732,11 @@ async def _run_operation(
     except Exception as exc:
         code = _error_code(exc)
         if code == "auth_failed":
-            # A 401/403 from a normal operation means this cached session is
-            # no longer safe to reuse.  Persist only the bounded code; the
-            # next operation will resume under this same lock protocol.
+            # A credential rejection (a 401, or the library's own
+            # authentication error) from a normal operation means this cached
+            # session is no longer safe to reuse.  Persist only the bounded
+            # code; the next operation will resume under this same lock
+            # protocol.  A 403 is a transient block and is left alone.
             garmin_client.forget(person_id, generation)
             await _record_auth_failure(person_id, generation, code)
         raise GarminOperationError(code) from None

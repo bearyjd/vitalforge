@@ -69,10 +69,19 @@ def _error_code(exc: Exception) -> str:
 
 
 def _http_status_code(status: int | None, *, default: str) -> str:
+    """Only a 401 is a credential verdict.
+
+    Garmin answers a Cloudflare bot challenge or an IP-reputation block with
+    a 403 (garminconnect's own "HTTP 403 (Cloudflare bot challenge)"); that
+    is transient and clears with a retry, so it must not evict a session or
+    stamp the link as needing a re-link.
+    """
     if status == 429:
         return "rate_limited"
-    if status in (401, 403):
+    if status == 401:
         return "auth_failed"
+    if status == 403:
+        return "network"
     return default
 
 
