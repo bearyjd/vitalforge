@@ -1,10 +1,9 @@
-"""B3: mapping body-composition fields onto shared.garmin_client.push_weight's
+"""B3: mapping body-composition fields onto shared.garmin_client.push_weight_to_client's
 new keyword-only parameters (docs/prp/00-design.md SS3.4). No Docker, no
 network, no real Garmin account.
 """
 
 import logging
-from datetime import datetime, timezone
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -39,37 +38,37 @@ def test_real_client_signature_accepts_our_kwargs():
 
 
 def test_fake_client_captures_composition_kwargs(fake_garmin_client):
-    garmin_client.push_weight(1, 1, 81600, percent_fat=18.4)
+    garmin_client.push_weight_to_client(fake_garmin_client, 81600, None, percent_fat=18.4)
     assert fake_garmin_client.pushed_weights[-1]["percent_fat"] == 18.4
 
 
 def test_body_fat_maps_to_percent_fat(fake_garmin_client):
-    garmin_client.push_weight(1, 1, 81600, percent_fat=18.4)
+    garmin_client.push_weight_to_client(fake_garmin_client, 81600, None, percent_fat=18.4)
     assert fake_garmin_client.pushed_weights[-1]["percent_fat"] == 18.4
 
 
 def test_body_water_maps_to_percent_hydration(fake_garmin_client):
-    garmin_client.push_weight(1, 1, 81600, percent_hydration=55.2)
+    garmin_client.push_weight_to_client(fake_garmin_client, 81600, None, percent_hydration=55.2)
     assert fake_garmin_client.pushed_weights[-1]["percent_hydration"] == 55.2
 
 
 def test_bone_mass_kg_passes_through_unconverted(fake_garmin_client):
-    garmin_client.push_weight(1, 1, 81600, bone_mass_kg=3.2)
+    garmin_client.push_weight_to_client(fake_garmin_client, 81600, None, bone_mass_kg=3.2)
     assert fake_garmin_client.pushed_weights[-1]["bone_mass"] == 3.2
 
 
 def test_bmr_maps_to_basal_met(fake_garmin_client):
-    garmin_client.push_weight(1, 1, 81600, basal_met=1620.0)
+    garmin_client.push_weight_to_client(fake_garmin_client, 81600, None, basal_met=1620.0)
     assert fake_garmin_client.pushed_weights[-1]["basal_met"] == 1620.0
 
 
 def test_amr_maps_to_active_met(fake_garmin_client):
-    garmin_client.push_weight(1, 1, 81600, active_met=2400.0)
+    garmin_client.push_weight_to_client(fake_garmin_client, 81600, None, active_met=2400.0)
     assert fake_garmin_client.pushed_weights[-1]["active_met"] == 2400.0
 
 
 def test_omitted_composition_passed_as_none(fake_garmin_client):
-    garmin_client.push_weight(1, 1, 81600)
+    garmin_client.push_weight_to_client(fake_garmin_client, 81600, None)
     pushed = fake_garmin_client.pushed_weights[-1]
     assert pushed["percent_fat"] is None
     assert pushed["percent_hydration"] is None
@@ -78,13 +77,13 @@ def test_omitted_composition_passed_as_none(fake_garmin_client):
 
 
 def test_push_weight_positional_call_still_works(fake_garmin_client):
-    garmin_client.push_weight(1, 1, 81600, datetime.now(timezone.utc))
+    garmin_client.push_weight_to_client(fake_garmin_client, 81600, None)
     assert len(fake_garmin_client.pushed_weights) == 1
 
 
 def test_no_composition_values_in_log_output(fake_garmin_client, caplog):
     with caplog.at_level(logging.INFO, logger=garmin_client.__name__):
-        garmin_client.push_weight(1, 1, 81600, percent_fat=18.4, percent_hydration=55.2, bone_mass_kg=3.2)
+        garmin_client.push_weight_to_client(fake_garmin_client, 81600, None, percent_fat=18.4, percent_hydration=55.2, bone_mass_kg=3.2)
     assert "18.4" not in caplog.text
     assert "55.2" not in caplog.text
     assert "3.2" not in caplog.text

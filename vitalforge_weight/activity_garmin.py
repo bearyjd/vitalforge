@@ -243,7 +243,7 @@ async def _push_activity(
     """Push one session to Garmin. NEVER RAISES -- mirrors _push_composition.
 
     The UTC-to-local-wall-clock conversion lives here rather than in
-    shared/garmin_client.push_activity because tests patch that name in this
+    activity_garmin.push_activity because tests patch that name in this
     module's namespace (tests/conftest.py); a conversion inside the patched
     function would be replaced by the fake, and the tests that pin it would
     be asserting on nothing.

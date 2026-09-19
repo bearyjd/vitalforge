@@ -138,10 +138,6 @@ def fake_garmin_client(monkeypatch):
     # from ``pushed_weights``, which represents what the Garmin client itself
     # receives after shared.garmin_client formats its wire timestamp.
     fake.route_weight_calls = []
-    # Direct adapter-mapping tests exercise the real person/generation API
-    # rather than the registry.  Give their synthetic primary link a client;
-    # no production path receives this shortcut.
-    monkeypatch.setitem(garmin_client._clients, (1, 1), fake)
 
     async def fake_call(person_id, operation, *, max_wait_seconds: float = 0.0):
         # The real registry selects a client by the durable (person,

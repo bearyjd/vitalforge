@@ -100,35 +100,6 @@ def forget_stale_generations(person_id: int, generation: int) -> None:
 # Push methods
 # ---------------------------------------------------------------------------
 
-def push_weight(
-    person_id: int,
-    generation: int,
-    weight_grams: int,
-    timestamp: datetime | None = None,
-    *,
-    percent_fat: float | None = None,
-    percent_hydration: float | None = None,
-    muscle_mass_kg: float | None = None,
-    bone_mass_kg: float | None = None,
-    bmi: float | None = None,
-    basal_met: float | None = None,
-    active_met: float | None = None,
-):
-    """Push a weight measurement through a cached person/generation client."""
-    return push_weight_to_client(
-        get_client(person_id, generation),
-        weight_grams,
-        timestamp,
-        percent_fat=percent_fat,
-        percent_hydration=percent_hydration,
-        muscle_mass_kg=muscle_mass_kg,
-        bone_mass_kg=bone_mass_kg,
-        bmi=bmi,
-        basal_met=basal_met,
-        active_met=active_met,
-    )
-
-
 def push_weight_to_client(
     client: Garmin,
     weight_grams: int,
@@ -183,76 +154,6 @@ def push_weight_to_client(
         active_met=active_met,
     )
     logger.info("Weight pushed to Garmin successfully")
-
-
-def push_activity(
-    person_id: int,
-    generation: int,
-    *,
-    start_datetime: str,
-    time_zone: str,
-    type_key: str,
-    distance_km: float,
-    duration_min: int,
-    activity_name: str,
-):
-    """Create a completed manual activity on Garmin Connect.
-
-    `start_datetime` must already be a LOCAL WALL-CLOCK string carrying no
-    offset ("2026-09-06T10:00:00.000") and `time_zone` the IANA name that
-    wall clock belongs to -- garminconnect's own documented contract. This
-    function deliberately does NOT do that conversion: the caller
-    (vitalforge_weight/app.py's _push_activity) owns it, because a test
-    monkeypatches THIS name in the app module's namespace and would
-    otherwise be asserting on a conversion the fake performed rather than
-    the one the app does.
-
-    Like push_weight, this does not catch -- the caller's never-raise
-    wrapper decides what a failure means for the stored row.
-    """
-    logger.info(
-        "Pushing activity to Garmin: %r at %s (%s), %s min",
-        activity_name, start_datetime, time_zone, duration_min,
-    )
-    result = get_client(person_id, generation).create_manual_activity(
-        start_datetime=start_datetime,
-        time_zone=time_zone,
-        type_key=type_key,
-        distance_km=distance_km,
-        duration_min=duration_min,
-        activity_name=activity_name,
-    )
-    return result
-
-
-def push_activity_sets(person_id: int, generation: int, activity_id: str, payload: dict):
-    """Attach per-exercise sets to an existing activity.
-
-    PUT semantics are REPLACE-ALL: the activity's existing exerciseSets
-    array is overwritten wholesale. Only ever called behind the
-    VITALFORGE_GARMIN_EXERCISE_SETS flag, which ships off -- see
-    build_exercise_sets_payload for why.
-    """
-    result = get_client(person_id, generation).set_activity_exercise_sets(activity_id, payload)
-    return result
-
-
-def find_activities_by_date(
-    person_id: int,
-    generation: int,
-    start_date: str,
-    end_date: str,
-    activity_type: str = STRENGTH_ACTIVITY_TYPE_KEY,
-):
-    """List activities in a date range, for reconciling an ambiguous push.
-
-    Dates are YYYY-MM-DD in the account's own local terms. Raising, like
-    every other push-side helper here: the caller decides what an
-    unreachable Garmin means for the row, and swallowing the error here
-    would make "no activities" and "could not ask" indistinguishable -- the
-    one distinction reconciliation depends on.
-    """
-    return get_client(person_id, generation).get_activities_by_date(start_date, end_date, activitytype=activity_type)
 
 
 def extract_activity_id(response) -> str | None:
@@ -327,47 +228,3 @@ def build_exercise_sets_payload(exercises: list[dict], start_local: datetime) ->
             # approximation available from what Cadence sends.
             cursor += timedelta(seconds=(seconds or 0) + (exercise.get("rest_s") or 0))
     return {"exerciseSets": entries}
-
-
-# ---------------------------------------------------------------------------
-# Pull methods — each returns raw JSON from Garmin Connect
-# ---------------------------------------------------------------------------
-
-def get_sleep_data(person_id: int, generation: int, date: str) -> dict | None:
-    """Get daily sleep data. date: YYYY-MM-DD."""
-    return get_client(person_id, generation).get_sleep_data(date)
-
-
-def get_user_summary(person_id: int, generation: int, date: str) -> dict | None:
-    """Get daily user summary (steps, calories, RHR, stress, etc.). date: YYYY-MM-DD."""
-    return get_client(person_id, generation).get_user_summary(date)
-
-
-def get_hrv_data(person_id: int, generation: int, date: str) -> dict | None:
-    """Get HRV data for a given date. date: YYYY-MM-DD."""
-    return get_client(person_id, generation).get_hrv_data(date)
-
-
-def get_body_battery(person_id: int, generation: int, date: str) -> list | None:
-    """Get body battery report for a single day. date: YYYY-MM-DD."""
-    return get_client(person_id, generation).get_body_battery(date)
-
-
-def get_stress_data(person_id: int, generation: int, date: str) -> dict | None:
-    """Get daily stress data. date: YYYY-MM-DD."""
-    return get_client(person_id, generation).get_stress_data(date)
-
-
-def get_max_metrics(person_id: int, generation: int, date: str) -> list | None:
-    """Get VO2 Max and fitness metrics. date: YYYY-MM-DD."""
-    return get_client(person_id, generation).get_max_metrics(date)
-
-
-def get_weight_range(person_id: int, generation: int, start_date: str, end_date: str) -> dict | None:
-    """Get weight history for a date range. Dates: YYYY-MM-DD."""
-    return get_client(person_id, generation).get_weigh_ins(start_date, end_date)
-
-
-def get_training_status(person_id: int, generation: int, date: str) -> dict | None:
-    """Get training status/load. date: YYYY-MM-DD."""
-    return get_client(person_id, generation).get_training_status(date)
