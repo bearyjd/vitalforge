@@ -30,12 +30,19 @@ shared/                   # imported by BOTH services as a real installed packag
   auth.py                 # cookie/HMAC session auth + login page HTML + FastAPI middleware
   database.py             # aiosqlite connection + schema; migrations.py runs one-shot schema
                           # migrations on top of it (001-person-id-rebuild, Phase 1)
-  garmin_registry.py      # per-person Garmin links: link/relink/unlink, token dirs, call pacing,
-                          # one-time legacy-store adoption; garmin_registry_runtime.py holds
-                          # the pieces that need a late import of the registry
+  garmin_registry.py      # the facade: per-person Garmin links (link/relink/unlink), token dirs
+                          # + GARTH_TOKEN_DIR (the monkeypatch seam), lock paths + person_flock /
+                          # legacy_store_flock, call/call_paced. Imports common/runtime/errors/locks
+                          # at the top; none of those imports it back (tests/test_registry_layering.py)
+  garmin_registry_common.py  # leaf: link-state / attempt-limit constants, utc_now, canonical_email,
+                             # call_interval_seconds; imports only garmin_registry_errors
+  garmin_registry_runtime.py # call permits, link-attempt quota, auth stamps, error classification,
+                             # link-row publication (_publish_link); never imports the facade
+  garmin_registry_legacy.py  # one-time legacy .garth flat-store adoption (bootstrap_legacy_token_store);
+                             # imports the facade (never the reverse); both app lifespans import it
   garmin_registry_errors.py  # the registry's bounded error types + GarminLink; no registry import
-  garmin_registry_locks.py   # person_flock / legacy_store_flock: flock across both processes
-                             # plus the per-loop asyncio.Lock that flock alone does not give
+  garmin_registry_locks.py   # root-agnostic leaf: flock_scope(key, lock_path) = flock across both
+                             # processes plus the per-loop asyncio.Lock that flock alone does not give
   garmin_routes.py        # /p/{slug}/api/garmin/{status,link,relink,unlink}, mounted on both apps
   garmin_client.py        # thin wrapper over garminconnect.Garmin; `_clients` is a
                           # `(person_id, generation)` -> Garmin cache, not a singleton

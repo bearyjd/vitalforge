@@ -28,7 +28,7 @@ from shared.database import (
     get_db,
     init_db,
 )
-from shared.garmin_registry import bootstrap_legacy_token_store
+from shared.garmin_registry_legacy import bootstrap_legacy_token_store
 from shared.garmin_routes import add_garmin_routes, is_garmin_credential_path
 from shared.persons_admin import add_person_routes
 from vitalforge_weight.activity_routes import add_activity_routes

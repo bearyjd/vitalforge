@@ -2,8 +2,11 @@
 
 ``flock`` is the crash-safe authority shared by both service processes; the
 per-loop ``asyncio.Lock`` layer only closes the gap that two descriptors in
-one process do not reliably wait for each other.  The public entry points are
-re-exported by :mod:`shared.garmin_registry`.
+one process do not reliably wait for each other.  This module is a leaf that
+knows nothing about where lock files live: :func:`flock_scope` takes its lock
+path from the caller, and :mod:`shared.garmin_registry` builds
+``person_flock`` / ``legacy_store_flock`` on it with paths under its own
+``GARTH_TOKEN_DIR``.
 """
 
 from __future__ import annotations
@@ -12,23 +15,9 @@ import asyncio
 import fcntl
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Callable
 
 _process_person_locks: dict[tuple[asyncio.AbstractEventLoop, int], asyncio.Lock] = {}
-
-
-def _registry():
-    # Delayed to avoid a facade/import cycle and to honour the facade's
-    # GARTH_TOKEN_DIR monkeypatch seam.
-    from shared import garmin_registry
-
-    return garmin_registry
-
-
-def _person_lock_path(person_id: int) -> Path:
-    """A stable lock survives a token-directory replacement on re-link."""
-    if person_id < 1:
-        raise ValueError("person_id must be a positive integer")
-    return _registry()._ensure_token_root() / f".person-{person_id}.lock"
 
 
 def _acquire_lock(lock_path: Path):
@@ -62,19 +51,27 @@ def _process_person_lock(person_id: int) -> asyncio.Lock:
 
 
 @asynccontextmanager
-async def person_flock(person_id: int):
-    """Serialize all operations for a person across both service processes.
+async def flock_scope(local_key: int, lock_path: Callable[[], Path]):
+    """Hold this process's lock for ``local_key``, then flock ``lock_path()``.
 
-    Lifecycle routes use the same public context manager, so unlink/re-link
-    cannot swap a token directory while :func:`call` is authenticating or
-    using it.  flock is released if a process dies; the file is intentionally
+    The process-local lock comes first because flock alone does not make two
+    descriptors in one process wait for each other (see
+    :func:`_process_person_lock`); ``lock_path`` is only called once it is
+    held, so a path that has to prepare its directory does so serialized per
+    key.  flock is released if a process dies; the file is intentionally
     retained as lock infrastructure, not a sentinel.
+
+    ``local_key`` is one namespace shared by every caller through
+    ``_process_person_locks``: ``0`` is reserved for the legacy-store lock and
+    every person uses its positive ``person_id``.  A new caller must not reuse
+    either -- a colliding key silently serializes against that person, and a
+    distinct key on a colliding lock file loses the in-process half of the
+    exclusion.
     """
-    person_id = int(person_id)
-    local_lock = _process_person_lock(person_id)
+    local_lock = _process_person_lock(local_key)
     async with local_lock:
-        lock_path = _person_lock_path(person_id)
-        acquire_task = asyncio.create_task(asyncio.to_thread(_acquire_lock, lock_path))
+        path = lock_path()
+        acquire_task = asyncio.create_task(asyncio.to_thread(_acquire_lock, path))
         try:
             handle = await asyncio.shield(acquire_task)
         except asyncio.CancelledError:
@@ -82,28 +79,6 @@ async def person_flock(person_id: int):
             # second cancellation can interrupt that await and orphan the
             # descriptor after flock() eventually succeeds.  The completion
             # callback owns that late handle instead.
-            _close_acquired_handle_when_done(acquire_task)
-            raise
-        try:
-            yield
-        finally:
-            await _close_lock_handle(handle)
-
-
-@asynccontextmanager
-async def legacy_store_flock():
-    """Serialize the one-time flat-store adoption across both services.
-
-    The lock belongs beside the historic flat store, not inside any person's
-    directory: before adoption there is deliberately no person-owned path.
-    """
-    local_lock = _process_person_lock(0)
-    async with local_lock:
-        lock_path = _registry()._ensure_token_root() / ".legacy-bootstrap.lock"
-        acquire_task = asyncio.create_task(asyncio.to_thread(_acquire_lock, lock_path))
-        try:
-            handle = await asyncio.shield(acquire_task)
-        except asyncio.CancelledError:
             _close_acquired_handle_when_done(acquire_task)
             raise
         try:
