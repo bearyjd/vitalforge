@@ -284,6 +284,37 @@ async def test_call_waits_for_a_permit_only_within_its_budget(
     assert sleeps == expected_sleeps
 
 
+async def test_cold_call_bounds_its_post_login_permit_by_the_remaining_budget(
+    initialized_db, monkeypatch, tmp_path
+):
+    person_id = await get_primary_person_id()
+    await _link(person_id)
+    generation_dir = tmp_path / "garth" / f"person-{person_id}" / "generation-1"
+    generation_dir.parent.mkdir(parents=True)
+    _write_fake_token_store(generation_dir)
+    calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _fake_auth(calls))
+    monkeypatch.setenv("GARMIN_MIN_CALL_INTERVAL_SECONDS", "60")
+    now = 1_000.0
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: now)
+    slept: list[float] = []
+
+    async def fake_sleep(seconds):
+        nonlocal now
+        slept.append(seconds)
+        now += seconds
+
+    monkeypatch.setattr(garmin_registry.asyncio, "sleep", fake_sleep)
+    await _set_next_allowed_at(0.0)  # first permit is free; the login consumes it
+
+    with pytest.raises(garmin_registry.GarminRateLimited):
+        await garmin_registry.call(person_id, lambda _c: "never", max_wait_seconds=5.0)
+
+    assert calls == [(person_id, 1)], "the cold login happened"
+    assert sum(slept) <= 5.0, f"post-login wait exceeded the budget: slept {slept}"
+    assert garmin_client.is_authenticated(person_id, 1), "the warm client is kept for the retry"
+
+
 @pytest.mark.parametrize("budget", (-1, float("nan")))
 async def test_call_rejects_a_negative_or_nan_wait_budget(initialized_db, budget):
     with pytest.raises(ValueError):

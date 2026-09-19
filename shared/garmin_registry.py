@@ -670,6 +670,7 @@ async def call(
             # otherwise a queued or unlinked request could consume a global
             # slot without being the next logical operation allowed to reach
             # Garmin.
+            started = time.monotonic()
             if max_wait_seconds > 0.0:
                 await _wait_for_call_permit(deadline_seconds=max_wait_seconds)
             else:
@@ -677,7 +678,10 @@ async def call(
             if garmin_client.is_authenticated(person_id, generation):
                 client = garmin_client.get_client(person_id, generation)
             else:
-                client = await _resume_link(person_id, generation, email)
+                remaining = (
+                    max(0.0, max_wait_seconds - (time.monotonic() - started)) if max_wait_seconds > 0.0 else None
+                )
+                client = await _resume_link(person_id, generation, email, deadline_seconds=remaining)
             return await _run_operation(person_id, generation, client, op)
     except GarminRegistryError:
         raise
@@ -702,8 +706,11 @@ async def _usable_link(person_id: int) -> tuple[int, str]:
     return int(link["generation"]), email
 
 
-async def _resume_link(person_id: int, generation: int, email: str) -> Garmin:
-    """Cold-load a durable generation's token store and take its second permit."""
+async def _resume_link(
+    person_id: int, generation: int, email: str, *, deadline_seconds: float | None = None
+) -> Garmin:
+    """Cold-load a durable generation's token store and take its second
+    permit within the caller's remaining budget."""
     token_dir = resolve_token_dir(person_id, generation)
     try:
         # Only the login moves off the event loop.  The operation itself runs
@@ -720,10 +727,11 @@ async def _resume_link(person_id: int, generation: int, email: str) -> Garmin:
     # login(tokenstore=...) can issue a profile/network request, so it
     # consumed the first permit.  The following operation is a distinct
     # Garmin call and obtains a second permit while the same person lock
-    # remains held.  It waits for that permit: rejecting the operation
-    # immediately after a successful cold login would make one logical
-    # request unable to complete at the configured global call rate.
-    await _wait_for_call_permit()
+    # remains held.  It waits for that permit, bounded by the caller's
+    # remaining budget: rejecting the operation immediately after a
+    # successful cold login would make one logical request unable to
+    # complete at the configured global call rate.
+    await _wait_for_call_permit(deadline_seconds=deadline_seconds)
     return client
 
 
