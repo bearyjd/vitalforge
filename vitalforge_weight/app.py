@@ -28,9 +28,8 @@ from shared.database import (
     get_db,
     init_db,
 )
-from shared.garmin_client import (
-    authenticate,
-)
+from shared.garmin_registry import bootstrap_legacy_token_store
+from shared.garmin_routes import add_garmin_routes, is_garmin_credential_path
 from shared.persons_admin import add_person_routes
 from vitalforge_weight.activity_routes import add_activity_routes
 from vitalforge_weight.weight_routes import add_weight_routes
@@ -53,11 +52,7 @@ async def lifespan(app: FastAPI):
     # exists to own it. See ensure_primary_person_grant()'s docstring.
     await ensure_primary_person_grant()
     await bootstrap_migrated_token()
-    logger.info("Authenticating with Garmin Connect...")
-    try:
-        authenticate()
-    except Exception as e:
-        logger.warning("Garmin authentication failed (will retry on first request): %s", e)
+    await bootstrap_legacy_token_store()
     yield
 
 app = FastAPI(title="VitalForge Weight", lifespan=lifespan)
@@ -69,6 +64,7 @@ add_auth_routes(app)
 # so an admin who opened the weight service should not have to switch ports to
 # add someone.
 add_person_routes(app)
+add_garmin_routes(app)
 
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 
@@ -98,6 +94,8 @@ async def _validation_exception_handler(request: Request, exc: RequestValidation
     payload before encoding so the intended 422 actually reaches the
     client.
     """
+    if is_garmin_credential_path(request.url.path):
+        return JSONResponse(status_code=422, content={"detail": "Invalid Garmin link request"})
     return JSONResponse(
         status_code=422,
         content={"detail": _scrub_non_finite(jsonable_encoder(exc.errors()))},

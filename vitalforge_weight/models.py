@@ -191,9 +191,6 @@ class ActivityIn(BaseModel):
     # Defaults to False deliberately: the safe default is to store, and a
     # destructive-side-effect default should never be implicit.
     push_to_garmin: bool = False
-    # D-015 override. Inert on its own -- consulted only when push_to_garmin
-    # is true AND the target person is not the Garmin-credential person.
-    garmin_target: Literal["credential_person"] | None = None
 
     @field_validator("duration_min", mode="before")
     @classmethod

@@ -1,10 +1,9 @@
-"""B3: mapping body-composition fields onto shared.garmin_client.push_weight's
+"""B3: mapping body-composition fields onto shared.garmin_client.push_weight_to_client's
 new keyword-only parameters (docs/prp/00-design.md SS3.4). No Docker, no
 network, no real Garmin account.
 """
 
 import logging
-from datetime import datetime, timezone
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -30,46 +29,47 @@ def test_real_client_signature_accepts_our_kwargs():
     import garminconnect
 
     params = set(inspect.signature(garminconnect.Garmin.add_body_composition).parameters)
-    # bmi is deliberately excluded here -- push_weight accepts it, but no
-    # production call site forwards it (00-design.md SS3.4), so it isn't
-    # something a garminconnect rename could silently break for us today.
+    # bmi is deliberately excluded here -- push_weight_to_client accepts it,
+    # but no production call site forwards it (00-design.md SS3.4), so it
+    # isn't something a garminconnect rename could silently break for us
+    # today.
     assert params >= {
         "percent_fat", "percent_hydration", "bone_mass", "muscle_mass", "basal_met", "active_met",
     }
 
 
 def test_fake_client_captures_composition_kwargs(fake_garmin_client):
-    garmin_client.push_weight(81600, percent_fat=18.4)
+    garmin_client.push_weight_to_client(fake_garmin_client, 81600, None, percent_fat=18.4)
     assert fake_garmin_client.pushed_weights[-1]["percent_fat"] == 18.4
 
 
 def test_body_fat_maps_to_percent_fat(fake_garmin_client):
-    garmin_client.push_weight(81600, percent_fat=18.4)
+    garmin_client.push_weight_to_client(fake_garmin_client, 81600, None, percent_fat=18.4)
     assert fake_garmin_client.pushed_weights[-1]["percent_fat"] == 18.4
 
 
 def test_body_water_maps_to_percent_hydration(fake_garmin_client):
-    garmin_client.push_weight(81600, percent_hydration=55.2)
+    garmin_client.push_weight_to_client(fake_garmin_client, 81600, None, percent_hydration=55.2)
     assert fake_garmin_client.pushed_weights[-1]["percent_hydration"] == 55.2
 
 
 def test_bone_mass_kg_passes_through_unconverted(fake_garmin_client):
-    garmin_client.push_weight(81600, bone_mass_kg=3.2)
+    garmin_client.push_weight_to_client(fake_garmin_client, 81600, None, bone_mass_kg=3.2)
     assert fake_garmin_client.pushed_weights[-1]["bone_mass"] == 3.2
 
 
 def test_bmr_maps_to_basal_met(fake_garmin_client):
-    garmin_client.push_weight(81600, basal_met=1620.0)
+    garmin_client.push_weight_to_client(fake_garmin_client, 81600, None, basal_met=1620.0)
     assert fake_garmin_client.pushed_weights[-1]["basal_met"] == 1620.0
 
 
 def test_amr_maps_to_active_met(fake_garmin_client):
-    garmin_client.push_weight(81600, active_met=2400.0)
+    garmin_client.push_weight_to_client(fake_garmin_client, 81600, None, active_met=2400.0)
     assert fake_garmin_client.pushed_weights[-1]["active_met"] == 2400.0
 
 
 def test_omitted_composition_passed_as_none(fake_garmin_client):
-    garmin_client.push_weight(81600)
+    garmin_client.push_weight_to_client(fake_garmin_client, 81600, None)
     pushed = fake_garmin_client.pushed_weights[-1]
     assert pushed["percent_fat"] is None
     assert pushed["percent_hydration"] is None
@@ -77,26 +77,15 @@ def test_omitted_composition_passed_as_none(fake_garmin_client):
     assert pushed["bone_mass"] is None
 
 
-def test_push_weight_positional_call_still_works(fake_garmin_client):
-    garmin_client.push_weight(81600, datetime.now(timezone.utc))
-    assert len(fake_garmin_client.pushed_weights) == 1
-
-
 def test_no_composition_values_in_log_output(fake_garmin_client, caplog):
     with caplog.at_level(logging.INFO, logger=garmin_client.__name__):
-        garmin_client.push_weight(81600, percent_fat=18.4, percent_hydration=55.2, bone_mass_kg=3.2)
+        garmin_client.push_weight_to_client(fake_garmin_client, 81600, None, percent_fat=18.4, percent_hydration=55.2, bone_mass_kg=3.2)
     assert "18.4" not in caplog.text
     assert "55.2" not in caplog.text
     assert "3.2" not in caplog.text
 
 
 async def test_muscle_pct_derives_muscle_mass_kg(client, weight_app_module, fake_garmin_client, monkeypatch, weight_routes_module):
-    # weight_app_module fakes push_weight wholesale by default (for tests that
-    # don't care about Garmin-side mapping). Restore the real function here so
-    # the route's muscle_mass_kg derivation reaches push_weight's own kwarg
-    # mapping instead of being bypassed by the double.
-    monkeypatch.setattr(weight_routes_module, "push_weight", garmin_client.push_weight)
-
     # weight=80kg, muscle_pct=40% -> 32.0kg. Deliberately not 100kg: at 100kg
     # the conversion (weight_kg * pct/100) is numerically the identity map on
     # the percent value, so a 100kg fixture can't distinguish "converted to a

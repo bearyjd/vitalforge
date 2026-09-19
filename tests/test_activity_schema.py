@@ -1,17 +1,9 @@
 """How `strength_sessions` is wired into the schema, and how it is NOT.
 
-The table is created unguarded in `init_db()`'s DDL block with no migration
-marker, like the other 19 tables there. That is not tidiness, it is the
-correct reading of this repo's own rule: the DDL block runs BEFORE any
-`run_migration()` call and `CREATE TABLE IF NOT EXISTS` is already right on a
-fresh database and an upgrade alike, so a `003` apply-function would be a
-no-op on every path.
-
-Adding the marker anyway would be actively harmful, which is what
-test_no_migration_marker_was_added exists to prevent:
-`assert_schema_understood()` boot-loops any image that finds a marker outside
-its own `_KNOWN_MIGRATIONS`, so a rollback to a pre-Cadence image would refuse
-to start. A bare extra table it does not recognise is ignored harmlessly.
+The current table is created unguarded in `init_db()`'s DDL block. Migration
+003 is the narrow exception: it rebuilds already-deployed tables to remove a
+retired column. Fresh databases create the final shape and the migration is a
+no-op for them.
 """
 
 import pytest
@@ -45,11 +37,13 @@ async def test_table_created_on_an_existing_database(production_schema_db, monke
     assert await table_sql("strength_sessions") is not None
 
 
-async def test_no_migration_marker_was_added(initialized_db):
-    """Pins _KNOWN_MIGRATIONS to exactly the two rebuilds that legitimately
-    need a marker. A `003` added "for tidiness" would make a rollback to any
-    earlier image boot-loop."""
-    assert migrations._KNOWN_MIGRATIONS == ("001-person-id-rebuild", "002-activities-person-id")
+async def test_strength_sessions_removal_migration_is_registered(initialized_db):
+    assert migrations._KNOWN_MIGRATIONS == (
+        "001-person-id-rebuild",
+        "002-activities-person-id",
+        "003-strength-sessions-remove-garmin-target",
+        "004-strength-sessions-redact-garmin-errors",
+    )
     assert "strength_sessions" not in migrations._REBUILD_TABLES
 
     db = await get_db()
@@ -57,7 +51,44 @@ async def test_no_migration_marker_was_added(initialized_db):
         rows = await (await db.execute("SELECT name FROM schema_migrations")).fetchall()
     finally:
         await db.close()
-    assert not [r["name"] for r in rows if "strength" in r["name"]]
+    assert [r["name"] for r in rows if "strength" in r["name"]] == [
+        "003-strength-sessions-remove-garmin-target",
+        "004-strength-sessions-redact-garmin-errors",
+    ]
+
+
+async def test_redaction_migration_replaces_historic_provider_error_text(initialized_db):
+    """The once-only migration cleans existing rows; route filtering is a backstop."""
+    from datetime import datetime, timezone
+
+    person_id = await database.get_primary_person_id()
+    now = datetime.now(timezone.utc).isoformat()
+    raw_error = "Bearer migration-sentinel-abcdefghijklmnopqrstuvwxyz"
+    db = await get_db()
+    try:
+        await db.execute(
+            "INSERT INTO strength_sessions (person_id, session_id, start_time_utc, duration_seconds, "
+            "exercises_json, garmin_status, garmin_error, created_at, updated_at) "
+            "VALUES (?, 'historic-error', ?, 60, '[]', 'failed', ?, ?, ?)",
+            (person_id, now, raw_error, now, now),
+        )
+        await db.execute(
+            "DELETE FROM schema_migrations WHERE name = '004-strength-sessions-redact-garmin-errors'"
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+    await database.init_db()
+
+    db = await get_db()
+    try:
+        row = await (
+            await db.execute("SELECT garmin_error FROM strength_sessions WHERE session_id = 'historic-error'")
+        ).fetchone()
+    finally:
+        await db.close()
+    assert row["garmin_error"] == "unknown"
 
 
 async def test_unique_constraint_is_not_partial(initialized_db):

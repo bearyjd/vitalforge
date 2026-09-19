@@ -27,7 +27,17 @@ class LiveServer:
     def __init__(self, app, host: str = "127.0.0.1"):
         self.port = _free_port()
         self.base_url = f"http://{host}:{self.port}"
-        config = uvicorn.Config(app, host=host, port=self.port, log_level="warning", lifespan="on")
+        # Production launchers disable Uvicorn's broad proxy-header middleware.
+        # Keep real-socket tests on that same transport policy: credential
+        # routes make their own source-IP-bound X-Forwarded-Proto decision.
+        config = uvicorn.Config(
+            app,
+            host=host,
+            port=self.port,
+            log_level="warning",
+            lifespan="on",
+            proxy_headers=False,
+        )
         self.server = uvicorn.Server(config)
         self.thread = threading.Thread(target=self.server.run, daemon=True)
 

@@ -1,11 +1,10 @@
-import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
 
 import aiosqlite
 
-logger = logging.getLogger(__name__)
+from shared.database_bootstrap import _attribute_orphaned_weight_log_rows
 
 DB_PATH = Path(os.getenv("DB_PATH", "/app/data/fitness.db"))
 
@@ -153,10 +152,14 @@ async def init_db():
     migrations."""
     from shared.migrations import (
         _PERSON_ID_REBUILD_SNAPSHOT_NAME,
+        _STRENGTH_SESSIONS_SNAPSHOT_NAME,
         SCHEMA_MIGRATIONS_TABLE_SQL,
         _apply_activities_person_id,
         _apply_person_id_rebuild,
+        _apply_strength_sessions_redact_garmin_errors,
+        _apply_strength_sessions_remove_garmin_target,
         _needs_person_id_rebuild,
+        _needs_strength_sessions_rebuild,
         assert_schema_understood,
         ensure_pre_migration_snapshot,
         run_migration,
@@ -336,6 +339,124 @@ async def init_db():
         """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_person_grants_user ON person_grants(user_id)")
 
+        # Per-person Garmin credential lifecycle. The garmin_* tables are
+        # additive (created here, before the migration runner) and an older
+        # image would ignore them -- but that does NOT make this release
+        # rollback-safe by itself: the same release ships migrations 003 and
+        # 004, whose markers an older image does not know, so
+        # assert_schema_understood() boot-loops it. Rollback is "restore
+        # fitness.pre-003-strength-sessions.db" (README, Upgrading), not
+        # "redeploy the old image against the current file". Tokens
+        # themselves remain on disk; do not add a password or token column
+        # here.
+        #
+        # 'legacy_bound' and 'legacy_disabled' are RETIRED: boot-time adoption
+        # of a pre-Phase-3 flat token store now moves that store under
+        # person-<id>/generation-1/ and publishes an ordinary 'linked' row, so
+        # nothing writes either value any more and the registry only treats
+        # 'linked' as usable. They stay in the CHECK because SQLite cannot
+        # alter a CHECK constraint and databases that already created this
+        # table carry the three-value shape; dropping them would need a
+        # rebuild of a table that holds nothing worth rebuilding for.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS garmin_links (
+                person_id          INTEGER PRIMARY KEY REFERENCES persons(id),
+                state              TEXT NOT NULL
+                                   CHECK (state IN ('linked', 'legacy_bound', 'legacy_disabled')),
+                -- The lifecycle layer owns Unicode canonicalization
+                -- (strip().casefold()) before storing an email. SQLite's
+                -- built-in case conversion and NOCASE collation are ASCII-only, so BINARY uniqueness is
+                -- deliberately only a backstop for that canonical value.
+                -- The SQL check rejects an empty or ASCII-space-padded value
+                -- without claiming to perform case conversion or validation
+                -- Garmin itself owns.
+                garmin_email       TEXT COLLATE BINARY UNIQUE
+                                   CHECK (garmin_email IS NULL OR
+                                          (garmin_email = trim(garmin_email)
+                                           AND length(garmin_email) > 0)),
+                generation         INTEGER NOT NULL CHECK (generation >= 1),
+                linked_at          TEXT,
+                linked_by          INTEGER REFERENCES users(id),
+                updated_at         TEXT NOT NULL,
+                last_auth_ok       TEXT,
+                last_auth_error    TEXT
+                                   CHECK (last_auth_error IS NULL OR last_auth_error IN
+                                          ('auth_failed', 'rate_limited', 'network', 'unknown')),
+                last_auth_error_at TEXT,
+                CHECK (
+                    (state IN ('linked', 'legacy_bound')
+                     AND garmin_email IS NOT NULL
+                     AND linked_at IS NOT NULL)
+                    OR (state = 'legacy_disabled' AND garmin_email IS NULL)
+                ),
+                -- A bounded code without a time is unusable to a status
+                -- caller, and a leftover time after clearing a code would
+                -- make a later successful link look failed. Keep the two
+                -- values atomic at the schema boundary as well as in the
+                -- lifecycle transaction.
+                CHECK (
+                    (last_auth_error IS NULL AND last_auth_error_at IS NULL)
+                    OR (last_auth_error IS NOT NULL AND last_auth_error_at IS NOT NULL)
+                )
+            )
+        """)
+
+        # One row coordinates Garmin calls across both services. The row is
+        # seeded idempotently so either concurrent init_db() caller may win.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS garmin_call_budget (
+                singleton       INTEGER PRIMARY KEY CHECK (singleton = 1),
+                next_allowed_at REAL NOT NULL
+            )
+        """)
+        await db.execute(
+            "INSERT OR IGNORE INTO garmin_call_budget (singleton, next_allowed_at) VALUES (1, 0)"
+        )
+
+        # Link attempts are deliberately per user, not per person or email:
+        # that is the security principal authorized to submit credentials.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS garmin_link_attempts (
+                user_id           INTEGER PRIMARY KEY REFERENCES users(id),
+                window_started_at REAL NOT NULL,
+                attempt_count     INTEGER NOT NULL CHECK (attempt_count BETWEEN 1 AND 3),
+                attempted_at_1    REAL NOT NULL,
+                attempted_at_2    REAL,
+                attempted_at_3    REAL,
+                -- window_started_at is retained for compatibility, but is
+                -- always the oldest timestamp in the rolling window.
+                CHECK (window_started_at = attempted_at_1),
+                -- Slots are densely packed, oldest first. This lets a
+                -- reservation transaction discard only expired attempts and
+                -- calculate a fourth request's precise retry time.
+                CHECK (
+                    (attempt_count = 1
+                     AND attempted_at_2 IS NULL
+                     AND attempted_at_3 IS NULL)
+                    OR (attempt_count = 2
+                        AND attempted_at_2 IS NOT NULL
+                        AND attempted_at_3 IS NULL)
+                    OR (attempt_count = 3
+                        AND attempted_at_2 IS NOT NULL
+                        AND attempted_at_3 IS NOT NULL)
+                ),
+                CHECK (
+                    (attempted_at_2 IS NULL OR attempted_at_1 <= attempted_at_2)
+                    AND (attempted_at_3 IS NULL OR attempted_at_2 <= attempted_at_3)
+                )
+            )
+        """)
+
+        # Unlink removes a garmin_links row, so its generation cannot be the
+        # source of truth. This ledger remains to ensure a relink always gets
+        # a new generation and stale work can never target a new credential.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS garmin_link_generations (
+                person_id  INTEGER PRIMARY KEY REFERENCES persons(id),
+                generation INTEGER NOT NULL CHECK (generation >= 1)
+            )
+        """)
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS api_tokens (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -484,16 +605,11 @@ async def init_db():
         # of a table two dashboard read routes already serve. The two concepts
         # stay separate on purpose; see CLAUDE.md.
         #
-        # No migration marker, unguarded, like the other 19 tables here: the
-        # whole DDL block runs BEFORE any run_migration() call, and CREATE
-        # TABLE IF NOT EXISTS is already correct on a fresh database and on an
-        # upgrade alike, so a `003` apply-function would be a no-op on every
-        # path. It would also be actively harmful -- assert_schema_understood()
-        # boot-loops any image that sees a marker outside its own
-        # _KNOWN_MIGRATIONS, so a rollback to a pre-Cadence image would refuse
-        # to start, where a bare extra table it does not know about is ignored
-        # harmlessly. `person_id` is in the CREATE TABLE itself, so the
-        # PRAGMA guard the activities index needs does not apply here.
+        # This creates the current shape for fresh databases. Migration 003
+        # separately rebuilds existing strength_sessions tables to remove the
+        # retired global-Garmin target column. `person_id` is in this CREATE
+        # TABLE itself, so the PRAGMA guard the activities index needs does not
+        # apply here.
         await db.execute("""
             CREATE TABLE IF NOT EXISTS strength_sessions (
                 id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -517,7 +633,6 @@ async def init_db():
                                    CHECK (garmin_status IN ('skipped','pending','synced','failed','unknown')),
                 garmin_activity_id TEXT,
                 garmin_error       TEXT,
-                garmin_target      TEXT,
                 garmin_sets_status TEXT NOT NULL DEFAULT 'not_attempted'
                                    CHECK (garmin_sets_status IN ('not_attempted','synced','failed')),
                 -- UTC ISO instant at which some request claimed the right to
@@ -535,9 +650,9 @@ async def init_db():
                 -- claiming process died) and may be re-claimed, so a crash
                 -- mid-push cannot strand a session forever.
                 garmin_claimed_at  TEXT,
-                -- The persons.display_name used to build this session's Garmin
-                -- activity title, captured at first push. NULL unless the
-                -- D-015 cross-person override applied.
+                -- The display name used in a pre-Phase-3 session title, retained
+                -- only so an old ambiguous push can be reconciled by its exact
+                -- historical Garmin title. New per-person-link rows leave it NULL.
                 --
                 -- Persisted because display_name is MUTABLE and the title is
                 -- the only handle reconciliation has: Garmin offers no
@@ -590,50 +705,16 @@ async def init_db():
     await ensure_pre_migration_snapshot(_PERSON_ID_REBUILD_SNAPSHOT_NAME, _needs_person_id_rebuild)
     await run_migration("001-person-id-rebuild", _apply_person_id_rebuild)
     await run_migration("002-activities-person-id", _apply_activities_person_id)
+    # 003 is a table rebuild that an older image cannot boot against (its
+    # marker is unknown to that image), so it gets its own snapshot -- taken
+    # here, AFTER 001/002, which is what makes it the right file to restore
+    # for a rollback to the previous release rather than to a pre-001 one.
+    await ensure_pre_migration_snapshot(_STRENGTH_SESSIONS_SNAPSHOT_NAME, _needs_strength_sessions_rebuild)
+    await run_migration("003-strength-sessions-remove-garmin-target", _apply_strength_sessions_remove_garmin_target)
+    await run_migration("004-strength-sessions-redact-garmin-errors", _apply_strength_sessions_redact_garmin_errors)
 
     # After the migrations, because it needs the primary person 001 creates.
     await _attribute_orphaned_weight_log_rows()
-
-
-async def _attribute_orphaned_weight_log_rows() -> None:
-    """Give any weight_log row with a NULL person_id to the primary person.
-
-    Migration 001 runs this same backfill, but its marker commits in the same
-    transaction -- so a row written with a NULL person_id AFTER 001 commits is
-    never repaired by the migration, which skips itself forever. Nothing else
-    repairs it either: weight_log.person_id cannot be NOT NULL (SQLite cannot
-    add a NOT NULL column without a constant default, which is why it is an
-    additive column rather than a rebuild), so the schema will not refuse such
-    a row on the way in.
-
-    That row is reachable by doing what README's Upgrading step 1 forbids:
-    leaving an old weight-service container running against the newly rebuilt
-    schema. Its INSERT predates person_id and simply omits it. Every read path
-    now filters `person_id = ?`, so the result is worse than mis-attribution
-    -- the entry is invisible in /recent, /trend and DELETE, and the user sees
-    a weight they logged silently missing rather than merely misfiled.
-
-    Running the backfill on every boot makes that self-healing instead of
-    permanent. It is idempotent and matches zero rows on a healthy database.
-    """
-    db = await get_db()
-    try:
-        cursor = await db.execute(
-            "UPDATE weight_log SET person_id = (SELECT id FROM persons WHERE is_primary = 1) "
-            "WHERE person_id IS NULL"
-        )
-        await db.commit()
-    finally:
-        await db.close()
-    if cursor.rowcount:
-        # warning, not info: reaching this means an unsupported upgrade
-        # happened and the operator should know their data was repaired.
-        logger.warning(
-            "Attributed %d unattributed weight_log row(s) to the primary person. "
-            "This means a pre-multi-tenancy weight service wrote to this database "
-            "after the person-id migration -- see README's Upgrading section.",
-            cursor.rowcount,
-        )
 
 
 async def get_primary_person_id() -> int:
@@ -654,33 +735,6 @@ async def get_primary_person_id() -> int:
     if row is None:
         raise RuntimeError("No primary person found -- has init_db() run?")
     return row["id"]
-
-
-async def garmin_credential_person_id() -> int:
-    """The person the deployment's single Garmin account actually describes.
-
-    shared/garmin_client.py holds ONE module-level client authenticated from
-    the deployment-wide GARMIN_EMAIL/GARMIN_PASSWORD. Whatever it returns is
-    that one human's sleep, HRV and heart rate, no matter which person_id the
-    caller asks to write it under. Until Phase 3 gives each person their own
-    credentials and token store, that human is the primary person.
-
-    require_person() authorizes a caller FOR A TARGET PERSON. It cannot
-    authorize them for a DATA SOURCE, and nothing else did either -- so a
-    caller holding `manage` on their own person could trigger a pull that
-    wrote the primary person's Garmin data under theirs, then read it back.
-    Every SQL statement involved was correctly person-scoped; the source was
-    not. Callers that pull from Garmin must compare their target against this.
-
-    PHASE 3 REPLACES THIS, and the RETURN TYPE changes with it. Today this
-    delegates to get_primary_person_id(), which RAISES when no primary row
-    exists -- acceptable because that state means init_db() has not completed,
-    so it is noise rather than a case. Once garmin_links exists, "this person
-    has no linked account" becomes a normal, expected answer, and the
-    signature should become `int | None` with callers handling None rather
-    than an exception escaping onto the request path as a 500.
-    """
-    return await get_primary_person_id()
 
 
 async def _grant_primary_person_to_first_admin(db, person_id: int) -> None:

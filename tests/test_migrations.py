@@ -1384,7 +1384,6 @@ async def test_init_db_adds_garmin_name_prefix_to_a_deployed_strength_sessions(t
                 garmin_status TEXT NOT NULL DEFAULT 'pending',
                 garmin_activity_id TEXT,
                 garmin_error TEXT,
-                garmin_target TEXT,
                 garmin_sets_status TEXT NOT NULL DEFAULT 'not_attempted',
                 garmin_claimed_at TEXT,
                 created_at TEXT NOT NULL,
@@ -1412,3 +1411,256 @@ async def test_init_db_adds_garmin_name_prefix_to_a_deployed_strength_sessions(t
         )
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_003_removes_legacy_global_target_and_terminalizes_its_retry(tmp_path, monkeypatch):
+    """A historical cross-account push must never be retried through a new link."""
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "legacy-target.db")
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "legacy-target.db"))
+
+    db = await database.get_db()
+    try:
+        await db.execute("""
+            CREATE TABLE strength_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_id INTEGER NOT NULL,
+                session_id TEXT NOT NULL,
+                session_label TEXT,
+                start_time_utc TEXT NOT NULL,
+                duration_seconds INTEGER NOT NULL,
+                exercises_json TEXT NOT NULL,
+                notes TEXT,
+                source TEXT,
+                garmin_status TEXT NOT NULL DEFAULT 'pending',
+                garmin_activity_id TEXT,
+                garmin_error TEXT,
+                garmin_target TEXT,
+                garmin_sets_status TEXT NOT NULL DEFAULT 'not_attempted',
+                garmin_claimed_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (person_id, session_id)
+            )
+        """)
+        await db.execute(
+            "INSERT INTO strength_sessions (person_id, session_id, start_time_utc, duration_seconds, "
+            "exercises_json, garmin_status, garmin_target, garmin_claimed_at, created_at, updated_at) "
+            "VALUES (1, 'legacy-global', '2026-09-06T08:00:00+00:00', 60, '[]', "
+            "'failed', 'credential_person', '2026-09-06T08:00:00+00:00', "
+            "'2026-09-06T08:00:00+00:00', '2026-09-06T08:00:00+00:00')"
+        )
+        # Leave sqlite_sequence above MAX(id), which is the shape a real
+        # deletion creates and the rebuild must not reset.
+        await db.execute(
+            "INSERT INTO strength_sessions (person_id, session_id, start_time_utc, duration_seconds, "
+            "exercises_json, created_at, updated_at) "
+            "VALUES (1, 'deleted-before-upgrade', '2026-09-06T08:00:00+00:00', 60, '[]', "
+            "'2026-09-06T08:00:00+00:00', '2026-09-06T08:00:00+00:00')"
+        )
+        await db.execute("DELETE FROM strength_sessions WHERE session_id = 'deleted-before-upgrade'")
+        await db.commit()
+    finally:
+        await db.close()
+
+    await database.init_db()
+
+    db = await database.get_db()
+    try:
+        columns = {
+            row["name"] for row in await (await db.execute("PRAGMA table_info(strength_sessions)")).fetchall()
+        }
+        assert "garmin_target" not in columns
+        row = await (
+            await db.execute(
+                "SELECT id, garmin_status, garmin_error, garmin_claimed_at "
+                "FROM strength_sessions WHERE session_id = 'legacy-global'"
+            )
+        ).fetchone()
+        assert dict(row) == {
+            "id": 1,
+            "garmin_status": "unknown",
+            "garmin_error": "legacy_target_retired",
+            "garmin_claimed_at": None,
+        }
+        marker = await (
+            await db.execute(
+                "SELECT 1 FROM schema_migrations WHERE name = '003-strength-sessions-remove-garmin-target'"
+            )
+        ).fetchone()
+        assert marker is not None
+        cursor = await db.execute(
+            "INSERT INTO strength_sessions (person_id, session_id, start_time_utc, duration_seconds, "
+            "exercises_json, created_at, updated_at) "
+            "VALUES (1, 'after-upgrade', '2026-09-06T08:00:00+00:00', 60, '[]', "
+            "'2026-09-06T08:00:00+00:00', '2026-09-06T08:00:00+00:00')"
+        )
+        assert cursor.lastrowid == 3, "the rebuild reset strength_sessions AUTOINCREMENT"
+    finally:
+        await db.close()
+
+
+# strength_sessions exactly as the last pre-003 release created it -- 184c33e,
+# main before feat/per-person-garmin-links, whose migrations.py knew only
+# 001/002. Taken from `git show 184c33e:shared/database.py` with the SQL
+# comments stripped (they never reach PRAGMA table_info, which is all the
+# parity check below reads). Keep the column list verbatim: this is the shape
+# every deployed database presents to 003.
+_PRE_003_STRENGTH_SESSIONS_DDL = """
+    CREATE TABLE IF NOT EXISTS strength_sessions (
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        person_id          INTEGER NOT NULL,
+        session_id         TEXT NOT NULL,
+        session_label      TEXT,
+        start_time_utc     TEXT NOT NULL,
+        duration_seconds   INTEGER NOT NULL,
+        exercises_json     TEXT NOT NULL,
+        notes              TEXT,
+        source             TEXT,
+        garmin_status      TEXT NOT NULL DEFAULT 'skipped'
+                           CHECK (garmin_status IN ('skipped','pending','synced','failed','unknown')),
+        garmin_activity_id TEXT,
+        garmin_error       TEXT,
+        garmin_target      TEXT,
+        garmin_sets_status TEXT NOT NULL DEFAULT 'not_attempted'
+                           CHECK (garmin_sets_status IN ('not_attempted','synced','failed')),
+        garmin_claimed_at  TEXT,
+        garmin_name_prefix TEXT,
+        created_at         TEXT NOT NULL,
+        updated_at         TEXT NOT NULL,
+        UNIQUE (person_id, session_id)
+    )
+"""
+_PRE_003_STRENGTH_SESSIONS_INDEX = (
+    "CREATE INDEX IF NOT EXISTS idx_strength_sessions_person_start "
+    "ON strength_sessions(person_id, start_time_utc)"
+)
+
+
+async def _seed_pre_003_strength_sessions(db_path, rows: int = 1) -> None:
+    """Build a database holding ONLY the deployed pre-003 strength_sessions.
+
+    tests/fixtures/production_schema.sql predates strength_sessions entirely,
+    so a production_schema_db-based parity test would get the table fresh
+    from init_db's DDL, 003 would no-op, and fresh would be compared with
+    fresh. Seeding the pre-003 shape by hand is what makes the rebuild run.
+    """
+    conn = await aiosqlite.connect(str(db_path))
+    try:
+        await conn.execute(_PRE_003_STRENGTH_SESSIONS_DDL)
+        await conn.execute(_PRE_003_STRENGTH_SESSIONS_INDEX)
+        for i in range(rows):
+            await conn.execute(
+                "INSERT INTO strength_sessions (person_id, session_id, start_time_utc, "
+                "duration_seconds, exercises_json, created_at, updated_at) "
+                "VALUES (1, ?, ?, 60, '[]', ?, ?)",
+                (
+                    f"session-{i}",
+                    f"2026-09-0{i + 1}T08:00:00+00:00",
+                    "2026-09-01T08:00:00+00:00",
+                    "2026-09-01T08:00:00+00:00",
+                ),
+            )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+
+async def _strength_sessions_columns(db_path) -> set[str]:
+    conn = await aiosqlite.connect(str(db_path))
+    try:
+        cur = await conn.execute("PRAGMA table_info(strength_sessions)")
+        return {row[1] for row in await cur.fetchall()}
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_strength_sessions_schema_parity_fresh_vs_migrated(tmp_path, monkeypatch):
+    """003's hand-written rebuild must reproduce init_db's DDL exactly.
+
+    The generic test_schema_parity_fresh_vs_migrated only iterates
+    _REBUILD_TABLES, so a bespoke rebuild whose DDL drifts from
+    shared/database.py's is invisible to it -- this is the strength_sessions
+    counterpart of test_activities_schema_parity_fresh_vs_migrated.
+    """
+    migrated_path = tmp_path / "pre-003.db"
+    await _seed_pre_003_strength_sessions(migrated_path)
+    assert "garmin_target" in await _strength_sessions_columns(migrated_path), (
+        "fixture must start from the deployed pre-003 shape or the rebuild never runs"
+    )
+
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "fresh.db")
+    await database.init_db()
+    fresh_db = await database.get_db()
+
+    monkeypatch.setattr(database, "DB_PATH", migrated_path)
+    await database.init_db()
+    migrated_db = await database.get_db()
+
+    try:
+        marker = await (await migrated_db.execute(
+            "SELECT 1 FROM schema_migrations WHERE name = '003-strength-sessions-remove-garmin-target'"
+        )).fetchone()
+        assert marker is not None, "003 did not run, so this compared fresh with fresh"
+
+        for pragma in ("table_info", "index_list"):
+            fresh = await (await fresh_db.execute(f"PRAGMA {pragma}(strength_sessions)")).fetchall()
+            migrated = await (await migrated_db.execute(f"PRAGMA {pragma}(strength_sessions)")).fetchall()
+            if pragma == "table_info":
+                fresh_shape = sorted((r["name"], r["type"], r["notnull"], r["dflt_value"], r["pk"]) for r in fresh)
+                migrated_shape = sorted((r["name"], r["type"], r["notnull"], r["dflt_value"], r["pk"]) for r in migrated)
+            else:
+                # Includes sqlite_autoindex_strength_sessions_1 -- the
+                # UNIQUE's own index, which must survive the __new table's
+                # RENAME under the same name it has on a fresh database --
+                # and idx_strength_sessions_person_start, which the rebuild
+                # has to recreate itself because the DROP TABLE took the
+                # original with it.
+                fresh_shape = sorted(r["name"] for r in fresh)
+                migrated_shape = sorted(r["name"] for r in migrated)
+            assert fresh_shape == migrated_shape, f"strength_sessions {pragma} diverged"
+    finally:
+        await fresh_db.close()
+        await migrated_db.close()
+
+
+@pytest.mark.asyncio
+async def test_pre_003_snapshot_not_taken_on_a_fresh_db(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "fresh.db")
+    await database.init_db()
+    assert not (tmp_path / migrations._STRENGTH_SESSIONS_SNAPSHOT_NAME).exists()
+
+
+@pytest.mark.asyncio
+async def test_pre_003_snapshot_is_taken_only_while_garmin_target_exists(tmp_path, monkeypatch):
+    """The snapshot is the rollback path for this release (its 003/004
+    markers boot-loop an older image), so it must exist, verify as SQLite,
+    and hold the PRE-rebuild shape -- and must not be re-taken once the
+    column is gone."""
+    db_path = tmp_path / "pre-003.db"
+    await _seed_pre_003_strength_sessions(db_path, rows=2)
+    monkeypatch.setattr(database, "DB_PATH", db_path)
+    await database.init_db()
+
+    snapshot = tmp_path / migrations._STRENGTH_SESSIONS_SNAPSHOT_NAME
+    assert snapshot.exists()
+    check = await aiosqlite.connect(str(snapshot))
+    try:
+        cur = await check.execute("PRAGMA integrity_check")
+        assert (await cur.fetchone())[0] == "ok"
+        cur = await check.execute("SELECT COUNT(*) FROM strength_sessions")
+        assert (await cur.fetchone())[0] == 2
+        cur = await check.execute("PRAGMA table_info(strength_sessions)")
+        cols = {row[1] for row in await cur.fetchall()}
+        assert "garmin_target" in cols, "snapshot must predate the 003 rebuild"
+    finally:
+        await check.close()
+    assert "garmin_target" not in await _strength_sessions_columns(db_path), "003 did not run"
+
+    # A later boot of a migrated database must not produce a second, now
+    # post-003 file under the pre-003 name: the predicate is the column, not
+    # the marker, and the column is gone.
+    snapshot.unlink()
+    await database.init_db()
+    assert not snapshot.exists(), "snapshot re-taken after the column it guards was already removed"

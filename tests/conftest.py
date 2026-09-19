@@ -12,6 +12,7 @@ Isolates every test from real infrastructure:
 """
 
 import hashlib
+import inspect
 import json
 import secrets
 import sys
@@ -22,8 +23,6 @@ import aiosqlite
 import pytest
 import pytest_asyncio
 from httpx import ReadTimeout
-
-from shared.garmin_client import STRENGTH_ACTIVITY_TYPE_KEY
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "garmin"
@@ -125,17 +124,79 @@ class FakeGarminClient:
 
 @pytest.fixture
 def fake_garmin_client(monkeypatch):
-    """Patch `shared.garmin_client` so no real Garmin call can happen.
+    """Patch the person-scoped registry so no real Garmin call can happen.
 
     Returns the FakeGarminClient instance so tests can assert on pushed data
     (e.g. `fake_garmin_client.pushed_weights`).
     """
-    from shared import garmin_client
+    from shared import garmin_client, garmin_registry
+    from vitalforge_weight import weight_routes
 
     fake = FakeGarminClient()
-    monkeypatch.setattr(garmin_client, "_client", fake)
-    monkeypatch.setattr(garmin_client, "authenticate", lambda: None)
+    fake.registry_calls = []
+    # Parallel to registry_calls (kept a bare (person_id, generation) 2-tuple
+    # since existing tests assert that exact shape): the `max_wait_seconds`
+    # each call carried, in the same order as registry_calls.
+    fake.registry_budgets = []
+    # Route-level calls retain the adapter-facing datetime.  This is separate
+    # from ``pushed_weights``, which represents what the Garmin client itself
+    # receives after shared.garmin_client formats its wire timestamp.
+    fake.route_weight_calls = []
+
+    async def fake_call(person_id, operation, *, max_wait_seconds: float = 0.0):
+        # The real registry selects a client by the durable (person,
+        # generation) link key before invoking the operation. Test routes do
+        # not need token-store setup, but preserving the selected person in
+        # this seam catches a caller that accidentally loses that boundary.
+        # `max_wait_seconds` mirrors garmin_registry.call's keyword (the
+        # interactive weight/activity pushes pass a bounded permit wait);
+        # there is no permit here to wait for, so it is recorded (not acted
+        # on) for tests that assert the interactive budget was passed.
+        key = (int(person_id), 1)
+        monkeypatch.setitem(garmin_client._clients, key, fake)
+        fake.registry_calls.append(key)
+        fake.registry_budgets.append(max_wait_seconds)
+        result = operation(fake)
+        return await result if inspect.isawaitable(result) else result
+
+    fake.registry_call = fake_call
+    monkeypatch.setattr(garmin_registry, "call", fake_call)
+    monkeypatch.setattr(garmin_registry, "call_paced", fake_call)
+
+    real_push_weight_at_route_seam = weight_routes.push_weight
+
+    def push_weight_at_route_seam(weight_grams, timestamp=None, **kwargs):
+        """Keep route tests at the datetime-level adapter seam.
+
+        Production calls the same seam from inside ``garmin_registry.call``;
+        its shared adapter formats the datetime only when invoking Garmin.
+        Record the value the route passes, then execute the real seam so the
+        fake Garmin client observes the same wire-format value as production.
+        The registry's person selection remains in the call path.
+        """
+        fake.route_weight_calls.append(
+            {"weight_grams": weight_grams, "timestamp": timestamp, **kwargs}
+        )
+        real_push_weight_at_route_seam(weight_grams, timestamp, **kwargs)
+
+    monkeypatch.setattr(weight_routes, "push_weight", push_weight_at_route_seam)
     yield fake
+
+
+@pytest.fixture(autouse=True)
+def _reset_step_up_failures():
+    """Clear the module-level failed-step-up-attempt tracker around every
+    test. Without this, a test that throttles a user id (five failed step-up
+    attempts in a 15-minute window) leaves that entry behind for the rest of
+    the session -- a later, unrelated test that reuses the same user id
+    would see 429 instead of 401 and point at the wrong place. Autouse
+    because any test that exercises step-up auth can trip this, not just
+    tests/test_auth_step_up.py."""
+    from shared import auth as shared_auth
+
+    shared_auth._step_up_failures.clear()
+    yield
+    shared_auth._step_up_failures.clear()
 
 
 @pytest.fixture
@@ -146,13 +207,25 @@ def tmp_db_path(tmp_path, monkeypatch):
     the module-level `DB_PATH` global on every call, so patching it here
     (even after `shared.database` has already been imported elsewhere)
     is sufficient to isolate every DB access made during the test.
+
+    The Garmin token root gets the same treatment, and needs the attribute
+    patch, not only the env var: `shared.garmin_registry.GARTH_TOKEN_DIR` is
+    evaluated from the environment at IMPORT time, and test modules import
+    the registry at collection, so by the time any fixture runs `setenv`
+    alone changes nothing. Without this, the live-server fixtures (whose
+    lifespans call `bootstrap_legacy_token_store()`) would probe
+    /app/data/.garth.
+    `_ensure_token_root()` reads the module global directly and
+    `garmin_registry_runtime` reaches it through `_registry()`, so this one
+    patch covers both.
     """
-    from shared import database
+    from shared import database, garmin_registry
 
     db_path = tmp_path / "vf-test.db"
     monkeypatch.setattr(database, "DB_PATH", db_path)
     monkeypatch.setenv("DB_PATH", str(db_path))
     monkeypatch.setenv("GARTH_TOKEN_DIR", str(tmp_path / "garth"))
+    monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", tmp_path / "garth")
     return db_path
 
 
@@ -320,51 +393,12 @@ async def primary_person_id() -> int:
 @pytest.fixture
 def weight_app_module(initialized_db, fake_garmin_client, monkeypatch):
     """The `vitalforge_weight` FastAPI app module, Garmin/DB fully faked."""
-    from vitalforge_weight import activity_garmin, weight_routes
     from vitalforge_weight import app as module
-
-    # The Garmin helpers are bound into each module's own namespace via
-    # `from shared.garmin_client import ...`, so patching the shared module alone
-    # doesn't reach them -- patch the names the handlers actually call. Since the
-    # app.py split those bindings live in three places, and patching only app.py
-    # would leave the routes calling the real client while every test still passed.
-    for m in (module, weight_routes, activity_garmin):
-        if hasattr(m, "authenticate"):
-            monkeypatch.setattr(m, "authenticate", lambda: None)
-
-    def fake_push_weight(weight_grams, timestamp=None, **kwargs):
-        fake_garmin_client.pushed_weights.append(
-            {"weight_grams": weight_grams, "timestamp": timestamp, **kwargs}
-        )
-
-    monkeypatch.setattr(weight_routes, "push_weight", fake_push_weight)
-
-    # Same direct-import situation for the activity push helpers: app.py does
-    # `from shared.garmin_client import push_activity, push_activity_sets`, so
-    # patching shared.garmin_client alone would leave the route calling the
-    # real client. Both forward into the same FakeGarminClient the weight
-    # fixture records against, so a test asserts on
-    # `fake_garmin_client.created_activities` / `.pushed_exercise_sets`.
-    def fake_push_activity(**kwargs):
-        return fake_garmin_client.create_manual_activity(**kwargs)
-
-    def fake_push_activity_sets(activity_id, payload):
-        return fake_garmin_client.set_activity_exercise_sets(activity_id, payload)
-
-    def fake_find_activities_by_date(start_date, end_date, activity_type=STRENGTH_ACTIVITY_TYPE_KEY):
-        # Mirrors shared.garmin_client.find_activities_by_date's own default,
-        # so a test can assert on the activity type the route actually asks
-        # Garmin for rather than on this fake's signature.
-        return fake_garmin_client.get_activities_by_date(start_date, end_date, activitytype=activity_type)
-
-    monkeypatch.setattr(activity_garmin, "push_activity", fake_push_activity)
-    monkeypatch.setattr(activity_garmin, "push_activity_sets", fake_push_activity_sets)
-    monkeypatch.setattr(activity_garmin, "find_activities_by_date", fake_find_activities_by_date)
     return module
 
 
 @pytest.fixture
-def no_real_garmin_client(weight_app_module):
+def no_real_garmin_client(weight_app_module, fake_garmin_client):
     """Fail loudly if a test could reach the real Garmin client.
 
     NOT autouse: opted into per module with
@@ -379,29 +413,10 @@ def no_real_garmin_client(weight_app_module):
     credential. Comparing identity against the real module attribute is what
     distinguishes "patched" from "patched somewhere that does not matter".
     """
-    from shared import garmin_client
-    from vitalforge_weight import activity_garmin, weight_routes
+    from shared import garmin_registry
 
-    # Checked per OWNING module. After the app.py split, `push_weight` lives in
-    # weight_routes and the activity helpers in activity_garmin; asserting only
-    # against app.py would pass while the routes called the real client.
-    owners = {
-        weight_routes: ("authenticate", "push_weight"),
-        activity_garmin: ("authenticate", "push_activity", "push_activity_sets", "find_activities_by_date"),
-    }
-    for module, names in owners.items():
-        dotted = module.__name__
-        for name in names:
-            assert hasattr(module, name), (
-                f"{dotted} no longer binds {name} -- a Garmin helper moved and this guard "
-                "was not updated with it, so nothing is checking that module any more"
-            )
-            assert getattr(module, name) is not getattr(garmin_client, name), (
-                f"{dotted}.{name} is still the real shared.garmin_client function; "
-                "patch the name in the owning module's namespace, not just the shared module"
-            )
-    assert isinstance(garmin_client._client, FakeGarminClient), (
-        "shared.garmin_client._client is not a FakeGarminClient -- this test could reach real Garmin"
+    assert garmin_registry.call is fake_garmin_client.registry_call, (
+        "shared.garmin_registry.call is not the fixture fake -- this test could reach real Garmin"
     )
     yield
 
@@ -411,8 +426,6 @@ def dashboard_app_module(initialized_db, fake_garmin_client, monkeypatch):
     """The `vitalforge_dashboard` FastAPI app module, Garmin/DB fully faked."""
     from vitalforge_dashboard import app as module
 
-    # Same direct-import situation as vitalforge_weight/app.py.
-    monkeypatch.setattr(module, "authenticate", lambda: None)
     return module
 
 
@@ -429,22 +442,8 @@ def weight_live_server(tmp_db_path, fake_garmin_client, monkeypatch):
     for the live server's own `lifespan` to call `init_db()` inside its
     dedicated server thread, where no such conflict exists.
     """
-    from vitalforge_weight import app as module
-    from vitalforge_weight import weight_routes
-
-    # Same owning-module rule as weight_app_module: after the app.py split the
-    # Garmin bindings live in weight_routes / activity_garmin, so patching app.py
-    # alone would leave the live server calling the real client.
-    for m in (module, weight_routes):
-        if hasattr(m, "authenticate"):
-            monkeypatch.setattr(m, "authenticate", lambda: None)
-
-    def fake_push_weight(weight_grams, timestamp=None, **kwargs):
-        fake_garmin_client.pushed_weights.append({"weight_grams": weight_grams, "timestamp": timestamp, **kwargs})
-
-    monkeypatch.setattr(weight_routes, "push_weight", fake_push_weight)
-
     from tests.live_server import LiveServer
+    from vitalforge_weight import app as module
 
     server = LiveServer(module.app)
     server.start()
@@ -463,8 +462,6 @@ def dashboard_live_server(tmp_db_path, fake_garmin_client, monkeypatch):
     noise/latency.
     """
     from vitalforge_dashboard import app as module
-
-    monkeypatch.setattr(module, "authenticate", lambda: None)
 
     async def _noop_scheduled_sync(lock, registry):
         return None

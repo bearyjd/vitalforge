@@ -9,6 +9,7 @@ Garmin client at all.
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -16,6 +17,11 @@ from httpx import ASGITransport, AsyncClient
 from shared.database import get_db, get_primary_person_id
 from tests.conftest import PERSON_PREFIX, seed_person
 from vitalforge_dashboard import sync as sync_module
+
+
+async def usable_garmin_link(_person_id: int) -> bool:
+    """Keep task/locking tests focused on their stated concern."""
+    return True
 
 
 def days_ago(n: int) -> str:
@@ -58,6 +64,63 @@ async def test_sync_status_never_synced(client):
     body = resp.json()
     assert body["last_sync_time"] is None
     assert body["last_sync_result"] == "never"
+
+
+async def test_manual_sync_without_a_link_is_explicitly_store_only(
+    client, dashboard_app_module, monkeypatch
+):
+    """An unlinked person must not queue work against deployment credentials."""
+    called = []
+
+    async def unexpected_run_sync(**_kwargs):
+        called.append(True)
+
+    monkeypatch.setattr(dashboard_app_module, "run_sync", unexpected_run_sync)
+
+    response = await client.post(f"{PERSON_PREFIX}/api/sync", json={"days": 1})
+
+    assert response.status_code == 200
+    # The whole body, not just status: the dashboard's triggerSync() reads
+    # `status` to decide not to poll and `message` for what to show, so both
+    # are part of the contract the template test below pins from its side.
+    assert response.json() == {
+        "status": "link_required",
+        "store_only": True,
+        "message": "Link Garmin before syncing this person's data",
+    }
+    assert called == []
+    assert await get_primary_person_id() not in dashboard_app_module._syncing_person_ids
+
+
+def test_dashboard_sync_handler_branches_on_link_required_and_non_2xx():
+    """triggerSync() must not poll or reload after a link_required answer,
+    nor after any non-2xx answer.
+
+    The route returns 200 for an unlinked person (test above), so a handler
+    that only checked `res.ok` would spin on /sync/status forever with the
+    button stuck at "Syncing...".  The converse also holds: a 409 (sync
+    already running), 401/403 or 5xx starts nothing, so polling for a run
+    that never began leaves the same stuck button -- the handler shows the
+    server's `detail` and hands the button back.  A string check on the
+    template is enough here; the Playwright smoke test loads the page for
+    real and would fail on a syntax error in the handler.
+    """
+    template = (
+        Path(__file__).resolve().parent.parent / "vitalforge_dashboard" / "templates" / "index.html"
+    ).read_text()
+    start = template.index("async function triggerSync()")
+    end = template.index("function updateSyncInfo(", start)
+    handler = template[start:end]
+    assert 'body.status === "link_required"' in handler
+    assert "body.message" in handler
+    assert "!res.ok" in handler
+    assert "body.detail" in handler
+    assert "Sync not available" in handler
+    # Both early returns must come BEFORE the poll is scheduled.
+    poll = handler.index("setInterval(")
+    assert handler.index("return;") < poll
+    assert handler.index("!res.ok") < poll
+    assert handler.index("return;", handler.index("!res.ok")) < poll
 
 
 async def test_sync_status_does_not_leak_another_persons_sync(
@@ -108,6 +171,7 @@ async def test_starting_a_sync_is_not_blocked_by_another_persons_sync(
         return "ok"
 
     monkeypatch.setattr(dashboard_app_module, "run_sync", _noop_run_sync)
+    monkeypatch.setattr(dashboard_app_module, "has_usable_garmin_link", usable_garmin_link)
 
     resp = await client.post(f"{PERSON_PREFIX}/api/sync", json={"days": 1})
     assert resp.json()["status"] == "started"
@@ -142,6 +206,7 @@ async def test_a_sync_task_cancelled_before_it_starts_still_clears_the_flag(
         return "ok"
 
     monkeypatch.setattr(dashboard_app_module, "run_sync", _noop_run_sync)
+    monkeypatch.setattr(dashboard_app_module, "has_usable_garmin_link", usable_garmin_link)
     person_id = await get_primary_person_id()
 
     # The window this guards is one event-loop iteration wide -- by the time
@@ -209,6 +274,7 @@ async def test_the_scheduled_backfill_registers_itself_as_syncing(
         await release.wait()
 
     monkeypatch.setattr(sync_module, "run_sync", _slow_run_sync)
+    monkeypatch.setattr(sync_module, "has_usable_garmin_link", usable_garmin_link)
     task = asyncio.create_task(
         sync_module.scheduled_sync(dashboard_app_module._sync_lock, registry)
     )
@@ -242,6 +308,7 @@ async def test_a_failed_sync_does_not_leave_the_person_marked_as_syncing(
         raise RuntimeError("garmin exploded")
 
     monkeypatch.setattr(dashboard_app_module, "run_sync", _boom)
+    monkeypatch.setattr(dashboard_app_module, "has_usable_garmin_link", usable_garmin_link)
     person_id = await get_primary_person_id()
     assert person_id not in dashboard_app_module._syncing_person_ids
 

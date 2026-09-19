@@ -5,10 +5,12 @@ and recording the outcome.
 import json
 import logging
 import os
-import re
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+
+from shared import garmin_registry
 
 # get_current_identity, not require_account_identity: the latter 401s
 # whenever `user_id is None`, which includes the open-access `anonymous`
@@ -16,15 +18,32 @@ from zoneinfo import ZoneInfo
 # CLAUDE.md documents.
 from shared.garmin_client import (
     STRENGTH_ACTIVITY_TYPE_KEY,
-    authenticate,
     build_exercise_sets_payload,
     extract_activity_id,
-    find_activities_by_date,
-    push_activity,
-    push_activity_sets,
 )
+from shared.garmin_registry_errors import STRENGTH_GARMIN_ERROR_CODES
 
 logger = logging.getLogger(__name__)
+
+
+# Set only within a registry operation below. These remain service-owned test
+# seams, while the registry remains the sole authority selecting the linked
+# person's generation-specific client.
+_operation_client: ContextVar[object] = ContextVar("activity_operation_client")
+
+
+def push_activity(**kwargs):
+    return _operation_client.get().create_manual_activity(**kwargs)
+
+
+def push_activity_sets(activity_id: str, payload: dict):
+    return _operation_client.get().set_activity_exercise_sets(activity_id, payload)
+
+
+def find_activities_by_date(start_date: str, end_date: str, activity_type: str = STRENGTH_ACTIVITY_TYPE_KEY):
+    return _operation_client.get().get_activities_by_date(
+        start_date, end_date, activitytype=activity_type
+    )
 
 
 @dataclass(frozen=True)
@@ -38,17 +57,24 @@ class ActivityPushOutcome:
     garmin_sets_status: str
 
 
-# garmin_error is echoed to the client AND stored, so it is the one place a
-# raw exception string from garminconnect crosses a trust boundary. Those
-# strings have been observed to carry the account email (login failures) and
-# request URLs with tokens in them.
-_ERROR_EMAIL_RE = re.compile(r"[^\s@,;<>()\[\]]+@[^\s@,;<>()\[\]]+\.[^\s@,;<>()\[\]]+")
+# garmin_error is echoed to the client and persisted.  Garmin client errors
+# and responses can contain account emails, request URLs, bearer tokens, and
+# opaque provider data, so this module stores only these fixed outcome codes.
+_PREPARATION_FAILED = "activity_preparation_failed"
+_PUSH_FAILED = "activity_push_failed"
+_PUSH_OUTCOME_UNKNOWN = "activity_push_outcome_unknown"
+_SETS_UPLOAD_FAILED = "activity_sets_upload_failed"
+_RECONCILIATION_FAILED = "activity_reconciliation_failed"
+_RECONCILIATION_PENDING = "activity_reconciliation_pending"
+_OUTCOME_RECORD_FAILED = "activity_outcome_record_failed"
+_SAFE_GARMIN_ERROR_CODES = frozenset(STRENGTH_GARMIN_ERROR_CODES)
 
 
-_ERROR_TOKEN_RE = re.compile(r"[A-Za-z0-9_\-]{24,}")
-
-
-_GARMIN_ERROR_MAX_CHARS = 300
+def bounded_garmin_error(error: object) -> str | None:
+    """Return an API/database-safe Garmin outcome code, never raw text."""
+    if error is None:
+        return None
+    return error if isinstance(error, str) and error in _SAFE_GARMIN_ERROR_CODES else "unknown"
 
 
 # Exception class names that mean the request may ALREADY HAVE REACHED Garmin
@@ -85,21 +111,6 @@ _PRE_SEND_ERRORS = frozenset({
     "GarminConnectAuthenticationError",
     "GarminConnectTooManyRequestsError",
 })
-
-
-def _sanitise_error(message: str) -> str:
-    """Strip credentials out of an exception string and bound its length.
-
-    garminconnect's errors quote the request it was making, which on a login
-    failure includes the account email and on a data call can include a URL
-    carrying a token. That string is stored on the row and returned to the
-    client, so it is sanitised once, here, at the boundary.
-    """
-    cleaned = _ERROR_EMAIL_RE.sub("[redacted]", message)
-    cleaned = _ERROR_TOKEN_RE.sub("[redacted]", cleaned)
-    if len(cleaned) > _GARMIN_ERROR_MAX_CHARS:
-        cleaned = cleaned[: _GARMIN_ERROR_MAX_CHARS - 1].rstrip() + "…"
-    return cleaned
 
 
 def _exception_names(error: BaseException) -> set[str]:
@@ -176,12 +187,12 @@ _SESSION_MARKER_CHARS = 6
 
 
 def _activity_name(session_label: str | None, display_name: str | None, session_id: str) -> str:
-    """The Garmin activity title. Exact strings, D-015.
+    """The Garmin activity title.
 
-    display_name is non-None only on the cross-person override, and is read
-    from persons.display_name for the TARGET person -- never from the request
-    body, which cannot be trusted to name the person the path addressed.
-    The dash is U+2014 with one space either side.
+    Per-person links always receive the addressed person's own session, so
+    new rows use the unprefixed form. ``display_name`` remains only to
+    reconcile a pre-Phase-3 row against the exact title that row previously
+    sent. The dash is U+2014 with one space either side.
 
     The trailing session marker is what makes reconciliation EXACT. Garmin
     offers no idempotency key, so an ambiguous push can only be resolved by
@@ -204,8 +215,26 @@ def _activity_name(session_label: str | None, display_name: str | None, session_
     return f"Cadence — {label} [{marker}]"
 
 
-def _push_activity(
+# How long an interactive Garmin push may wait for the global call permit,
+# mirroring weight_routes._push_composition.  The reconciliation lookup stays
+# fail-fast: it runs on a retry path that already tolerates "ask again later".
+_INTERACTIVE_PERMIT_WAIT_SECONDS = 10.0
+
+
+def _registry_failure_code(error: garmin_registry.GarminRegistryError) -> str:
+    """Return the bounded provider-state code safe to store and return."""
+    if isinstance(error, garmin_registry.GarminNotLinked):
+        return "link_required"
+    if isinstance(error, garmin_registry.GarminRateLimited):
+        return "rate_limited"
+    if isinstance(error, (garmin_registry.GarminAuthenticationError, garmin_registry.GarminOperationError)):
+        return error.code
+    return "unknown"
+
+
+async def _push_activity(
     *,
+    person_id: int,
     start_time_utc: str,
     duration_min: int,
     activity_name: str,
@@ -214,7 +243,7 @@ def _push_activity(
     """Push one session to Garmin. NEVER RAISES -- mirrors _push_composition.
 
     The UTC-to-local-wall-clock conversion lives here rather than in
-    shared/garmin_client.push_activity because tests patch that name in this
+    activity_garmin.push_activity because tests patch that name in this
     module's namespace (tests/conftest.py); a conversion inside the patched
     function would be replaced by the fake, and the tests that pin it would
     be asserting on nothing.
@@ -246,57 +275,73 @@ def _push_activity(
     # transport classifier to reason about our own json/ZoneInfo errors too.
     try:
         exercises = json.loads(exercises_json)
-        authenticate()
         time_zone = _garmin_time_zone()
         start_local = datetime.fromisoformat(start_time_utc).astimezone(ZoneInfo(time_zone))
-    except Exception as e:
-        logger.error("Could not prepare the Garmin activity push: %s", e)
-        return ActivityPushOutcome("failed", None, _sanitise_error(str(e)), "not_attempted")
+    except Exception:
+        logger.error("Could not prepare the Garmin activity push (%s)", _PREPARATION_FAILED)
+        return ActivityPushOutcome("failed", None, _PREPARATION_FAILED, "not_attempted")
 
     try:
         # LOCAL wall clock, no offset, plus the zone name alongside -- the
         # library's documented contract. A UTC string sent with a local zone
         # name, or a string carrying an offset, silently shifts the activity
         # by the offset amount and nobody notices for weeks.
-        response = push_activity(
-            start_datetime=start_local.strftime("%Y-%m-%dT%H:%M:%S.000"),
-            time_zone=time_zone,
-            # Passed explicitly rather than defaulted inside push_activity so
-            # every argument Garmin receives is visible at the one call site,
-            # and so a test can assert on the type key -- it is confirmed only
-            # as a strength WORKOUT sportTypeKey, not as an ACTIVITY typeKey,
-            # and JD's live get_activity_types() probe may yet rename it.
-            type_key=STRENGTH_ACTIVITY_TYPE_KEY,
-            distance_km=0.0,
-            duration_min=duration_min,
-            activity_name=activity_name,
+        def create(client):
+            # Keep the provider exception local to this operation so the
+            # outcome classifier can distinguish an ambiguous post-send
+            # timeout from a safe pre-send failure. Registry errors remain
+            # bounded at its public boundary below.
+            token = _operation_client.set(client)
+            try:
+                return push_activity(
+                    start_datetime=start_local.strftime("%Y-%m-%dT%H:%M:%S.000"),
+                    time_zone=time_zone,
+                    type_key=STRENGTH_ACTIVITY_TYPE_KEY,
+                    distance_km=0.0,
+                    duration_min=duration_min,
+                    activity_name=activity_name,
+                )
+            except Exception as error:
+                return error
+            finally:
+                _operation_client.reset(token)
+
+        response = await garmin_registry.call(
+            person_id,
+            create,
+            max_wait_seconds=_INTERACTIVE_PERMIT_WAIT_SECONDS,
         )
+        if isinstance(response, Exception):
+            raise response
+    except garmin_registry.GarminRegistryError as e:
+        code = _registry_failure_code(e)
+        logger.warning("Garmin activity push unavailable for person %s: %s", person_id, code)
+        return ActivityPushOutcome("failed", None, code, "not_attempted")
     except Exception as e:
         if _push_outcome_is_ambiguous(e):
             # The request may already have been on the wire. Retrying blind
             # would file a second activity for one session, and this service
             # has no delete path, so the duplicate would be permanent.
             logger.error(
-                "Garmin activity push failed ambiguously (%s: %s); marking the session "
+                "Garmin activity push failed ambiguously (%s); marking the session "
                 "'unknown' -- a re-POST reconciles it by lookup before pushing again.",
-                type(e).__name__, e,
+                _PUSH_OUTCOME_UNKNOWN,
             )
             return ActivityPushOutcome(
                 "unknown", None,
-                _sanitise_error(f"push outcome unknown ({type(e).__name__}): {e}"),
+                _PUSH_OUTCOME_UNKNOWN,
                 "not_attempted",
             )
-        logger.error("Failed to push activity to Garmin: %s", e)
-        return ActivityPushOutcome("failed", None, _sanitise_error(str(e)), "not_attempted")
+        logger.error("Failed to push activity to Garmin (%s)", _PUSH_FAILED)
+        return ActivityPushOutcome("failed", None, _PUSH_FAILED, "not_attempted")
 
     activity_id = extract_activity_id(response)
     if activity_id is None:
         # The activity really is on Garmin -- 'synced' is the honest status.
         # There is simply no id to address it by, so the sets step cannot run.
         logger.warning(
-            "create_manual_activity returned no usable activity id (%r); "
-            "the activity was created but exercise sets cannot be attached.",
-            response,
+            "create_manual_activity returned no usable activity id; "
+            "the activity was created but exercise sets cannot be attached."
         )
         return ActivityPushOutcome("synced", None, None, "not_attempted")
 
@@ -309,19 +354,36 @@ def _push_activity(
             # Every exercise lacked a garmin_category. Nothing to send, and
             # nothing failed.
             return ActivityPushOutcome("synced", activity_id, None, "not_attempted")
-        push_activity_sets(activity_id, payload)
-    except Exception as e:
+        def attach_sets(client):
+            token = _operation_client.set(client)
+            try:
+                return push_activity_sets(activity_id, payload)
+            finally:
+                _operation_client.reset(token)
+
+        await garmin_registry.call(person_id, attach_sets, max_wait_seconds=_INTERACTIVE_PERMIT_WAIT_SECONDS)
+    except garmin_registry.GarminRegistryError as e:
+        logger.warning(
+            "Garmin exercise-set upload unavailable for person %s activity %s: %s",
+            person_id,
+            activity_id,
+            _registry_failure_code(e),
+        )
+        return ActivityPushOutcome("synced", activity_id, None, "failed")
+    except Exception:
         # Only garmin_sets_status degrades. garmin_status stays 'synced'
         # because the activity itself genuinely exists on Garmin -- flipping
         # it to 'failed' would make the client re-POST and create a SECOND
         # activity for the same session.
-        logger.error("Failed to push exercise sets for activity %s: %s", activity_id, e)
+        logger.error("Failed to push exercise sets for activity %s (%s)", activity_id, _SETS_UPLOAD_FAILED)
         return ActivityPushOutcome("synced", activity_id, None, "failed")
 
     return ActivityPushOutcome("synced", activity_id, None, "synced")
 
 
-def _reconcile_activity(*, start_time_utc: str, activity_name: str) -> ActivityPushOutcome | None:
+async def _reconcile_activity(
+    *, person_id: int, start_time_utc: str, activity_name: str
+) -> ActivityPushOutcome | None:
     """Ask Garmin whether an ambiguous push actually landed. NEVER RAISES.
 
     Returns a resolved outcome, or None meaning "Garmin answered and the
@@ -336,23 +398,34 @@ def _reconcile_activity(*, start_time_utc: str, activity_name: str) -> ActivityP
     session's LOCAL date plus or minus a day. The window is one day wide on
     each side because the name is composed from a local wall clock and Garmin
     files by its own account-local date; a session near midnight can land on
-    the neighbouring day. The name carries the session label and, for a D-015
-    push, the person's display name, which makes a same-day collision between
-    two genuinely different sessions unlikely but not impossible -- the honest
-    limit of reconciling without an idempotency key Garmin does not offer.
+    the neighbouring day. The name carries the session label and a session
+    marker, which makes a same-day collision between two genuinely different
+    sessions unlikely but not impossible -- the honest limit of reconciling
+    without an idempotency key Garmin does not offer.
     """
     try:
         time_zone = _garmin_time_zone()
         local_date = datetime.fromisoformat(start_time_utc).astimezone(ZoneInfo(time_zone)).date()
-        activities = find_activities_by_date(
-            (local_date - timedelta(days=1)).isoformat(),
-            (local_date + timedelta(days=1)).isoformat(),
+        def find(client):
+            token = _operation_client.set(client)
+            try:
+                return find_activities_by_date(
+                    (local_date - timedelta(days=1)).isoformat(),
+                    (local_date + timedelta(days=1)).isoformat(),
+                )
+            finally:
+                _operation_client.reset(token)
+
+        activities = await garmin_registry.call(person_id, find)
+    except garmin_registry.GarminRegistryError:
+        return ActivityPushOutcome(
+            "unknown", None, _RECONCILIATION_PENDING, "not_attempted"
         )
-    except Exception as e:
-        logger.error("Could not reconcile an ambiguous Garmin push (%s: %s)", type(e).__name__, e)
+    except Exception:
+        logger.error("Could not reconcile an ambiguous Garmin push (%s)", _RECONCILIATION_FAILED)
         return ActivityPushOutcome(
             "unknown", None,
-            _sanitise_error(f"reconciliation pending, Garmin lookup failed ({type(e).__name__}): {e}"),
+            _RECONCILIATION_FAILED,
             "not_attempted",
         )
 
@@ -397,7 +470,7 @@ async def _record_activity_garmin_outcome(db, row_id: int, outcome: ActivityPush
         (
             outcome.garmin_status,
             outcome.garmin_activity_id,
-            outcome.garmin_error,
+            bounded_garmin_error(outcome.garmin_error),
             outcome.garmin_sets_status,
             datetime.now(timezone.utc).isoformat(),
             row_id,
@@ -406,7 +479,7 @@ async def _record_activity_garmin_outcome(db, row_id: int, outcome: ActivityPush
     await db.commit()
 
 
-async def _mark_activity_outcome_unknown(db, row_id: int, reason: str) -> None:
+async def _mark_activity_outcome_unknown(db, row_id: int) -> None:
     """Last-resort downgrade when recording a real outcome failed.
 
     Deliberately the smallest possible write: no activity id, no sets status,
@@ -419,7 +492,10 @@ async def _mark_activity_outcome_unknown(db, row_id: int, reason: str) -> None:
         "UPDATE strength_sessions SET garmin_status = 'unknown', garmin_error = ?, "
         "garmin_claimed_at = NULL, updated_at = ? WHERE id = ?",
         (
-            _sanitise_error(f"push outcome could not be recorded: {reason}"),
+            # This is an internal fallback and is also read by the client.
+            # Keep the durable value a fixed code; never pass a DB/provider
+            # exception string through this boundary.
+            _OUTCOME_RECORD_FAILED,
             datetime.now(timezone.utc).isoformat(),
             row_id,
         ),

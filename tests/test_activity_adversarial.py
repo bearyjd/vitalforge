@@ -107,29 +107,23 @@ async def test_skipped_is_never_pushed_on_retry_even_when_asked(client, fake_gar
     assert row["garmin_activity_id"] is None
 
 
-async def test_skipped_retry_with_override_does_not_stamp_garmin_target(client, son, fake_garmin_client):
-    """The cross-person case of the rule above, on the row's audit column.
+async def test_skipped_retry_stays_store_only_for_another_person(client, son, fake_garmin_client):
+    """A store-only session never becomes pushable by replaying its id.
 
-    A first store-only POST leaves garmin_target NULL. A second POST asking
-    for both the push and the D-015 override must not push -- and must not
-    back-date the override onto a row that was never filed under anyone.
-    garmin_target exists to record what Garmin actually received; a value
-    there for a session Garmin never saw would make the audit trail lie.
+    The same invariant applies to every person now that each Garmin operation
+    is scoped to that person's own link. A later client setting change must
+    not turn a previously local-only session into a provider side effect.
     """
     first = await client.post("/p/son/api/activity", json=body())
     assert first.status_code == 202
-    assert (await fetch_row())["garmin_target"] is None
 
-    second = await client.post(
-        "/p/son/api/activity", json=body(push_to_garmin=True, garmin_target="credential_person")
-    )
+    second = await client.post("/p/son/api/activity", json=body(push_to_garmin=True))
     assert second.status_code == 200
     assert second.json()["garmin_status"] == "skipped"
     assert fake_garmin_client.created_activities == []
 
     row = await fetch_row()
     assert row["garmin_status"] == "skipped"
-    assert row["garmin_target"] is None, "the override must not be stamped onto a session never pushed"
 
 
 async def test_synced_is_never_repushed_however_many_times_it_is_posted(client, fake_garmin_client):

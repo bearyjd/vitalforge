@@ -19,15 +19,40 @@ logger = logging.getLogger(__name__)
 # presumed dead and the row may be re-claimed: a possible duplicate after a
 # crash beats a weigh-in stranded unpushable forever.
 #
-# This value is only safe while the push is SYNCHRONOUS. A claim going stale
+# This value is only safe while no push can outlive it. A claim going stale
 # underneath a still-running push would let a retry re-claim and duplicate --
-# the exact failure the claim exists to prevent. That cannot happen today
-# because push_weight blocks the event loop for its whole duration, so while a
-# push is in flight nothing else runs to re-claim anything. That is a property
-# of the current deployment, NOT something this code enforces, and it is the
-# same class of reasoning that made the original double push look impossible.
-# If push_weight ever moves to a thread or worker pool, this constant MUST be
-# bounded by a hard push timeout -- garminconnect sets none of its own.
+# the exact failure the claim exists to prevent. The push runs in a worker
+# thread (garmin_registry.call hands a synchronous op to asyncio.to_thread),
+# so other requests DO run while it is in flight; what keeps them from
+# re-claiming is that garminconnect==0.3.11 bounds every request itself.
+# Both weight and activity pushes go through the UNDECORATED
+# Client.post -> Client._run_request path (client.py), not the decorated
+# Client.connectapi retry wrapper the sync *reads* use: one request at
+# timeout=15, and on a 401 one _refresh_session() (its DI-token refresh
+# path uses timeout=30) followed by exactly one retry at timeout=15 -- about
+# 60 s worst case for an already-authenticated (warm) push. A COLD push (no
+# cached client yet) additionally runs Garmin.login(tokenstore) first, which
+# can call _load_profile_and_settings(): two fetches (social profile, user
+# settings), each retried up to 3 attempts at timeout=15 with a 1 s sleep
+# between attempts (3*15 + 2*1 = 47 s each, 94 s for both), plus one more
+# possible proactive _refresh_session() before that (~30 s) -- about 124 s
+# on top of the warm-push figure, ~185 s worst case. Both are well inside
+# these 600 s. Re-check those library defaults when bumping garminconnect;
+# shared/garmin_client.py constructs Garmin() with them unchanged.
+#
+# Do NOT try to enforce this from the loop with asyncio.wait_for around the
+# op. Cancelling the awaiting coroutine cannot stop the worker thread; it
+# would only clear the claim while the push may still land at Garmin, which
+# turns a slow push into a guaranteed duplicate on the next retry. The same
+# holds for a cancellation mid-op (shutdown only -- uvicorn/Starlette do not
+# cancel handlers on client disconnect): the person flock is released while
+# the worker thread still holds the cached client's shared requests.Session
+# (not thread-safe), so a concurrent unlink/link for the same person in the
+# OTHER process cannot reach that in-memory object -- it only ever sees the
+# durable (person, generation) directory. The worst case there is the
+# outliving thread's client dump()-ing a refreshed token into a generation
+# directory that unlink already swept (inert: nothing reads it again); the
+# thread's own Garmin write is what this claim bounds against a duplicate.
 #
 # Ten minutes is also short enough that a crashed process cannot strand a row
 # or session unpushable for a meaningful time. The claim is a mutual-exclusion

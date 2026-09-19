@@ -113,7 +113,6 @@ async def test_landing_denies_an_unrecognised_grant_value(
 
     # Parametrised by dotted name, so this is a real dynamic import.
     module = importlib.import_module(service_module)
-    monkeypatch.setattr(module, "authenticate", lambda: None)
     if hasattr(module, "scheduled_sync"):
 
         async def _noop(lock, registry):

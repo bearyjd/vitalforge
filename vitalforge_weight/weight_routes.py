@@ -2,9 +2,12 @@
 """
 
 import logging
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, HTTPException
+
+from shared import garmin_registry
 
 # get_current_identity, not require_account_identity: the latter 401s
 # whenever `user_id is None`, which includes the open-access `anonymous`
@@ -16,14 +19,50 @@ from shared.auth import (
 from shared.database import (
     get_db,
 )
-from shared.garmin_client import (
-    authenticate,
-    push_weight,
-)
+from shared.garmin_client import push_weight_to_client
 from vitalforge_weight.garmin_claim import _garmin_claim_is_live
 from vitalforge_weight.models import GRAMS_PER_KG, LBS_PER_KG, WeightIn
 
 logger = logging.getLogger(__name__)
+
+
+# The selected client exists only while garmin_registry.call is invoking this
+# operation. Keeping this service-owned compatibility seam lets tests replace
+# one Garmin write without bypassing the registry's person/generation choice.
+_operation_client: ContextVar[object] = ContextVar("weight_operation_client")
+
+
+def push_weight(
+    weight_grams: int,
+    timestamp: datetime,
+    *,
+    percent_fat: float | None = None,
+    percent_hydration: float | None = None,
+    muscle_mass_kg: float | None = None,
+    bone_mass_kg: float | None = None,
+    bmi: float | None = None,
+    basal_met: float | None = None,
+    active_met: float | None = None,
+) -> None:
+    """Write through the registry-selected client (test seam).
+
+    This deliberately retains the shared adapter's public ``*_kg`` names and
+    datetime timestamp at the route boundary.  The shared adapter owns the
+    Garmin wire conversion, while the registry remains responsible for
+    selecting the person/generation-specific client before this seam runs.
+    """
+    push_weight_to_client(
+        _operation_client.get(),
+        weight_grams,
+        timestamp,
+        percent_fat=percent_fat,
+        percent_hydration=percent_hydration,
+        muscle_mass_kg=muscle_mass_kg,
+        bone_mass_kg=bone_mass_kg,
+        bmi=bmi,
+        basal_met=basal_met,
+        active_met=active_met,
+    )
 
 
 DEDUP_WEIGHT_TOLERANCE_GRAMS = 50
@@ -69,30 +108,56 @@ _WEIGHT_LOG_EXISTING_ROW_COLUMNS = (
 )
 
 
-def _push_composition(weight_grams: int, timestamp: datetime, composition: dict) -> str | None:
+# How long an interactive Garmin push may wait for the global call permit.
+_INTERACTIVE_PERMIT_WAIT_SECONDS = 10.0
+
+
+async def _push_composition(
+    person_id: int, weight_grams: int, timestamp: datetime, composition: dict
+) -> str | None:
     """Push weight + composition to Garmin; returns an error string, or None
     on success. Never raises -- callers decide what to do with the row."""
     try:
-        authenticate()
         muscle_pct = composition.get("muscle_pct")
         muscle_mass_kg = (weight_grams / 1000.0) * muscle_pct / 100 if muscle_pct is not None else None
-        push_weight(
-            weight_grams,
-            timestamp,
-            percent_fat=composition.get("body_fat_pct"),
-            percent_hydration=composition.get("body_water_pct"),
-            muscle_mass_kg=muscle_mass_kg,
-            bone_mass_kg=composition.get("bone_mass_kg"),
-            # bmi intentionally NOT forwarded -- see the ENRICHABLE_FIELDS
-            # comment above. Still stored in weight_log and echoed in the
-            # response; only the Garmin push is withheld.
-            basal_met=composition.get("bmr"),
-            active_met=composition.get("amr"),
-        )
+        def operation(client):
+            token = _operation_client.set(client)
+            try:
+                return push_weight(
+                    weight_grams,
+                    timestamp,
+                    percent_fat=composition.get("body_fat_pct"),
+                    percent_hydration=composition.get("body_water_pct"),
+                    muscle_mass_kg=muscle_mass_kg,
+                    bone_mass_kg=composition.get("bone_mass_kg"),
+                    # bmi intentionally NOT forwarded -- see the ENRICHABLE_FIELDS
+                    # comment above. Still stored in weight_log and echoed in the
+                    # response; only the Garmin push is withheld.
+                    basal_met=composition.get("bmr"),
+                    active_met=composition.get("amr"),
+                )
+            finally:
+                _operation_client.reset(token)
+
+        # A user-facing tap should absorb the deployment-wide call interval
+        # rather than answer "rate_limited" whenever another call just went
+        # out; the bound keeps a genuinely busy limiter from hanging the
+        # request.
+        await garmin_registry.call(person_id, operation, max_wait_seconds=_INTERACTIVE_PERMIT_WAIT_SECONDS)
         return None
-    except Exception as e:
-        logger.error("Failed to push weight to Garmin: %s", e)
-        return str(e)
+    except garmin_registry.GarminNotLinked:
+        # A local reading is useful even before the person has linked Garmin.
+        # Do not expose account state or a provider exception in this durable
+        # response field.
+        return "link_required"
+    except garmin_registry.GarminRateLimited:
+        return "rate_limited"
+    except (garmin_registry.GarminAuthenticationError, garmin_registry.GarminOperationError) as exc:
+        logger.warning("Garmin weight push failed for person %s: %s", person_id, exc.code)
+        return exc.code
+    except Exception:
+        logger.exception("Unexpected Garmin weight push failure for person %s", person_id)
+        return "unknown"
 
 
 def add_weight_routes(app):
@@ -143,9 +208,10 @@ def add_weight_routes(app):
 
         # Atomic: read for a duplicate and (if any) write inside one transaction,
         # so two concurrent requests can never both observe "no duplicate". The
-        # Garmin push happens after COMMIT, outside the lock -- see
-        # docs/prp/00-design.md SS3.7 for why (no timeout mechanism exists to
-        # bound the call otherwise, and it is synchronous).
+        # Garmin push happens after COMMIT, outside the lock -- it is a provider
+        # round-trip in a worker thread, bounded only by garminconnect's own
+        # per-request timeouts, so it must never sit inside the write lock; see
+        # garmin_claim.py for the claim that makes pushing after COMMIT safe.
         db = await get_db()
         try:
             await db.execute("BEGIN IMMEDIATE")
@@ -412,10 +478,12 @@ def add_weight_routes(app):
 
             await db.commit()
 
-            # Push happens outside the transaction -- it is synchronous and must
-            # not be held across the write lock (test_concurrent_writer_not_blocked
-            # _by_garmin_push pins that); the claim above is what makes doing so
-            # safe. This connection stays open only to record the outcome
+            # Push happens outside the transaction -- it is a provider round-trip
+            # in a worker thread, bounded only by garminconnect's own timeouts
+            # (see garmin_claim._GARMIN_CLAIM_TIMEOUT_SECONDS), and must not be held
+            # across the write lock (test_concurrent_writer_not_blocked_by_garmin_push
+            # pins that); the claim above is what makes doing so safe. This
+            # connection stays open only to record the outcome
             # afterward. By this point the row (and any enrichment) is already
             # durably committed, so a failure here must never surface as a 500 over
             # already-successful data -- it would tell the client the whole request
@@ -437,7 +505,8 @@ def add_weight_routes(app):
                     # against real Garmin Connect behavior for a large backdate --
                     # confirm with a live account before this path sees real
                     # replay traffic (Devil's-advocate review, Round 2).
-                    garmin_error = _push_composition(
+                    garmin_error = await _push_composition(
+                        person_id,
                         weight_grams,
                         dedup_anchor,
                         {
@@ -467,7 +536,9 @@ def add_weight_routes(app):
                     except ValueError as e:
                         garmin_error = f"could not parse stored timestamp for Garmin push: {e}"
                     else:
-                        garmin_error = _push_composition(existing["weight_grams"], original_ts, merged)
+                        garmin_error = await _push_composition(
+                            person_id, existing["weight_grams"], original_ts, merged
+                        )
                         synced = garmin_error is None
                 else:
                     # Nothing needed pushing, or another request holds the claim.

@@ -211,14 +211,11 @@ async def test_enrichment_updates_null_columns_and_repushes(client, fake_garmin_
 
 
 async def test_enrichment_uses_original_timestamp(client, fake_garmin_client):
-    """weight_app_module's push_weight double records the raw datetime it's
-    called with (the route<->push_weight boundary), not Garmin's wire-format
-    string -- that string-formatting is push_weight's own job, already
-    covered by test_garmin_mapping.py."""
+    """The registry-selected client receives Garmin's local wire timestamp."""
     row_id, ts = await seed_row(84096, seconds_ago=5)
     await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 185.4, "unit": "lbs", "body_fat_pct": 18.4})
     pushed_ts = fake_garmin_client.pushed_weights[-1]["timestamp"]
-    assert pushed_ts == datetime.fromisoformat(ts)
+    assert pushed_ts == datetime.fromisoformat(ts).strftime("%Y-%m-%dT%H:%M:%S")
 
 
 async def test_enrichment_push_failure_sets_synced_to_garmin_zero(client, weight_app_module, monkeypatch, weight_routes_module):
@@ -364,7 +361,7 @@ async def test_enrichment_with_partial_conflict_updates_only_null_columns(client
 
     pushed = fake_garmin_client.pushed_weights[-1]
     assert pushed["percent_fat"] == 18.4  # the stored (not incoming) value
-    assert pushed["bone_mass_kg"] == 3.2
+    assert pushed["bone_mass"] == 3.2
 
 
 async def test_conflict_response_names_the_conflicting_fields(client, fake_garmin_client):

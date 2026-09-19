@@ -45,6 +45,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from shared import garmin_registry
 from shared.auth import Identity, get_current_identity, require_admin
 from shared.database import get_db
 from shared.persons_admin_page import ADMIN_PERSONS_PAGE_HTML
@@ -88,18 +89,12 @@ class UpdatePersonIn(BaseModel):
     # get_primary_person_id() raises when there is none, and scheduled_sync
     # still depends on it through Phase 3 (plan D3).
     is_primary: bool | None = None
-    # Promotion is NOT just a scheduling preference. `is_primary` is also what
-    # garmin_credential_person_id() returns, i.e. which person the deployment's
-    # single Garmin account is understood to describe -- so promoting reassigns
-    # that account, and the next scheduled sync files the ORIGINAL human's
-    # sleep, HRV and weight under the new primary. The .garth token directory
-    # and GARMIN_EMAIL/GARMIN_PASSWORD are untouched by this route and would
-    # need changing too.
-    #
-    # A client-side confirm() cannot enforce that, so the acknowledgement lives
-    # in the API: without it, promotion is refused. Phase 3's per-person
-    # garmin_links is what removes the coupling and this flag with it.
-    acknowledge_garmin_reassignment: bool = False
+    # Retired in Phase 3 (per-person links made the cross-person Garmin
+    # reassignment impossible).  Accepted and ignored for one release so a
+    # PATCH written against the old 409 guidance ("re-send with
+    # acknowledge_garmin_reassignment: true") does not now fail as a whole
+    # under extra="forbid".  Remove after the next release.
+    acknowledge_garmin_reassignment: bool | None = None
 
 
 class GrantIn(BaseModel):
@@ -331,36 +326,6 @@ def add_person_routes(app):
                     status_code=409,
                     detail="An archived person cannot be made primary.",
                 )
-            if (
-                data.is_primary
-                and not row["is_primary"]
-                and not data.acknowledge_garmin_reassignment
-            ):
-                # See UpdatePersonIn.acknowledge_garmin_reassignment. Refused
-                # rather than warned: a scripted PATCH bypasses the admin
-                # page's confirm() entirely, and the resulting contamination --
-                # another human's measurements written under this person -- is
-                # invisible until someone reads the data and believes it.
-                #
-                # Checked here, after the existence and archived checks, so
-                # those keep their own answers: a promote of a person who does
-                # not exist is a 404, not a lecture about Garmin.
-                await db.rollback()
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "The primary person is also the person this deployment's single "
-                        "Garmin account is taken to describe (garmin_credential_person_id). "
-                        "Promoting reassigns it, with three consequences: the next scheduled "
-                        "sync files that account's sleep, HRV and weight under THIS person, "
-                        "overwriting any measurement they already had for those dates; this "
-                        "person becomes the only one POST /p/{slug}/api/sync will accept; and "
-                        "the previous primary can no longer sync their own data. If the "
-                        "Garmin account should change too, update GARMIN_EMAIL/"
-                        "GARMIN_PASSWORD and clear the .garth token directory. Re-send with "
-                        "acknowledge_garmin_reassignment: true to proceed."
-                    ),
-                )
             if display_name is not None:
                 await db.execute(
                     "UPDATE persons SET display_name = ? WHERE id = ?", (display_name, person_id)
@@ -383,55 +348,74 @@ def add_person_routes(app):
         history.
         """
         await require_admin(request)
-        db = await get_db()
-        try:
-            await db.execute("BEGIN IMMEDIATE")
-            row = await (
-                await db.execute(
-                    "SELECT archived_at, is_primary FROM persons WHERE id = ?", (person_id,)
-                )
-            ).fetchone()
-            if row is None:
-                await db.rollback()
-                raise HTTPException(status_code=404, detail="Person not found")
-            if row["archived_at"] is not None:
-                # Idempotent, but not a bare early return: the
-                # default_person_id cleanup below has to run on this path too,
-                # or the two archive paths differ in what they leave behind.
+        if person_id < 1:
+            raise HTTPException(status_code=404, detail="Person not found")
+        # This is the same cross-process lifecycle boundary used by a Garmin
+        # call, link, and unlink.  Holding it through both the durable state
+        # change and cleanup prevents an in-flight call from authenticating a
+        # token store after this route has archived its owner.
+        async with garmin_registry.person_flock(person_id):
+            db = await get_db()
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                row = await (
+                    await db.execute(
+                        "SELECT archived_at, is_primary FROM persons WHERE id = ?", (person_id,)
+                    )
+                ).fetchone()
+                if row is None:
+                    await db.rollback()
+                    raise HTTPException(status_code=404, detail="Person not found")
+                archived_at = row["archived_at"]
+                if archived_at is None:
+                    if row["is_primary"]:
+                        await db.rollback()
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "The primary person cannot be archived. Promote another person "
+                                "first (PATCH /api/persons/{id} with is_primary: true), then "
+                                "archive this one."
+                            ),
+                        )
+                    archived_at = datetime.now(timezone.utc).isoformat()
+                    await db.execute(
+                        "UPDATE persons SET archived_at = ? WHERE id = ?", (archived_at, person_id)
+                    )
+                # An archived person drops out of _reachable_persons in both
+                # services, so a default_person_id still pointing at them makes
+                # GET / fall through to the "more than one person, no default" 400
+                # -- a dead end a non-admin cannot clear for themselves. Same
+                # reasoning as NULLing person_grants.granted_by on user delete:
+                # a pointer to a row that can no longer be reached is worse than
+                # no pointer.
                 await db.execute(
                     "UPDATE users SET default_person_id = NULL WHERE default_person_id = ?",
                     (person_id,),
                 )
+
+                # Archive and credential invalidation are one transaction.
+                # Every link row goes, including a retired 'legacy_bound' one
+                # left by an older release: the one-time adoption marker in
+                # auth_migrations, not a tombstone row, is what keeps the
+                # historic flat store from ever being adopted again.
+                await db.execute("DELETE FROM garmin_links WHERE person_id = ?", (person_id,))
                 await db.commit()
-                return {"success": True, "archived_at": row["archived_at"]}
-            if row["is_primary"]:
-                await db.rollback()
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "The primary person cannot be archived. Promote another person "
-                        "first (PATCH /api/persons/{id} with is_primary: true), then "
-                        "archive this one."
-                    ),
-                )
-            archived_at = datetime.now(timezone.utc).isoformat()
-            await db.execute(
-                "UPDATE persons SET archived_at = ? WHERE id = ?", (archived_at, person_id)
-            )
-            # An archived person drops out of _reachable_persons in both
-            # services, so a default_person_id still pointing at them makes
-            # GET / fall through to the "more than one person, no default" 400
-            # -- a dead end a non-admin cannot clear for themselves. Same
-            # reasoning as NULLing person_grants.granted_by on user delete:
-            # a pointer to a row that can no longer be reached is worse than
-            # no pointer.
-            await db.execute(
-                "UPDATE users SET default_person_id = NULL WHERE default_person_id = ?",
-                (person_id,),
-            )
-            await db.commit()
-        finally:
-            await db.close()
+            except BaseException:
+                if db.in_transaction:
+                    await db.rollback()
+                raise
+            finally:
+                await db.close()
+
+            # The database has already made the link unusable.  Cleanup is
+            # best effort: report only a fixed message (never an exception
+            # whose text might contain a credential path) and let a later
+            # idempotent archive retry it.
+            try:
+                await garmin_registry.forget_and_remove_person_token_store(person_id)
+            except Exception:
+                logger.warning("Archived person's Garmin token cleanup did not complete")
         return {"success": True, "archived_at": archived_at}
 
     @app.get("/api/persons/{person_id}/grants")

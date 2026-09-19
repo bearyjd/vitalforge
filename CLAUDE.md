@@ -15,8 +15,9 @@ and out of scope for inspection beyond schema.
   the dashboard), PWA manifest + service worker on each service.
 - `aiosqlite` — one SQLite file (`/app/data/fitness.db` in containers) shared by both services
   via a Docker named volume (`vitalforge-data`).
-- `garminconnect` (garth-based) for all Garmin Connect reads/writes. Tokens persist to
-  `/app/data/.garth`.
+- `garminconnect` (garth-based) for all Garmin Connect reads/writes, always reached through
+  `shared/garmin_registry.call(person_id, op)`. Tokens persist per link to
+  `/app/data/.garth/person-<id>/generation-<n>/`; Garmin passwords are never stored.
 - `anthropic` SDK — optional LLM layer on top of a rules engine for health recommendations.
   Falls back to rules-only output if no `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL` is set.
 - No frontend build step, no JS package manager — templates and static JS are hand-written and
@@ -29,7 +30,15 @@ shared/                   # imported by BOTH services as a real installed packag
   auth.py                 # cookie/HMAC session auth + login page HTML + FastAPI middleware
   database.py             # aiosqlite connection + schema; migrations.py runs one-shot schema
                           # migrations on top of it (001-person-id-rebuild, Phase 1)
-  garmin_client.py        # thin wrapper over garminconnect.Garmin, module-level singleton `_client`
+  garmin_registry.py      # per-person Garmin links: link/relink/unlink, token dirs, call pacing,
+                          # one-time legacy-store adoption; garmin_registry_runtime.py holds
+                          # the pieces that need a late import of the registry
+  garmin_registry_errors.py  # the registry's bounded error types + GarminLink; no registry import
+  garmin_registry_locks.py   # person_flock / legacy_store_flock: flock across both processes
+                             # plus the per-loop asyncio.Lock that flock alone does not give
+  garmin_routes.py        # /p/{slug}/api/garmin/{status,link,relink,unlink}, mounted on both apps
+  garmin_client.py        # thin wrapper over garminconnect.Garmin; `_clients` is a
+                          # `(person_id, generation)` -> Garmin cache, not a singleton
 vitalforge_weight/        # port 8085 — weight entry PWA, writes to Garmin + weight_log table
 vitalforge_dashboard/     # port 8086 — reads synced metrics, runs sync.py + recommendations.py
 nginx/nginx.conf          # optional reverse proxy for subdomain routing (not used by docker-compose*.yml directly)
@@ -49,8 +58,9 @@ docker-compose.prod.yml   # PROD — pulls prebuilt images from Docker Hub / GHC
   independent tests. It IS a real package: `pyproject.toml` declares `packages = ["shared"]`
   and each Dockerfile runs `pip install -e .`, so both services import it with plain
   `from shared.x import y` — there is no `sys.path` hack for `shared`, despite what this file
-  used to claim. Any change to `shared/auth.py`, `shared/database.py`, or
-  `shared/garmin_client.py` affects both services simultaneously — always re-check both
+  used to claim. Any change to `shared/auth.py`, `shared/database.py`,
+  `shared/garmin_registry.py`, or `shared/garmin_client.py` affects both services
+  simultaneously — always re-check both
   `vitalforge_weight` and `vitalforge_dashboard` after touching `shared/`.
 - **The service directories are `vitalforge_weight/` and `vitalforge_dashboard/` (underscores).**
   They are NOT pip-installed; they resolve as namespace packages off the working directory
@@ -74,14 +84,41 @@ docker-compose.prod.yml   # PROD — pulls prebuilt images from Docker Hub / GHC
   auth remains enabled even if those environment variables are later removed.
 - **Dashboard read endpoints do not call Garmin at request time.** `/api/metrics/{name}`,
   `/api/recommendations`, and `/api/recommendations/rules-only` only read from the local
-  SQLite tables populated by `sync.py`. Garmin Connect is only contacted during
-  `POST /api/sync` (dashboard) and `POST /api/weight` (weight service, via
-  `shared/garmin_client.push_weight`). This means most dashboard bugs can be reproduced by
-  seeding the local DB directly — no live Garmin account needed (see roadmap item 2).
+  SQLite tables populated by `sync.py`. Garmin Connect is contacted only from
+  `POST /p/{slug}/api/sync` and the scheduled sync (dashboard), `POST /p/{slug}/api/weight`
+  and the strength-activity push (weight service), the `link`/`relink` routes on either
+  service, and the one-time legacy-store adoption at boot — every one of them through
+  `shared/garmin_registry`. This means most dashboard bugs can be reproduced by seeding
+  the local DB directly — no live Garmin account needed (see roadmap item 2).
 - **`DB_PATH` and `GARTH_TOKEN_DIR` are env-overridable** (`shared/database.py`,
-  `shared/garmin_client.py`), defaulting to `/app/data/...`. Point these at a scratch
+  `shared/garmin_registry.py`), defaulting to `/app/data/...`. Point these at a scratch
   directory to run either service against an isolated database without touching the real
-  `/app/data` volume.
+  `/app/data` volume. Both are read at import time; in tests, patch the module attribute
+  (`tests/conftest.py::tmp_db_path` does), not just the env var.
+- **`shared/garmin_registry.call` is the only Garmin boundary.** Nothing else may
+  authenticate or hold a Garmin client: `call()` resolves the person's durable link, picks
+  the `(person_id, generation)` client (cold-loading tokens from that generation's directory
+  on first use), takes the deployment-wide call permit (`garmin_call_budget`,
+  `GARMIN_MIN_CALL_INTERVAL_SECONDS`), and stamps `last_auth_ok`/`last_auth_error` on the
+  link. Pure helpers in `shared/garmin_client` are fine to call from anywhere -- the payload
+  builders, and `push_weight_to_client` on a client the registry handed to your `op` -- what
+  is off limits is `garmin_client.authenticate`/`get_client`/`_clients` outside the registry. There is no deployment credential any
+  more: an unlinked person raises `GarminNotLinked` (callers report `link_required`), and a
+  token Garmin rejects raises `GarminAuthenticationError` — never a re-login from `.env`.
+  A re-link always gets a fresh generation, so stale work can never land on a new
+  credential.
+- **The legacy `.garth` flat store is adopted ONCE, at first boot.**
+  `bootstrap_legacy_token_store()` (the last bootstrap step in both lifespans) verifies the old flat
+  store resumes, physically moves it to `person-<id>/generation-1/garmin_tokens.json`,
+  publishes the primary person's link as state `linked`, and commits the
+  `legacy-garth-store-adopted` marker in `auth_migrations` — under `legacy_store_flock`
+  with `person_flock` taken inside it (never the reverse; no path takes them the other
+  way round). The marker, not the file, is what makes it one-time: unlink,
+  archive, or a restored `.garth` backup never re-adopts. `GARMIN_EMAIL` is read only
+  here (it becomes the adopted link's `garmin_email`); `GARMIN_PASSWORD` is read nowhere.
+  The `legacy_bound`/`legacy_disabled` link states are retired — only `linked` exists —
+  but stay in the `garmin_links` CHECK because SQLite cannot alter one (see the comment
+  in `shared/database.py`).
 
 ## Verified run/build commands (from Dockerfile / README — do not invent alternatives)
 
@@ -95,7 +132,7 @@ curl http://localhost:8086/health   # {"status": "ok", "service": "vitalforge-da
 # Running a single service without Docker (matches Dockerfile CMD, from repo root):
 pip install -r vitalforge_weight/requirements.txt
 DB_PATH=/tmp/vf-test.db GARTH_TOKEN_DIR=/tmp/vf-garth \
-  uvicorn vitalforge_weight.app:app --host 0.0.0.0 --port 8085
+  uvicorn vitalforge_weight.app:app --host 0.0.0.0 --port 8085 --no-proxy-headers
 
 # Lint and test (repo root; mirrors .github/workflows/docker.yml's `test` job).
 # Use a venv, not the system/global Python — installing these into a shared interpreter
@@ -138,9 +175,10 @@ dependencies (which is the point — `starlette` was transitive and unpinned unt
 PYSEC-2026-1942 bump), but an advisory in `pytest`/`ruff`/`playwright` must not block an
 image push for something that never ships in the image.
 Tests live in `tests/` and never touch real infrastructure: `tests/conftest.py` points
-`shared.database.DB_PATH` at a per-test `tmp_path` and monkeypatches
-`shared.garmin_client` to a fake client backed by canned fixtures in
-`tests/fixtures/garmin/` — no live Garmin account or `/app/data` access required. The
+`shared.database.DB_PATH` and `shared.garmin_registry.GARTH_TOKEN_DIR` at a per-test
+`tmp_path` and monkeypatches `shared.garmin_registry.call` to run operations against a
+fake client backed by canned fixtures in `tests/fixtures/garmin/` — no live Garmin
+account or `/app/data` access required. The
 Playwright smoke tests reuse the same faked DB/Garmin setup but serve the app for real
 over HTTP (`tests/live_server.py::LiveServer`, real `uvicorn` in a background thread)
 since a browser needs an actual socket, not `httpx.ASGITransport`. There is still no
@@ -149,8 +187,11 @@ the original test-suite rationale (marked DONE).
 
 ## Conventions observed in the existing code (follow these, don't impose new house style)
 
-- FastAPI apps use `@asynccontextmanager` lifespan for startup (`init_db()`, Garmin
-  `authenticate()`), not `@app.on_event`.
+- FastAPI apps use `@asynccontextmanager` lifespan for startup (`init_db()`,
+  `bootstrap_first_admin()`, `ensure_primary_person_grant()`, `bootstrap_migrated_token()`,
+  `bootstrap_legacy_token_store()` — in that order), not `@app.on_event`. No Garmin login
+  happens at startup beyond the one-time legacy adoption; clients are created lazily by
+  the registry on first `call()`.
 - DB access pattern: open a connection with `get_db()`, use `try/finally: await db.close()`
   per-request — no connection pooling. Preserve this pattern in new endpoints.
 - Errors from Garmin calls are caught and logged, never allowed to crash a request; endpoints
@@ -171,10 +212,20 @@ the original test-suite rationale (marked DONE).
   its own `id` primary key, or carries `NOT NULL`/`DEFAULT`/`CHECK`/`UNIQUE` columns, cannot go
   in that list — `_rebuild_columns` refuses exactly those shapes rather than silently dropping
   the constraint. Such tables get a hand-written rebuild instead (`_rebuild_sync_status`,
-  `_rebuild_activities`). If you add one, also add it to
-  `tests/test_migrations.py`'s parity checks: the generic
+  `_rebuild_activities`, `_apply_strength_sessions_remove_garmin_target`). If you add one,
+  also add it to `tests/test_migrations.py`'s parity checks: the generic
   `test_schema_parity_fresh_vs_migrated` only iterates `_REBUILD_TABLES`, so a bespoke rebuild
-  whose DDL drifts from `shared/database.py`'s is invisible to it.
+  whose DDL drifts from `shared/database.py`'s is invisible to it
+  (`test_activities_schema_parity_fresh_vs_migrated` and
+  `test_strength_sessions_schema_parity_fresh_vs_migrated` are the models — note the
+  latter seeds its own pre-003 table because `tests/fixtures/production_schema.sql` predates
+  `strength_sessions`, so a fixture-based version would compare fresh with fresh). A rebuild
+  of a deployed table also gets its own `ensure_pre_migration_snapshot` call right before
+  its `run_migration` (003 has `fitness.pre-003-strength-sessions.db`): the marker it
+  commits makes the previous image refuse to boot, so the snapshot IS the rollback path.
+  Note `run_migration` commits the marker even when `apply` no-ops, while the snapshot is
+  gated on its predicate — a database that never had the column gets markers and no
+  snapshot, which README's Upgrading section has to spell out for the operator.
 - **Migrations are immutable once written — never add work to an existing marker.** A database
   that already committed a marker skips that migration wholesale forever, so anything appended
   to it silently never runs there while the app code assumes it did. Add a new marker instead

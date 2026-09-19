@@ -322,6 +322,13 @@ def add_auth_routes(app):
             # their owner.
             await db.execute("DELETE FROM api_tokens WHERE user_id = ?", (user_id,))
             await db.execute("DELETE FROM goals WHERE user_id = ?", (user_id,))
+            # Phase 3's Garmin-link attempt window is keyed to the credential
+            # submitter. Leaving it behind would be both stale state and an
+            # authorization hazard if an implementation ever stopped using
+            # AUTOINCREMENT user ids. Link provenance is audit-only, so retain
+            # the link but explicitly make its deleted actor unknown.
+            await db.execute("DELETE FROM garmin_link_attempts WHERE user_id = ?", (user_id,))
+            await db.execute("UPDATE garmin_links SET linked_by = NULL WHERE linked_by = ?", (user_id,))
             # users.id is AUTOINCREMENT, so an orphaned grant left behind here
             # would hand the NEXT account created with a reused id this
             # account's access to someone's health data -- the same

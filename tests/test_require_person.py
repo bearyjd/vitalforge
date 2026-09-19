@@ -215,7 +215,7 @@ def test_anonymous_sentinel_has_no_role():
     src = Path(__file__).resolve().parent.parent / "shared" / "auth.py"
     construction = re.search(r'_Identity\("anonymous"[^)]*\)', src.read_text())
     assert construction is not None, "the anonymous sentinel construction moved or was renamed"
-    assert construction.group(0) == '_Identity("anonymous", None, None, None)', (
+    assert construction.group(0) == '_Identity("anonymous", None, None, None, "anonymous")', (
         f"the anonymous sentinel changed shape: {construction.group(0)}. require_person "
         "checks anonymous before admin on the assumption that its role is None -- if it now "
         "carries a role, that ordering stops being merely defensive and must be re-examined."
