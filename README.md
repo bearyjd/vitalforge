@@ -28,7 +28,7 @@ No building required. Pull and run the latest images:
 curl -O https://raw.githubusercontent.com/bearyjd/vitalforge/main/docker-compose.prod.yml
 curl -O https://raw.githubusercontent.com/bearyjd/vitalforge/main/.env.example
 cp .env.example .env
-# Edit .env with your Garmin credentials and auth settings
+# Edit .env with your auth settings; Garmin is linked per person after first login
 docker compose -f docker-compose.prod.yml up -d
 ```
 
@@ -59,13 +59,14 @@ cp .env.example .env
 Edit `.env` with your credentials:
 
 ```
-GARMIN_EMAIL=your_garmin_email@example.com
-GARMIN_PASSWORD=your_garmin_password
 ANTHROPIC_API_KEY=sk-ant-your-api-key-here
 VITALFORGE_USER=admin
 VITALFORGE_PASS=your-password-here
 VITALFORGE_SECRET=your-random-secret-here
 ```
+
+Garmin credentials do not go in `.env`: each person's Garmin account is linked from a
+browser session after you sign in (see [Linking Garmin](#linking-garmin)).
 
 ### 2. Build and run
 
@@ -86,8 +87,9 @@ Visit `http://localhost:8085` for weight logging and `http://localhost:8086` for
 
 | Variable | Required | Description |
 |---|---|---|
-| `GARMIN_EMAIL` | Yes | Your Garmin Connect email |
-| `GARMIN_PASSWORD` | Yes | Your Garmin Connect password |
+| `GARMIN_EMAIL` | No | Upgrade compatibility only: read once, at first boot, to adopt a pre-existing `.garth` token store as the primary person's Garmin link (see [Upgrading](#upgrading)). Leave empty on new installs and link from the browser instead |
+| `GARMIN_PASSWORD` | No | **No longer read.** Garmin passwords are submitted per person through `/p/{slug}/api/garmin/link` and never stored; remove this from `.env` |
+| `GARMIN_MIN_CALL_INTERVAL_SECONDS` | No | Minimum spacing between any two Garmin Connect calls across both services (default `2`, clamped to 1–60; a non-numeric value falls back to the default). A call that would arrive sooner is refused with `429` and a `Retry-After` |
 | `ANTHROPIC_API_KEY` | No | Claude API key for AI recommendations (rules engine works without it) |
 | `ANTHROPIC_BASE_URL` | No | Custom API base URL (e.g. `http://localhost:4000` for LiteLLM proxy) |
 | `VITALFORGE_USER` | No | One-time bootstrap username (default: `admin`) — seeds the first admin account on first boot if no users exist yet; not read for ongoing auth after that (manage accounts from `/auth/admin/users` instead) |
@@ -114,7 +116,9 @@ vitalforge/
 ├── shared/                    # Shared Python modules
 │   ├── auth.py                # Cookie-session + bearer-token authentication
 │   ├── database.py            # SQLite connection and schema setup
-│   └── garmin_client.py       # Garmin Connect API wrapper (garminconnect)
+│   ├── garmin_registry.py     # Per-person Garmin links: link/relink/unlink, token dirs, call pacing
+│   ├── garmin_routes.py       # /p/{slug}/api/garmin/* lifecycle routes, mounted on both services
+│   └── garmin_client.py       # Garmin Connect API wrapper (garminconnect), one client per link
 ├── vitalforge_weight/         # Weight logging PWA service
 │   ├── app.py                 # FastAPI app — weight CRUD + Garmin push
 │   ├── templates/index.html   # Mobile-first weight entry UI
@@ -131,14 +135,17 @@ vitalforge/
 └── .github/workflows/         # CI/CD — builds and pushes Docker images
 ```
 
-- **Data volume** — SQLite database and Garmin auth tokens persist in a Docker volume at `/app/data`
+- **Data volume** — SQLite database and Garmin auth tokens persist in a Docker volume at `/app/data`; tokens live under `/app/data/.garth/person-<id>/generation-<n>/`, one directory per link
 - **Docker health checks** — Both containers report health via `/health` endpoint
 - **Non-root containers** — Entrypoint fixes volume permissions, then drops to dedicated `vitalforge` user
 - **CI/CD** — GitHub Actions builds and pushes images to GHCR on every push to `main`
 
 ### Data sync
 
-The dashboard automatically syncs data from Garmin Connect every 2 hours. You can also trigger a manual sync from the dashboard UI. Synced metrics:
+The dashboard automatically syncs the primary person's data from Garmin Connect every 2 hours.
+You can also trigger a manual sync for any person you hold `manage` on from the dashboard UI.
+Both need that person to have a Garmin link: a manual sync on an unlinked person is refused
+with `{"status": "link_required", ...}` and nothing is started. Synced metrics:
 
 - Sleep duration and sleep score
 - Resting heart rate and HRV
@@ -241,6 +248,74 @@ A few behaviours are deliberate and worth knowing before they surprise you:
 If a token is leaked, revoke that token. If the session signing secret is leaked, rotate
 `VITALFORGE_SECRET` to invalidate all cookies.
 
+### Linking Garmin
+
+Each person has their own Garmin Connect link, or none. A link is created by submitting that
+person's Garmin credentials once; only the resulting session tokens are kept (on disk, under
+`/app/data/.garth/person-<id>/generation-<n>/`), never the password. Both services mount the
+same four routes:
+
+| Method | Endpoint | Body | Description |
+|---|---|---|---|
+| `GET` | `/p/{slug}/api/garmin/status` | — | Whether the person is linked, plus last-success/last-failure times |
+| `POST` | `/p/{slug}/api/garmin/link` | `{"email", "password", "current_password"}` | Link a Garmin account to a person who has none |
+| `POST` | `/p/{slug}/api/garmin/relink` | `{"email", "password", "current_password"}` | Replace the person's link (new credentials or a rejected token) |
+| `POST` | `/p/{slug}/api/garmin/unlink` | `{"current_password"}` | Remove the link and delete its tokens |
+
+`email`/`password` are the Garmin Connect credentials; `current_password` is the password of
+the VitalForge account making the request (a step-up check, so a stolen cookie alone cannot
+change a link). Extra fields are rejected.
+
+All four require, in this order:
+
+1. **A browser session cookie** holding `manage` (or higher) on the person. Bearer tokens are
+   refused even when their owner holds `manage`, and so are anonymous open-access callers —
+   both get the same non-enumerating `404 Person not found` that a stranger gets. `status`
+   is included in this rule: an API token must not be able to learn who in a household has a
+   linked account.
+2. **HTTPS**, for the three password-carrying routes. Plain HTTP is refused with `400`. A
+   reverse proxy terminating TLS must be listed in `VITALFORGE_TRUSTED_PROXY_IPS` for its
+   `X-Forwarded-Proto: https` to count; `VITALFORGE_ALLOW_INSECURE_GARMIN_LINKS=1` waives the
+   check for local development only.
+3. **The step-up password**, checked before anything is sent to Garmin (`401 Current password
+   incorrect`).
+
+Responses are the same redacted status object the `GET` returns — the Garmin email is never
+echoed, and errors are bounded codes, not provider text:
+
+```json
+{"linked": true, "last_auth_ok": "2026-09-18T07:12:04+00:00", "last_auth_error": null, "last_auth_error_at": null}
+```
+
+`last_auth_error`, when set, is one of `auth_failed`, `rate_limited`, `network`, `unknown`.
+
+| Status | Meaning |
+|---|---|
+| `200` | Done; body is the status object above |
+| `400` | Not HTTPS (see 2. above) |
+| `401` | `current_password` wrong, or your account changed mid-request — sign in again |
+| `401` `Garmin authentication failed` | Garmin rejected the credentials |
+| `404` | No such person, no `manage` grant, bearer token, or anonymous caller — indistinguishable on purpose |
+| `409` | That Garmin account is already linked to a different person |
+| `422` | Malformed body (the rejected input is never echoed back) |
+| `429` | Rate limited — either the deployment-wide Garmin call spacing (`GARMIN_MIN_CALL_INTERVAL_SECONDS`) or the per-account link limit of 3 attempts per 15 minutes; honour `Retry-After` |
+| `502` | Garmin could not be reached or answered unexpectedly |
+
+From a shell, reuse the `vf_session` cookie your browser holds after signing in (DevTools →
+Application → Cookies):
+
+```bash
+curl -sS https://health.example.com/p/alice/api/garmin/link \
+  -H 'Content-Type: application/json' \
+  --cookie 'vf_session=<paste the cookie value>' \
+  -d '{"email": "alice@example.com", "password": "garmin-password", "current_password": "vitalforge-password"}'
+```
+
+A link that Garmin later rejects (password changed, session revoked) is **not** re-tried with
+anything from `.env`: `status` reports `last_auth_error: "auth_failed"`, that person's syncs
+and weight pushes report `auth_failed` (an unlinked person's report `link_required`), and the
+fix is `relink`. Archiving a person removes their link and tokens.
+
 ## Deployment
 
 ### Docker images
@@ -307,6 +382,42 @@ database schema in a way that is not safely readable by an older image. For thes
 6. Once the upgrade is verified good and at least 7 days have passed, delete
    `fitness.pre-001-person-id.db` — it is a full second copy of your health data and is not
    cleaned up automatically.
+
+### Per-person Garmin links (migrations 003 and 004)
+
+This release moves Garmin from one deployment-wide credential in `.env` to a link per person
+(see [Linking Garmin](#linking-garmin)). The same rules as above apply, with these specifics:
+
+1. **Stop both services first** (`docker compose down`). Migration 003 rebuilds
+   `strength_sessions`; an old **weight** image still running against the rebuilt table
+   answers every strength-activity route with a `500`, so a rolling restart is not safe.
+2. The new image takes `fitness.pre-003-strength-sessions.db` (next to `fitness.db`, integrity
+   checked) before 003 runs. It is taken *after* 001/002, so on a database that skipped
+   several releases you get both snapshot files, from different points — and the volume
+   needs room for two extra full copies in that one boot, not one. The snapshot is only
+   taken when `strength_sessions` still has the column 003 removes, which is every database
+   that has the table at all; one that predates the table (older than the Cadence
+   write-back release) gets the `003`/`004` markers with no pre-003 snapshot — see step 5.
+3. **Your existing Garmin login is adopted once, automatically.** On the first boot, if
+   `/app/data/.garth` still holds the old flat token store and `GARMIN_EMAIL` is set, the store
+   is verified against Garmin, moved to `/app/data/.garth/person-<id>/generation-1/`, and
+   published as the primary person's link. This happens exactly once and is recorded in the
+   database: unlinking later, or restoring an old `.garth` backup, never re-adopts it. If
+   `GARMIN_EMAIL` is unset or the store no longer resumes, nothing is adopted and the primary
+   person starts unlinked — link from the browser. Only the primary person is ever adopted.
+4. **`GARMIN_PASSWORD` is no longer read.** A token Garmin later rejects is not re-logged-in
+   from `.env`; the person's status shows `auth_failed` and the fix is the `relink` route.
+   Remove `GARMIN_PASSWORD` from `.env`; `GARMIN_EMAIL` can go once step 3 has happened.
+5. **Rollback**: stop both services and restore `fitness.pre-003-strength-sessions.db` over
+   `fitness.db` (removing `-wal`/`-shm` sidecars), then redeploy the previous images. Do not
+   simply redeploy the old images against the migrated file: they refuse to boot on the
+   unknown `003`/`004` markers, on purpose. The `garmin_*` tables themselves are additive and
+   would have been ignored — the markers are what make the snapshot necessary. If there is
+   no pre-003 snapshot (step 2), restore `fitness.pre-001-person-id.db` if this same boot
+   wrote one, otherwise a volume-level backup taken before the upgrade. Rolling back also
+   strands the moved token directory: the previous image expects the flat store and
+   recreates it by logging in from `GARMIN_EMAIL`/`GARMIN_PASSWORD`, so put both back in
+   `.env` before rolling back.
 
 ## Nginx (optional)
 
@@ -447,7 +558,7 @@ the same weigh-in rather than a new one:
 |---|---|---|
 | `GET` | `/health` | Health check |
 | `GET` | `/` | Dashboard UI |
-| `POST` | `/api/sync?days=7` | Trigger manual Garmin sync |
+| `POST` | `/api/sync?days=7` | Trigger manual Garmin sync; `200 {"status": "link_required", "store_only": true, "message": ...}` when the person has no Garmin link (nothing is started) |
 | `GET` | `/api/sync/status` | Last sync time and status |
 | `GET` | `/api/metrics/{name}?days=30` | Time series data with 7-day moving average |
 | `GET` | `/api/recommendations` | AI-powered health recommendations |
