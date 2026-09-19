@@ -33,6 +33,9 @@ shared/                   # imported by BOTH services as a real installed packag
   garmin_registry.py      # per-person Garmin links: link/relink/unlink, token dirs, call pacing,
                           # one-time legacy-store adoption; garmin_registry_runtime.py holds
                           # the pieces that need a late import of the registry
+  garmin_registry_errors.py  # the registry's bounded error types + GarminLink; no registry import
+  garmin_registry_locks.py   # person_flock / legacy_store_flock: flock across both processes
+                             # plus the per-loop asyncio.Lock that flock alone does not give
   garmin_routes.py        # /p/{slug}/api/garmin/{status,link,relink,unlink}, mounted on both apps
   garmin_client.py        # thin wrapper over garminconnect.Garmin; `_clients` is a
                           # `(person_id, generation)` -> Garmin cache, not a singleton
@@ -92,12 +95,14 @@ docker-compose.prod.yml   # PROD — pulls prebuilt images from Docker Hub / GHC
   directory to run either service against an isolated database without touching the real
   `/app/data` volume. Both are read at import time; in tests, patch the module attribute
   (`tests/conftest.py::tmp_db_path` does), not just the env var.
-- **`shared/garmin_registry.call` is the only Garmin boundary.** Nothing else may call
-  `garminconnect` or `shared/garmin_client` directly: `call()` resolves the person's durable
-  link, picks the `(person_id, generation)` client (cold-loading tokens from that
-  generation's directory on first use), takes the deployment-wide call permit
-  (`garmin_call_budget`, `GARMIN_MIN_CALL_INTERVAL_SECONDS`), and stamps
-  `last_auth_ok`/`last_auth_error` on the link. There is no deployment credential any
+- **`shared/garmin_registry.call` is the only Garmin boundary.** Nothing else may
+  authenticate or hold a Garmin client: `call()` resolves the person's durable link, picks
+  the `(person_id, generation)` client (cold-loading tokens from that generation's directory
+  on first use), takes the deployment-wide call permit (`garmin_call_budget`,
+  `GARMIN_MIN_CALL_INTERVAL_SECONDS`), and stamps `last_auth_ok`/`last_auth_error` on the
+  link. Pure helpers in `shared/garmin_client` are fine to call from anywhere -- the payload
+  builders, and `push_weight_to_client` on a client the registry handed to your `op` -- what
+  is off limits is `garmin_client.authenticate`/`get_client`/`_clients` outside the registry. There is no deployment credential any
   more: an unlinked person raises `GarminNotLinked` (callers report `link_required`), and a
   token Garmin rejects raises `GarminAuthenticationError` — never a re-login from `.env`.
   A re-link always gets a fresh generation, so stale work can never land on a new

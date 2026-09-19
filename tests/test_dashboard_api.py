@@ -92,14 +92,18 @@ async def test_manual_sync_without_a_link_is_explicitly_store_only(
     assert await get_primary_person_id() not in dashboard_app_module._syncing_person_ids
 
 
-def test_dashboard_sync_handler_branches_on_link_required():
-    """triggerSync() must not poll or reload after a link_required answer.
+def test_dashboard_sync_handler_branches_on_link_required_and_non_2xx():
+    """triggerSync() must not poll or reload after a link_required answer,
+    nor after any non-2xx answer.
 
     The route returns 200 for an unlinked person (test above), so a handler
     that only checked `res.ok` would spin on /sync/status forever with the
-    button stuck at "Syncing...". A string check on the template is enough
-    here; the Playwright smoke test loads the page for real and would fail
-    on a syntax error in the handler.
+    button stuck at "Syncing...".  The converse also holds: a 409 (sync
+    already running), 401/403 or 5xx starts nothing, so polling for a run
+    that never began leaves the same stuck button -- the handler shows the
+    server's `detail` and hands the button back.  A string check on the
+    template is enough here; the Playwright smoke test loads the page for
+    real and would fail on a syntax error in the handler.
     """
     template = (
         Path(__file__).resolve().parent.parent / "vitalforge_dashboard" / "templates" / "index.html"
@@ -109,8 +113,14 @@ def test_dashboard_sync_handler_branches_on_link_required():
     handler = template[start:end]
     assert 'body.status === "link_required"' in handler
     assert "body.message" in handler
-    # The early return must come BEFORE the poll is scheduled.
-    assert handler.index("return;") < handler.index("setInterval(")
+    assert "!res.ok" in handler
+    assert "body.detail" in handler
+    assert "Sync not available" in handler
+    # Both early returns must come BEFORE the poll is scheduled.
+    poll = handler.index("setInterval(")
+    assert handler.index("return;") < poll
+    assert handler.index("!res.ok") < poll
+    assert handler.index("return;", handler.index("!res.ok")) < poll
 
 
 async def test_sync_status_does_not_leak_another_persons_sync(

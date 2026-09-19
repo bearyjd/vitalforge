@@ -1,10 +1,18 @@
+from __future__ import annotations
+
 import asyncio
 import logging
 import os
 from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING, Any, Callable
 
 from shared import garmin_registry
 from shared.database import get_db
+
+if TYPE_CHECKING:
+    # Annotation only: the registry hands each op its client; nothing here
+    # may hold or authenticate one.
+    from garminconnect import Garmin
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +95,9 @@ def _stop_reason(exc: Exception) -> str | None:
     return None
 
 
-async def _fetch_metric(person_id: int, label: str, op, skipped: list[str]):
+async def _fetch_metric(
+    person_id: int, label: str, op: Callable[[Garmin], Any], skipped: list[str]
+) -> Any | None:
     """Read one metric; a failed read is skipped so the rest of the date syncs.
 
     Only a failure that makes every further read pointless propagates (see
@@ -266,7 +276,7 @@ async def sync_date(date_str: str, person_id: int) -> int:
     return len(skipped)
 
 
-async def sync_weight_history(start_date: str, end_date: str, person_id: int):
+async def sync_weight_history(start_date: str, end_date: str, person_id: int) -> None:
     """Pull weight data from Garmin and store in weight_history table."""
     data = await garmin_registry.call_paced(
         person_id, lambda client: client.get_weigh_ins(start_date, end_date)
@@ -302,7 +312,7 @@ async def sync_weight_history(start_date: str, end_date: str, person_id: int):
                 )
 
 
-async def run_sync(days: int = 7, *, person_id: int):
+async def run_sync(days: int = 7, *, person_id: int) -> str:
     """Run a full sync for the given number of days back from today."""
     logger.info("Starting sync for person %s, last %d days", person_id, days)
     start_time = datetime.now(timezone.utc)
@@ -440,7 +450,7 @@ class SyncRegistry:
             self._counts.pop(person_id, None)
 
 
-async def scheduled_sync(lock: asyncio.Lock, registry: SyncRegistry):
+async def scheduled_sync(lock: asyncio.Lock, registry: SyncRegistry) -> None:
     """Background loop that syncs every SYNC_INTERVAL_HOURS.
 
     Takes the same lock `/api/sync`'s manual trigger holds during `run_sync`

@@ -706,9 +706,10 @@ async def _resume_link(person_id: int, generation: int, email: str) -> Garmin:
     """Cold-load a durable generation's token store and take its second permit."""
     token_dir = resolve_token_dir(person_id, generation)
     try:
-        # Login alone moves off the event loop. Garmin operations stay
-        # synchronous here because existing write-race reasoning relies on
-        # that behavior; this change does not widen it.
+        # Only the login moves off the event loop.  The operation itself runs
+        # synchronously in _run_operation, so two Garmin writes for one
+        # person cannot interleave inside one call() -- the write-race
+        # reasoning in the weight and activity routes relies on that.
         client = await asyncio.to_thread(garmin_client.authenticate, person_id, generation, token_dir, email, None)
     except Exception as exc:
         code = _error_code(exc)

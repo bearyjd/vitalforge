@@ -443,14 +443,26 @@
             try {
                 const res = await fetch(`${API_BASE}/sync`, { method: "POST" });
                 const body = await res.json().catch(() => null);
+                const el = document.getElementById("syncInfo");
                 if (body && body.status === "link_required") {
                     // Nothing was started: this person has no usable Garmin
                     // link, so there is no run to poll for and no data to
                     // reload. Show the server's message where the last-sync
                     // time normally goes and hand the button back.
-                    const el = document.getElementById("syncInfo");
                     el.classList.remove("syncing");
                     el.textContent = body.message || "Link Garmin before syncing";
+                    btn.disabled = false; btn.textContent = "Sync";
+                    return;
+                }
+                if (!res.ok) {
+                    // A 409 (a sync is already running), 401/403 or 5xx
+                    // started nothing either; polling for a run that never
+                    // began would leave the button stuck at "Syncing...".
+                    el.classList.remove("syncing");
+                    // `detail` is a string for the route's own errors and a
+                    // list for a validation error; only show the former.
+                    const detail = body && body.detail;
+                    el.textContent = typeof detail === "string" ? detail : "Sync not available";
                     btn.disabled = false; btn.textContent = "Sync";
                     return;
                 }
