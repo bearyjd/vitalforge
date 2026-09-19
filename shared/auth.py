@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import time
+from collections import deque
 from datetime import datetime, timezone
 from typing import Literal, NamedTuple
 
@@ -501,14 +502,42 @@ def require_person(level: str):
     return dependency
 
 
+_STEP_UP_FAILURE_LIMIT = 5
+_STEP_UP_WINDOW_SECONDS = 15 * 60
+# Per-process, per-user timestamps of failed step-ups.  In-memory on purpose:
+# a step-up already requires a valid session, so this only slows a stolen
+# cookie down; the durable per-user window in garmin_link_attempts still
+# bounds what a successful step-up can do with Garmin.
+_step_up_failures: dict[int, deque[float]] = {}
+
+
+def _step_up_retry_after(user_id: int, now: float) -> int | None:
+    failures = _step_up_failures.get(user_id)
+    if not failures:
+        return None
+    while failures and failures[0] <= now - _STEP_UP_WINDOW_SECONDS:
+        failures.popleft()
+    if len(failures) < _STEP_UP_FAILURE_LIMIT:
+        return None
+    return max(1, int(failures[0] + _STEP_UP_WINDOW_SECONDS - now) + 1)
+
+
 async def _require_step_up(identity: _Identity, current_password: str):
+    if identity.user_id is None:
+        raise HTTPException(status_code=401, detail="Current password incorrect")
+    now = time.time()
+    retry_after = _step_up_retry_after(identity.user_id, now)
+    if retry_after is not None:
+        raise HTTPException(status_code=429, detail="Too many attempts", headers={"Retry-After": str(retry_after)})
     verified = await _authenticate_credentials(identity.username, current_password)
     if (
         verified is None
         or verified[0] != identity.user_id
         or verified[1] != identity.session_version
     ):
+        _step_up_failures.setdefault(identity.user_id, deque()).append(now)
         raise HTTPException(status_code=401, detail="Current password incorrect")
+    _step_up_failures.pop(identity.user_id, None)
 
 
 async def _authenticate_credentials(username: str, password: str) -> tuple[int, int] | None:
