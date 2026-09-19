@@ -22,8 +22,10 @@ SYNC_INTERVAL_HOURS = int(os.getenv("SYNC_INTERVAL_HOURS", "2"))
 # (a provider 429) gets worse with every extra call.
 _TERMINAL_OPERATION_CODES = frozenset({"auth_failed", "rate_limited"})
 # Results that end a sync early; none is an error count, and none should be
-# overwritten by one.
-_STOPPED_RESULTS = frozenset({"link_required", "auth_failed", "rate_limited"})
+# overwritten by one.  A failed cold login stops the run under whichever
+# code it failed with -- there is no session to continue on -- but only
+# ``auth_failed`` asks the person to relink; the rest retry next sync.
+_STOPPED_RESULTS = frozenset({"link_required", "auth_failed", "rate_limited", "network", "unknown"})
 
 
 async def has_usable_garmin_link(person_id: int) -> bool:
@@ -82,14 +84,19 @@ def _extract_sleep_score(dto: dict, sleep: dict) -> int | None:
 def _stop_reason(exc: Exception) -> str | None:
     """The result a failure ends the whole run with, or None to carry on.
 
-    No usable link, a token store that no longer resumes, and an operation
-    the provider rejected as unauthenticated or throttled all make every
-    further read pointless (or, for a throttle, actively harmful).
+    No usable link, a cold login that failed for any reason, and an
+    operation the provider rejected as unauthenticated or throttled all make
+    every further read pointless (or, for a throttle, actively harmful).
+
+    A failed login is reported by its own bounded code rather than as a
+    blanket ``auth_failed``: a transient 403, network error, or throttle
+    leaves the link intact and is retried at the next sync, and telling the
+    person to relink for one of those would be wrong.
     """
     if isinstance(exc, garmin_registry.GarminNotLinked):
         return "link_required"
     if isinstance(exc, garmin_registry.GarminAuthenticationError):
-        return "auth_failed"
+        return exc.code
     if isinstance(exc, garmin_registry.GarminOperationError) and exc.code in _TERMINAL_OPERATION_CODES:
         return exc.code
     return None

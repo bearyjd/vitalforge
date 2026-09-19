@@ -163,23 +163,50 @@ async def test_run_sync_skips_a_failed_metric_and_keeps_the_rest_of_the_date(
     assert provider_text not in caplog.text
 
 
-async def test_run_sync_stops_at_the_first_authentication_failure(initialized_db, monkeypatch):
-    """A token store that no longer resumes would otherwise cost one failed
-    login per metric per date; stop, record it, and skip weight history."""
+@pytest.mark.parametrize("code", ("auth_failed", "rate_limited", "network", "unknown"))
+async def test_run_sync_stops_at_the_first_authentication_failure(initialized_db, monkeypatch, code):
+    """A cold login that fails leaves no session, so every later read of the
+    run would repeat the same failed login; stop after the first one and
+    skip weight history.  The recorded result is the login's own bounded
+    code, not a blanket ``auth_failed``: a transient block (a 403, a network
+    error, a throttle) is retried at the next sync, and only a genuine
+    credential rejection asks the person to relink."""
     person_id = await get_primary_person_id()
     calls: list[int] = []
 
     async def dead_link(person_id, operation):
         calls.append(person_id)
-        raise garmin_registry.GarminAuthenticationError("auth_failed")
+        raise garmin_registry.GarminAuthenticationError(code)
 
     monkeypatch.setattr(sync.garmin_registry, "call_paced", dead_link)
 
     result = await sync.run_sync(days=3, person_id=person_id)
 
-    assert result == "auth_failed"
+    assert result == code
     assert calls == [person_id], "no further metric, date, or weight-history read after the failed login"
-    assert (await _sync_status(person_id))["last_sync_result"] == "auth_failed"
+    assert (await _sync_status(person_id))["last_sync_result"] == code
+
+
+async def test_run_sync_keeps_a_stop_result_over_an_earlier_error_count(initialized_db, monkeypatch):
+    """A metric skipped before the login fails must not turn the stop into
+    ``completed with 1 errors``: the stop result is the state the next sync
+    and the UI act on, and an error count would hide it."""
+    person_id = await get_primary_person_id()
+    calls: list[int] = []
+
+    async def skip_then_stop(person_id, operation):
+        calls.append(person_id)
+        if len(calls) == 1:
+            raise garmin_registry.GarminOperationError("network")
+        raise garmin_registry.GarminAuthenticationError("network")
+
+    monkeypatch.setattr(sync.garmin_registry, "call_paced", skip_then_stop)
+
+    result = await sync.run_sync(days=3, person_id=person_id)
+
+    assert result == "network"
+    assert len(calls) == 2, "the skipped metric's read, then the failed login, then nothing"
+    assert (await _sync_status(person_id))["last_sync_result"] == "network"
 
 
 @pytest.mark.parametrize("code", ("auth_failed", "rate_limited"))

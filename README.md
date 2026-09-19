@@ -298,8 +298,8 @@ echoed, and errors are bounded codes, not provider text:
 | `404` | No such person, no `manage` grant, bearer token, or anonymous caller — indistinguishable on purpose |
 | `409` | That Garmin account is already linked to a different person |
 | `422` | Malformed body (the rejected input is never echoed back) |
-| `429` | Rate limited — either the deployment-wide Garmin call spacing (`GARMIN_MIN_CALL_INTERVAL_SECONDS`) or the per-account link limit of 3 attempts per 15 minutes; honour `Retry-After` |
-| `502` | Garmin could not be reached or answered unexpectedly |
+| `429` | Rate limited — the deployment-wide Garmin call spacing (`GARMIN_MIN_CALL_INTERVAL_SECONDS`), the per-account link limit of 3 attempts per 15 minutes, or Garmin throttling the login itself; honour `Retry-After` |
+| `502` | Garmin could not be reached or answered unexpectedly — including a login that hit a network error or a transient block; retry |
 
 From a shell, reuse the `vf_session` cookie your browser holds after signing in (DevTools →
 Application → Cookies):
@@ -314,7 +314,10 @@ curl -sS https://health.example.com/p/alice/api/garmin/link \
 A link that Garmin later rejects (password changed, session revoked) is **not** re-tried with
 anything from `.env`: `status` reports `last_auth_error: "auth_failed"`, that person's syncs
 and weight pushes report `auth_failed` (an unlinked person's report `link_required`), and the
-fix is `relink`. Archiving a person removes their link and tokens.
+fix is `relink`. A login that merely hit a transient block, network error, or throttle also
+stops that sync, but reports its own code (`network`, `rate_limited`, `unknown`), leaves the
+link in place, and is simply retried at the next sync — only `auth_failed` needs a `relink`.
+Archiving a person removes their link and tokens.
 
 ## Deployment
 

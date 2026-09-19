@@ -23,6 +23,9 @@ _SAFE_AUTH_ERRORS = frozenset({"auth_failed", "rate_limited", "network", "unknow
 _CREDENTIAL_PATH_RE = re.compile(r"^/p/[^/]+/api/garmin/(?:link|relink|unlink)$")
 _ALLOW_INSECURE_LINKS_ENV = "VITALFORGE_ALLOW_INSECURE_GARMIN_LINKS"
 _TRUSTED_PROXY_IPS_ENV = "VITALFORGE_TRUSTED_PROXY_IPS"
+# A credential login Garmin throttled carries no provider wait of its own;
+# advertise one long enough to outlast a typical login-endpoint cooldown.
+_LOGIN_RATE_LIMIT_RETRY_AFTER_SECONDS = 60
 
 
 def is_garmin_credential_path(path: str) -> bool:
@@ -152,7 +155,18 @@ def _registry_http_error(exc: garmin_registry.GarminRegistryError) -> HTTPExcept
     if isinstance(exc, garmin_registry.GarminLinkInputError):
         return HTTPException(status_code=422, detail="Garmin link details are invalid")
     if isinstance(exc, garmin_registry.GarminAuthenticationError):
-        return HTTPException(status_code=401, detail="Garmin authentication failed")
+        # The login's bounded code, not its type, decides the answer: only a
+        # genuine credential rejection is a 401 that asks for new credentials.
+        # A throttled login has no retry_after of its own, so it advertises
+        # a fixed wait; a transient failure is the same 502 as any other.
+        if exc.code == "auth_failed":
+            return HTTPException(status_code=401, detail="Garmin authentication failed")
+        if exc.code == "rate_limited":
+            return HTTPException(
+                status_code=429,
+                detail="Garmin is temporarily rate limited",
+                headers={"Retry-After": str(_LOGIN_RATE_LIMIT_RETRY_AFTER_SECONDS)},
+            )
     return HTTPException(status_code=502, detail="Garmin operation failed")
 
 

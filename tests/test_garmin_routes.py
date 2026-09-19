@@ -501,17 +501,25 @@ async def test_credential_changes_reject_a_view_only_cookie_before_any_side_effe
         (garmin_registry.GarminSessionExpired(), 401, "Account changed; authenticate again", None),
         (garmin_registry.GarminLinkInputError(), 422, "Garmin link details are invalid", None),
         (garmin_registry.GarminAuthenticationError("auth_failed"), 401, "Garmin authentication failed", None),
+        (garmin_registry.GarminAuthenticationError("rate_limited"), 429, "Garmin is temporarily rate limited", "60"),
+        (garmin_registry.GarminAuthenticationError("network"), 502, "Garmin operation failed", None),
+        (garmin_registry.GarminAuthenticationError("unknown"), 502, "Garmin operation failed", None),
         (garmin_registry.GarminOperationError("network"), 502, "Garmin operation failed", None),
         (garmin_registry.GarminRegistryError("anything else"), 502, "Garmin operation failed", None),
     ],
-    ids=lambda value: type(value).__name__ if isinstance(value, Exception) else None,
+    ids=lambda value: (
+        f"{type(value).__name__}-{value.code}" if hasattr(value, "code") else type(value).__name__
+    ) if isinstance(value, Exception) else None,
 )
 def test_registry_http_error_maps_each_bounded_failure(exc, status, detail, retry_after):
     """Pins the registry-exception -> HTTP contract, including the fallback.
 
     The two rate-limit types are siblings, not parent/child, so both must be
     listed explicitly; each carries its own retry_after through to the
-    header. Everything unlisted -- including the base class -- must collapse
+    header. A credential login is answered by its bounded code, not its
+    type: only a genuine rejection is a 401, a throttled login is a 429 with
+    a fixed Retry-After, and a transient failure is the same 502 as any
+    other. Everything unlisted -- including the base class -- must collapse
     to the generic 502 rather than leak a more specific reason."""
     http_error = garmin_routes._registry_http_error(exc)
 
