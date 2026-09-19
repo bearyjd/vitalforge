@@ -67,6 +67,8 @@ _T = TypeVar("_T")
 _VALID_LINK_STATES = frozenset({"linked"})
 _LINK_ATTEMPT_LIMIT = 3
 _LINK_ATTEMPT_WINDOW_SECONDS = 15 * 60
+# The longest call() may sleep for a permit while holding a person flock.
+_MAX_INTERACTIVE_WAIT_SECONDS = 30.0
 
 
 def _utc_now() -> str:
@@ -614,7 +616,8 @@ async def _delete_link_row(person_id: int, actor_id: int, session_version: int) 
         if row is None:
             await db.rollback()
             return False
-        await asyncio.to_thread(_sweep_unreferenced_generation_dirs, person_id, int(row["generation"]))
+        # No filesystem work inside BEGIN IMMEDIATE: unlink() removes the
+        # whole person root once this has committed.
         await db.execute("DELETE FROM garmin_links WHERE person_id = ?", (person_id,))
         await db.commit()
         return True
@@ -646,7 +649,10 @@ async def call(
     sleep behind the deployment-wide interval.  The default ``0`` keeps the
     fail-fast behaviour interactive callers translate into a retry response;
     a small positive budget lets a user-facing push absorb the interval
-    instead of failing on every other tap.
+    instead of failing on every other tap.  That sleep happens while holding
+    the person flock, so same-person lifecycle routes and the scheduled sync
+    wait behind it; the budget is therefore clamped to
+    :data:`_MAX_INTERACTIVE_WAIT_SECONDS` whatever the caller asks for.
     """
     person_id = int(person_id)
     if person_id < 1:
@@ -654,6 +660,7 @@ async def call(
     max_wait_seconds = float(max_wait_seconds)
     if not max_wait_seconds >= 0.0:  # also rejects NaN
         raise ValueError("max_wait_seconds must be a non-negative number")
+    max_wait_seconds = min(max_wait_seconds, _MAX_INTERACTIVE_WAIT_SECONDS)
     try:
         async with person_flock(person_id):
             generation, email = await _usable_link(person_id)

@@ -283,9 +283,46 @@ async def test_call_waits_for_a_permit_only_within_its_budget(
     assert sleeps == expected_sleeps
 
 
-async def test_call_rejects_a_negative_wait_budget(initialized_db):
+@pytest.mark.parametrize("budget", (-1, float("nan")))
+async def test_call_rejects_a_negative_or_nan_wait_budget(initialized_db, budget):
     with pytest.raises(ValueError):
-        await garmin_registry.call(1, lambda _client: None, max_wait_seconds=-1)
+        await garmin_registry.call(1, lambda _client: None, max_wait_seconds=budget)
+
+
+@pytest.mark.parametrize(
+    "next_allowed_at, expected_sleeps, outcome",
+    ((130.0, [30], "succeeds"), (131.0, [], "rate_limited")),
+)
+async def test_call_clamps_an_unbounded_wait_budget_to_thirty_seconds(
+    initialized_db, monkeypatch, next_allowed_at, expected_sleeps, outcome
+):
+    """The wait happens while holding the person flock, so every same-person
+    lifecycle route and the scheduled sync queue behind it; a caller cannot
+    buy more than thirty seconds of that however large its budget."""
+    person_id = await get_primary_person_id()
+    await _link(person_id)
+    garmin_client._clients[(person_id, 1)] = _FakeClient(1)
+    clock = {"now": 100.0}
+    sleeps: list[float] = []
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: clock["now"])
+    monkeypatch.setenv("GARMIN_MIN_CALL_INTERVAL_SECONDS", "60")
+    await _set_next_allowed_at(next_allowed_at)
+
+    async def advance(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(garmin_registry.asyncio, "sleep", advance)
+
+    if outcome == "succeeds":
+        assert await garmin_registry.call(person_id, lambda client: client.generation, max_wait_seconds=float("inf")) == 1
+    else:
+        with pytest.raises(garmin_registry.GarminRateLimited) as exc_info:
+            await garmin_registry.call(
+                person_id, lambda _client: pytest.fail("must not call Garmin"), max_wait_seconds=float("inf")
+            )
+        assert exc_info.value.retry_after == 31
+    assert sleeps == expected_sleeps
 
 
 async def test_call_evicts_a_stale_generation_before_running_the_operation(initialized_db, monkeypatch):
@@ -1758,6 +1795,12 @@ async def test_unlink_removes_normal_link_after_commit_and_keeps_generation_ledg
     final = garmin_registry._generation_token_dir(person_id, 1)
     final.mkdir(parents=True, mode=0o700)
     (final / "garmin_tokens.json").touch()
+    # Residue of an earlier crash, unreferenced by any row: unlink removes the
+    # whole person root after its commit, so it needs no sweep of its own
+    # inside the transaction.
+    residue = garmin_registry._generation_token_dir(person_id, 7)
+    residue.mkdir(mode=0o700)
+    (residue / "garmin_tokens.json").touch()
     garmin_client._clients[(person_id, 1)] = _FakeClient(1)
 
     assert await garmin_registry.unlink(person_id, actor_id, 1)
@@ -1772,6 +1815,7 @@ async def test_unlink_removes_normal_link_after_commit_and_keeps_generation_ledg
     assert link is None
     assert ledger["generation"] == 1
     assert not final.exists()
+    assert not residue.exists()
     assert not garmin_registry._person_token_root(person_id).exists()
     assert not garmin_client._clients
 
