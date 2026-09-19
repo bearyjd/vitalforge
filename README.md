@@ -407,7 +407,11 @@ This release moves Garmin from one deployment-wide credential in `.env` to a lin
    published as the primary person's link. This happens exactly once and is recorded in the
    database: unlinking later, or restoring an old `.garth` backup, never re-adopts it. If
    `GARMIN_EMAIL` is unset or the store no longer resumes, nothing is adopted and the primary
-   person starts unlinked — link from the browser. Only the primary person is ever adopted.
+   person starts unlinked — link from the browser. Only the primary person is ever adopted. A
+   *transient* verification failure (Garmin unreachable, rate-limited, and so on) leaves the
+   flat store exactly where it was and is retried only at the next boot — adoption is not
+   retried while the container keeps running, so restart it if you expect adoption and the
+   primary comes up unlinked.
 4. **`GARMIN_PASSWORD` is no longer read.** A token Garmin later rejects is not re-logged-in
    from `.env`; the person's status shows `auth_failed` and the fix is the `relink` route.
    Remove `GARMIN_PASSWORD` from `.env`; `GARMIN_EMAIL` can go once step 3 has happened.

@@ -396,9 +396,9 @@ async def link(
         # Garmin budget. The final durable reservation below remains the
         # concurrency authority before any credential reaches Garmin.
         await check_link_attempt_quota(actor_id)
-        # Reserve before taking the lifecycle flock.  BEGIN IMMEDIATE must
-        # never wait behind a flock holder that will itself need SQLite; this
-        # order keeps the two cross-process authorities deadlock-free.
+        # Reserve before taking the lifecycle flock.  Harmless, but the
+        # invariant kept is the reverse of "BEGIN IMMEDIATE must never wait
+        # behind a flock holder": no write transaction outlives a flock wait.
         await reserve_call_permit()
         async with person_flock(person_id):
             return await _link_locked(person_id, actor_id, session_version, canonical_email, password)
@@ -748,8 +748,8 @@ async def _note_operation_failure(person_id: int, generation: int, exc: BaseExce
 
 
 # A synchronous op runs to completion on its worker thread: cancelling the
-# awaiting task (shutdown only) releases the person flock while the provider
-# call may still land, and the callers' outcome claim bounds any duplicate.
+# awaiting task (shutdown only) releases the flock while the thread still
+# holds the shared, non-thread-safe Session; the caller's claim bounds it.
 async def _run_operation(
     person_id: int, generation: int, client: Garmin, op: Callable[[Garmin], _T | Awaitable[_T]]
 ) -> _T:

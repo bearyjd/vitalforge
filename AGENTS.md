@@ -111,8 +111,9 @@ docker-compose.prod.yml   # PROD — pulls prebuilt images from Docker Hub / GHC
   `bootstrap_legacy_token_store()` (the last bootstrap step in both lifespans) verifies the old flat
   store resumes, physically moves it to `person-<id>/generation-1/garmin_tokens.json`,
   publishes the primary person's link as state `linked`, and commits the
-  `legacy-garth-store-adopted` marker in `auth_migrations` — all under
-  `legacy_store_flock`. The marker, not the file, is what makes it one-time: unlink,
+  `legacy-garth-store-adopted` marker in `auth_migrations` — under `legacy_store_flock`
+  with `person_flock` taken inside it (never the reverse; no path takes them the other
+  way round). The marker, not the file, is what makes it one-time: unlink,
   archive, or a restored `.garth` backup never re-adopts. `GARMIN_EMAIL` is read only
   here (it becomes the adopted link's `garmin_email`); `GARMIN_PASSWORD` is read nowhere.
   The `legacy_bound`/`legacy_disabled` link states are retired — only `linked` exists —

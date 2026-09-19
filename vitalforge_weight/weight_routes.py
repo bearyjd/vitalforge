@@ -208,11 +208,10 @@ def add_weight_routes(app):
 
         # Atomic: read for a duplicate and (if any) write inside one transaction,
         # so two concurrent requests can never both observe "no duplicate". The
-        # Garmin push happens after COMMIT, outside the lock -- see
-        # docs/prp/00-design.md SS3.7 for why (it is a provider round-trip in a
-        # worker thread, bounded only by garminconnect's own per-request
-        # timeouts, so it must never sit inside the write lock; the claim in
-        # garmin_claim.py is what makes pushing after COMMIT safe).
+        # Garmin push happens after COMMIT, outside the lock -- it is a provider
+        # round-trip in a worker thread, bounded only by garminconnect's own
+        # per-request timeouts, so it must never sit inside the write lock; see
+        # garmin_claim.py for the claim that makes pushing after COMMIT safe.
         db = await get_db()
         try:
             await db.execute("BEGIN IMMEDIATE")
