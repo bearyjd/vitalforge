@@ -1002,3 +1002,20 @@ async def test_admin_persons_page_never_assigns_server_data_to_innerhtml(client)
     assert not re.search(r"\.innerHTML\s*=", html), "server data is being assigned to innerHTML"
     assert "td.textContent = text;" in html
     assert "opt.textContent = u.username;" in html
+
+
+async def test_patch_still_accepts_the_retired_acknowledge_flag(client):
+    # Setup copied from the existing promotion test in this file (admin user,
+    # second person, admin session cookie).  Keep it identical.
+    _, cookies = await _as("root", role="admin")
+    created = (
+        await client.post("/api/persons", json={"display_name": "Bryn"}, cookies=cookies)
+    ).json()
+
+    response = await client.patch(
+        f"/api/persons/{created['id']}",
+        json={"is_primary": True, "acknowledge_garmin_reassignment": True},
+        cookies=cookies,
+    )
+    assert response.status_code == 200, response.text
+    assert "acknowledge_garmin_reassignment" not in response.json()

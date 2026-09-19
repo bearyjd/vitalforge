@@ -89,6 +89,12 @@ class UpdatePersonIn(BaseModel):
     # get_primary_person_id() raises when there is none, and scheduled_sync
     # still depends on it through Phase 3 (plan D3).
     is_primary: bool | None = None
+    # Retired in Phase 3 (per-person links made the cross-person Garmin
+    # reassignment impossible).  Accepted and ignored for one release so a
+    # PATCH written against the old 409 guidance ("re-send with
+    # acknowledge_garmin_reassignment: true") does not now fail as a whole
+    # under extra="forbid".  Remove after the next release.
+    acknowledge_garmin_reassignment: bool | None = None
 
 
 class GrantIn(BaseModel):
