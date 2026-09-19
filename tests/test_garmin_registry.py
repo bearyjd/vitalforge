@@ -5,6 +5,7 @@ import logging
 import threading
 
 import pytest
+import requests
 from fastapi import FastAPI
 from garminconnect import (
     GarminConnectAuthenticationError,
@@ -421,6 +422,37 @@ async def test_auth_failure_is_persisted_as_a_bounded_code_without_raw_exception
     assert row["last_auth_error_at"] is not None
 
 
+async def test_cold_login_blocked_by_a_wrapped_403_is_reported_as_network(initialized_db, monkeypatch):
+    """garminconnect re-raises a failed post-login profile fetch as its
+    authentication error ``from`` the real failure.  A Cloudflare 403 there
+    is a transient block, not a rejected token store: the link must keep
+    its health and the caller must not be told to re-link."""
+    person_id = await get_primary_person_id()
+    await _link(person_id)
+
+    def blocked_resume(*_args):
+        raise _caused_by(
+            GarminConnectAuthenticationError("Failed to retrieve social profile"),
+            GarminConnectConnectionError("API Error 403 - Forbidden"),
+        )
+
+    monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", blocked_resume)
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
+
+    with pytest.raises(garmin_registry.GarminAuthenticationError) as exc_info:
+        await garmin_registry.call(person_id, lambda _client: None)
+    assert exc_info.value.code == "network"
+
+    db = await get_db()
+    try:
+        row = await (
+            await db.execute("SELECT last_auth_error FROM garmin_links WHERE person_id = ?", (person_id,))
+        ).fetchone()
+    finally:
+        await db.close()
+    assert row["last_auth_error"] == "network"
+
+
 async def test_cold_call_reserves_separate_intervals_for_login_and_operation(initialized_db, monkeypatch):
     person_id = await get_primary_person_id()
     await _link(person_id)
@@ -629,6 +661,38 @@ async def test_bootstrap_restores_the_flat_store_when_publication_fails(
     assert not await _adoption_marker_recorded()
     assert sentinel not in caplog.text
     assert "RuntimeError" in caplog.text
+
+
+async def test_bootstrap_cancelled_after_publication_leaves_the_moved_store_in_place(
+    initialized_db, monkeypatch, tmp_path
+):
+    """Once the linked row and its marker are committed, they expect the
+    token file under generation-1; a cancellation arriving after that commit
+    must not move it back to a flat root nothing will ever read again."""
+    root = _flat_store(tmp_path)
+    person_id = await get_primary_person_id()
+    calls: list[tuple[int, int]] = []
+    real_publish = garmin_registry_runtime._publish_legacy_adoption
+
+    async def publish_then_cancel(*args):
+        assert await real_publish(*args) is True
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", root)
+    monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _fake_auth(calls))
+    monkeypatch.setattr(garmin_registry_runtime, "_publish_legacy_adoption", publish_then_cancel)
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
+    monkeypatch.setenv("GARMIN_EMAIL", f"person-{person_id}@example.test")
+
+    with pytest.raises(asyncio.CancelledError):
+        await garmin_registry.bootstrap_legacy_token_store()
+
+    assert calls == [(person_id, 1)]
+    durable = garmin_registry._generation_token_dir(person_id, 1)
+    assert (durable / "garmin_tokens.json").read_text(encoding="ascii") == "{}"
+    assert not (root / "garmin_tokens.json").exists()
+    assert tuple(await _link_row(person_id)) == ("linked", f"person-{person_id}@example.test", 1)
+    assert await _adoption_marker_recorded()
 
 
 @pytest.mark.parametrize("prior", ("link_row", "ledger_row", "conflicting_email"))
@@ -1970,6 +2034,17 @@ def _with_response(exc: Exception, status_code: int) -> Exception:
     return exc
 
 
+def _caused_by(wrapped: Exception, cause: Exception) -> Exception:
+    """Chain ``wrapped`` from ``cause`` the way a ``raise ... from e`` does."""
+    try:
+        raise cause
+    except Exception as chained:
+        try:
+            raise wrapped from chained
+        except Exception as result:
+            return result
+
+
 @pytest.mark.parametrize(
     "exc, code",
     (
@@ -2004,6 +2079,99 @@ def _with_response(exc: Exception, status_code: int) -> Exception:
         (GarminConnectNotFoundError("API Error 404 - no data"), "unknown"),
         (TimeoutError("read timed out"), "network"),
         (RuntimeError("HTTP 401 mentioned by an unrelated error"), "unknown"),
+        # Garmin._load_profile_and_settings re-raises whatever broke its three
+        # profile/settings fetches as GarminConnectAuthenticationError(...)
+        # from e -- a Cloudflare block, an outage, a dropped connection -- so
+        # the wrapper's type is not a credential verdict; the cause is.
+        (
+            _caused_by(
+                GarminConnectAuthenticationError("Failed to retrieve social profile"),
+                GarminConnectConnectionError("API Error 403 - Forbidden"),
+            ),
+            "network",
+        ),
+        (
+            _caused_by(
+                GarminConnectAuthenticationError("Failed to retrieve user settings"),
+                GarminConnectConnectionError("API Error 503 - Service Unavailable"),
+            ),
+            "network",
+        ),
+        (
+            _caused_by(
+                GarminConnectAuthenticationError("Failed to retrieve social profile"),
+                ConnectionError("Connection reset by peer"),
+            ),
+            "network",
+        ),
+        (
+            _caused_by(
+                GarminConnectAuthenticationError("Failed to retrieve social profile"),
+                requests.exceptions.ConnectionError("HTTPSConnectionPool: Max retries exceeded"),
+            ),
+            "network",
+        ),
+        (
+            _caused_by(
+                GarminConnectAuthenticationError("Failed to retrieve user settings"),
+                GarminConnectTooManyRequestsError("Rate limit exceeded: API Error 429"),
+            ),
+            "rate_limited",
+        ),
+        (
+            _caused_by(
+                GarminConnectAuthenticationError("Failed to retrieve social profile"),
+                GarminConnectConnectionError("API Error 401 - Unauthorized"),
+            ),
+            "auth_failed",
+        ),
+        (GarminConnectAuthenticationError("Invalid profile data found"), "auth_failed"),
+        # Garmin.login() also chains its own credential verdicts from a cause
+        # it judged by text alone ("unauthorized", "login failed").  A cause
+        # with no HTTP status, throttle type or transport type of its own
+        # carries no verdict to override that judgement with.
+        (
+            _caused_by(
+                GarminConnectAuthenticationError("Authentication failed: Widget login: server error 'Unauthorized'"),
+                GarminConnectConnectionError("Widget login: server error 'Unauthorized'"),
+            ),
+            "auth_failed",
+        ),
+        (
+            _caused_by(
+                GarminConnectAuthenticationError("Failed to retrieve social profile"),
+                ValueError("Expecting value: line 1 column 1 (char 0)"),
+            ),
+            "auth_failed",
+        ),
+        # requests' own decode error is a RequestException, so a non-JSON body
+        # (a maintenance page) is the transport's verdict, not a credential one.
+        (
+            _caused_by(
+                GarminConnectAuthenticationError("Failed to retrieve social profile"),
+                requests.exceptions.JSONDecodeError("Expecting value", "", 0),
+            ),
+            "network",
+        ),
+        (
+            _caused_by(
+                GarminConnectAuthenticationError("Authentication failed: Not authenticated"),
+                GarminConnectAuthenticationError("Not authenticated"),
+            ),
+            "auth_failed",
+        ),
+        # The walk skips an intermediate authentication error to reach the
+        # cause that carries the verdict.
+        (
+            _caused_by(
+                GarminConnectAuthenticationError("Failed to retrieve social profile"),
+                _caused_by(
+                    GarminConnectAuthenticationError("Authentication failed: API Error 403"),
+                    GarminConnectConnectionError("API Error 403 - Forbidden"),
+                ),
+            ),
+            "network",
+        ),
     ),
 )
 def test_error_code_classifies_real_garminconnect_exceptions(exc, code):

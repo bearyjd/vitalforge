@@ -58,7 +58,7 @@ def _error_code(exc: Exception) -> str:
     if isinstance(exc, GarminConnectTooManyRequestsError):
         return "rate_limited"
     if isinstance(exc, GarminConnectAuthenticationError):
-        return "auth_failed"
+        return _wrapped_auth_error_code(exc)
     if isinstance(exc, GarminConnectNotFoundError):
         # A missing resource is neither a connectivity nor a credential
         # problem; "network" would send an operator chasing the wrong fault.
@@ -66,6 +66,51 @@ def _error_code(exc: Exception) -> str:
     if isinstance(exc, GarminConnectConnectionError):
         return _http_status_code(_http_status(exc) or _http_status_from_message(exc), default="network")
     return _http_status_code(_http_status(exc), default=_error_code_from_type(exc))
+
+
+def _wrapped_auth_error_code(exc: GarminConnectAuthenticationError) -> str:
+    """The library's authentication error is a credential verdict only when it stands alone.
+
+    ``Garmin._load_profile_and_settings`` re-raises whatever broke its
+    profile fetch as ``GarminConnectAuthenticationError(...) from e`` -- a
+    Cloudflare 403, a 503, a dropped connection -- so a cold token-store
+    resume on a flaky network would otherwise stop a sync, answer 401 and
+    ask for a re-link over something a retry fixes.  ``Garmin.login()``
+    chains the same type from a cause it judged by message text alone
+    ("unauthorized", "login failed"); that judgement stands unless the cause
+    carries a verdict of its own (an HTTP status, a throttle or not-found
+    type, a transport error); a chain made only of authentication errors
+    is no cause at all.
+    """
+    cause = _first_foreign_cause(exc)
+    if cause is None or not _carries_own_verdict(cause):
+        return "auth_failed"
+    return _error_code(cause)
+
+
+def _first_foreign_cause(exc: BaseException) -> Exception | None:
+    """The nearest explicit ``__cause__`` that is not another authentication error.
+
+    Only ``__cause__`` is followed: ``__context__`` would let an unrelated
+    exception that happened to be in flight decide a credential verdict.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc.__cause__
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if not isinstance(current, GarminConnectAuthenticationError):
+            return current if isinstance(current, Exception) else None
+        current = current.__cause__
+    return None
+
+
+def _carries_own_verdict(cause: Exception) -> bool:
+    """Whether :func:`_error_code` would classify ``cause`` on evidence, not on a default."""
+    if isinstance(cause, (GarminConnectTooManyRequestsError, GarminConnectNotFoundError)):
+        return True
+    if isinstance(cause, GarminConnectConnectionError):
+        return (_http_status(cause) or _http_status_from_message(cause)) is not None
+    return _http_status(cause) is not None or isinstance(cause, (ConnectionError, TimeoutError, OSError))
 
 
 def _http_status_code(status: int | None, *, default: str) -> str:
@@ -482,18 +527,25 @@ async def _warn_about_orphaned_moved_stores(root: Path, primary_id: int) -> None
 
 
 async def _adopt_flat_store(person_id: int, canonical_email: str, root: Path, durable: Path) -> bool:
-    """Verify, move, then publish; a failed publication puts the file back."""
+    """Verify, move, then publish; a failed publication puts the file back.
+
+    A cancellation never does: after the commit the ``linked`` row expects
+    the file under ``generation-1``, and before it the moved file is exactly
+    what the interrupted-adoption branch of :func:`_adopt_for_person_locked`
+    completes at the next boot.
+    """
     if not await _verify_token_store(person_id, canonical_email, root):
         return False
     source = token_file_path(str(root))
     target = token_file_path(str(durable))
     await asyncio.to_thread(_move_token_file, source, target)
-    published = False
     try:
         published = await _publish_legacy_adoption(person_id, canonical_email)
-    finally:
-        if not published:
-            await asyncio.to_thread(_restore_token_file, target, source)
+    except Exception:
+        await asyncio.to_thread(_restore_token_file, target, source)
+        raise
+    if not published:
+        await asyncio.to_thread(_restore_token_file, target, source)
     return published
 
 
