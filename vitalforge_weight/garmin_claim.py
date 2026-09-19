@@ -19,15 +19,26 @@ logger = logging.getLogger(__name__)
 # presumed dead and the row may be re-claimed: a possible duplicate after a
 # crash beats a weigh-in stranded unpushable forever.
 #
-# This value is only safe while the push is SYNCHRONOUS. A claim going stale
+# This value is only safe while no push can outlive it. A claim going stale
 # underneath a still-running push would let a retry re-claim and duplicate --
-# the exact failure the claim exists to prevent. That cannot happen today
-# because push_weight blocks the event loop for its whole duration, so while a
-# push is in flight nothing else runs to re-claim anything. That is a property
-# of the current deployment, NOT something this code enforces, and it is the
-# same class of reasoning that made the original double push look impossible.
-# If push_weight ever moves to a thread or worker pool, this constant MUST be
-# bounded by a hard push timeout -- garminconnect sets none of its own.
+# the exact failure the claim exists to prevent. The push runs in a worker
+# thread (garmin_registry.call hands a synchronous op to asyncio.to_thread),
+# so other requests DO run while it is in flight; what keeps them from
+# re-claiming is that garminconnect==0.3.11 bounds every request itself:
+# Client._run_request defaults to timeout=15, the SSO/login paths use
+# timeout=30, and retry_attempts=3 with backoff capped at 10 s puts one API
+# call at roughly 70 s worst case (a 401 re-login adds one more SSO round
+# trip) -- far inside these 600 s. Re-check those library defaults when
+# bumping garminconnect; shared/garmin_client.py constructs Garmin() with
+# them unchanged.
+#
+# Do NOT try to enforce this from the loop with asyncio.wait_for around the
+# op. Cancelling the awaiting coroutine cannot stop the worker thread; it
+# would only clear the claim while the push may still land at Garmin, which
+# turns a slow push into a guaranteed duplicate on the next retry. The same
+# holds for a cancellation mid-op (shutdown only -- uvicorn/Starlette do not
+# cancel handlers on client disconnect): the thread finishes after the person
+# flock is released, and this claim is what bounds it.
 #
 # Ten minutes is also short enough that a crashed process cannot strand a row
 # or session unpushable for a meaningful time. The claim is a mutual-exclusion

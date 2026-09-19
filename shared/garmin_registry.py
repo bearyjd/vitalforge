@@ -747,6 +747,9 @@ async def _note_operation_failure(person_id: int, generation: int, exc: BaseExce
     return code
 
 
+# A synchronous op runs to completion on its worker thread: cancelling the
+# awaiting task (shutdown only) releases the person flock while the provider
+# call may still land, and the callers' outcome claim bounds any duplicate.
 async def _run_operation(
     person_id: int, generation: int, client: Garmin, op: Callable[[Garmin], _T | Awaitable[_T]]
 ) -> _T:
