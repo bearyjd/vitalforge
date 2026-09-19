@@ -18,8 +18,8 @@ from pydantic import BaseModel, ConfigDict, SecretStr
 from shared import auth, garmin_registry
 from shared.auth import Identity, require_cookie_session_identity, require_person
 from shared.database import get_db
+from shared.garmin_registry_errors import REGISTRY_ERROR_CODES as _SAFE_AUTH_ERRORS
 
-_SAFE_AUTH_ERRORS = frozenset({"auth_failed", "rate_limited", "network", "unknown"})
 _CREDENTIAL_PATH_RE = re.compile(r"^/p/[^/]+/api/garmin/(?:link|relink|unlink)$")
 _ALLOW_INSECURE_LINKS_ENV = "VITALFORGE_ALLOW_INSECURE_GARMIN_LINKS"
 _TRUSTED_PROXY_IPS_ENV = "VITALFORGE_TRUSTED_PROXY_IPS"

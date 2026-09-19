@@ -9,7 +9,29 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-_ERROR_CODES = frozenset({"auth_failed", "rate_limited", "network", "unknown"})
+REGISTRY_ERROR_CODES = frozenset({"auth_failed", "rate_limited", "network", "unknown"})
+_ERROR_CODES = REGISTRY_ERROR_CODES  # alias; remove after the next release
+
+LEGACY_GARMIN_TARGET_RETIRED_ERROR = "legacy_target_retired"
+
+# Every value strength_sessions.garmin_error may hold.  APPEND-ONLY: migration
+# 004 rewrites any historic value outside this tuple to 'unknown' on databases
+# that have not run it yet, so removing an entry would redact live rows.
+STRENGTH_GARMIN_ERROR_CODES: tuple[str, ...] = (
+    "auth_failed",
+    "link_required",
+    "rate_limited",
+    "network",
+    "unknown",
+    LEGACY_GARMIN_TARGET_RETIRED_ERROR,
+    "activity_preparation_failed",
+    "activity_push_failed",
+    "activity_push_outcome_unknown",
+    "activity_sets_upload_failed",
+    "activity_reconciliation_failed",
+    "activity_reconciliation_pending",
+    "activity_outcome_record_failed",
+)
 
 
 class GarminRegistryError(RuntimeError):

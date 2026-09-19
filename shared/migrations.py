@@ -16,6 +16,12 @@ from typing import Awaitable, Callable
 import aiosqlite
 
 from shared.database import _grant_primary_person_to_first_admin, get_db
+from shared.garmin_registry_errors import (
+    LEGACY_GARMIN_TARGET_RETIRED_ERROR as _LEGACY_GARMIN_TARGET_RETIRED_ERROR,
+)
+from shared.garmin_registry_errors import (
+    STRENGTH_GARMIN_ERROR_CODES as _SAFE_STRENGTH_GARMIN_ERRORS,
+)
 from shared.slugs import RESERVED_SLUGS, slugify
 
 logger = logging.getLogger(__name__)
@@ -67,23 +73,6 @@ _REBUILD_TABLES = [
     "sleep", "resting_hr", "hrv", "body_battery", "stress",
     "vo2max", "weight_history", "training_load", "steps", "active_calories",
 ]
-
-_LEGACY_GARMIN_TARGET_RETIRED_ERROR = "legacy_target_retired"
-_SAFE_STRENGTH_GARMIN_ERRORS = (
-    "auth_failed",
-    "link_required",
-    "rate_limited",
-    "network",
-    "unknown",
-    _LEGACY_GARMIN_TARGET_RETIRED_ERROR,
-    "activity_preparation_failed",
-    "activity_push_failed",
-    "activity_push_outcome_unknown",
-    "activity_sets_upload_failed",
-    "activity_reconciliation_failed",
-    "activity_reconciliation_pending",
-    "activity_outcome_record_failed",
-)
 
 
 def now_iso() -> str:

@@ -18,6 +18,9 @@ from shared.auth import (
 from shared.database import (
     get_db,
 )
+from shared.garmin_registry_errors import (
+    LEGACY_GARMIN_TARGET_RETIRED_ERROR as _LEGACY_GARMIN_TARGET_RETIRED_ERROR,
+)
 from vitalforge_weight.activity_garmin import (
     ActivityPushOutcome,
     _activity_name,
@@ -68,7 +71,6 @@ _ACTIVITY_CONFLICT_FIELDS = (
 # should_attempt_garmin_push's shape for weight. A client that wants a
 # session on Garmin must say so on the FIRST post of that session_id.
 _RETRYABLE_GARMIN_STATUSES = ("pending", "failed")
-_LEGACY_GARMIN_TARGET_RETIRED_ERROR = "legacy_target_retired"
 
 
 def _normalise_since(since: str) -> str:

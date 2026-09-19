@@ -21,6 +21,7 @@ from shared.garmin_client import (
     build_exercise_sets_payload,
     extract_activity_id,
 )
+from shared.garmin_registry_errors import STRENGTH_GARMIN_ERROR_CODES
 
 logger = logging.getLogger(__name__)
 
@@ -66,21 +67,7 @@ _SETS_UPLOAD_FAILED = "activity_sets_upload_failed"
 _RECONCILIATION_FAILED = "activity_reconciliation_failed"
 _RECONCILIATION_PENDING = "activity_reconciliation_pending"
 _OUTCOME_RECORD_FAILED = "activity_outcome_record_failed"
-_SAFE_GARMIN_ERROR_CODES = frozenset({
-    "auth_failed",
-    "link_required",
-    "rate_limited",
-    "network",
-    "unknown",
-    "legacy_target_retired",
-    _PREPARATION_FAILED,
-    _PUSH_FAILED,
-    _PUSH_OUTCOME_UNKNOWN,
-    _SETS_UPLOAD_FAILED,
-    _RECONCILIATION_FAILED,
-    _RECONCILIATION_PENDING,
-    _OUTCOME_RECORD_FAILED,
-})
+_SAFE_GARMIN_ERROR_CODES = frozenset(STRENGTH_GARMIN_ERROR_CODES)
 
 
 def bounded_garmin_error(error: object) -> str | None:
