@@ -575,6 +575,7 @@ async def test_bootstrap_adopts_a_verified_flat_store_once_by_moving_it(
     assert not (root / "garmin_tokens.json").exists(), "the flat store must be moved, not copied"
     assert (durable / "garmin_tokens.json").read_text(encoding="ascii") == "{}"
     assert durable.stat().st_mode & 0o777 == 0o700
+    assert oct(garmin_registry._person_token_root(person_id).stat().st_mode & 0o777) == oct(0o700)
     # The verification client's persistence path is the flat root; it must not
     # stay cached and dump a refreshed token there later.
     assert (person_id, 1) not in garmin_client._clients

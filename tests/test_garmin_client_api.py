@@ -161,3 +161,27 @@ def test_exercise_categories_are_available_for_model_validation():
     # UNKNOWN is deliberately NOT a category in this catalog -- the correct
     # "I don't know the variant" encoding is a known category with name=None.
     assert "UNKNOWN" not in CATEGORIES
+
+
+def test_ensure_token_dir_leaves_an_existing_parent_mode_alone(tmp_path):
+    from shared.garmin_client import _ensure_token_dir
+
+    data_root = tmp_path / "data"
+    data_root.mkdir(mode=0o755)
+    token_root = data_root / ".garth"
+
+    _ensure_token_dir(token_root)
+
+    assert oct(data_root.stat().st_mode & 0o777) == oct(0o755), "the volume root must not be tightened"
+    assert oct(token_root.stat().st_mode & 0o777) == oct(0o700)
+
+
+def test_ensure_token_dir_creates_missing_ancestors_privately(tmp_path):
+    from shared.garmin_client import _ensure_token_dir
+
+    generation = tmp_path / "garth" / "person-7" / "generation-2"
+
+    _ensure_token_dir(generation)
+
+    assert oct((tmp_path / "garth" / "person-7").stat().st_mode & 0o777) == oct(0o700)
+    assert oct(generation.stat().st_mode & 0o777) == oct(0o700)

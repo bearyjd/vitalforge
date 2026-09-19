@@ -21,16 +21,21 @@ _clients: dict[tuple[int, int], Garmin] = {}
 
 
 def _ensure_token_dir(token_dir: Path) -> Path:
-    """Create a token-store directory and its parent with private modes.
+    """Create a token-store directory privately without touching what exists above it.
 
-    The asynchronous registry chooses ``token_dir`` after checking the
-    person-scoped link.  Keeping this filesystem-only helper here means this
-    module never needs a database import.  ``exist_ok`` does not tighten an
-    existing directory, therefore both levels are chmod'ed explicitly.
+    ``Path.mkdir(parents=True, mode=...)`` only applies ``mode`` to the leaf
+    it creates -- any missing intermediate ancestor is made with the process
+    umask instead, mimicking POSIX ``mkdir -p``. Each missing ancestor is
+    therefore created 0700 explicitly, walking from the filesystem root
+    down; an ancestor that already exists is left alone entirely, since on
+    the one-time legacy adoption ``token_dir`` is the token root itself and
+    its parent is the data volume that also holds the database.
+    ``exist_ok`` does not tighten an existing ``token_dir``, so that one
+    level is chmod'ed explicitly too.
     """
-    token_dir.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-    token_dir.parent.chmod(0o700)
-    token_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+    for ancestor in reversed(token_dir.parents):
+        ancestor.mkdir(mode=0o700, exist_ok=True)
+    token_dir.mkdir(mode=0o700, exist_ok=True)
     token_dir.chmod(0o700)
     return token_dir
 

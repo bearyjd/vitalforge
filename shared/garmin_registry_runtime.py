@@ -584,6 +584,7 @@ def _move_token_file(source: Path, target: Path) -> None:
     a published generation, and the flat store is then residue.
     """
     garmin_client._ensure_token_dir(target.parent)
+    target.parent.parent.chmod(0o700)  # person-<id>/ is registry-owned; tighten it even if it pre-existed
     if target.exists() or target.is_symlink():
         raise FileExistsError("generation token file already exists")
     os.replace(source, target)
