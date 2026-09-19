@@ -110,7 +110,7 @@ def _redacted_status(row) -> dict[str, str | bool | None]:
         }
     error = row["last_auth_error"]
     return {
-        "linked": row["state"] in {"linked", "legacy_bound"},
+        "linked": row["state"] == "linked",
         "last_auth_ok": row["last_auth_ok"],
         "last_auth_error": error if error in _SAFE_AUTH_ERRORS else "unknown" if error is not None else None,
         "last_auth_error_at": row["last_auth_error_at"],

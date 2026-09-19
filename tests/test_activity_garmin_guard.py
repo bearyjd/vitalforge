@@ -57,7 +57,7 @@ async def test_unlinked_push_is_stored_with_bounded_link_required(
     """An unlinked person's explicit push never reaches another person's Garmin."""
     requested_person_ids: list[int] = []
 
-    async def unlinked(person_id, operation):
+    async def unlinked(person_id, operation, *, max_wait_seconds=0.0):
         requested_person_ids.append(person_id)
         raise garmin_registry.GarminNotLinked(person_id)
 

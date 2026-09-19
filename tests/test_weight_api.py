@@ -84,7 +84,7 @@ async def test_unlinked_weight_is_stored_without_cross_person_garmin_fallback(
     son = await seed_person("son", "Son")
     requested_person_ids: list[int] = []
 
-    async def unlinked(person_id, operation):
+    async def unlinked(person_id, operation, *, max_wait_seconds=0.0):
         requested_person_ids.append(person_id)
         raise garmin_registry.GarminNotLinked(person_id)
 

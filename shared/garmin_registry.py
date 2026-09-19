@@ -9,15 +9,12 @@ operation rather than conventions individual routes can forget.
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import inspect
 import logging
 import os
 import shutil
 import time  # noqa: F401 - public registry clock/monkeypatch seam
 import uuid
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Callable, TypeVar
@@ -26,10 +23,29 @@ from garminconnect import Garmin
 
 from shared import garmin_client
 from shared.database import get_db
+from shared.garmin_registry_errors import (
+    _ERROR_CODES,  # noqa: F401 - runtime helpers read it through this facade
+    GarminAuthenticationError,
+    GarminLink,
+    GarminLinkAttemptRateLimited,  # noqa: F401 - public facade export
+    GarminLinkConflict,
+    GarminLinkInputError,
+    GarminNotLinked,
+    GarminOperationError,
+    GarminRateLimited,
+    GarminRegistryError,
+    GarminSessionExpired,
+)
+from shared.garmin_registry_locks import (
+    legacy_store_flock,  # noqa: F401 - public facade export
+    person_flock,
+)
 from shared.garmin_registry_runtime import (
+    _error_code,
     _load_link,
     _record_auth_failure,
     _record_auth_success,
+    _token_store_has_content,
     _wait_for_call_permit,
     actor_has_effective_manage,
     bootstrap_legacy_token_store,  # noqa: F401 - public facade export
@@ -44,85 +60,13 @@ logger = logging.getLogger(__name__)
 GARTH_TOKEN_DIR = Path(os.getenv("GARTH_TOKEN_DIR", "/app/data/.garth"))
 
 _T = TypeVar("_T")
-_VALID_LINK_STATES = frozenset({"linked", "legacy_bound"})
-_ERROR_CODES = frozenset({"auth_failed", "rate_limited", "network", "unknown"})
+# 'legacy_bound' / 'legacy_disabled' are retired: boot-time adoption now moves
+# the flat store under person-<id>/generation-1/ and publishes 'linked'.  The
+# DDL still tolerates the old values (SQLite cannot alter a CHECK), so a row
+# carrying one is simply not usable until it is re-linked.
+_VALID_LINK_STATES = frozenset({"linked"})
 _LINK_ATTEMPT_LIMIT = 3
 _LINK_ATTEMPT_WINDOW_SECONDS = 15 * 60
-_process_person_locks: dict[tuple[asyncio.AbstractEventLoop, int], asyncio.Lock] = {}
-
-
-class GarminRegistryError(RuntimeError):
-    """Base error whose text intentionally contains no third-party detail."""
-
-
-class GarminNotLinked(GarminRegistryError):
-    """The requested person has no usable durable Garmin link."""
-
-    def __init__(self, person_id: int):
-        self.person_id = person_id
-        super().__init__("Garmin is not linked for this person")
-
-
-class GarminRateLimited(GarminRegistryError):
-    """The durable deployment-wide call budget has not yet refilled."""
-
-    def __init__(self, retry_after: int):
-        self.retry_after = retry_after
-        super().__init__("Garmin is temporarily rate limited")
-
-
-class GarminLinkAttemptRateLimited(GarminRegistryError):
-    """The authenticated user has exhausted their link-attempt window."""
-
-    def __init__(self, retry_after: int):
-        self.retry_after = retry_after
-        super().__init__("Too many Garmin link attempts")
-
-
-class GarminAuthenticationError(GarminRegistryError):
-    """A link could not resume its token store without exposing why."""
-
-    def __init__(self, code: str):
-        self.code = code if code in _ERROR_CODES else "unknown"
-        super().__init__("Garmin authentication failed")
-
-
-class GarminOperationError(GarminRegistryError):
-    """A Garmin operation failed without surfacing its raw exception text."""
-
-    def __init__(self, code: str):
-        self.code = code if code in _ERROR_CODES else "unknown"
-        super().__init__("Garmin operation failed")
-
-
-class GarminLinkConflict(GarminRegistryError):
-    """Another person already owns the requested canonical Garmin account."""
-
-    def __init__(self):
-        super().__init__("Garmin account is already linked")
-
-
-class GarminSessionExpired(GarminRegistryError):
-    """The actor's step-up session changed while a credential login ran."""
-
-    def __init__(self):
-        super().__init__("Your session is no longer current")
-
-
-class GarminLinkInputError(GarminRegistryError):
-    """Credential metadata could not be accepted without echoing it back."""
-
-    def __init__(self):
-        super().__init__("Garmin link details are invalid")
-
-
-@dataclass(frozen=True)
-class GarminLink:
-    """Non-secret durable link metadata returned to future route handlers."""
-
-    person_id: int
-    generation: int
-    state: str
 
 
 def _utc_now() -> str:
@@ -143,137 +87,6 @@ def _ensure_token_root() -> Path:
     GARTH_TOKEN_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
     GARTH_TOKEN_DIR.chmod(0o700)
     return GARTH_TOKEN_DIR
-
-
-def _person_lock_path(person_id: int) -> Path:
-    """A stable lock survives a token-directory replacement on re-link."""
-    if person_id < 1:
-        raise ValueError("person_id must be a positive integer")
-    return _ensure_token_root() / f".person-{person_id}.lock"
-
-
-def _acquire_lock(lock_path: Path):
-    handle = open(lock_path, "a")
-    try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-    except BaseException:
-        handle.close()
-        raise
-    return handle
-
-
-def _process_person_lock(person_id: int) -> asyncio.Lock:
-    """Return this process's companion lock for the durable flock.
-
-    ``flock`` coordinates the two service processes, but its semantics do not
-    reliably make two independently-opened descriptors in the same process
-    wait for each other. The tiny process-local layer closes that gap while
-    retaining flock as the crash-safe, cross-process authority.
-    """
-    # pytest-asyncio (and application reloads) can create a new event loop in
-    # the same interpreter. asyncio.Lock is loop-bound once contended, so the
-    # cache must be scoped to both loop and person rather than leaking a lock
-    # from a completed loop into the next one.
-    key = (asyncio.get_running_loop(), person_id)
-    lock = _process_person_locks.get(key)
-    if lock is None:
-        lock = asyncio.Lock()
-        _process_person_locks[key] = lock
-    return lock
-
-
-@asynccontextmanager
-async def person_flock(person_id: int):
-    """Serialize all operations for a person across both service processes.
-
-    Lifecycle routes use the same public context manager, so unlink/re-link
-    cannot swap a token directory while :func:`call` is authenticating or
-    using it.  flock is released if a process dies; the file is intentionally
-    retained as lock infrastructure, not a sentinel.
-    """
-    person_id = int(person_id)
-    local_lock = _process_person_lock(person_id)
-    async with local_lock:
-        lock_path = _person_lock_path(person_id)
-        acquire_task = asyncio.create_task(asyncio.to_thread(_acquire_lock, lock_path))
-        try:
-            handle = await asyncio.shield(acquire_task)
-        except asyncio.CancelledError:
-            # shield() leaves the worker alive.  Do not await it here: a
-            # second cancellation can interrupt that await and orphan the
-            # descriptor after flock() eventually succeeds.  The completion
-            # callback owns that late handle instead.
-            _close_acquired_handle_when_done(acquire_task)
-            raise
-        try:
-            yield
-        finally:
-            await _close_lock_handle(handle)
-
-
-@asynccontextmanager
-async def legacy_store_flock():
-    """Serialize the one-time flat-store adoption across both services.
-
-    The lock belongs beside the historic flat store, not inside any person's
-    directory: before adoption there is deliberately no person-owned path.
-    """
-    local_lock = _process_person_lock(0)
-    async with local_lock:
-        lock_path = _ensure_token_root() / ".legacy-bootstrap.lock"
-        acquire_task = asyncio.create_task(asyncio.to_thread(_acquire_lock, lock_path))
-        try:
-            handle = await asyncio.shield(acquire_task)
-        except asyncio.CancelledError:
-            _close_acquired_handle_when_done(acquire_task)
-            raise
-        try:
-            yield
-        finally:
-            await _close_lock_handle(handle)
-
-
-def _close_acquired_handle_when_done(task: asyncio.Task) -> None:
-    """Arrange cleanup for a cancelled flock acquisition without leaking it."""
-    def close_handle(completed: asyncio.Task) -> None:
-        if completed.cancelled():
-            return
-        try:
-            handle = completed.result()
-        except BaseException:
-            return
-        handle.close()
-
-    task.add_done_callback(close_handle)
-
-
-async def _close_lock_handle(handle) -> None:
-    """Close a flock descriptor even if cleanup itself is cancelled twice."""
-    close_task = asyncio.create_task(asyncio.to_thread(handle.close))
-    try:
-        await asyncio.shield(close_task)
-    except asyncio.CancelledError:
-        # The shielded worker still owns ``handle`` and will close it. Keep a
-        # callback solely to consume any unexpected worker exception.
-        close_task.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
-        raise
-
-
-def _error_code(exc: Exception) -> str:
-    """Classify without logging or returning third-party exception content."""
-    status = getattr(exc, "status_code", None)
-    response = getattr(exc, "response", None)
-    status = status if status is not None else getattr(response, "status_code", None)
-    if status == 429:
-        return "rate_limited"
-    if status in (401, 403):
-        return "auth_failed"
-    name = type(exc).__name__.lower()
-    if "auth" in name or "credential" in name or "login" in name:
-        return "auth_failed"
-    if isinstance(exc, (ConnectionError, TimeoutError, OSError)) or "network" in name or "timeout" in name:
-        return "network"
-    return "unknown"
 
 
 def _canonical_email(email: str) -> str:
@@ -344,21 +157,36 @@ def _remove_person_token_root(person_id: int) -> None:
         shutil.rmtree(path)
 
 
+def _sweep_stale_staging_dirs(person_id: int) -> None:
+    """Remove this person's staging residue; the caller holds the person flock.
+
+    A staging directory outlives its link attempt only after SIGKILL or a
+    cancelled login whose worker thread dumped tokens after the attempt's own
+    cleanup ran.  Under the flock no attempt for this person is in flight, so
+    every match is residue.
+    """
+    root = _ensure_token_root()
+    for child in root.glob(f".person-{int(person_id)}-generation-*.staging"):
+        if child.is_dir() and not child.is_symlink():
+            _remove_token_dir(child)
+
+
 async def forget_and_remove_person_token_store(person_id: int) -> None:
     """Evict a person's cached clients and remove its owned token directories.
 
     The caller must already hold :func:`person_flock`.  Keeping the cache
     eviction before the filesystem operation means a cleanup failure can leave
-    an inert artifact but never a usable in-process credential.  This helper
-    intentionally does not touch the flat legacy store: a ``legacy_disabled``
-    tombstone is what prevents that historic shared store from being adopted
-    again.
+    an inert artifact but never a usable in-process credential.  The flat
+    legacy root is never touched: once adopted, its store lives under
+    ``person-<id>/`` like any other, and the ``auth_migrations`` marker keeps
+    a later copy at the root from being adopted again.
     """
     person_id = int(person_id)
     if person_id < 1:
         raise ValueError("person_id must be a positive integer")
     garmin_client.forget(person_id)
     await asyncio.to_thread(_remove_person_token_root, person_id)
+    await asyncio.to_thread(_sweep_stale_staging_dirs, person_id)
 
 
 def _sweep_unreferenced_generation_dirs(person_id: int, durable_generation: int | None) -> None:
@@ -384,20 +212,45 @@ def _sweep_unreferenced_generation_dirs(person_id: int, durable_generation: int 
         _remove_token_dir(child)
 
 
-async def _next_generation(person_id: int) -> int:
-    db = await get_db()
+async def _next_generation(db, person_id: int) -> int:
+    ledger = await (
+        await db.execute(
+            "SELECT generation FROM garmin_link_generations WHERE person_id = ?", (person_id,)
+        )
+    ).fetchone()
+    link = await (
+        await db.execute("SELECT generation FROM garmin_links WHERE person_id = ?", (person_id,))
+    ).fetchone()
+    return max(ledger["generation"] if ledger is not None else 0, link["generation"] if link is not None else 0) + 1
+
+
+async def _reserve_generation(person_id: int) -> int:
+    """Durably allocate the next generation before any credential login.
+
+    The ledger is a monotonic allocator: a cancelled or failed attempt simply
+    burns its number.  A login thread that outlives its cancelled request can
+    therefore only ever cache ``(person, N)`` or dump tokens into
+    ``generation-N`` for an N no published link will resolve.
+    """
+    db = await get_db(isolation_level=None)
     try:
-        ledger = await (
-            await db.execute(
-                "SELECT generation FROM garmin_link_generations WHERE person_id = ?", (person_id,)
-            )
-        ).fetchone()
-        link = await (
-            await db.execute("SELECT generation FROM garmin_links WHERE person_id = ?", (person_id,))
-        ).fetchone()
+        await db.execute("BEGIN IMMEDIATE")
+        generation = await _next_generation(db, person_id)
+        await db.execute(
+            """
+            INSERT INTO garmin_link_generations (person_id, generation) VALUES (?, ?)
+            ON CONFLICT(person_id) DO UPDATE SET generation = excluded.generation
+            """,
+            (person_id, generation),
+        )
+        await db.commit()
+        return generation
+    except BaseException:
+        if db.in_transaction:
+            await db.rollback()
+        raise
     finally:
         await db.close()
-    return max(ledger["generation"] if ledger is not None else 0, link["generation"] if link is not None else 0) + 1
 
 
 async def _validate_link_target(person_id: int, actor_id: int, session_version: int) -> None:
@@ -467,15 +320,19 @@ async def _publish_link(
         current = await (
             await db.execute("SELECT generation FROM garmin_links WHERE person_id = ?", (person_id,))
         ).fetchone()
-        durable_generation = max(
-            ledger["generation"] if ledger is not None else 0,
-            current["generation"] if current is not None else 0,
-        ) + 1
-        # The person flock makes this stable across normal lifecycle callers.
-        # Refuse, rather than attach the staged client to a surprise generation,
-        # if a direct DB writer changed it while credential login was running.
-        if durable_generation != generation:
+        # ``generation`` was reserved in the ledger before the credential
+        # login (_reserve_generation).  The person flock keeps that stable
+        # across lifecycle callers; refuse, rather than publish a staged
+        # client under a surprise generation, if a direct DB writer moved the
+        # ledger or published a newer link while the login was running.
+        reserved = ledger is not None and int(ledger["generation"]) == generation
+        superseded = current is not None and int(current["generation"]) >= generation
+        if not reserved or superseded:
             await db.rollback()
+            logger.warning(
+                "Garmin link publication for person %s refused: generation reservation changed",
+                person_id,
+            )
             raise GarminOperationError("unknown")
 
         now = _utc_now()
@@ -542,79 +399,156 @@ async def link(
         # order keeps the two cross-process authorities deadlock-free.
         await reserve_call_permit()
         async with person_flock(person_id):
-            existing = await _load_link(person_id)
-            await asyncio.to_thread(
-                _sweep_unreferenced_generation_dirs,
-                person_id,
-                int(existing["generation"]) if existing is not None else None,
-            )
-            generation = await _next_generation(person_id)
-            # This durable user-scoped throttle must succeed before any
-            # credential reaches Garmin.  It remains inside the flock so a
-            # re-link cannot race this person's generation/token swap.
-            await reserve_link_attempt(actor_id)
-            await _validate_link_target(person_id, actor_id, session_version)
-            target = _generation_token_dir(person_id, generation)
-            # If a process died after installing the staged directory but
-            # before the database publication, this next generation is not
-            # reachable from durable metadata.  Discard it before retrying;
-            # otherwise a crash would permanently block this person's next
-            # link attempt on an already-existing target directory.
-            if target.exists():
-                await asyncio.to_thread(_remove_token_dir, target)
-            staging = _staging_token_dir(person_id, generation)
-            try:
-                try:
-                    await asyncio.to_thread(
-                        garmin_client.authenticate,
-                        person_id,
-                        generation,
-                        staging,
-                        canonical_email,
-                        password,
-                    )
-                except Exception as exc:
-                    code = _error_code(exc)
-                    garmin_client.forget(person_id, generation)
-                    if existing is not None:
-                        await _record_auth_failure(person_id, int(existing["generation"]), code)
-                    raise GarminAuthenticationError(code) from None
-
-                try:
-                    await asyncio.to_thread(_install_staged_token_dir, staging, target)
-                except Exception:
-                    garmin_client.forget(person_id, generation)
-                    raise GarminOperationError("unknown") from None
-                try:
-                    published = await _publish_link(
-                        person_id, actor_id, session_version, canonical_email, generation
-                    )
-                except GarminRegistryError:
-                    garmin_client.forget(person_id, generation)
-                    try:
-                        await asyncio.to_thread(_remove_token_dir, target)
-                    except Exception:
-                        pass
-                    raise
-                garmin_client.forget_stale_generations(person_id, generation)
-                if existing is not None and existing["state"] == "linked":
-                    try:
-                        await asyncio.to_thread(
-                            _remove_token_dir,
-                            _generation_token_dir(person_id, int(existing["generation"])),
-                        )
-                    except Exception:
-                        raise GarminOperationError("unknown") from None
-                return published
-            finally:
-                if staging.exists():
-                    try:
-                        await asyncio.to_thread(_remove_token_dir, staging)
-                    except Exception:
-                        pass
+            return await _link_locked(person_id, actor_id, session_version, canonical_email, password)
     except GarminRegistryError:
         raise
+    except Exception as exc:
+        logger.warning("Garmin link for person %s failed outside its bounded errors (%s)", person_id, type(exc).__name__)
+        raise GarminOperationError("unknown") from None
+
+
+async def _link_locked(
+    person_id: int, actor_id: int, session_version: int, canonical_email: str, password: str
+) -> GarminLink:
+    """The lifecycle body; the caller holds :func:`person_flock`."""
+    existing = await _load_link(person_id)
+    await asyncio.to_thread(
+        _sweep_unreferenced_generation_dirs,
+        person_id,
+        int(existing["generation"]) if existing is not None else None,
+    )
+    await asyncio.to_thread(_sweep_stale_staging_dirs, person_id)
+    # This durable user-scoped throttle must succeed before any credential
+    # reaches Garmin.  It remains inside the flock so a re-link cannot race
+    # this person's generation/token swap.
+    await reserve_link_attempt(actor_id)
+    await _validate_link_target(person_id, actor_id, session_version)
+    generation = await _reserve_generation(person_id)
+    target = _generation_token_dir(person_id, generation)
+    # The ledger reservation makes a reachable ``target`` impossible for a
+    # fresh number; keep the removal as a cheap guard against a directory
+    # created outside the registry.
+    if target.exists():
+        await asyncio.to_thread(_remove_token_dir, target)
+    staging = _staging_token_dir(person_id, generation)
+    try:
+        await _login_into_staging(person_id, generation, staging, canonical_email, password)
+        published = await _install_and_publish(
+            person_id, actor_id, session_version, canonical_email, generation, staging, target
+        )
+        if existing is not None:
+            await _remove_superseded_generation(person_id, int(existing["generation"]))
+        return published
+    finally:
+        if staging.exists():
+            try:
+                await asyncio.to_thread(_remove_token_dir, staging)
+            except Exception as exc:
+                logger.warning(
+                    "Garmin staging cleanup for person %s did not complete (%s)", person_id, type(exc).__name__
+                )
+
+
+async def _login_into_staging(
+    person_id: int, generation: int, staging: Path, canonical_email: str, password: str
+) -> None:
+    """Run the credential login off the loop; abandon it safely if cancelled.
+
+    The worker thread cannot be interrupted.  If the request is cancelled
+    mid-login the thread will still cache ``(person, generation)`` and may
+    dump tokens into ``staging`` later; ``generation`` is already burned in
+    the ledger, so neither can collide with a later link, and the completion
+    callback discards both (mirroring :func:`_close_acquired_handle_when_done`).
+    """
+    login = asyncio.create_task(
+        asyncio.to_thread(garmin_client.authenticate, person_id, generation, staging, canonical_email, password)
+    )
+    try:
+        await asyncio.shield(login)
+    except asyncio.CancelledError:
+        _discard_abandoned_login(login, person_id, generation, staging)
+        raise
+    except Exception as exc:
+        code = _error_code(exc)
+        garmin_client.forget(person_id, generation)
+        raise GarminAuthenticationError(code) from None
+    if not _token_store_has_content(staging):
+        logger.warning("Garmin login for person %s left no token store to publish", person_id)
+        garmin_client.forget(person_id, generation)
+        raise GarminOperationError("unknown")
+
+
+def _discard_abandoned_login(login: asyncio.Task, person_id: int, generation: int, staging: Path) -> None:
+    """Evict whatever a cancelled credential login eventually produces."""
+
+    def discard(completed: asyncio.Task) -> None:
+        if not completed.cancelled():
+            try:
+                completed.result()
+            except Exception as exc:
+                logger.info("Abandoned Garmin login for person %s ended with %s", person_id, type(exc).__name__)
+        garmin_client.forget(person_id, generation)
+        try:
+            _remove_token_dir(staging)
+        except Exception as exc:
+            logger.warning(
+                "Abandoned Garmin login cleanup for person %s did not complete (%s)",
+                person_id,
+                type(exc).__name__,
+            )
+
+    login.add_done_callback(discard)
+
+
+async def _install_and_publish(
+    person_id: int,
+    actor_id: int,
+    session_version: int,
+    canonical_email: str,
+    generation: int,
+    staging: Path,
+    target: Path,
+) -> GarminLink:
+    """Publish the staged store durably, then drop the link-time client."""
+    try:
+        await asyncio.to_thread(_install_staged_token_dir, staging, target)
+    except Exception as exc:
+        logger.warning(
+            "Garmin token store for person %s could not be installed (%s)", person_id, type(exc).__name__
+        )
+        garmin_client.forget(person_id, generation)
+        raise GarminOperationError("unknown") from None
+    try:
+        published = await _publish_link(person_id, actor_id, session_version, canonical_email, generation)
     except Exception:
+        garmin_client.forget(person_id, generation)
+        try:
+            await asyncio.to_thread(_remove_token_dir, target)
+        except Exception as exc:
+            logger.warning(
+                "Unpublished Garmin generation cleanup for person %s did not complete (%s)",
+                person_id,
+                type(exc).__name__,
+            )
+        raise
+    # The link-time client's SDK persistence path is the staging directory
+    # that was just renamed away; a cached copy would dump a refreshed token
+    # into a path no durable link resolves.  Evict every generation and let
+    # the first call() cold-load from ``target`` -- one extra login, never a
+    # silently lost token.
+    garmin_client.forget(person_id)
+    return published
+
+
+async def _remove_superseded_generation(person_id: int, generation: int) -> None:
+    try:
+        await asyncio.to_thread(_remove_token_dir, _generation_token_dir(person_id, generation))
+    except Exception as exc:
+        logger.warning(
+            "Superseded Garmin generation cleanup for person %s did not complete (%s)",
+            person_id,
+            type(exc).__name__,
+        )
         raise GarminOperationError("unknown") from None
 
 
@@ -626,7 +560,7 @@ async def relink(
 
 
 async def unlink(person_id: int, actor_id: int, session_version: int) -> bool:
-    """Remove a normal link or durably tombstone a legacy-bound one.
+    """Remove a person's link, its cached clients, and its token directories.
 
     The database change commits before cache eviction and filesystem cleanup;
     an interrupted cleanup can leave only an inert credential artifact, never
@@ -639,54 +573,60 @@ async def unlink(person_id: int, actor_id: int, session_version: int) -> bool:
         raise GarminLinkInputError()
     try:
         async with person_flock(person_id):
-            db = await get_db(isolation_level=None)
+            deleted = await _delete_link_row(person_id, actor_id, session_version)
+            if deleted:
+                garmin_client.forget(person_id)
             try:
-                await db.execute("BEGIN IMMEDIATE")
-                if not await actor_has_effective_manage(db, actor_id, session_version, person_id):
-                    await db.rollback()
-                    raise GarminSessionExpired()
-                row = await (
-                    await db.execute("SELECT state, generation FROM garmin_links WHERE person_id = ?", (person_id,))
-                ).fetchone()
-                if row is None:
-                    await db.rollback()
-                    return False
-                await asyncio.to_thread(_sweep_unreferenced_generation_dirs, person_id, int(row["generation"]))
-                if row["state"] == "legacy_bound":
-                    await db.execute(
-                        """
-                        UPDATE garmin_links
-                        SET state = 'legacy_disabled', garmin_email = NULL,
-                            linked_at = NULL, linked_by = NULL, updated_at = ?,
-                            last_auth_ok = NULL, last_auth_error = NULL,
-                            last_auth_error_at = NULL
-                        WHERE person_id = ?
-                        """,
-                        (_utc_now(), person_id),
-                    )
-                else:
-                    await db.execute("DELETE FROM garmin_links WHERE person_id = ?", (person_id,))
-                await db.commit()
-            except BaseException:
-                if db.in_transaction:
-                    await db.rollback()
-                raise
-            finally:
-                await db.close()
-
-            garmin_client.forget(person_id)
-            try:
-                await asyncio.to_thread(_remove_person_token_root, person_id)
-            except Exception:
+                if deleted:
+                    await asyncio.to_thread(_remove_person_token_root, person_id)
+                # Staging residue belongs to no link row, so it is swept even
+                # when there was nothing to unlink.
+                await asyncio.to_thread(_sweep_stale_staging_dirs, person_id)
+            except Exception as exc:
+                logger.warning(
+                    "Garmin token cleanup for person %s did not complete (%s)", person_id, type(exc).__name__
+                )
                 raise GarminOperationError("unknown") from None
-            return True
+            return deleted
     except GarminRegistryError:
         raise
-    except Exception:
+    except Exception as exc:
+        logger.warning("Garmin unlink for person %s failed outside its bounded errors (%s)", person_id, type(exc).__name__)
         raise GarminOperationError("unknown") from None
 
 
-async def call(person_id: int, op: Callable[[Garmin], _T | Awaitable[_T]]) -> _T:
+async def _delete_link_row(person_id: int, actor_id: int, session_version: int) -> bool:
+    """Atomically re-check the actor and delete the link; False if none existed."""
+    db = await get_db(isolation_level=None)
+    try:
+        await db.execute("BEGIN IMMEDIATE")
+        if not await actor_has_effective_manage(db, actor_id, session_version, person_id):
+            await db.rollback()
+            raise GarminSessionExpired()
+        row = await (
+            await db.execute("SELECT generation FROM garmin_links WHERE person_id = ?", (person_id,))
+        ).fetchone()
+        if row is None:
+            await db.rollback()
+            return False
+        await asyncio.to_thread(_sweep_unreferenced_generation_dirs, person_id, int(row["generation"]))
+        await db.execute("DELETE FROM garmin_links WHERE person_id = ?", (person_id,))
+        await db.commit()
+        return True
+    except BaseException:
+        if db.in_transaction:
+            await db.rollback()
+        raise
+    finally:
+        await db.close()
+
+
+async def call(
+    person_id: int,
+    op: Callable[[Garmin], _T | Awaitable[_T]],
+    *,
+    max_wait_seconds: float = 0.0,
+) -> _T:
     """Run one complete Garmin operation for an explicitly selected person.
 
     After any wait for the stable per-person flock, the link is read again;
@@ -696,85 +636,103 @@ async def call(person_id: int, op: Callable[[Garmin], _T | Awaitable[_T]]) -> _T
     consumes only the operation permit. ``op`` receives the exact client
     instead of an unlocked global singleton and can be synchronous (the
     normal garminconnect case) or async for small adapter tests.
+
+    ``max_wait_seconds`` bounds how long the first permit reservation may
+    sleep behind the deployment-wide interval.  The default ``0`` keeps the
+    fail-fast behaviour interactive callers translate into a retry response;
+    a small positive budget lets a user-facing push absorb the interval
+    instead of failing on every other tap.
     """
     person_id = int(person_id)
     if person_id < 1:
         raise ValueError("person_id must be a positive integer")
+    max_wait_seconds = float(max_wait_seconds)
+    if not max_wait_seconds >= 0.0:  # also rejects NaN
+        raise ValueError("max_wait_seconds must be a non-negative number")
     try:
         async with person_flock(person_id):
-            link = await _load_link(person_id)
-            if link is None or link["state"] not in _VALID_LINK_STATES:
-                garmin_client.forget(person_id)
-                raise GarminNotLinked(person_id)
-            generation = int(link["generation"])
-            email = link["garmin_email"]
+            generation, email = await _usable_link(person_id)
             await asyncio.to_thread(_sweep_unreferenced_generation_dirs, person_id, generation)
-            if not isinstance(email, str):  # Schema protects this; avoid an unsafe fallback if it drifts.
-                garmin_client.forget(person_id)
-                raise GarminNotLinked(person_id)
-
             garmin_client.forget_stale_generations(person_id, generation)
             # This must happen after the flock wait and durable link check:
             # otherwise a queued or unlinked request could consume a global
             # slot without being the next logical operation allowed to reach
             # Garmin.
-            await reserve_call_permit()
+            if max_wait_seconds > 0.0:
+                await _wait_for_call_permit(deadline_seconds=max_wait_seconds)
+            else:
+                await reserve_call_permit()
             if garmin_client.is_authenticated(person_id, generation):
                 client = garmin_client.get_client(person_id, generation)
             else:
-                token_dir = await resolve_token_dir(person_id, link["state"], generation)
-                try:
-                    # Login alone moves off the event loop. Garmin operations
-                    # stay synchronous here because existing write-race
-                    # reasoning relies on that behavior; this change does not
-                    # widen it.
-                    client = await asyncio.to_thread(
-                        garmin_client.authenticate,
-                        person_id,
-                        generation,
-                        token_dir,
-                        email,
-                        None,
-                    )
-                except Exception as exc:
-                    code = _error_code(exc)
-                    garmin_client.forget(person_id, generation)
-                    await _record_auth_failure(person_id, generation, code)
-                    raise GarminAuthenticationError(code) from None
-                await _record_auth_success(person_id, generation)
-                # login(tokenstore=...) can issue a profile/network request,
-                # so it consumed the first permit.  The following operation
-                # is a distinct Garmin call and obtains a second permit while
-                # the same person lock remains held.  It waits for that
-                # permit: rejecting the operation immediately after a
-                # successful cold login would make one logical request unable
-                # to complete at the configured global call rate.
-                await _wait_for_call_permit()
-
-            try:
-                result = op(client)
-                if inspect.isawaitable(result):
-                    return await result
-                return result
-            except GarminRegistryError:
-                raise
-            except Exception as exc:
-                code = _error_code(exc)
-                if code == "auth_failed":
-                    # A 401/403 from a normal operation means this cached
-                    # session is no longer safe to reuse.  Persist only the
-                    # bounded code; the next operation will resume under this
-                    # same lock protocol.
-                    garmin_client.forget(person_id, generation)
-                    await _record_auth_failure(person_id, generation, code)
-                raise GarminOperationError(code) from None
+                client = await _resume_link(person_id, generation, email)
+            return await _run_operation(person_id, generation, client, op)
     except GarminRegistryError:
         raise
-    except Exception:
+    except Exception as exc:
         # Token-root chmod/mkdir and flock setup can carry absolute paths in
         # their OS errors.  They cross the same public boundary as a Garmin
         # failure, so callers receive a bounded, path-free error.
+        logger.warning("Garmin call for person %s failed outside its bounded errors (%s)", person_id, type(exc).__name__)
         raise GarminOperationError("unknown") from None
+
+
+async def _usable_link(person_id: int) -> tuple[int, str]:
+    """Read the durable link under the flock, evicting any cache for a dead one."""
+    link = await _load_link(person_id)
+    if link is None or link["state"] not in _VALID_LINK_STATES:
+        garmin_client.forget(person_id)
+        raise GarminNotLinked(person_id)
+    email = link["garmin_email"]
+    if not isinstance(email, str):  # Schema protects this; avoid an unsafe fallback if it drifts.
+        garmin_client.forget(person_id)
+        raise GarminNotLinked(person_id)
+    return int(link["generation"]), email
+
+
+async def _resume_link(person_id: int, generation: int, email: str) -> Garmin:
+    """Cold-load a durable generation's token store and take its second permit."""
+    token_dir = resolve_token_dir(person_id, generation)
+    try:
+        # Login alone moves off the event loop. Garmin operations stay
+        # synchronous here because existing write-race reasoning relies on
+        # that behavior; this change does not widen it.
+        client = await asyncio.to_thread(garmin_client.authenticate, person_id, generation, token_dir, email, None)
+    except Exception as exc:
+        code = _error_code(exc)
+        garmin_client.forget(person_id, generation)
+        await _record_auth_failure(person_id, generation, code)
+        raise GarminAuthenticationError(code) from None
+    await _record_auth_success(person_id, generation)
+    # login(tokenstore=...) can issue a profile/network request, so it
+    # consumed the first permit.  The following operation is a distinct
+    # Garmin call and obtains a second permit while the same person lock
+    # remains held.  It waits for that permit: rejecting the operation
+    # immediately after a successful cold login would make one logical
+    # request unable to complete at the configured global call rate.
+    await _wait_for_call_permit()
+    return client
+
+
+async def _run_operation(
+    person_id: int, generation: int, client: Garmin, op: Callable[[Garmin], _T | Awaitable[_T]]
+) -> _T:
+    try:
+        result = op(client)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+    except GarminRegistryError:
+        raise
+    except Exception as exc:
+        code = _error_code(exc)
+        if code == "auth_failed":
+            # A 401/403 from a normal operation means this cached session is
+            # no longer safe to reuse.  Persist only the bounded code; the
+            # next operation will resume under this same lock protocol.
+            garmin_client.forget(person_id, generation)
+            await _record_auth_failure(person_id, generation, code)
+        raise GarminOperationError(code) from None
 
 
 async def call_paced(person_id: int, op: Callable[[Garmin], _T | Awaitable[_T]]) -> _T:

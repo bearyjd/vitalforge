@@ -388,29 +388,12 @@ def add_person_routes(app):
                     (person_id,),
                 )
 
-                # Archive and credential invalidation are one transaction. A
-                # normal link can be removed, while a legacy link must retain
-                # its tombstone so the historic flat store can never be
-                # adopted again after its owner is archived.
-                link = await (
-                    await db.execute(
-                        "SELECT state FROM garmin_links WHERE person_id = ?", (person_id,)
-                    )
-                ).fetchone()
-                if link is not None and link["state"] == "legacy_bound":
-                    await db.execute(
-                        """
-                        UPDATE garmin_links
-                        SET state = 'legacy_disabled', garmin_email = NULL,
-                            linked_at = NULL, linked_by = NULL, updated_at = ?,
-                            last_auth_ok = NULL, last_auth_error = NULL,
-                            last_auth_error_at = NULL
-                        WHERE person_id = ?
-                        """,
-                        (archived_at, person_id),
-                    )
-                elif link is not None and link["state"] == "linked":
-                    await db.execute("DELETE FROM garmin_links WHERE person_id = ?", (person_id,))
+                # Archive and credential invalidation are one transaction.
+                # Every link row goes, including a retired 'legacy_bound' one
+                # left by an older release: the one-time adoption marker in
+                # auth_migrations, not a tombstone row, is what keeps the
+                # historic flat store from ever being adopted again.
+                await db.execute("DELETE FROM garmin_links WHERE person_id = ?", (person_id,))
                 await db.commit()
             except BaseException:
                 if db.in_transaction:

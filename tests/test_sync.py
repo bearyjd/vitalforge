@@ -7,6 +7,7 @@ from contextlib import suppress
 
 import pytest
 
+from shared import garmin_registry
 from shared.database import get_db, get_primary_person_id
 from vitalforge_dashboard import sync
 
@@ -85,8 +86,10 @@ async def test_scheduled_sync_serializes_against_shared_lock(initialized_db, mon
     assert not lock.locked()
 
 
-@pytest.mark.parametrize("state", ("linked", "legacy_bound"))
-async def test_usable_garmin_link_accepts_linked_and_legacy_bound(initialized_db, state):
+@pytest.mark.parametrize("state, usable", (("linked", True), ("legacy_bound", False)))
+async def test_usable_garmin_link_accepts_only_linked(initialized_db, state, usable):
+    """'legacy_bound' is a retired state an older release may have left
+    behind; it is tolerated by the schema but never synced from."""
     person_id = await get_primary_person_id()
     db = await get_db()
     try:
@@ -102,7 +105,96 @@ async def test_usable_garmin_link_accepts_linked_and_legacy_bound(initialized_db
     finally:
         await db.close()
 
-    assert await sync.has_usable_garmin_link(person_id) is True
+    assert await sync.has_usable_garmin_link(person_id) is usable
+
+
+async def _sync_status(person_id: int):
+    db = await get_db()
+    try:
+        return await (
+            await db.execute("SELECT last_sync_result FROM sync_status WHERE person_id = ?", (person_id,))
+        ).fetchone()
+    finally:
+        await db.close()
+
+
+async def _row_count(table: str, person_id: int) -> int:
+    db = await get_db()
+    try:
+        row = await (
+            await db.execute(f"SELECT COUNT(*) AS n FROM [{table}] WHERE person_id = ?", (person_id,))
+        ).fetchone()
+    finally:
+        await db.close()
+    return row["n"]
+
+
+@pytest.mark.parametrize("failure", ("registry_operation_error", "provider_exception"))
+async def test_run_sync_skips_a_failed_metric_and_keeps_the_rest_of_the_date(
+    initialized_db, fake_garmin_client, monkeypatch, caplog, failure
+):
+    """One failing metric read must not abort the whole date, and the sync
+    result must still say something went wrong."""
+    person_id = await get_primary_person_id()
+    provider_text = "provider-response-text-that-must-not-be-logged"
+    real_call_paced = fake_garmin_client.registry_call
+    pending_failures = [
+        garmin_registry.GarminOperationError("network")
+        if failure == "registry_operation_error"
+        else RuntimeError(provider_text)
+    ]
+
+    async def flaky_call_paced(person_id, operation):
+        # The first read of the run is sleep; fail exactly that one.
+        if pending_failures:
+            raise pending_failures.pop()
+        return await real_call_paced(person_id, operation)
+
+    monkeypatch.setattr(sync.garmin_registry, "call_paced", flaky_call_paced)
+    with caplog.at_level("WARNING", logger="vitalforge_dashboard.sync"):
+        result = await sync.run_sync(days=1, person_id=person_id)
+
+    assert result == "completed with 1 errors"
+    assert await _row_count("sleep", person_id) == 0
+    assert await _row_count("resting_hr", person_id) == 1
+    assert await _row_count("weight_history", person_id) > 0
+    assert (await _sync_status(person_id))["last_sync_result"] == "completed with 1 errors"
+    assert "Skipping sleep" in caplog.text
+    assert provider_text not in caplog.text
+
+
+async def test_run_sync_stops_at_the_first_authentication_failure(initialized_db, monkeypatch):
+    """A token store that no longer resumes would otherwise cost one failed
+    login per metric per date; stop, record it, and skip weight history."""
+    person_id = await get_primary_person_id()
+    calls: list[int] = []
+
+    async def dead_link(person_id, operation):
+        calls.append(person_id)
+        raise garmin_registry.GarminAuthenticationError("auth_failed")
+
+    monkeypatch.setattr(sync.garmin_registry, "call_paced", dead_link)
+
+    result = await sync.run_sync(days=3, person_id=person_id)
+
+    assert result == "auth_failed"
+    assert calls == [person_id], "no further metric, date, or weight-history read after the failed login"
+    assert (await _sync_status(person_id))["last_sync_result"] == "auth_failed"
+
+
+async def test_run_sync_records_link_required_when_the_link_disappears(initialized_db, monkeypatch):
+    person_id = await get_primary_person_id()
+    calls: list[int] = []
+
+    async def unlinked(person_id, operation):
+        calls.append(person_id)
+        raise garmin_registry.GarminNotLinked(person_id)
+
+    monkeypatch.setattr(sync.garmin_registry, "call_paced", unlinked)
+
+    assert await sync.run_sync(days=3, person_id=person_id) == "link_required"
+    assert calls == [person_id]
+    assert (await _sync_status(person_id))["last_sync_result"] == "link_required"
 
 
 async def test_scheduled_sync_skips_an_unlinked_primary(initialized_db, monkeypatch):

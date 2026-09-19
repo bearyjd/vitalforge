@@ -78,23 +78,14 @@ async def _seed_garmin_link(person_id: int, state: str, generation: int = 1) -> 
     now = "2026-09-14T00:00:00Z"
     db = await get_db()
     try:
-        if state == "legacy_disabled":
-            await db.execute(
-                """
-                INSERT INTO garmin_links (person_id, state, generation, updated_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (person_id, state, generation, now),
-            )
-        else:
-            await db.execute(
-                """
-                INSERT INTO garmin_links
-                    (person_id, state, garmin_email, generation, linked_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (person_id, state, f"archive-{person_id}@example.test", generation, now, now),
-            )
+        await db.execute(
+            """
+            INSERT INTO garmin_links
+                (person_id, state, garmin_email, generation, linked_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (person_id, state, f"archive-{person_id}@example.test", generation, now, now),
+        )
         await db.commit()
     finally:
         await db.close()
@@ -507,6 +498,9 @@ async def test_archiving_deletes_a_normal_garmin_link_and_its_owned_token_store(
     token_dir = garmin_registry._generation_token_dir(person_id, 1)
     token_dir.mkdir(parents=True, mode=0o700)
     (token_dir / "garmin_tokens.json").touch()
+    # SIGKILL residue from an interrupted link attempt is swept with the rest.
+    staging_residue = garmin_registry.GARTH_TOKEN_DIR / f".person-{person_id}-generation-2-dead.staging"
+    staging_residue.mkdir(mode=0o700)
     garmin_client._clients[(person_id, 1)] = object()
 
     response = await client.post(f"/api/persons/{person_id}/archive", cookies=cookies)
@@ -514,11 +508,14 @@ async def test_archiving_deletes_a_normal_garmin_link_and_its_owned_token_store(
     assert response.status_code == 200
     assert await _fetchone("SELECT 1 FROM garmin_links WHERE person_id = ?", (person_id,)) is None
     assert not garmin_registry._person_token_root(person_id).exists()
+    assert not staging_residue.exists()
     assert not any(key[0] == person_id for key in garmin_client._clients)
 
 
-async def test_archiving_tombstones_a_legacy_garmin_link_without_deleting_flat_store(client):
-    """The legacy root is shared infrastructure, so its tombstone is the revoke."""
+async def test_archiving_deletes_a_retired_legacy_bound_row_without_touching_the_flat_root(client):
+    """A row from the release that wrote 'legacy_bound' goes like any other;
+    the flat root is never this person's to remove, and the one-time adoption
+    marker (not a tombstone row) is what keeps it from being adopted again."""
     _, cookies = await _as("root", role="admin")
     person = (
         await client.post("/api/persons", json={"display_name": "Bryn"}, cookies=cookies)
@@ -536,11 +533,7 @@ async def test_archiving_tombstones_a_legacy_garmin_link_without_deleting_flat_s
     response = await client.post(f"/api/persons/{person_id}/archive", cookies=cookies)
 
     assert response.status_code == 200
-    row = await _fetchone(
-        "SELECT state, garmin_email, generation, linked_at FROM garmin_links WHERE person_id = ?",
-        (person_id,),
-    )
-    assert tuple(row) == ("legacy_disabled", None, 3, None)
+    assert await _fetchone("SELECT 1 FROM garmin_links WHERE person_id = ?", (person_id,)) is None
     assert flat_token.is_file(), "the flat legacy store must not be recursively removed"
     assert not garmin_registry._person_token_root(person_id).exists()
     assert not any(key[0] == person_id for key in garmin_client._clients)

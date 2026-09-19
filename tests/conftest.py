@@ -143,11 +143,14 @@ def fake_garmin_client(monkeypatch):
     # no production path receives this shortcut.
     monkeypatch.setitem(garmin_client._clients, (1, 1), fake)
 
-    async def fake_call(person_id, operation):
+    async def fake_call(person_id, operation, *, max_wait_seconds: float = 0.0):
         # The real registry selects a client by the durable (person,
         # generation) link key before invoking the operation. Test routes do
         # not need token-store setup, but preserving the selected person in
         # this seam catches a caller that accidentally loses that boundary.
+        # `max_wait_seconds` mirrors garmin_registry.call's keyword (the
+        # interactive weight/activity pushes pass a bounded permit wait);
+        # there is no permit here to wait for, so it is accepted and ignored.
         key = (int(person_id), 1)
         monkeypatch.setitem(garmin_client._clients, key, fake)
         fake.registry_calls.append(key)
@@ -186,13 +189,25 @@ def tmp_db_path(tmp_path, monkeypatch):
     the module-level `DB_PATH` global on every call, so patching it here
     (even after `shared.database` has already been imported elsewhere)
     is sufficient to isolate every DB access made during the test.
+
+    The Garmin token root gets the same treatment, and needs the attribute
+    patch, not only the env var: `shared.garmin_registry.GARTH_TOKEN_DIR` is
+    evaluated from the environment at IMPORT time, and test modules import
+    the registry at collection, so by the time any fixture runs `setenv`
+    alone changes nothing. Without this, the live-server fixtures (whose
+    lifespans call `bootstrap_legacy_token_store()`) would probe
+    /app/data/.garth.
+    `_ensure_token_root()` reads the module global directly and
+    `garmin_registry_runtime` reaches it through `_registry()`, so this one
+    patch covers both.
     """
-    from shared import database
+    from shared import database, garmin_registry
 
     db_path = tmp_path / "vf-test.db"
     monkeypatch.setattr(database, "DB_PATH", db_path)
     monkeypatch.setenv("DB_PATH", str(db_path))
     monkeypatch.setenv("GARTH_TOKEN_DIR", str(tmp_path / "garth"))
+    monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", tmp_path / "garth")
     return db_path
 
 

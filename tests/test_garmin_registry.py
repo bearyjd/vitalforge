@@ -1,13 +1,22 @@
 """Focused contract tests for the Garmin registry's security boundary."""
 
 import asyncio
+import logging
 import threading
 
 import pytest
+from garminconnect import (
+    GarminConnectAuthenticationError,
+    GarminConnectConnectionError,
+    GarminConnectTooManyRequestsError,
+)
+from garminconnect.exceptions import GarminConnectNotFoundError
 
-from shared import garmin_client, garmin_registry
+from shared import garmin_client, garmin_registry, garmin_registry_locks, garmin_registry_runtime
 from shared.database import get_db, get_primary_person_id
 from tests.conftest import seed_person, seed_user
+
+_LEGACY_ADOPTION_MARKER = garmin_registry_runtime._LEGACY_ADOPTION_MARKER
 
 
 class _FakeClient:
@@ -53,13 +62,44 @@ def _clear_clients(monkeypatch, tmp_path):
     garmin_client._clients.clear()
 
 
-def _fake_auth(calls: list[tuple[int, int]]):
+def _write_fake_token_store(token_dir) -> None:
+    """Leave the inert, non-empty artifact a real login persists."""
+    token_dir.mkdir(mode=0o700, exist_ok=True)
+    (token_dir / "garmin_tokens.json").write_text("{}", encoding="ascii")
+
+
+async def _adoption_marker_recorded() -> bool:
+    db = await get_db()
+    try:
+        row = await (
+            await db.execute("SELECT 1 FROM auth_migrations WHERE name = ?", (_LEGACY_ADOPTION_MARKER,))
+        ).fetchone()
+    finally:
+        await db.close()
+    return row is not None
+
+
+async def _link_row(person_id: int):
+    db = await get_db()
+    try:
+        return await (
+            await db.execute(
+                "SELECT state, garmin_email, generation FROM garmin_links WHERE person_id = ?", (person_id,)
+            )
+        ).fetchone()
+    finally:
+        await db.close()
+
+
+def _fake_auth(calls: list[tuple[int, int]], token_dirs: list | None = None):
     def authenticate(person_id, generation, token_dir, email, password):
         assert password is None
         assert email == f"person-{person_id}@example.test"
         client = _FakeClient(generation)
         garmin_client._clients[(person_id, generation)] = client
         calls.append((person_id, generation))
+        if token_dirs is not None:
+            token_dirs.append(token_dir)
         return client
 
     return authenticate
@@ -69,8 +109,7 @@ def _lifecycle_auth(calls: list[tuple[int, int]]):
     """Fake login that leaves an inert token artifact in the staging dir."""
     def authenticate(person_id, generation, token_dir, email, password):
         assert password == "transient-password"
-        token_dir.mkdir(mode=0o700, exist_ok=True)
-        (token_dir / "garmin_tokens.json").touch()
+        _write_fake_token_store(token_dir)
         client = _FakeClient(generation)
         garmin_client._clients[(person_id, generation)] = client
         calls.append((person_id, generation))
@@ -138,18 +177,93 @@ async def test_call_permit_allows_only_one_of_two_concurrent_requests(initialize
     assert sorted(await asyncio.gather(reserve(), reserve())) == ["accepted", "limited"]
 
 
-async def test_call_permit_retry_after_stays_within_configured_bounds(initialized_db, monkeypatch):
-    monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
+async def _set_next_allowed_at(value: float) -> None:
     db = await get_db()
     try:
-        await db.execute("UPDATE garmin_call_budget SET next_allowed_at = ?", (10000.0,))
+        await db.execute("UPDATE garmin_call_budget SET next_allowed_at = ?", (value,))
         await db.commit()
     finally:
         await db.close()
 
+
+async def _next_allowed_at() -> float:
+    db = await get_db()
+    try:
+        row = await (await db.execute("SELECT next_allowed_at FROM garmin_call_budget")).fetchone()
+    finally:
+        await db.close()
+    return row["next_allowed_at"]
+
+
+async def test_call_permit_retry_after_stays_within_configured_bounds(initialized_db, monkeypatch):
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
+    monkeypatch.setenv("GARMIN_MIN_CALL_INTERVAL_SECONDS", "60")
+    await _set_next_allowed_at(160.0)
+
     with pytest.raises(garmin_registry.GarminRateLimited) as exc_info:
         await garmin_registry.reserve_call_permit()
     assert exc_info.value.retry_after == 60
+
+
+async def test_call_permit_treats_a_slot_beyond_one_interval_as_clock_skew(initialized_db, monkeypatch):
+    """A reservation only ever writes now + interval; anything further ahead
+    is a clock regression, and honouring it would freeze Garmin calls until
+    the wall clock caught up."""
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
+    monkeypatch.setenv("GARMIN_MIN_CALL_INTERVAL_SECONDS", "2")
+    await _set_next_allowed_at(10000.0)
+
+    await garmin_registry.reserve_call_permit()
+
+    assert await _next_allowed_at() == 102.0
+    with pytest.raises(garmin_registry.GarminRateLimited):
+        await garmin_registry.reserve_call_permit()
+
+
+@pytest.mark.parametrize(
+    "max_wait_seconds, expected_sleeps, outcome",
+    (
+        (5.0, [2], "succeeds"),
+        (1.0, [], "rate_limited"),
+        (0.0, [], "rate_limited"),
+    ),
+)
+async def test_call_waits_for_a_permit_only_within_its_budget(
+    initialized_db, monkeypatch, max_wait_seconds, expected_sleeps, outcome
+):
+    """An interactive push may absorb one interval; a zero budget fails fast."""
+    person_id = await get_primary_person_id()
+    await _link(person_id)
+    garmin_client._clients[(person_id, 1)] = _FakeClient(1)
+    clock = {"now": 100.0}
+    sleeps: list[float] = []
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: clock["now"])
+    monkeypatch.setenv("GARMIN_MIN_CALL_INTERVAL_SECONDS", "2")
+    await _set_next_allowed_at(102.0)
+
+    async def advance(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(garmin_registry.asyncio, "sleep", advance)
+
+    if outcome == "succeeds":
+        result = await garmin_registry.call(
+            person_id, lambda client: client.generation, max_wait_seconds=max_wait_seconds
+        )
+        assert result == 1
+    else:
+        with pytest.raises(garmin_registry.GarminRateLimited) as exc_info:
+            await garmin_registry.call(
+                person_id, lambda _client: pytest.fail("must not call Garmin"), max_wait_seconds=max_wait_seconds
+            )
+        assert exc_info.value.retry_after == 2
+    assert sleeps == expected_sleeps
+
+
+async def test_call_rejects_a_negative_wait_budget(initialized_db):
+    with pytest.raises(ValueError):
+        await garmin_registry.call(1, lambda _client: None, max_wait_seconds=-1)
 
 
 async def test_call_evicts_a_stale_generation_before_running_the_operation(initialized_db, monkeypatch):
@@ -310,13 +424,20 @@ async def test_paced_call_waits_between_dashboard_batch_operations(initialized_d
     assert sleeps == [2]
 
 
-async def test_bootstrap_adopts_only_a_verified_flat_token_store_once(
-    initialized_db, monkeypatch, tmp_path
-):
-    """A verified flat store binds once with canonical metadata, never copied."""
+def _flat_store(tmp_path):
     root = tmp_path / "garth"
     root.mkdir(mode=0o700)
-    (root / "garmin_tokens.json").touch()
+    (root / "garmin_tokens.json").write_text("{}", encoding="ascii")
+    return root
+
+
+async def test_bootstrap_adopts_a_verified_flat_store_once_by_moving_it(
+    initialized_db, monkeypatch, tmp_path
+):
+    """Adoption moves the flat store under the primary person, publishes an
+    ordinary 'linked' row and records its one-time marker; a second boot is
+    a no-op that never contacts Garmin again."""
+    root = _flat_store(tmp_path)
     person_id = await get_primary_person_id()
     calls: list[tuple[int, int]] = []
     monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", root)
@@ -325,40 +446,184 @@ async def test_bootstrap_adopts_only_a_verified_flat_token_store_once(
     monkeypatch.setenv("GARMIN_EMAIL", f" Person-{person_id}@Example.Test ")
 
     assert await garmin_registry.bootstrap_legacy_token_store() is True
-    # The second service startup observes the durable legacy-bound row under
-    # the parent flock and must neither authenticate nor create another link.
     assert await garmin_registry.bootstrap_legacy_token_store() is False
     assert calls == [(person_id, 1)]
-    assert (root / "garmin_tokens.json").is_file()
 
+    durable = garmin_registry._generation_token_dir(person_id, 1)
+    assert not (root / "garmin_tokens.json").exists(), "the flat store must be moved, not copied"
+    assert (durable / "garmin_tokens.json").read_text(encoding="ascii") == "{}"
+    assert durable.stat().st_mode & 0o777 == 0o700
+    # The verification client's persistence path is the flat root; it must not
+    # stay cached and dump a refreshed token there later.
+    assert (person_id, 1) not in garmin_client._clients
+    assert tuple(await _link_row(person_id)) == ("linked", f"person-{person_id}@example.test", 1)
+    assert await _adoption_marker_recorded()
     db = await get_db()
     try:
-        row = await (
-            await db.execute(
-                "SELECT state, garmin_email, generation FROM garmin_links WHERE person_id = ?", (person_id,)
-            )
+        ledger = await (
+            await db.execute("SELECT generation FROM garmin_link_generations WHERE person_id = ?", (person_id,))
         ).fetchone()
     finally:
         await db.close()
-    assert tuple(row) == ("legacy_bound", f"person-{person_id}@example.test", 1)
+    assert ledger["generation"] == 1
+
+
+async def test_first_call_after_adoption_resumes_from_the_moved_store(initialized_db, monkeypatch, tmp_path):
+    root = _flat_store(tmp_path)
+    person_id = await get_primary_person_id()
+    calls: list[tuple[int, int]] = []
+    token_dirs: list = []
+    monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", root)
+    monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _fake_auth(calls, token_dirs))
+    moments = iter((100.0, 110.0, 112.0))
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: next(moments))
+    monkeypatch.setenv("GARMIN_EMAIL", f"person-{person_id}@example.test")
+
+    assert await garmin_registry.bootstrap_legacy_token_store() is True
+    assert await garmin_registry.call(person_id, lambda client: client.generation) == 1
+
+    assert calls == [(person_id, 1), (person_id, 1)]
+    assert token_dirs == [root, garmin_registry._generation_token_dir(person_id, 1)]
+
+
+async def test_bootstrap_never_re_adopts_after_unlink_even_if_the_flat_store_returns(
+    initialized_db, monkeypatch, tmp_path
+):
+    """The marker, not the row or the file, is the durable 'already done'."""
+    root = _flat_store(tmp_path)
+    person_id = await get_primary_person_id()
+    actor_id = await seed_user("post-adoption-unlink", role="admin")
+    calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", root)
+    monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _fake_auth(calls))
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
+    monkeypatch.setenv("GARMIN_EMAIL", f"person-{person_id}@example.test")
+
+    assert await garmin_registry.bootstrap_legacy_token_store() is True
+    assert await garmin_registry.unlink(person_id, actor_id, 1) is True
+    assert not garmin_registry._person_token_root(person_id).exists()
+    # A restored backup (or a stray copy) reappears at the flat root.
+    (root / "garmin_tokens.json").write_text("{}", encoding="ascii")
+
+    assert await garmin_registry.bootstrap_legacy_token_store() is False
+    assert calls == [(person_id, 1)], "the flat store must never be verified again"
+    assert await _link_row(person_id) is None
+    assert (root / "garmin_tokens.json").is_file(), "an un-adoptable store is left where it was"
+
+
+async def test_bootstrap_completes_an_interrupted_adoption_without_moving_again(
+    initialized_db, monkeypatch, tmp_path
+):
+    """SIGKILL between the file move and the commit leaves the store under
+    generation-1 with no row and no marker; the next boot only publishes."""
+    root = tmp_path / "garth"
+    root.mkdir(mode=0o700)
+    person_id = await get_primary_person_id()
+    monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", root)
+    durable = garmin_registry._generation_token_dir(person_id, 1)
+    durable.mkdir(parents=True, mode=0o700)
+    (durable / "garmin_tokens.json").write_text("{}", encoding="ascii")
+    calls: list[tuple[int, int]] = []
+    token_dirs: list = []
+    monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _fake_auth(calls, token_dirs))
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
+    monkeypatch.setenv("GARMIN_EMAIL", f"person-{person_id}@example.test")
+
+    assert await garmin_registry.bootstrap_legacy_token_store() is True
+
+    assert calls == [(person_id, 1)]
+    assert token_dirs == [durable]
+    assert (durable / "garmin_tokens.json").is_file()
+    assert not (root / "garmin_tokens.json").exists()
+    assert tuple(await _link_row(person_id)) == ("linked", f"person-{person_id}@example.test", 1)
+    assert await _adoption_marker_recorded()
+    assert (person_id, 1) not in garmin_client._clients
+
+
+async def test_bootstrap_restores_the_flat_store_when_publication_fails(
+    initialized_db, monkeypatch, tmp_path, caplog
+):
+    root = _flat_store(tmp_path)
+    person_id = await get_primary_person_id()
+    calls: list[tuple[int, int]] = []
+    sentinel = "publication-failure-path-must-not-escape"
+
+    async def failed_publish(*_args):
+        raise RuntimeError(sentinel)
+
+    monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", root)
+    monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _fake_auth(calls))
+    monkeypatch.setattr(garmin_registry_runtime, "_publish_legacy_adoption", failed_publish)
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
+    monkeypatch.setenv("GARMIN_EMAIL", f"person-{person_id}@example.test")
+    caplog.set_level(logging.WARNING, logger="shared.garmin_registry_runtime")
+
+    assert await garmin_registry.bootstrap_legacy_token_store() is False
+
+    assert calls == [(person_id, 1)]
+    assert (root / "garmin_tokens.json").read_text(encoding="ascii") == "{}"
+    assert not (garmin_registry._generation_token_dir(person_id, 1) / "garmin_tokens.json").exists()
+    assert await _link_row(person_id) is None
+    assert not await _adoption_marker_recorded()
+    assert sentinel not in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
+@pytest.mark.parametrize("prior", ("link_row", "ledger_row", "conflicting_email"))
+async def test_bootstrap_skips_a_primary_the_new_lifecycle_already_touched(
+    initialized_db, monkeypatch, tmp_path, prior
+):
+    """Once any per-person lifecycle state exists, the flat store is residue."""
+    root = _flat_store(tmp_path)
+    person_id = await get_primary_person_id()
+    db = await get_db()
+    try:
+        if prior == "link_row":
+            await db.execute(
+                "INSERT INTO garmin_links (person_id, state, garmin_email, generation, linked_at, updated_at) "
+                "VALUES (?, 'linked', 'other@example.test', 2, '2026-09-15T00:00:00Z', '2026-09-15T00:00:00Z')",
+                (person_id,),
+            )
+        elif prior == "ledger_row":
+            await db.execute("INSERT INTO garmin_link_generations VALUES (?, 1)", (person_id,))
+        else:
+            other = await seed_person("owner-of-that-email")
+            await db.execute(
+                "INSERT INTO garmin_links (person_id, state, garmin_email, generation, linked_at, updated_at) "
+                "VALUES (?, 'linked', ?, 1, '2026-09-15T00:00:00Z', '2026-09-15T00:00:00Z')",
+                (other, f"person-{person_id}@example.test"),
+            )
+        await db.commit()
+    finally:
+        await db.close()
+    calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", root)
+    monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _fake_auth(calls))
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
+    monkeypatch.setenv("GARMIN_EMAIL", f"person-{person_id}@example.test")
+
+    assert await garmin_registry.bootstrap_legacy_token_store() is False
+
+    assert calls == []
+    assert (root / "garmin_tokens.json").is_file()
+    assert not await _adoption_marker_recorded()
 
 
 async def test_concurrent_startups_adopt_a_verified_flat_store_exactly_once(
     initialized_db, monkeypatch, tmp_path
 ):
     """The GARTH parent flock makes two service lifespans one adoption."""
-    root = tmp_path / "garth"
-    root.mkdir(mode=0o700)
-    (root / "garmin_tokens.json").touch()
+    root = _flat_store(tmp_path)
     person_id = await get_primary_person_id()
     calls: list[tuple[int, int]] = []
     auth_started = threading.Event()
     permit_publish = threading.Event()
 
     def gated_authenticate(person, generation, token_dir, email, password):
-        assert (person, generation, email, password) == (
+        assert (person, generation, token_dir, email, password) == (
             person_id,
             1,
+            root,
             f"person-{person_id}@example.test",
             None,
         )
@@ -395,18 +660,17 @@ async def test_concurrent_startups_adopt_a_verified_flat_store_exactly_once(
         ).fetchall()
     finally:
         await db.close()
-    assert [tuple(row) for row in rows] == [
-        ("legacy_bound", f"person-{person_id}@example.test", 1)
-    ]
+    assert [tuple(row) for row in rows] == [("linked", f"person-{person_id}@example.test", 1)]
+    assert not (root / "garmin_tokens.json").exists()
+    assert (garmin_registry._generation_token_dir(person_id, 1) / "garmin_tokens.json").is_file()
 
 
 async def test_bootstrap_does_not_bind_a_flat_store_that_fails_verification(
     initialized_db, monkeypatch, tmp_path, caplog
 ):
-    """A provider failure leaves no durable link and never logs token detail."""
-    root = tmp_path / "garth"
-    root.mkdir(mode=0o700)
-    (root / "garmin_tokens.json").touch()
+    """A provider failure leaves no durable link, moves nothing, and never
+    logs token detail."""
+    root = _flat_store(tmp_path)
     person_id = await get_primary_person_id()
     sensitive_detail = "legacy-token-content-or-path-must-not-escape"
 
@@ -421,15 +685,10 @@ async def test_bootstrap_does_not_bind_a_flat_store_that_fails_verification(
     assert await garmin_registry.bootstrap_legacy_token_store() is False
     assert sensitive_detail not in caplog.text
     assert (person_id, 1) not in garmin_client._clients
-
-    db = await get_db()
-    try:
-        row = await (
-            await db.execute("SELECT 1 FROM garmin_links WHERE person_id = ?", (person_id,))
-        ).fetchone()
-    finally:
-        await db.close()
-    assert row is None
+    assert (root / "garmin_tokens.json").is_file()
+    assert not garmin_registry._person_token_root(person_id).exists()
+    assert await _link_row(person_id) is None
+    assert not await _adoption_marker_recorded()
 
 
 async def test_token_root_or_flock_setup_error_is_sanitized(initialized_db, monkeypatch):
@@ -438,7 +697,7 @@ async def test_token_root_or_flock_setup_error_is_sanitized(initialized_db, monk
     def cannot_prepare_lock(_person_id):
         raise OSError(f"permission denied: {sentinel_path}")
 
-    monkeypatch.setattr(garmin_registry, "_person_lock_path", cannot_prepare_lock)
+    monkeypatch.setattr(garmin_registry_locks, "_person_lock_path", cannot_prepare_lock)
 
     with pytest.raises(garmin_registry.GarminOperationError) as exc_info:
         await garmin_registry.call(1, lambda _client: pytest.fail("must not run"))
@@ -651,8 +910,8 @@ async def test_person_token_directories_are_distinct_and_private(monkeypatch, tm
     root = tmp_path / "garth"
     monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", root)
 
-    first = await garmin_registry.resolve_token_dir(1, "linked", 1)
-    second = await garmin_registry.resolve_token_dir(2, "linked", 1)
+    first = garmin_registry.resolve_token_dir(1, 1)
+    second = garmin_registry.resolve_token_dir(2, 1)
     garmin_client._ensure_token_dir(first)
     garmin_client._ensure_token_dir(second)
 
@@ -696,6 +955,156 @@ async def test_link_publishes_canonical_email_generation_and_staged_store(initia
     assert (final / "garmin_tokens.json").exists()
     assert final.stat().st_mode & 0o777 == 0o700
     assert not list(garmin_registry.GARTH_TOKEN_DIR.glob("*.staging"))
+    # The link-time client's persistence path is the renamed-away staging
+    # directory; it must not stay cached and dump a refreshed token there.
+    assert not garmin_client._clients
+
+
+async def test_first_call_after_link_resumes_from_the_published_generation(initialized_db, monkeypatch):
+    person_id = await get_primary_person_id()
+    actor_id = await seed_user("cold-after-link-actor", role="admin")
+    token_dirs: list = []
+
+    def authenticate(person, generation, token_dir, email, password):
+        token_dirs.append((generation, token_dir, password))
+        _write_fake_token_store(token_dir)
+        client = _FakeClient(generation)
+        garmin_client._clients[(person, generation)] = client
+        return client
+
+    monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", authenticate)
+    moments = iter((100.0, 100.0, 110.0, 112.0))
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: next(moments))
+
+    await garmin_registry.link(person_id, actor_id, 1, "owner@example.test", "transient-password")
+    assert await garmin_registry.call(person_id, lambda client: client.generation) == 1
+
+    final = garmin_registry._generation_token_dir(person_id, 1)
+    assert [(generation, password) for generation, _dir, password in token_dirs] == [
+        (1, "transient-password"),
+        (1, None),
+    ]
+    assert token_dirs[0][1] != final, "login must happen in a private staging directory"
+    assert token_dirs[1][1] == final
+
+
+async def test_link_refuses_to_publish_a_login_that_left_no_token_store(initialized_db, monkeypatch):
+    """login() can return without persisting; publishing that would create a
+    link whose first cold call resumes nothing."""
+    person_id = await get_primary_person_id()
+    actor_id = await seed_user("empty-store-actor", role="admin")
+
+    def authenticate(person, generation, token_dir, email, password):
+        token_dir.mkdir(mode=0o700, exist_ok=True)
+        (token_dir / "garmin_tokens.json").touch()
+        client = _FakeClient(generation)
+        garmin_client._clients[(person, generation)] = client
+        return client
+
+    monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", authenticate)
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
+
+    with pytest.raises(garmin_registry.GarminOperationError) as exc_info:
+        await garmin_registry.link(person_id, actor_id, 1, "owner@example.test", "transient-password")
+
+    assert exc_info.value.code == "unknown"
+    assert await _link_row(person_id) is None
+    assert not garmin_registry._generation_token_dir(person_id, 1).exists()
+    assert not list(garmin_registry.GARTH_TOKEN_DIR.glob("*.staging"))
+    assert not garmin_client._clients
+
+
+async def test_link_and_unlink_sweep_staging_residue_of_a_killed_attempt(initialized_db, monkeypatch):
+    """A SIGKILL mid-login leaves a staging directory nothing else references."""
+    person_id = await get_primary_person_id()
+    other_person = await seed_person("other-residue-person")
+    actor_id = await seed_user("residue-actor", role="admin")
+    root = garmin_registry._ensure_token_root()
+    residue = root / f".person-{person_id}-generation-7-deadbeef.staging"
+    other_residue = root / f".person-{other_person}-generation-1-cafe.staging"
+    for path in (residue, other_residue):
+        _write_fake_token_store(path)
+    calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _lifecycle_auth(calls))
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
+
+    await garmin_registry.link(person_id, actor_id, 1, "owner@example.test", "transient-password")
+    assert not residue.exists()
+    assert other_residue.exists(), "another person's residue is outside this person's flock"
+
+    _write_fake_token_store(residue)
+    assert await garmin_registry.unlink(person_id, actor_id, 1)
+    assert not residue.exists()
+    assert other_residue.exists()
+
+    # Residue belongs to no link row, so an unlink with nothing to remove
+    # still sweeps it.
+    _write_fake_token_store(residue)
+    assert await garmin_registry.unlink(person_id, actor_id, 1) is False
+    assert not residue.exists()
+    assert other_residue.exists()
+
+
+async def test_cancelled_login_burns_its_generation_and_never_reaches_a_later_link(initialized_db, monkeypatch):
+    """The login thread cannot be interrupted.  Its generation is reserved
+    before it starts, so whatever it caches or writes later belongs to a
+    number no published link will ever resolve."""
+    person_id = await get_primary_person_id()
+    actor_id = await seed_user("cancel-login-actor", role="admin")
+    first_started = threading.Event()
+    release_first = threading.Event()
+    first_finished = threading.Event()
+    calls: list[tuple[int, str]] = []
+
+    def gated_authenticate(person, generation, token_dir, email, password):
+        calls.append((generation, email))
+        _write_fake_token_store(token_dir)
+        if email == "first@example.test":
+            first_started.set()
+            assert release_first.wait(timeout=5)
+        client = _FakeClient(generation)
+        garmin_client._clients[(person, generation)] = client
+        if email == "first@example.test":
+            first_finished.set()
+        return client
+
+    clock = {"now": 100.0}
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", gated_authenticate)
+
+    stale = asyncio.create_task(
+        garmin_registry.link(person_id, actor_id, 1, "first@example.test", "transient-password")
+    )
+    assert await asyncio.to_thread(first_started.wait, 5)
+    stale.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stale
+
+    clock["now"] = 200.0
+    published = await garmin_registry.link(person_id, actor_id, 1, "second@example.test", "transient-password")
+    assert published.generation == 2
+    assert calls == [(1, "first@example.test"), (2, "second@example.test")]
+    assert (person_id, 2) not in garmin_client._clients
+
+    release_first.set()
+    assert await asyncio.to_thread(first_finished.wait, 5)
+    for _ in range(100):
+        if (person_id, 1) not in garmin_client._clients:
+            break
+        await real_sleep(0.01)
+    assert (person_id, 1) not in garmin_client._clients, "the abandoned login's client was not discarded"
+    assert (person_id, 2) not in garmin_client._clients, "the stale thread must not touch the newer generation"
+
+    async def advance(seconds: float) -> None:
+        clock["now"] += seconds
+        await real_sleep(0)
+
+    clock["now"] = 300.0
+    monkeypatch.setattr(garmin_registry.asyncio, "sleep", advance)
+    assert await garmin_registry.call(person_id, lambda client: client.generation) == 2
+    assert calls[-1] == (2, "second@example.test")
+    assert set(garmin_client._clients) == {(person_id, 2)}
 
 
 async def test_failed_relink_preserves_existing_link_and_token_store(initialized_db, monkeypatch):
@@ -718,6 +1127,14 @@ async def test_failed_relink_preserves_existing_link_and_token_store(initialized
 
     monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", failed_auth)
     monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
+    db = await get_db()
+    try:
+        await db.execute(
+            "UPDATE garmin_links SET last_auth_ok = '2026-09-15T00:00:00Z' WHERE person_id = ?", (person_id,)
+        )
+        await db.commit()
+    finally:
+        await db.close()
     with pytest.raises(garmin_registry.GarminAuthenticationError) as exc_info:
         await garmin_registry.relink(person_id, actor_id, 1, "new@example.test", "transient-password")
     assert "password-and-token" not in str(exc_info.value)
@@ -725,11 +1142,21 @@ async def test_failed_relink_preserves_existing_link_and_token_store(initialized
     db = await get_db()
     try:
         row = await (
-            await db.execute("SELECT garmin_email, generation FROM garmin_links WHERE person_id = ?", (person_id,))
+            await db.execute(
+                "SELECT garmin_email, generation, last_auth_ok, last_auth_error, last_auth_error_at "
+                "FROM garmin_links WHERE person_id = ?",
+                (person_id,),
+            )
+        ).fetchone()
+        ledger = await (
+            await db.execute("SELECT generation FROM garmin_link_generations WHERE person_id = ?", (person_id,))
         ).fetchone()
     finally:
         await db.close()
-    assert tuple(row) == (f"person-{person_id}@example.test", 1)
+    # The failed attempt had its own credentials; the existing generation's
+    # health must not be stamped with that attempt's rejection.
+    assert tuple(row) == (f"person-{person_id}@example.test", 1, "2026-09-15T00:00:00Z", None, None)
+    assert ledger["generation"] == 2, "a failed attempt burns its reserved generation"
 
 
 async def test_failed_publication_removes_new_generation_and_preserves_old_store(initialized_db, monkeypatch):
@@ -749,6 +1176,7 @@ async def test_failed_publication_removes_new_generation_and_preserves_old_store
 
     def authenticate(person_id, generation, token_dir, email, password):
         assert password == "transient-password"
+        _write_fake_token_store(token_dir)
         (token_dir / "account-marker").write_text("new", encoding="ascii")
         client = _FakeClient(generation)
         garmin_client._clients[(person_id, generation)] = client
@@ -848,8 +1276,7 @@ async def test_link_rechecks_manage_grant_revoked_while_login_is_in_flight(initi
     release_auth = threading.Event()
 
     def authenticate(person, generation, token_dir, _email, _password):
-        token_dir.mkdir(mode=0o700, exist_ok=True)
-        (token_dir / "garmin_tokens.json").touch()
+        _write_fake_token_store(token_dir)
         auth_started.set()
         assert release_auth.wait(timeout=5)
         client = _FakeClient(generation)
@@ -940,8 +1367,7 @@ async def test_concurrent_links_cannot_claim_one_canonical_account_twice(initial
 
     def authenticate(person_id, generation, token_dir, email, password):
         assert password == "transient-password"
-        token_dir.mkdir(mode=0o700, exist_ok=True)
-        (token_dir / "garmin_tokens.json").touch()
+        _write_fake_token_store(token_dir)
         with calls_lock:
             calls.append((person_id, generation))
             if len(calls) == 2:
@@ -1011,7 +1437,9 @@ async def test_unlink_removes_normal_link_after_commit_and_keeps_generation_ledg
     assert not garmin_client._clients
 
 
-async def test_unlink_tombstones_legacy_bound_link_without_removing_generation(initialized_db):
+async def test_unlink_deletes_a_retired_legacy_bound_row_and_leaves_the_flat_root_alone(initialized_db):
+    """A database from the release that wrote 'legacy_bound' still carries the
+    row; unlink removes it like any other and never touches the flat root."""
     person_id = await get_primary_person_id()
     actor_id = await seed_user("legacy-unlink-actor", role="admin")
     await _link(person_id, generation=3, state="legacy_bound")
@@ -1021,18 +1449,22 @@ async def test_unlink_tombstones_legacy_bound_link_without_removing_generation(i
         await db.commit()
     finally:
         await db.close()
+    flat_token = garmin_registry._ensure_token_root() / "garmin_tokens.json"
+    flat_token.write_text("{}", encoding="ascii")
 
+    with pytest.raises(garmin_registry.GarminNotLinked):
+        await garmin_registry.call(person_id, lambda _client: pytest.fail("a retired state is not usable"))
     assert await garmin_registry.unlink(person_id, actor_id, 1)
+    assert await _link_row(person_id) is None
+    assert flat_token.is_file()
     db = await get_db()
     try:
-        row = await (
-            await db.execute(
-                "SELECT state, garmin_email, generation, linked_at FROM garmin_links WHERE person_id = ?", (person_id,)
-            )
+        ledger = await (
+            await db.execute("SELECT generation FROM garmin_link_generations WHERE person_id = ?", (person_id,))
         ).fetchone()
     finally:
         await db.close()
-    assert tuple(row) == ("legacy_disabled", None, 3, None)
+    assert ledger["generation"] == 3
 
 
 async def test_unlink_rejects_stale_actor_session_without_mutating_or_cleaning(initialized_db):
@@ -1142,3 +1574,80 @@ async def test_call_cleans_post_publication_crash_stale_generation_directory(ini
     assert await garmin_registry.call(person_id, lambda client: client.generation) == 2
     assert not old_dir.exists()
     assert new_dir.exists()
+
+
+
+def _with_response(exc: Exception, status_code: int) -> Exception:
+    class _Response:
+        pass
+
+    response = _Response()
+    response.status_code = status_code
+    exc.response = response
+    return exc
+
+
+@pytest.mark.parametrize(
+    "exc, code",
+    (
+        (GarminConnectTooManyRequestsError("Mobile login returned 429 — IP rate limited by Garmin"), "rate_limited"),
+        (GarminConnectTooManyRequestsError("Portal login: 429 in JSON body"), "rate_limited"),
+        (GarminConnectAuthenticationError("Not authenticated"), "auth_failed"),
+        (GarminConnectAuthenticationError("Login failed: bad credentials"), "auth_failed"),
+        (GarminConnectConnectionError("API Error 429"), "rate_limited"),
+        (GarminConnectConnectionError("API Error 401 - Unauthorized"), "auth_failed"),
+        (GarminConnectConnectionError("API Error 403 - Forbidden"), "auth_failed"),
+        (GarminConnectConnectionError("Mobile login: HTTP 403 (Cloudflare bot challenge) — next"), "auth_failed"),
+        (GarminConnectConnectionError("Mobile login failed (non-JSON): HTTP 502"), "network"),
+        (GarminConnectConnectionError("Widget embed returned 503"), "network"),
+        (GarminConnectConnectionError("curl_cffi not available"), "network"),
+        (_with_response(GarminConnectConnectionError("wrapped"), 429), "rate_limited"),
+        (GarminConnectNotFoundError("API Error 404 - no data"), "unknown"),
+        (TimeoutError("read timed out"), "network"),
+        (RuntimeError("HTTP 401 mentioned by an unrelated error"), "unknown"),
+    ),
+)
+def test_error_code_classifies_real_garminconnect_exceptions(exc, code):
+    assert garmin_registry._error_code(exc) == code
+
+
+async def test_rate_limited_operation_keeps_the_cached_client_and_status(initialized_db):
+    person_id = await get_primary_person_id()
+    await _link(person_id)
+    cached = _FakeClient(1)
+    garmin_client._clients[(person_id, 1)] = cached
+    await garmin_registry._record_auth_success(person_id, 1)
+
+    def throttled_op(_client):
+        raise GarminConnectTooManyRequestsError("Portal login POST returned 429 — Cloudflare blocking this request.")
+
+    with pytest.raises(garmin_registry.GarminOperationError) as exc_info:
+        await garmin_registry.call(person_id, throttled_op)
+
+    assert exc_info.value.code == "rate_limited"
+    assert "Cloudflare" not in str(exc_info.value)
+    assert garmin_client._clients[(person_id, 1)] is cached
+    db = await get_db()
+    try:
+        row = await (
+            await db.execute("SELECT last_auth_error FROM garmin_links WHERE person_id = ?", (person_id,))
+        ).fetchone()
+    finally:
+        await db.close()
+    assert row["last_auth_error"] is None
+
+
+async def test_unbounded_failure_is_logged_by_type_name_only(initialized_db, monkeypatch, caplog):
+    sentinel_path = "/private/garth/person-1"
+
+    def cannot_prepare_lock(_person_id):
+        raise OSError(f"permission denied: {sentinel_path}")
+
+    monkeypatch.setattr(garmin_registry_locks, "_person_lock_path", cannot_prepare_lock)
+    caplog.set_level(logging.WARNING, logger="shared.garmin_registry")
+
+    with pytest.raises(garmin_registry.GarminOperationError):
+        await garmin_registry.call(1, lambda _client: pytest.fail("must not run"))
+
+    assert "OSError" in caplog.text
+    assert sentinel_path not in caplog.text

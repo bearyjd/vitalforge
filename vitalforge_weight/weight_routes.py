@@ -108,6 +108,10 @@ _WEIGHT_LOG_EXISTING_ROW_COLUMNS = (
 )
 
 
+# How long an interactive Garmin push may wait for the global call permit.
+_INTERACTIVE_PERMIT_WAIT_SECONDS = 10.0
+
+
 async def _push_composition(
     person_id: int, weight_grams: int, timestamp: datetime, composition: dict
 ) -> str | None:
@@ -135,7 +139,11 @@ async def _push_composition(
             finally:
                 _operation_client.reset(token)
 
-        await garmin_registry.call(person_id, operation)
+        # A user-facing tap should absorb the deployment-wide call interval
+        # rather than answer "rate_limited" whenever another call just went
+        # out; the bound keeps a genuinely busy limiter from hanging the
+        # request.
+        await garmin_registry.call(person_id, operation, max_wait_seconds=_INTERACTIVE_PERMIT_WAIT_SECONDS)
         return None
     except garmin_registry.GarminNotLinked:
         # A local reading is useful even before the person has linked Garmin.

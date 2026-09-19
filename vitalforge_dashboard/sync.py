@@ -9,6 +9,9 @@ from shared.database import get_db
 logger = logging.getLogger(__name__)
 
 SYNC_INTERVAL_HOURS = int(os.getenv("SYNC_INTERVAL_HOURS", "2"))
+# Results that end a sync early; neither is an error count, and neither
+# should be overwritten by one.
+_STOPPED_RESULTS = frozenset({"link_required", "auth_failed"})
 
 
 async def has_usable_garmin_link(person_id: int) -> bool:
@@ -20,7 +23,7 @@ async def has_usable_garmin_link(person_id: int) -> bool:
         ).fetchone()
     finally:
         await db.close()
-    return row is not None and row["state"] in {"linked", "legacy_bound"}
+    return row is not None and row["state"] == "linked"
 
 
 async def get_synced_dates(table: str, person_id: int) -> set[str]:
@@ -64,11 +67,37 @@ def _extract_sleep_score(dto: dict, sleep: dict) -> int | None:
     return dto.get("overallSleepScoreValue") or sleep.get("overallSleepScoreValue")
 
 
-async def sync_date(date_str: str, person_id: int):
-    """Pull all metrics from Garmin for a single date and store them."""
+async def _fetch_metric(person_id: int, label: str, op, skipped: list[str]):
+    """Read one metric; a failed read is skipped so the rest of the date syncs.
+
+    Only the two failures that make every further read pointless propagate:
+    no usable link, and a link whose token store no longer resumes (which
+    would otherwise cost one failed login per remaining metric and date).
+    Anything else is logged by bounded code or type name -- never provider
+    text -- and the metric is left for the next sync.
+    """
+    try:
+        return await garmin_registry.call_paced(person_id, op)
+    except (garmin_registry.GarminNotLinked, garmin_registry.GarminAuthenticationError):
+        raise
+    except garmin_registry.GarminOperationError as exc:
+        logger.warning("Skipping %s for person %s: Garmin operation failed (%s)", label, person_id, exc.code)
+    except Exception as exc:
+        logger.warning("Skipping %s for person %s (%s)", label, person_id, type(exc).__name__)
+    skipped.append(label)
+    return None
+
+
+async def sync_date(date_str: str, person_id: int) -> int:
+    """Pull all metrics from Garmin for a single date and store them.
+
+    Returns how many metrics were skipped because their read failed, so
+    ``run_sync`` can still report a partial date honestly.
+    """
+    skipped: list[str] = []
 
     # --- Sleep ---
-    sleep = await garmin_registry.call_paced(person_id, lambda client: client.get_sleep_data(date_str))
+    sleep = await _fetch_metric(person_id, "sleep", lambda client: client.get_sleep_data(date_str), skipped)
     if sleep and isinstance(sleep, dict):
         # garminconnect wraps sleep data under dailySleepDTO
         dto = sleep.get("dailySleepDTO", sleep)
@@ -86,7 +115,9 @@ async def sync_date(date_str: str, person_id: int):
             )
 
     # --- User summary (steps, calories, RHR) ---
-    summary = await garmin_registry.call_paced(person_id, lambda client: client.get_user_summary(date_str))
+    summary = await _fetch_metric(
+        person_id, "user summary", lambda client: client.get_user_summary(date_str), skipped
+    )
     if summary and isinstance(summary, dict):
         rhr = summary.get("restingHeartRate")
         if rhr:
@@ -101,7 +132,7 @@ async def sync_date(date_str: str, person_id: int):
             await upsert("active_calories", date_str, person_id, value=active_cal)
 
     # --- HRV ---
-    hrv = await garmin_registry.call_paced(person_id, lambda client: client.get_hrv_data(date_str))
+    hrv = await _fetch_metric(person_id, "hrv", lambda client: client.get_hrv_data(date_str), skipped)
     if hrv and isinstance(hrv, dict):
         hrv_summary = hrv.get("hrvSummary", hrv)
         if isinstance(hrv_summary, dict):
@@ -116,7 +147,7 @@ async def sync_date(date_str: str, person_id: int):
                 )
 
     # --- Body Battery ---
-    bb = await garmin_registry.call_paced(person_id, lambda client: client.get_body_battery(date_str))
+    bb = await _fetch_metric(person_id, "body battery", lambda client: client.get_body_battery(date_str), skipped)
     if bb:
         entry = bb[0] if isinstance(bb, list) and bb else bb
         if isinstance(entry, dict):
@@ -146,7 +177,7 @@ async def sync_date(date_str: str, person_id: int):
                 )
 
     # --- Stress ---
-    stress = await garmin_registry.call_paced(person_id, lambda client: client.get_stress_data(date_str))
+    stress = await _fetch_metric(person_id, "stress", lambda client: client.get_stress_data(date_str), skipped)
     if stress and isinstance(stress, dict):
         # garminconnect uses avgStressLevel / overallStressLevel
         avg_stress = stress.get("avgStressLevel") or stress.get("overallStressLevel")
@@ -162,7 +193,9 @@ async def sync_date(date_str: str, person_id: int):
             )
 
     # --- VO2 Max (from training status, since get_max_metrics often returns null) ---
-    training = await garmin_registry.call_paced(person_id, lambda client: client.get_training_status(date_str))
+    training = await _fetch_metric(
+        person_id, "training status", lambda client: client.get_training_status(date_str), skipped
+    )
     if training and isinstance(training, dict):
         # Extract VO2 Max from training status
         most_recent = training.get("mostRecentVO2Max", {})
@@ -209,6 +242,8 @@ async def sync_date(date_str: str, person_id: int):
                     chronic_load=training.get("chronicLoad") or (agg.get("chronicLoad") if isinstance(agg, dict) else None),
                     load_ratio=training.get("loadRatio") or (agg.get("loadRatio") if isinstance(agg, dict) else None),
                 )
+
+    return len(skipped)
 
 
 async def sync_weight_history(start_date: str, end_date: str, person_id: int):
@@ -277,29 +312,39 @@ async def run_sync(days: int = 7, *, person_id: int):
                 continue
 
         try:
-            await sync_date(date_str, person_id)
+            errors += await sync_date(date_str, person_id)
         except garmin_registry.GarminNotLinked:
             # A scheduled run can race an unlink after its initial link check.
             # Record the expected state rather than leaking a provider error or
             # retrying every metric for every requested date.
             result = "link_required"
             break
+        except garmin_registry.GarminAuthenticationError as exc:
+            # The token store no longer resumes.  Every further read would
+            # repeat the same failed login, so stop here and let the status
+            # say why; a re-link is the only fix.
+            logger.warning("Stopping sync for person %s: Garmin authentication failed (%s)", person_id, exc.code)
+            result = "auth_failed"
+            break
         except Exception:
             logger.exception("Error syncing date %s", date_str)
             errors += 1
 
     # Weight history — fetch as a range
-    if result != "link_required":
+    if result not in _STOPPED_RESULTS:
         try:
             start_date = (today - timedelta(days=days)).isoformat()
             await sync_weight_history(start_date, today_str, person_id)
         except garmin_registry.GarminNotLinked:
             result = "link_required"
+        except garmin_registry.GarminAuthenticationError as exc:
+            logger.warning("Weight history skipped for person %s: Garmin authentication failed (%s)", person_id, exc.code)
+            result = "auth_failed"
         except Exception as e:
             logger.error("Error syncing weight history: %s", e)
             errors += 1
 
-    if errors and result != "link_required":
+    if errors and result not in _STOPPED_RESULTS:
         result = f"completed with {errors} errors"
 
     # Update sync status

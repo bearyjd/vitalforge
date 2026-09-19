@@ -228,6 +228,12 @@ def _activity_name(session_label: str | None, display_name: str | None, session_
     return f"Cadence — {label} [{marker}]"
 
 
+# How long an interactive Garmin push may wait for the global call permit,
+# mirroring weight_routes._push_composition.  The reconciliation lookup stays
+# fail-fast: it runs on a retry path that already tolerates "ask again later".
+_INTERACTIVE_PERMIT_WAIT_SECONDS = 10.0
+
+
 def _registry_failure_code(error: garmin_registry.GarminRegistryError) -> str:
     """Return the bounded provider-state code safe to store and return."""
     if isinstance(error, garmin_registry.GarminNotLinked):
@@ -316,6 +322,7 @@ async def _push_activity(
         response = await garmin_registry.call(
             person_id,
             create,
+            max_wait_seconds=_INTERACTIVE_PERMIT_WAIT_SECONDS,
         )
         if isinstance(response, Exception):
             raise response
@@ -367,7 +374,7 @@ async def _push_activity(
             finally:
                 _operation_client.reset(token)
 
-        await garmin_registry.call(person_id, attach_sets)
+        await garmin_registry.call(person_id, attach_sets, max_wait_seconds=_INTERACTIVE_PERMIT_WAIT_SECONDS)
     except garmin_registry.GarminRegistryError as e:
         logger.warning(
             "Garmin exercise-set upload unavailable for person %s activity %s: %s",

@@ -267,7 +267,7 @@ async def test_garmin_error_uses_a_bounded_code_without_logging_provider_secrets
             f"401 for user {secret_email} using Bearer {secret_token} at /activity-service"
         )
 
-    async def direct_registry_call(_person_id, operation):
+    async def direct_registry_call(_person_id, operation, *, max_wait_seconds=0.0):
         return operation(fake_garmin_client)
 
     monkeypatch.setattr(activity_garmin_module, "push_activity", leaky)
@@ -293,7 +293,7 @@ async def test_garmin_response_is_not_logged_verbatim(client, monkeypatch, activ
     def secret_without_activity_id(**kwargs):
         return {"detail": secret_response}
 
-    async def direct_registry_call(_person_id, operation):
+    async def direct_registry_call(_person_id, operation, *, max_wait_seconds=0.0):
         return operation(fake_garmin_client)
 
     monkeypatch.setattr(activity_garmin_module, "push_activity", secret_without_activity_id)
