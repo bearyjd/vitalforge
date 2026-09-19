@@ -566,6 +566,11 @@ async def test_bootstrap_adopts_a_verified_flat_store_once_by_moving_it(
     monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _fake_auth(calls))
     monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
     monkeypatch.setenv("GARMIN_EMAIL", f" Person-{person_id}@Example.Test ")
+    # Pre-existing and world/group-readable, like a directory left behind by an
+    # older release: only an explicit chmod in the move path can tighten it --
+    # _ensure_token_dir's ancestor walk skips whatever already exists.
+    person_root = root / f"person-{person_id}"
+    person_root.mkdir(mode=0o755)
 
     assert await garmin_registry.bootstrap_legacy_token_store() is True
     assert await garmin_registry.bootstrap_legacy_token_store() is False
@@ -575,7 +580,9 @@ async def test_bootstrap_adopts_a_verified_flat_store_once_by_moving_it(
     assert not (root / "garmin_tokens.json").exists(), "the flat store must be moved, not copied"
     assert (durable / "garmin_tokens.json").read_text(encoding="ascii") == "{}"
     assert durable.stat().st_mode & 0o777 == 0o700
-    assert oct(garmin_registry._person_token_root(person_id).stat().st_mode & 0o777) == oct(0o700)
+    assert oct(garmin_registry._person_token_root(person_id).stat().st_mode & 0o777) == oct(
+        0o700
+    ), "the move must tighten a pre-existing person directory, not just skip it"
     # The verification client's persistence path is the flat root; it must not
     # stay cached and dump a refreshed token there later.
     assert (person_id, 1) not in garmin_client._clients
