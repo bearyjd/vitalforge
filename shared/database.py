@@ -152,12 +152,14 @@ async def init_db():
     migrations."""
     from shared.migrations import (
         _PERSON_ID_REBUILD_SNAPSHOT_NAME,
+        _STRENGTH_SESSIONS_SNAPSHOT_NAME,
         SCHEMA_MIGRATIONS_TABLE_SQL,
         _apply_activities_person_id,
         _apply_person_id_rebuild,
         _apply_strength_sessions_redact_garmin_errors,
         _apply_strength_sessions_remove_garmin_target,
         _needs_person_id_rebuild,
+        _needs_strength_sessions_rebuild,
         assert_schema_understood,
         ensure_pre_migration_snapshot,
         run_migration,
@@ -337,12 +339,25 @@ async def init_db():
         """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_person_grants_user ON person_grants(user_id)")
 
-        # Per-person Garmin credential lifecycle. These are deliberately
-        # additive tables rather than a migration: init_db() creates them
-        # before the migration runner, so an older image simply ignores the
-        # extra tables on rollback instead of refusing to boot on an unknown
-        # migration marker. Tokens themselves remain on disk; do not add a
-        # password or token column here.
+        # Per-person Garmin credential lifecycle. The garmin_* tables are
+        # additive (created here, before the migration runner) and an older
+        # image would ignore them -- but that does NOT make this release
+        # rollback-safe by itself: the same release ships migrations 003 and
+        # 004, whose markers an older image does not know, so
+        # assert_schema_understood() boot-loops it. Rollback is "restore
+        # fitness.pre-003-strength-sessions.db" (README, Upgrading), not
+        # "redeploy the old image against the current file". Tokens
+        # themselves remain on disk; do not add a password or token column
+        # here.
+        #
+        # 'legacy_bound' and 'legacy_disabled' are RETIRED: boot-time adoption
+        # of a pre-Phase-3 flat token store now moves that store under
+        # person-<id>/generation-1/ and publishes an ordinary 'linked' row, so
+        # nothing writes either value any more and the registry only treats
+        # 'linked' as usable. They stay in the CHECK because SQLite cannot
+        # alter a CHECK constraint and databases that already created this
+        # table carry the three-value shape; dropping them would need a
+        # rebuild of a table that holds nothing worth rebuilding for.
         await db.execute("""
             CREATE TABLE IF NOT EXISTS garmin_links (
                 person_id          INTEGER PRIMARY KEY REFERENCES persons(id),
@@ -690,6 +705,11 @@ async def init_db():
     await ensure_pre_migration_snapshot(_PERSON_ID_REBUILD_SNAPSHOT_NAME, _needs_person_id_rebuild)
     await run_migration("001-person-id-rebuild", _apply_person_id_rebuild)
     await run_migration("002-activities-person-id", _apply_activities_person_id)
+    # 003 is a table rebuild that an older image cannot boot against (its
+    # marker is unknown to that image), so it gets its own snapshot -- taken
+    # here, AFTER 001/002, which is what makes it the right file to restore
+    # for a rollback to the previous release rather than to a pre-001 one.
+    await ensure_pre_migration_snapshot(_STRENGTH_SESSIONS_SNAPSHOT_NAME, _needs_strength_sessions_rebuild)
     await run_migration("003-strength-sessions-remove-garmin-target", _apply_strength_sessions_remove_garmin_target)
     await run_migration("004-strength-sessions-redact-garmin-errors", _apply_strength_sessions_redact_garmin_errors)
 

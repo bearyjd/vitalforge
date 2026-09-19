@@ -52,6 +52,12 @@ _KNOWN_MIGRATIONS = (
 
 _PERSON_ID_REBUILD_SNAPSHOT_NAME = "fitness.pre-001-person-id.db"
 
+# Taken between 002 and 003, so on a database that still needs 001 this is a
+# post-001, pre-003 image -- restoring it rolls back to an image that knows
+# 001/002 but not 003/004. README's Upgrading section spells out which
+# snapshot to restore for which target image.
+_STRENGTH_SESSIONS_SNAPSHOT_NAME = "fitness.pre-003-strength-sessions.db"
+
 # Table NAMES only -- no column DDL. _rebuild_columns derives the actual
 # column list from the live schema (PRAGMA table_info) instead, so there is
 # no second copy of any table's shape to drift out of sync with
@@ -95,6 +101,16 @@ async def _needs_person_id_rebuild(db) -> bool:
     losing this race is a wasted snapshot, because correctness comes
     entirely from the marker check inside run_migration's transaction."""
     return not await _has_column(db, "sleep", "person_id")
+
+
+async def _needs_strength_sessions_rebuild(db) -> bool:
+    """Same racy-by-design pre-check as _needs_person_id_rebuild, keyed on the
+    column 003 removes. A fresh database (init_db's DDL already built the
+    current shape) and an already-migrated one both answer False; only the
+    deployed pre-003 shape answers True. PRAGMA table_info on a missing table
+    returns no rows rather than raising, so calling this before init_db has
+    created the table is also False, not an error."""
+    return await _has_column(db, "strength_sessions", "garmin_target")
 
 
 async def _first_admin_username(db) -> str | None:
