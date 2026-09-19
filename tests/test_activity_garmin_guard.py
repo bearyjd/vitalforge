@@ -84,6 +84,12 @@ async def test_linked_person_pushes_only_to_their_own_registry_client(client, so
     assert resp.json()["garmin_status"] == "synced"
     assert fake_garmin_client.registry_calls == [(son, 1)]
     assert fake_garmin_client.created_activities[0]["activity_name"] == "Cadence — Lower A [6-a3f9]"
+    # The interactive activity push must pass its bounded permit wait, not
+    # the unbounded default -- see
+    # activity_garmin._INTERACTIVE_PERMIT_WAIT_SECONDS. (Exercise-sets attach
+    # is gated behind VITALFORGE_GARMIN_EXERCISE_SETS, unset here, so this is
+    # the only registry call the push makes.)
+    assert fake_garmin_client.registry_budgets == [10.0]
 
     row = await fetch_row()
     assert row["person_id"] == son

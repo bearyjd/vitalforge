@@ -4,12 +4,9 @@ from fastapi import HTTPException
 from shared import auth
 from tests.conftest import seed_user
 
-
-@pytest.fixture(autouse=True)
-def _reset_step_up_window():
-    auth._step_up_failures.clear()
-    yield
-    auth._step_up_failures.clear()
+# The step-up failure window is cleared around every test by the autouse
+# `_reset_step_up_failures` fixture in tests/conftest.py; no per-file
+# fixture needed here.
 
 
 async def test_sixth_failed_step_up_in_a_window_is_throttled_before_scrypt(initialized_db, monkeypatch):

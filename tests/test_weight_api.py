@@ -115,6 +115,9 @@ async def test_linked_secondary_person_weight_uses_only_their_registry_client(
     assert resp.json()["synced_to_garmin"] is True
     assert fake_garmin_client.registry_calls == [(son, 1)]
     assert len(fake_garmin_client.pushed_weights) == 1
+    # The interactive weight push must pass its bounded permit wait, not the
+    # unbounded default -- see weight_routes._INTERACTIVE_PERMIT_WAIT_SECONDS.
+    assert fake_garmin_client.registry_budgets == [10.0]
 
 
 async def test_get_recent_weights_orders_newest_first(client):

@@ -134,6 +134,10 @@ def fake_garmin_client(monkeypatch):
 
     fake = FakeGarminClient()
     fake.registry_calls = []
+    # Parallel to registry_calls (kept a bare (person_id, generation) 2-tuple
+    # since existing tests assert that exact shape): the `max_wait_seconds`
+    # each call carried, in the same order as registry_calls.
+    fake.registry_budgets = []
     # Route-level calls retain the adapter-facing datetime.  This is separate
     # from ``pushed_weights``, which represents what the Garmin client itself
     # receives after shared.garmin_client formats its wire timestamp.
@@ -146,10 +150,12 @@ def fake_garmin_client(monkeypatch):
         # this seam catches a caller that accidentally loses that boundary.
         # `max_wait_seconds` mirrors garmin_registry.call's keyword (the
         # interactive weight/activity pushes pass a bounded permit wait);
-        # there is no permit here to wait for, so it is accepted and ignored.
+        # there is no permit here to wait for, so it is recorded (not acted
+        # on) for tests that assert the interactive budget was passed.
         key = (int(person_id), 1)
         monkeypatch.setitem(garmin_client._clients, key, fake)
         fake.registry_calls.append(key)
+        fake.registry_budgets.append(max_wait_seconds)
         result = operation(fake)
         return await result if inspect.isawaitable(result) else result
 
@@ -175,6 +181,22 @@ def fake_garmin_client(monkeypatch):
 
     monkeypatch.setattr(weight_routes, "push_weight", push_weight_at_route_seam)
     yield fake
+
+
+@pytest.fixture(autouse=True)
+def _reset_step_up_failures():
+    """Clear the module-level failed-step-up-attempt tracker around every
+    test. Without this, a test that throttles a user id (five failed step-up
+    attempts in a 15-minute window) leaves that entry behind for the rest of
+    the session -- a later, unrelated test that reuses the same user id
+    would see 429 instead of 401 and point at the wrong place. Autouse
+    because any test that exercises step-up auth can trip this, not just
+    tests/test_auth_step_up.py."""
+    from shared import auth as shared_auth
+
+    shared_auth._step_up_failures.clear()
+    yield
+    shared_auth._step_up_failures.clear()
 
 
 @pytest.fixture
