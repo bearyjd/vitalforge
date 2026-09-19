@@ -727,27 +727,38 @@ async def _resume_link(person_id: int, generation: int, email: str) -> Garmin:
     return client
 
 
+async def _note_operation_failure(person_id: int, generation: int, exc: BaseException) -> str:
+    """Classify a provider failure and drop a session it says is dead.
+
+    A 401/403 from a normal operation means this cached session is no
+    longer safe to reuse.  Persist only the bounded code; the next
+    operation resumes under this same lock protocol.
+    """
+    code = _error_code(exc)
+    if code == "auth_failed":
+        garmin_client.forget(person_id, generation)
+        await _record_auth_failure(person_id, generation, code)
+    return code
+
+
 async def _run_operation(
     person_id: int, generation: int, client: Garmin, op: Callable[[Garmin], _T | Awaitable[_T]]
 ) -> _T:
     try:
         result = op(client)
         if inspect.isawaitable(result):
-            return await result
-        return result
+            result = await result
     except GarminRegistryError:
         raise
     except Exception as exc:
-        code = _error_code(exc)
-        if code == "auth_failed":
-            # A credential rejection (a 401, or the library's own
-            # authentication error) from a normal operation means this cached
-            # session is no longer safe to reuse.  Persist only the bounded
-            # code; the next operation will resume under this same lock
-            # protocol.  A 403 is a transient block and is left alone.
-            garmin_client.forget(person_id, generation)
-            await _record_auth_failure(person_id, generation, code)
+        code = await _note_operation_failure(person_id, generation, exc)
         raise GarminOperationError(code) from None
+    if isinstance(result, Exception):
+        # Some callers return the provider exception instead of raising it so
+        # they can tell an ambiguous post-send failure from a safe one.  The
+        # session-health side effects must not depend on that choice.
+        await _note_operation_failure(person_id, generation, result)
+    return result
 
 
 async def call_paced(person_id: int, op: Callable[[Garmin], _T | Awaitable[_T]]) -> _T:

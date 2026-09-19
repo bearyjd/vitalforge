@@ -2231,6 +2231,33 @@ async def test_rate_limited_operation_keeps_the_cached_client_and_status(initial
     assert row["last_auth_error"] is None
 
 
+async def test_returned_auth_exception_evicts_the_client_like_a_raised_one(initialized_db):
+    person_id = await get_primary_person_id()
+    await _link(person_id)
+    cached = _FakeClient(1)
+    garmin_client._clients[(person_id, 1)] = cached
+    await garmin_registry._record_auth_success(person_id, 1)
+    rejected = GarminConnectAuthenticationError("Portal login POST returned 401")
+
+    def returns_the_error(_client):
+        # activity_garmin hands provider errors back as values so it can
+        # classify ambiguous post-send failures itself.
+        return rejected
+
+    result = await garmin_registry.call(person_id, returns_the_error)
+
+    assert result is rejected, "the value contract must survive: the caller still classifies it"
+    assert not garmin_client.is_authenticated(person_id, 1)
+    db = await get_db()
+    try:
+        row = await (
+            await db.execute("SELECT last_auth_error FROM garmin_links WHERE person_id = ?", (person_id,))
+        ).fetchone()
+    finally:
+        await db.close()
+    assert row["last_auth_error"] == "auth_failed"
+
+
 async def test_unbounded_failure_is_logged_by_type_name_only(initialized_db, monkeypatch, caplog):
     sentinel_path = "/private/garth/person-1"
 
