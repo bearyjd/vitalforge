@@ -400,6 +400,129 @@ async def test_missing_target_from_registry_is_a_non_enumerating_404(client, mon
     assert response.json() == {"detail": "Person not found"}
 
 
+_CREDENTIAL_ROUTE_PAYLOADS = {
+    "/p/primary/api/garmin/link": {
+        "email": "person@example.test",
+        "password": "garmin-password-secret",
+        "current_password": "local-password",
+    },
+    "/p/primary/api/garmin/relink": {
+        "email": "person@example.test",
+        "password": "garmin-password-secret",
+        "current_password": "local-password",
+    },
+    "/p/primary/api/garmin/unlink": {"current_password": "local-password"},
+}
+
+
+def _record_denied_path_calls(monkeypatch) -> list:
+    """Replace every step the route body would take with a recorder.
+
+    A denied caller must be stopped by the dependencies, before the body
+    runs: no step-up check (which would burn a password-verification and
+    could be probed for timing) and no registry operation (which would start
+    a credential login or delete a token store). Recording rather than
+    raising so a wrongly-reached step shows up as a call, not as a different
+    status code that a 404 assertion could accidentally accept.
+    """
+    calls = []
+
+    async def step_up(identity, password):
+        calls.append(("step_up", identity.user_id))
+
+    def registry_op(name):
+        async def op(*args):
+            calls.append((name, *args))
+            raise AssertionError(f"registry.{name} reached by a denied caller")
+        return op
+
+    monkeypatch.setattr(auth, "_require_step_up", step_up)
+    for name in ("link", "relink", "unlink"):
+        monkeypatch.setattr(garmin_registry, name, registry_op(name))
+    return calls
+
+
+@pytest.mark.parametrize("path", sorted(_CREDENTIAL_ROUTE_PAYLOADS))
+async def test_credential_changes_reject_a_manage_bearer_token_before_any_side_effect(
+    client, monkeypatch, path
+):
+    """A long-lived API token, even one whose owner holds `manage`, cannot
+    submit or revoke Garmin credentials -- these are cookie-session-only, and
+    the refusal must be the same non-enumerating 404 a stranger gets."""
+    user_id = await seed_user("token-manager")
+    await grant_person(await primary_person_id(), user_id, "manage")
+    _, raw_token = await seed_token(user_id, raw_token="manager-token")
+    calls = _record_denied_path_calls(monkeypatch)
+
+    response = await client.post(
+        path,
+        headers={"Authorization": f"Bearer {raw_token}"},
+        json=_CREDENTIAL_ROUTE_PAYLOADS[path],
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Person not found"}
+    assert calls == []
+    assert "garmin-password-secret" not in response.text
+    assert "local-password" not in response.text
+
+
+@pytest.mark.parametrize("path", sorted(_CREDENTIAL_ROUTE_PAYLOADS))
+async def test_credential_changes_reject_a_view_only_cookie_before_any_side_effect(
+    client, monkeypatch, path
+):
+    """`view` is enough to read the dashboard but not to touch the link. The
+    grant check runs in require_person(), ahead of the body, so a viewer must
+    never trigger a step-up or a registry operation."""
+    viewer_id = await seed_user("viewer", password="local-password")
+    await grant_person(await primary_person_id(), viewer_id, "view")
+    calls = _record_denied_path_calls(monkeypatch)
+
+    response = await client.post(
+        path,
+        cookies={"vf_session": create_session_cookie("viewer", viewer_id, 1)},
+        json=_CREDENTIAL_ROUTE_PAYLOADS[path],
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Person not found"}
+    assert calls == []
+    assert "garmin-password-secret" not in response.text
+    assert "local-password" not in response.text
+
+
+@pytest.mark.parametrize(
+    ("exc", "status", "detail", "retry_after"),
+    [
+        (garmin_registry.GarminRateLimited(7), 429, "Garmin is temporarily rate limited", "7"),
+        (garmin_registry.GarminLinkAttemptRateLimited(11), 429, "Garmin is temporarily rate limited", "11"),
+        (garmin_registry.GarminLinkConflict(), 409, "Garmin account is already linked", None),
+        (garmin_registry.GarminNotLinked(1), 404, "Person not found", None),
+        (garmin_registry.GarminSessionExpired(), 401, "Account changed; authenticate again", None),
+        (garmin_registry.GarminLinkInputError(), 422, "Garmin link details are invalid", None),
+        (garmin_registry.GarminAuthenticationError("auth_failed"), 401, "Garmin authentication failed", None),
+        (garmin_registry.GarminOperationError("network"), 502, "Garmin operation failed", None),
+        (garmin_registry.GarminRegistryError("anything else"), 502, "Garmin operation failed", None),
+    ],
+    ids=lambda value: type(value).__name__ if isinstance(value, Exception) else None,
+)
+def test_registry_http_error_maps_each_bounded_failure(exc, status, detail, retry_after):
+    """Pins the registry-exception -> HTTP contract, including the fallback.
+
+    The two rate-limit types are siblings, not parent/child, so both must be
+    listed explicitly; each carries its own retry_after through to the
+    header. Everything unlisted -- including the base class -- must collapse
+    to the generic 502 rather than leak a more specific reason."""
+    http_error = garmin_routes._registry_http_error(exc)
+
+    assert http_error.status_code == status
+    assert http_error.detail == detail
+    if retry_after is None:
+        assert not (http_error.headers or {}).get("Retry-After")
+    else:
+        assert http_error.headers == {"Retry-After": retry_after}
+
+
 def test_both_apps_register_the_shared_garmin_route_surface():
     """Both service factories install the shared surface on their app object.
 

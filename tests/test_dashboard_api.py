@@ -9,6 +9,7 @@ Garmin client at all.
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -79,10 +80,37 @@ async def test_manual_sync_without_a_link_is_explicitly_store_only(
     response = await client.post(f"{PERSON_PREFIX}/api/sync", json={"days": 1})
 
     assert response.status_code == 200
-    assert response.json()["status"] == "link_required"
-    assert response.json()["store_only"] is True
+    # The whole body, not just status: the dashboard's triggerSync() reads
+    # `status` to decide not to poll and `message` for what to show, so both
+    # are part of the contract the template test below pins from its side.
+    assert response.json() == {
+        "status": "link_required",
+        "store_only": True,
+        "message": "Link Garmin before syncing this person's data",
+    }
     assert called == []
     assert await get_primary_person_id() not in dashboard_app_module._syncing_person_ids
+
+
+def test_dashboard_sync_handler_branches_on_link_required():
+    """triggerSync() must not poll or reload after a link_required answer.
+
+    The route returns 200 for an unlinked person (test above), so a handler
+    that only checked `res.ok` would spin on /sync/status forever with the
+    button stuck at "Syncing...". A string check on the template is enough
+    here; the Playwright smoke test loads the page for real and would fail
+    on a syntax error in the handler.
+    """
+    template = (
+        Path(__file__).resolve().parent.parent / "vitalforge_dashboard" / "templates" / "index.html"
+    ).read_text()
+    start = template.index("async function triggerSync()")
+    end = template.index("function updateSyncInfo(", start)
+    handler = template[start:end]
+    assert 'body.status === "link_required"' in handler
+    assert "body.message" in handler
+    # The early return must come BEFORE the poll is scheduled.
+    assert handler.index("return;") < handler.index("setInterval(")
 
 
 async def test_sync_status_does_not_leak_another_persons_sync(

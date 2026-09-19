@@ -441,7 +441,19 @@
             const btn = document.getElementById("syncBtn");
             btn.disabled = true; btn.textContent = "Syncing...";
             try {
-                await fetch(`${API_BASE}/sync`, { method: "POST" });
+                const res = await fetch(`${API_BASE}/sync`, { method: "POST" });
+                const body = await res.json().catch(() => null);
+                if (body && body.status === "link_required") {
+                    // Nothing was started: this person has no usable Garmin
+                    // link, so there is no run to poll for and no data to
+                    // reload. Show the server's message where the last-sync
+                    // time normally goes and hand the button back.
+                    const el = document.getElementById("syncInfo");
+                    el.classList.remove("syncing");
+                    el.textContent = body.message || "Link Garmin before syncing";
+                    btn.disabled = false; btn.textContent = "Sync";
+                    return;
+                }
                 const poll = setInterval(async () => {
                     const status = await fetchSyncStatus();
                     if (status && !status.syncing) {
