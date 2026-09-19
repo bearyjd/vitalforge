@@ -431,6 +431,7 @@ async def bootstrap_legacy_token_store() -> bool:
         return False
     legacy_email = os.getenv("GARMIN_EMAIL")
     if not isinstance(legacy_email, str):
+        logger.info("Legacy Garmin token-store adoption skipped: GARMIN_EMAIL is not set")
         return False
     try:
         canonical_email = registry._canonical_email(legacy_email)
@@ -463,12 +464,22 @@ async def _adopt_legacy_store_locked(root: Path, canonical_email: str) -> bool:
     """
     registry = _registry()
     if await _legacy_adoption_recorded():
+        logger.info("Legacy Garmin token-store adoption skipped: marker already recorded")
         return False
     person_id = await _adoptable_primary_person(canonical_email)
     if person_id is None:
+        logger.info(
+            "Legacy Garmin token-store adoption skipped: no primary person is adoptable "
+            "(no primary, or the primary already has lifecycle state / an email conflict)"
+        )
         return False
     async with registry.person_flock(person_id):
         if await _adoptable_primary_person(canonical_email) != person_id:
+            logger.info(
+                "Legacy Garmin token-store adoption skipped for person %s: it gained "
+                "lifecycle state while its lock was being acquired",
+                person_id,
+            )
             return False
         return await _adopt_for_person_locked(person_id, canonical_email, root)
 
@@ -482,9 +493,15 @@ async def _adopt_for_person_locked(person_id: int, canonical_email: str, root: P
     if _looks_like_legacy_token_store(durable):
         if not await _verify_token_store(person_id, canonical_email, durable):
             return False
-        return await _publish_legacy_adoption(person_id, canonical_email)
+        published = await _publish_legacy_adoption(person_id, canonical_email)
+        if published:
+            logger.info(
+                "Adopted the legacy Garmin token store for person %s as generation 1", person_id
+            )
+        return published
     await _warn_about_orphaned_moved_stores(root, person_id)
     if not _looks_like_legacy_token_store(root):
+        logger.info("Legacy Garmin token-store adoption skipped: no flat token store is present")
         return False
     return await _adopt_flat_store(person_id, canonical_email, root, durable)
 
@@ -546,6 +563,8 @@ async def _adopt_flat_store(person_id: int, canonical_email: str, root: Path, du
         raise
     if not published:
         await asyncio.to_thread(_restore_token_file, target, source)
+    else:
+        logger.info("Adopted the legacy Garmin token store for person %s as generation 1", person_id)
     return published
 
 

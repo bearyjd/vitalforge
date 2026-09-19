@@ -555,11 +555,13 @@ def _flat_store(tmp_path):
 
 
 async def test_bootstrap_adopts_a_verified_flat_store_once_by_moving_it(
-    initialized_db, monkeypatch, tmp_path
+    initialized_db, monkeypatch, tmp_path, caplog
 ):
     """Adoption moves the flat store under the primary person, publishes an
     ordinary 'linked' row and records its one-time marker; a second boot is
-    a no-op that never contacts Garmin again."""
+    a no-op that never contacts Garmin again. The first boot logs the
+    "Adopted" line exactly once; the second boot logs the marker-recorded
+    skip instead of repeating it."""
     root = _flat_store(tmp_path)
     person_id = await get_primary_person_id()
     calls: list[tuple[int, int]] = []
@@ -572,9 +574,16 @@ async def test_bootstrap_adopts_a_verified_flat_store_once_by_moving_it(
     # _ensure_token_dir's ancestor walk skips whatever already exists.
     person_root = root / f"person-{person_id}"
     person_root.mkdir(mode=0o755)
+    caplog.set_level(logging.INFO, logger="shared.garmin_registry_runtime")
 
     assert await garmin_registry.bootstrap_legacy_token_store() is True
+    adopted_line = f"Adopted the legacy Garmin token store for person {person_id} as generation 1"
+    assert caplog.text.count(adopted_line) == 1
+    caplog.clear()
+
     assert await garmin_registry.bootstrap_legacy_token_store() is False
+    assert adopted_line not in caplog.text
+    assert "marker already recorded" in caplog.text
     assert calls == [(person_id, 1)]
 
     durable = garmin_registry._generation_token_dir(person_id, 1)
@@ -597,6 +606,40 @@ async def test_bootstrap_adopts_a_verified_flat_store_once_by_moving_it(
     finally:
         await db.close()
     assert ledger["generation"] == 1
+
+
+async def test_bootstrap_logs_the_skip_reason_when_no_flat_store_exists(
+    initialized_db, monkeypatch, tmp_path, caplog
+):
+    """No garmin_tokens.json at the flat root: nothing to adopt, and the
+    skip reason is logged rather than silently returning False."""
+    root = tmp_path / "garth"
+    person_id = await get_primary_person_id()
+    calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", root)
+    monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _fake_auth(calls))
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
+    monkeypatch.setenv("GARMIN_EMAIL", f"person-{person_id}@example.test")
+    caplog.set_level(logging.INFO, logger="shared.garmin_registry_runtime")
+
+    assert await garmin_registry.bootstrap_legacy_token_store() is False
+
+    assert calls == []
+    assert "no flat token store is present" in caplog.text
+    assert not await _adoption_marker_recorded()
+
+
+async def test_bootstrap_logs_the_skip_reason_when_garmin_email_is_unset(
+    initialized_db, monkeypatch, tmp_path, caplog
+):
+    root = _flat_store(tmp_path)
+    monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", root)
+    monkeypatch.delenv("GARMIN_EMAIL", raising=False)
+    caplog.set_level(logging.INFO, logger="shared.garmin_registry_runtime")
+
+    assert await garmin_registry.bootstrap_legacy_token_store() is False
+
+    assert "GARMIN_EMAIL is not set" in caplog.text
 
 
 async def test_first_call_after_adoption_resumes_from_the_moved_store(initialized_db, monkeypatch, tmp_path):
