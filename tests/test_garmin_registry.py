@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import threading
+import time
 
 import pytest
 import requests
@@ -2311,3 +2312,42 @@ async def test_unbounded_failure_is_logged_by_type_name_only(initialized_db, mon
 
     assert "OSError" in caplog.text
     assert sentinel_path not in caplog.text
+
+
+async def test_blocking_operation_does_not_freeze_the_event_loop(initialized_db):
+    """A synchronous op must run off the loop: while it blocks on the provider
+    round-trip the service has to keep serving every other request."""
+    person_id = await get_primary_person_id()
+    await _link(person_id)
+    garmin_client._clients[(person_id, 1)] = _FakeClient(1)
+    started = threading.Event()
+    release = threading.Event()
+    ticks = 0
+
+    def blocking_op(_client):
+        started.set()
+        release.wait(timeout=5)
+        return "done"
+
+    def release_after_the_window() -> None:
+        # Released off the loop on purpose: were op still run on the loop,
+        # nothing scheduled there could set this until op's own wait timed
+        # out, and a release issued after the freeze proves nothing.
+        started.wait(timeout=5)
+        time.sleep(0.25)
+        release.set()
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not release.is_set():
+            if started.is_set():  # count only while the op is blocking
+                ticks += 1
+            await asyncio.sleep(0.005)
+
+    tick_task = asyncio.create_task(ticker())
+    releaser = threading.Thread(target=release_after_the_window, daemon=True)
+    releaser.start()
+    assert await garmin_registry.call(person_id, blocking_op) == "done"
+    await tick_task
+    releaser.join(timeout=5)
+    assert ticks >= 10, f"event loop was blocked by the synchronous op (ticks={ticks})"

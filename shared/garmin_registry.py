@@ -643,7 +643,9 @@ async def call(
     and ``op``), so it consumes two separately spaced permits; a cache hit
     consumes only the operation permit. ``op`` receives the exact client
     instead of an unlocked global singleton and can be synchronous (the
-    normal garminconnect case) or async for small adapter tests.
+    normal garminconnect case) or async for small adapter tests; a
+    synchronous op runs in a worker thread so the service keeps serving
+    requests during the provider round-trip.
 
     ``max_wait_seconds`` bounds how long the first permit reservation may
     sleep behind the deployment-wide interval.  The default ``0`` keeps the
@@ -713,10 +715,6 @@ async def _resume_link(
     permit within the caller's remaining budget."""
     token_dir = resolve_token_dir(person_id, generation)
     try:
-        # Only the login moves off the event loop.  The operation itself runs
-        # synchronously in _run_operation, so two Garmin writes for one
-        # person cannot interleave inside one call() -- the write-race
-        # reasoning in the weight and activity routes relies on that.
         client = await asyncio.to_thread(garmin_client.authenticate, person_id, generation, token_dir, email, None)
     except Exception as exc:
         code = _error_code(exc)
@@ -753,7 +751,7 @@ async def _run_operation(
     person_id: int, generation: int, client: Garmin, op: Callable[[Garmin], _T | Awaitable[_T]]
 ) -> _T:
     try:
-        result = op(client)
+        result = await asyncio.to_thread(op, client)
         if inspect.isawaitable(result):
             result = await result
     except GarminRegistryError:
