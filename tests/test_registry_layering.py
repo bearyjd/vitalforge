@@ -120,10 +120,28 @@ def _import_nodes(tree: ast.AST):
             yield node
 
 
-def test_the_module_list_is_not_empty():
-    """A glob that stops matching would make the per-module checks vacuous."""
+def test_the_dag_tables_cover_every_registry_module():
+    """The DAG and fresh-interpreter tests iterate hand-written tables; a new
+    `shared/garmin_registry_<x>.py` gets no enforcement until it is placed in
+    them, and an emptied table would pass every check. So the tables and the
+    glob must agree exactly, and the glob must still match."""
     assert len(REGISTRY_MODULES) >= 4, f"only found {REGISTRY_MODULES}; the glob is not matching"
-    assert {_source_path(m).relative_to(REPO).as_posix() for m in FORBIDDEN_EDGES} <= set(REGISTRY_MODULES)
+    place = "place it in the DAG: add it to IMPORTABLE_MODULES and to FORBIDDEN_EDGES (or LEAF_IMPORTS)"
+    listed = {_source_path(m).relative_to(REPO).as_posix() for m in IMPORTABLE_MODULES}
+    assert listed == set(REGISTRY_MODULES), (
+        f"IMPORTABLE_MODULES and the shared/garmin_registry*.py glob disagree "
+        f"(only in glob: {sorted(set(REGISTRY_MODULES) - listed)}, only in table: {sorted(listed - set(REGISTRY_MODULES))}); "
+        f"a new registry module must be listed: {place}"
+    )
+    ruled = set(FORBIDDEN_EDGES) | {LEGACY}
+    assert ruled == set(IMPORTABLE_MODULES), (
+        f"every registry module but the top one needs a FORBIDDEN_EDGES row "
+        f"(missing: {sorted(set(IMPORTABLE_MODULES) - ruled)}, extra: {sorted(ruled - set(IMPORTABLE_MODULES))}); {place}"
+    )
+    assert set(LEAF_IMPORTS) == {ERRORS, LOCKS, COMMON}, (
+        f"LEAF_IMPORTS must name exactly the leaves (got {sorted(LEAF_IMPORTS)}); "
+        "a new leaf needs a row here saying what it may import from shared., a non-leaf needs none"
+    )
 
 
 def test_no_registry_module_imports_one_above_it():
@@ -172,8 +190,12 @@ def test_no_function_local_imports_in_registry_modules():
 
 def test_no_smuggled_imports_in_registry_modules():
     """The import checks above read Import/ImportFrom nodes; close the other
-    doors: a relative import names no `shared.` path, and `importlib` /
-    `__import__` import nothing at parse time at all."""
+    doors. Flagged: any relative import (it names no `shared.` path); any
+    `import importlib[.x]` or `from importlib[.x] import ...`; and any bare
+    use of the names `importlib`, `__import__` or `import_module`, which is
+    what a call through them looks like once the import itself is disguised
+    (aliasing `import_module` to another name is not caught -- nor is
+    anything that reaches the facade through `sys.modules`)."""
     violations = []
     for module in REGISTRY_MODULES:
         tree = ast.parse((REPO / module).read_text(), filename=module)
@@ -182,7 +204,9 @@ def test_no_smuggled_imports_in_registry_modules():
                 violations.append(f"{module}:{node.lineno} relative import")
             elif isinstance(node, ast.Import) and any(_names_module(alias.name, "importlib") for alias in node.names):
                 violations.append(f"{module}:{node.lineno} imports importlib")
-            elif isinstance(node, ast.Name) and node.id in ("importlib", "__import__"):
+            elif isinstance(node, ast.ImportFrom) and _names_module(node.module or "", "importlib"):
+                violations.append(f"{module}:{node.lineno} imports from importlib")
+            elif isinstance(node, ast.Name) and node.id in ("importlib", "__import__", "import_module"):
                 violations.append(f"{module}:{node.lineno} uses {node.id}")
     assert not violations, "late-import mechanisms in registry modules:\n" + "\n".join(violations)
 
