@@ -133,3 +133,63 @@ def test_correlations_drilldown_survives_a_malformed_date_with_nonzero_lag(page,
         timeout=5000,
     )
     assert errors == []
+
+
+def _seed_recent_weigh_ins(count: int = 3):
+    """Enough recent weight_log rows for `/api/weight/trend` to return >= 2
+    points, which is what makes the trend chart render at all. Same sync
+    sqlite3 approach as `_seed_resting_hr_and_steps_with_a_malformed_date`
+    and for the same event-loop reason."""
+    conn = sqlite3.connect(str(shared.database.DB_PATH))
+    try:
+        person_id = conn.execute("SELECT id FROM persons WHERE is_primary = 1").fetchone()[0]
+        now = datetime.now(timezone.utc)
+        for n in range(count):
+            lbs = 180.0 - n
+            conn.execute(
+                "INSERT INTO weight_log (person_id, weight_lbs, weight_kg, weight_grams, timestamp, synced_to_garmin) "
+                "VALUES (?, ?, ?, ?, ?, 1)",
+                (person_id, lbs, lbs * 0.45359237, round(lbs * 453.59237), (now - timedelta(days=n)).isoformat()),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.mark.playwright
+def test_weight_trend_chart_height_settles(page, weight_live_server):
+    """The 30-day trend canvas must reach a fixed size and stay there.
+
+    Chart.js with `maintainAspectRatio: false` sizes the canvas to its parent
+    container's content height. If that container's height is itself derived
+    from the canvas (canvas as a sibling of the section title, no explicit
+    height), every resize grows the container, the ResizeObserver fires
+    again, and the page grows without bound -- the "infinite scroll down"
+    reported on prod. Chart.js's own docs require a dedicated, relatively
+    positioned container for exactly this reason.
+    """
+    _seed_recent_weigh_ins()
+    errors = _collect_console_errors(page)
+
+    page.goto(f"{weight_live_server}{PERSON_PREFIX}/")
+    page.wait_for_selector("#trendSection", state="visible")
+    page.wait_for_function(
+        "typeof Chart !== 'undefined' && Chart.getChart(document.getElementById('trendChart')) !== undefined",
+        timeout=5000,
+    )
+
+    def canvas_height():
+        return page.evaluate("document.getElementById('trendChart').getBoundingClientRect().height")
+
+    page.wait_for_timeout(500)
+    first = canvas_height()
+    scroll_first = page.evaluate("document.documentElement.scrollHeight")
+    page.wait_for_timeout(2000)
+    second = canvas_height()
+    scroll_second = page.evaluate("document.documentElement.scrollHeight")
+
+    assert first > 0
+    assert second == first, f"trend canvas kept growing: {first}px -> {second}px"
+    assert scroll_second == scroll_first, f"page kept growing: {scroll_first}px -> {scroll_second}px"
+    assert second < 400, f"trend canvas is {second}px tall; it should be a short strip"
+    assert errors == []
