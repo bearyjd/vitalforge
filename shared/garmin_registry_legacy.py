@@ -2,9 +2,10 @@
 
 Both service lifespans call :func:`bootstrap_legacy_token_store` last, after
 the schema and the first admin exist.  This module sits above the facade: it
-imports :mod:`shared.garmin_registry` for the token-directory helpers and the
-flocks, whose ``GARTH_TOKEN_DIR`` is a facade global read at call time, and the
-facade never imports it back.  Nothing else in the registry knows the flat store exists.
+takes everything it needs from the registry -- token directories, the flocks,
+the permit wait -- as attributes of :mod:`shared.garmin_registry` read at call
+time (``GARTH_TOKEN_DIR`` is a facade global), and the facade never imports it
+back.  Nothing else in the registry knows the flat store exists.
 """
 
 from __future__ import annotations
@@ -19,7 +20,6 @@ from garminconnect.client import token_file_path
 from shared import garmin_client, garmin_registry, garmin_registry_common
 from shared.database import get_db
 from shared.garmin_registry_errors import GarminLinkInputError, GarminRateLimited
-from shared.garmin_registry_runtime import _wait_for_call_permit
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +112,7 @@ async def _adopt_for_person_locked(person_id: int, canonical_email: str, root: P
     """Both flocks are held.  The moved-store branch exists for a process
     killed between the file move and the database commit: the flat store is
     already under ``generation-1`` and only the publication is missing."""
-    durable = garmin_registry._generation_token_dir(person_id, _LEGACY_GENERATION)
+    durable = garmin_registry.resolve_token_dir(person_id, _LEGACY_GENERATION)
     if _looks_like_legacy_token_store(durable):
         if not await _verify_token_store(person_id, canonical_email, durable):
             return False
@@ -202,7 +202,7 @@ async def _verify_token_store(person_id: int, canonical_email: str, token_dir: P
     # A busy permit is worth a short wait rather than a whole boot cycle.
     # This sleeps while holding both the legacy-store and the primary's
     # person flock, so the bound is deliberately a few intervals, not open.
-    await _wait_for_call_permit(deadline_seconds=3 * garmin_registry_common.call_interval_seconds())
+    await garmin_registry._wait_for_call_permit(deadline_seconds=3 * garmin_registry_common.call_interval_seconds())
     try:
         await asyncio.to_thread(
             garmin_client.authenticate, person_id, _LEGACY_GENERATION, token_dir, canonical_email, None

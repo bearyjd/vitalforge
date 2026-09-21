@@ -15,9 +15,19 @@ import asyncio
 import fcntl
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Callable
+from typing import AsyncIterator, Callable
 
-_process_person_locks: dict[tuple[asyncio.AbstractEventLoop, int], asyncio.Lock] = {}
+# A process-local lock key names the lock's kind and identity, so callers that
+# share ``_process_local_locks`` cannot collide: the legacy-store key is a
+# one-tuple and every person key carries its id.
+LockKey = tuple[str] | tuple[str, int]
+LEGACY_STORE_LOCK_KEY: LockKey = ("legacy-store",)
+
+_process_local_locks: dict[tuple[asyncio.AbstractEventLoop, LockKey], asyncio.Lock] = {}
+
+
+def person_lock_key(person_id: int) -> LockKey:
+    return ("person", person_id)
 
 
 def _acquire_lock(lock_path: Path):
@@ -30,7 +40,7 @@ def _acquire_lock(lock_path: Path):
     return handle
 
 
-def _process_person_lock(person_id: int) -> asyncio.Lock:
+def _process_local_lock(local_key: LockKey) -> asyncio.Lock:
     """Return this process's companion lock for the durable flock.
 
     ``flock`` coordinates the two service processes, but its semantics do not
@@ -40,35 +50,35 @@ def _process_person_lock(person_id: int) -> asyncio.Lock:
     """
     # pytest-asyncio (and application reloads) can create a new event loop in
     # the same interpreter. asyncio.Lock is loop-bound once contended, so the
-    # cache must be scoped to both loop and person rather than leaking a lock
+    # cache must be scoped to both loop and key rather than leaking a lock
     # from a completed loop into the next one.
-    key = (asyncio.get_running_loop(), person_id)
-    lock = _process_person_locks.get(key)
+    key = (asyncio.get_running_loop(), local_key)
+    lock = _process_local_locks.get(key)
     if lock is None:
         lock = asyncio.Lock()
-        _process_person_locks[key] = lock
+        _process_local_locks[key] = lock
     return lock
 
 
 @asynccontextmanager
-async def flock_scope(local_key: int, lock_path: Callable[[], Path]):
+async def flock_scope(local_key: LockKey, lock_path: Callable[[], Path]) -> AsyncIterator[None]:
     """Hold this process's lock for ``local_key``, then flock ``lock_path()``.
 
     The process-local lock comes first because flock alone does not make two
     descriptors in one process wait for each other (see
-    :func:`_process_person_lock`); ``lock_path`` is only called once it is
+    :func:`_process_local_lock`); ``lock_path`` is only called once it is
     held, so a path that has to prepare its directory does so serialized per
     key.  flock is released if a process dies; the file is intentionally
     retained as lock infrastructure, not a sentinel.
 
-    ``local_key`` is one namespace shared by every caller through
-    ``_process_person_locks``: ``0`` is reserved for the legacy-store lock and
-    every person uses its positive ``person_id``.  A new caller must not reuse
-    either -- a colliding key silently serializes against that person, and a
-    distinct key on a colliding lock file loses the in-process half of the
-    exclusion.
+    ``local_key`` is structural: :data:`LEGACY_STORE_LOCK_KEY` for the
+    flat-store adoption and :func:`person_lock_key` for a person share
+    ``_process_local_locks`` without any way to collide, since a legacy key
+    can never equal a person key.  A new caller gets its own kind.  Keys and
+    lock files must still pair one-to-one: a distinct key on a colliding lock
+    file would lose the in-process half of the exclusion.
     """
-    local_lock = _process_person_lock(local_key)
+    local_lock = _process_local_lock(local_key)
     async with local_lock:
         path = lock_path()
         acquire_task = asyncio.create_task(asyncio.to_thread(_acquire_lock, path))

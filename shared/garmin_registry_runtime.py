@@ -6,8 +6,10 @@ module sits beneath it: it reads its limits and clock from
 :mod:`shared.garmin_registry_common` and its error types from
 :mod:`shared.garmin_registry_errors`, and never imports the facade.  The
 ``time`` and ``asyncio`` it calls are the same module objects the facade
-exposes as monkeypatch seams, so a test that freezes ``garmin_registry.time``
-freezes the permit clock here too.
+exposes as monkeypatch seams, so a test that freezes the clock with
+``setattr(garmin_registry.time, "time", ...)`` -- the stdlib module's
+attribute, not the ``time`` name on the facade -- freezes the permit clock
+here too.
 """
 
 from __future__ import annotations

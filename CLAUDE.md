@@ -95,7 +95,8 @@ docker-compose.prod.yml   # PROD — pulls prebuilt images from Docker Hub / GHC
   `POST /p/{slug}/api/sync` and the scheduled sync (dashboard), `POST /p/{slug}/api/weight`
   and the strength-activity push (weight service), the `link`/`relink` routes on either
   service, and the one-time legacy-store adoption at boot — every one of them through
-  `shared/garmin_registry`. This means most dashboard bugs can be reproduced by seeding
+  the registry (`shared/garmin_registry` for routes and sync, `shared/garmin_registry_legacy`
+  for the boot-time adoption). This means most dashboard bugs can be reproduced by seeding
   the local DB directly — no live Garmin account needed (see roadmap item 2).
 - **`DB_PATH` and `GARTH_TOKEN_DIR` are env-overridable** (`shared/database.py`,
   `shared/garmin_registry.py`), defaulting to `/app/data/...`. Point these at a scratch

@@ -110,10 +110,15 @@ def person_flock(person_id: int) -> AbstractAsyncContextManager[None]:
     Lifecycle routes use the same public context manager, so unlink/re-link
     cannot swap a token directory while :func:`call` is authenticating or
     using it.  flock is released if a process dies; the file is intentionally
-    retained as lock infrastructure, not a sentinel.
+    retained as lock infrastructure, not a sentinel.  A non-positive id is
+    refused here, before any process-local lock is taken.
     """
     person_id = int(person_id)
-    return garmin_registry_locks.flock_scope(person_id, lambda: _person_lock_path(person_id))
+    if person_id < 1:
+        raise ValueError("person_id must be a positive integer")
+    return garmin_registry_locks.flock_scope(
+        garmin_registry_locks.person_lock_key(person_id), lambda: _person_lock_path(person_id)
+    )
 
 
 def legacy_store_flock() -> AbstractAsyncContextManager[None]:
@@ -122,7 +127,9 @@ def legacy_store_flock() -> AbstractAsyncContextManager[None]:
     The lock belongs beside the historic flat store, not inside any person's
     directory: before adoption there is deliberately no person-owned path.
     """
-    return garmin_registry_locks.flock_scope(0, lambda: _ensure_token_root() / ".legacy-bootstrap.lock")
+    return garmin_registry_locks.flock_scope(
+        garmin_registry_locks.LEGACY_STORE_LOCK_KEY, lambda: _ensure_token_root() / ".legacy-bootstrap.lock"
+    )
 
 
 def _remove_token_dir(path: Path) -> None:

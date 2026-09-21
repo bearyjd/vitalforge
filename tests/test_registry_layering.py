@@ -59,11 +59,17 @@ LEAF_IMPORTS = {
 REGISTRY_MODULES = sorted(str(p.relative_to(REPO)) for p in (REPO / "shared").glob("garmin_registry*.py"))
 IMPORTABLE_MODULES = (ERRORS, LOCKS, COMMON, RUNTIME, FACADE, LEGACY)
 
-# Every facade attribute some test or fixture monkeypatches or reads directly.
-# This catches a LOST attribute, not a seam that stopped being read through the
-# facade: runtime's clock and sleep still respond to patches of
-# `garmin_registry.time.time` / `.asyncio.sleep` only because those are
-# attributes on the shared stdlib module objects.
+# Every facade attribute the suite patches or reads, plus the registry
+# attributes the legacy module builds on (`legacy_store_flock`,
+# `_wait_for_call_permit`, ...) -- public constructors and re-exports that no
+# test patches but whose loss would break adoption at boot. This catches a
+# LOST attribute, not a seam that stopped being read through the facade:
+# `reserve_call_permit` and `actor_has_effective_manage` are runtime-bound
+# seams now (a patch on the facade no longer reaches `_wait_for_call_permit`
+# or `_publish_link`; patch them on `shared.garmin_registry_runtime`), and
+# runtime's clock and sleep respond to `garmin_registry.time.time` /
+# `.asyncio.sleep` patches only because those are attributes on the shared
+# stdlib module objects.
 FACADE_PATCH_POINTS = (
     "GARTH_TOKEN_DIR",
     "time",
@@ -78,6 +84,7 @@ FACADE_PATCH_POINTS = (
     "person_flock",
     "legacy_store_flock",
     "_person_lock_path",
+    "_wait_for_call_permit",
     "_publish_link",
     "_reserve_generation",
     "_remove_token_dir",
@@ -190,12 +197,14 @@ def test_no_function_local_imports_in_registry_modules():
 
 def test_no_smuggled_imports_in_registry_modules():
     """The import checks above read Import/ImportFrom nodes; close the other
-    doors. Flagged: any relative import (it names no `shared.` path); any
-    `import importlib[.x]` or `from importlib[.x] import ...`; and any bare
-    use of the names `importlib`, `__import__` or `import_module`, which is
-    what a call through them looks like once the import itself is disguised
-    (aliasing `import_module` to another name is not caught -- nor is
-    anything that reaches the facade through `sys.modules`)."""
+    doors. Flagged: any relative import (it names no `shared.` path); a bare
+    `import shared` (the package's attributes resolve submodules at call time,
+    which is the old shim in a new spelling); any `import importlib[.x]` or
+    `from importlib[.x] import ...`; and any bare use of the names `importlib`,
+    `__import__` or `import_module`, which is what a call through them looks
+    like once the import itself is disguised (aliasing `import_module` to
+    another name is not caught -- nor is anything that reaches the facade
+    through `sys.modules`)."""
     violations = []
     for module in REGISTRY_MODULES:
         tree = ast.parse((REPO / module).read_text(), filename=module)
@@ -206,6 +215,10 @@ def test_no_smuggled_imports_in_registry_modules():
                 violations.append(f"{module}:{node.lineno} imports importlib")
             elif isinstance(node, ast.ImportFrom) and _names_module(node.module or "", "importlib"):
                 violations.append(f"{module}:{node.lineno} imports from importlib")
+            elif isinstance(node, ast.Import) and any(alias.name == "shared" for alias in node.names):
+                # `import shared` + `shared.garmin_registry.X` at call time is the _registry() shim
+                # in a new spelling; no registry module needs the bare package.
+                violations.append(f"{module}:{node.lineno} imports the bare `shared` package")
             elif isinstance(node, ast.Name) and node.id in ("importlib", "__import__", "import_module"):
                 violations.append(f"{module}:{node.lineno} uses {node.id}")
     assert not violations, "late-import mechanisms in registry modules:\n" + "\n".join(violations)
