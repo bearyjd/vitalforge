@@ -206,7 +206,11 @@
            to the canvas, relatively positioned, and explicitly sized --
            otherwise its height is derived from the canvas it is sizing,
            every resize grows it, the ResizeObserver fires again, and the
-           page scrolls forever (tests/test_smoke_ui.py guards this). */
+           page scrolls forever (tests/test_smoke_ui.py guards this).
+           The dashboard's .chart-wrap has no height on purpose -- its charts
+           keep maintainAspectRatio:true and size themselves. Do not converge
+           the two rules: dropping this height reintroduces a canvas whose
+           settled size is whatever the layout happens to give it. */
         .trend-chart-wrap { position: relative; width: 100%; height: 140px; }
         .trend-chart { width: 100%; }
     </style>

@@ -188,8 +188,17 @@ def test_weight_trend_chart_height_settles(page, weight_live_server):
     second = canvas_height()
     scroll_second = page.evaluate("document.documentElement.scrollHeight")
 
+    wrap_height = page.evaluate(
+        "getComputedStyle(document.querySelector('.trend-chart-wrap')).height"
+    )
+
     assert first > 0
     assert second == first, f"trend canvas kept growing: {first}px -> {second}px"
     assert scroll_second == scroll_first, f"page kept growing: {scroll_first}px -> {scroll_second}px"
     assert second < 400, f"trend canvas is {second}px tall; it should be a short strip"
+    # Dedicating the wrapper stops the runaway; the fixed height is what makes
+    # the settled size deterministic, and so what makes `second == first` above
+    # a reliable assertion rather than a lucky one. Without it the canvas still
+    # settles, just at whatever the layout happens to give it.
+    assert wrap_height == "140px", f"trend chart wrapper must keep its fixed height, got {wrap_height}"
     assert errors == []
