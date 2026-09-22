@@ -1,7 +1,9 @@
 """Durable registry admission, auth stamps, and link-row publication.
 
 The public API remains in :mod:`shared.garmin_registry`, which imports these
-helpers at the top and re-exports the ones tests and routes reach for.  This
+helpers at the top and re-exports the ones tests and
+:mod:`shared.garmin_registry_legacy` reach for (see ``FACADE_PATCH_POINTS`` in
+``tests/test_registry_layering.py``).  This
 module sits beneath it: it reads its limits and clock from
 :mod:`shared.garmin_registry_common` and its error types from
 :mod:`shared.garmin_registry_errors`, and never imports the facade.  The
@@ -418,7 +420,7 @@ async def _publish_link(
     canonical_email: str,
     generation: int,
 ) -> GarminLink:
-    """Atomically verify the actor, allocate generation, and publish a link."""
+    """Atomically re-verify the actor and the reserved generation, then publish the link."""
     db = await get_db(isolation_level=None)
     try:
         await db.execute("BEGIN IMMEDIATE")
@@ -451,7 +453,7 @@ async def _publish_link(
             await db.execute("SELECT generation FROM garmin_links WHERE person_id = ?", (person_id,))
         ).fetchone()
         # ``generation`` was reserved in the ledger before the credential
-        # login (_reserve_generation).  The person flock keeps that stable
+        # login (shared.garmin_registry._reserve_generation).  The person flock keeps that stable
         # across lifecycle callers; refuse, rather than publish a staged
         # client under a surprise generation, if a direct DB writer moved the
         # ledger or published a newer link while the login was running.

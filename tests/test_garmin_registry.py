@@ -642,6 +642,24 @@ async def test_bootstrap_logs_the_skip_reason_when_garmin_email_is_unset(
     assert "GARMIN_EMAIL is not set" in caplog.text
 
 
+async def test_bootstrap_logs_the_skip_reason_when_garmin_email_is_blank(
+    initialized_db, monkeypatch, tmp_path, caplog
+):
+    """`.env.example` ships `GARMIN_EMAIL=`; a blank value passes the is-set
+    check and must log its own skip rather than returning False silently.
+    The value itself is never logged."""
+    root = _flat_store(tmp_path)
+    monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", root)
+    monkeypatch.setenv("GARMIN_EMAIL", "   ")
+    caplog.set_level(logging.INFO, logger="shared.garmin_registry_legacy")
+
+    assert await garmin_registry_legacy.bootstrap_legacy_token_store() is False
+
+    assert "GARMIN_EMAIL is empty" in caplog.text
+    assert "GARMIN_EMAIL is not set" not in caplog.text
+    assert (root / "garmin_tokens.json").is_file(), "a skipped adoption must leave the flat store alone"
+
+
 async def test_first_call_after_adoption_resumes_from_the_moved_store(initialized_db, monkeypatch, tmp_path):
     root = _flat_store(tmp_path)
     person_id = await get_primary_person_id()

@@ -33,20 +33,16 @@ RUNTIME = "shared.garmin_registry_runtime"
 FACADE = "shared.garmin_registry"
 LEGACY = "shared.garmin_registry_legacy"
 
-# The DAG, written as the edges that must never exist: each module maps to the
-# registry modules ABOVE it, which it may not name in any import spelling --
-# `from shared import x`, `from shared.x import y`, `import shared.x`, aliased
-# or not, at the top or inside a function. The module-form spelling matters:
-# `from shared import garmin_registry_legacy` at the top of the facade imports
-# cleanly in every order (Python resolves it against the partially initialised
-# module) and would bring the cycle #64 removed straight back.
-FORBIDDEN_EDGES = {
-    ERRORS: (RUNTIME, FACADE, LEGACY),
-    LOCKS: (RUNTIME, FACADE, LEGACY),
-    COMMON: (RUNTIME, FACADE, LEGACY),
-    RUNTIME: (FACADE, LEGACY),
-    FACADE: (LEGACY,),
-}
+# The layering, bottom to top. The DAG is derived from it rather than written
+# by hand, so no row can be trimmed on its own: each module may not name any
+# module later in ORDER, in any import spelling -- `from shared import x`,
+# `from shared.x import y`, `import shared.x`, aliased or not, at the top or
+# inside a function. The module-form spelling matters: `from shared import
+# garmin_registry_legacy` at the top of the facade imports cleanly in every
+# order (Python resolves it against the partially initialised module) and
+# would bring the cycle #64 removed straight back.
+ORDER = (ERRORS, LOCKS, COMMON, RUNTIME, FACADE, LEGACY)
+FORBIDDEN_EDGES = {module: ORDER[i + 1:] for i, module in enumerate(ORDER[:-1])}
 # The leaves, each with the only `shared.` modules it may import at all: the
 # errors and the locks import nothing from the package (the facade hands the
 # locks their paths); common needs the one bounded error it raises.
@@ -57,7 +53,6 @@ LEAF_IMPORTS = {
 }
 
 REGISTRY_MODULES = sorted(str(p.relative_to(REPO)) for p in (REPO / "shared").glob("garmin_registry*.py"))
-IMPORTABLE_MODULES = (ERRORS, LOCKS, COMMON, RUNTIME, FACADE, LEGACY)
 
 # Every facade attribute the suite patches or reads, plus the registry
 # attributes the legacy module builds on (`legacy_store_flock`,
@@ -128,22 +123,23 @@ def _import_nodes(tree: ast.AST):
 
 
 def test_the_dag_tables_cover_every_registry_module():
-    """The DAG and fresh-interpreter tests iterate hand-written tables; a new
+    """The DAG and fresh-interpreter tests iterate ORDER; a new
     `shared/garmin_registry_<x>.py` gets no enforcement until it is placed in
-    them, and an emptied table would pass every check. So the tables and the
-    glob must agree exactly, and the glob must still match."""
+    it, and a table replaced by a hand-written one could be trimmed. So ORDER
+    and the glob must agree exactly, the derived table must still cover ORDER,
+    and the glob must still match."""
     assert len(REGISTRY_MODULES) >= 4, f"only found {REGISTRY_MODULES}; the glob is not matching"
-    place = "place it in the DAG: add it to IMPORTABLE_MODULES and to FORBIDDEN_EDGES (or LEAF_IMPORTS)"
-    listed = {_source_path(m).relative_to(REPO).as_posix() for m in IMPORTABLE_MODULES}
+    place = "place it in the DAG: add it to ORDER at its layer (and to LEAF_IMPORTS if it is a leaf)"
+    listed = {_source_path(m).relative_to(REPO).as_posix() for m in ORDER}
     assert listed == set(REGISTRY_MODULES), (
-        f"IMPORTABLE_MODULES and the shared/garmin_registry*.py glob disagree "
-        f"(only in glob: {sorted(set(REGISTRY_MODULES) - listed)}, only in table: {sorted(listed - set(REGISTRY_MODULES))}); "
+        f"ORDER and the shared/garmin_registry*.py glob disagree "
+        f"(only in glob: {sorted(set(REGISTRY_MODULES) - listed)}, only in ORDER: {sorted(listed - set(REGISTRY_MODULES))}); "
         f"a new registry module must be listed: {place}"
     )
-    ruled = set(FORBIDDEN_EDGES) | {LEGACY}
-    assert ruled == set(IMPORTABLE_MODULES), (
+    ruled = set(FORBIDDEN_EDGES) | {ORDER[-1]}
+    assert ruled == set(ORDER), (
         f"every registry module but the top one needs a FORBIDDEN_EDGES row "
-        f"(missing: {sorted(set(IMPORTABLE_MODULES) - ruled)}, extra: {sorted(ruled - set(IMPORTABLE_MODULES))}); {place}"
+        f"(missing: {sorted(set(ORDER) - ruled)}, extra: {sorted(ruled - set(ORDER))}); {place}"
     )
     assert set(LEAF_IMPORTS) == {ERRORS, LOCKS, COMMON}, (
         f"LEAF_IMPORTS must name exactly the leaves (got {sorted(LEAF_IMPORTS)}); "
@@ -151,20 +147,51 @@ def test_the_dag_tables_cover_every_registry_module():
     )
 
 
-def test_no_registry_module_imports_one_above_it():
-    """Walk EVERY node, not just the module top level: the shim was a
-    function-local import, which is exactly where a cycle hides."""
+def _upward_import_violations(source: str, module: str) -> list[str]:
+    """Every import in ``source`` that names a module above ``module`` in ORDER.
+
+    Walks EVERY node, not just the module top level: the shim was a
+    function-local import, which is exactly where a cycle hides.
+    """
     violations = []
-    for module, forbidden in FORBIDDEN_EDGES.items():
+    for node in _import_nodes(ast.parse(source, filename=module)):
+        for target in _imported_modules(node):
+            for above in FORBIDDEN_EDGES[module]:
+                if _names_module(target, above):
+                    violations.append(f"{module}:{node.lineno} imports {above} (via {target})")
+    return violations
+
+
+def test_no_registry_module_imports_one_above_it():
+    violations = []
+    for module in FORBIDDEN_EDGES:
         if not _source_path(module).is_file():
             violations.append(f"{module} does not exist")
             continue
-        for node in _import_nodes(_parse(module)):
-            for target in _imported_modules(node):
-                for above in forbidden:
-                    if _names_module(target, above):
-                        violations.append(f"{module}:{node.lineno} imports {above} (via {target})")
+        violations += _upward_import_violations(_source_path(module).read_text(), module)
     assert not violations, "registry modules reach up the layering:\n" + "\n".join(violations)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from shared import garmin_registry\n",
+        "from shared.garmin_registry import call\n",
+        "import shared.garmin_registry\n",
+        "import shared.garmin_registry as registry\n",
+        "def f():\n    from shared import garmin_registry\n    return garmin_registry\n",
+    ],
+    ids=["module-form", "by-name", "import", "aliased", "function-local"],
+)
+def test_the_dag_walker_flags_each_upward_spelling(source):
+    """A walker that only ever sees clean modules proves nothing; each spelling
+    of the runtime -> facade edge #64 removed is tried here on purpose."""
+    violations = _upward_import_violations(source, RUNTIME)
+    assert any(f"imports {FACADE} " in violation for violation in violations), f"got {violations}"
+
+
+def test_the_dag_walker_accepts_a_downward_edge():
+    assert _upward_import_violations("from shared import garmin_registry_common\n", RUNTIME) == []
 
 
 def test_leaves_import_nothing_else_from_the_package():
@@ -195,40 +222,112 @@ def test_no_function_local_imports_in_registry_modules():
     assert not violations, "function-local imports in registry modules:\n" + "\n".join(violations)
 
 
-def test_no_smuggled_imports_in_registry_modules():
-    """The import checks above read Import/ImportFrom nodes; close the other
-    doors. Flagged: any relative import (it names no `shared.` path); a bare
-    `import shared` (the package's attributes resolve submodules at call time,
-    which is the old shim in a new spelling); any `import importlib[.x]` or
-    `from importlib[.x] import ...`; and any bare use of the names `importlib`,
-    `__import__` or `import_module`, which is what a call through them looks
-    like once the import itself is disguised (aliasing `import_module` to
-    another name is not caught -- nor is anything that reaches the facade
-    through `sys.modules`)."""
+# Modules that import by name at call time, and the attributes a call through
+# them ends in: `importlib.import_module`, `builtins.__import__`,
+# `pkgutil.resolve_name`, `runpy.run_module`.
+_LATE_IMPORT_MODULES = ("importlib", "builtins", "pkgutil", "runpy")
+_LATE_IMPORT_ATTRS = ("__import__", "import_module", "resolve_name")
+
+
+def _smuggled_import_violations(source: str, label: str) -> list[str]:
+    """Every late-import mechanism in ``source``, as ``label:line reason``.
+
+    The import checks above read Import/ImportFrom nodes; this closes the
+    other doors. Flagged: any relative import (it names no `shared.` path);
+    a bare `import shared` (the package's attributes resolve submodules at
+    call time, which is the old shim in a new spelling); any import of or
+    from `importlib`, `builtins`, `pkgutil` or `runpy` (dotted or not); any
+    attribute access ending in `__import__`, `import_module` or
+    `resolve_name` (`builtins.__import__(...)`, `pkgutil.resolve_name(...)`);
+    and any bare use of the names `importlib`, `__import__`, `import_module`,
+    `resolve_name` or `shared`, which is what a call through them looks like
+    once the import itself is disguised (`import shared.x` then
+    `shared.garmin_registry.y`, say). Still not caught: an aliasing import
+    (`from importlib import import_module as load`) and anything that reaches
+    the facade through `sys.modules`.
+    """
     violations = []
-    for module in REGISTRY_MODULES:
-        tree = ast.parse((REPO / module).read_text(), filename=module)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.level > 0:
-                violations.append(f"{module}:{node.lineno} relative import")
-            elif isinstance(node, ast.Import) and any(_names_module(alias.name, "importlib") for alias in node.names):
-                violations.append(f"{module}:{node.lineno} imports importlib")
-            elif isinstance(node, ast.ImportFrom) and _names_module(node.module or "", "importlib"):
-                violations.append(f"{module}:{node.lineno} imports from importlib")
-            elif isinstance(node, ast.Import) and any(alias.name == "shared" for alias in node.names):
-                # `import shared` + `shared.garmin_registry.X` at call time is the _registry() shim
-                # in a new spelling; no registry module needs the bare package.
-                violations.append(f"{module}:{node.lineno} imports the bare `shared` package")
-            elif isinstance(node, ast.Name) and node.id in ("importlib", "__import__", "import_module"):
-                violations.append(f"{module}:{node.lineno} uses {node.id}")
+    for node in ast.walk(ast.parse(source, filename=label)):
+        if isinstance(node, ast.ImportFrom) and node.level > 0:
+            violations.append(f"{label}:{node.lineno} relative import")
+        elif isinstance(node, ast.Import) and any(
+            _names_module(alias.name, late) for alias in node.names for late in _LATE_IMPORT_MODULES
+        ):
+            violations.append(f"{label}:{node.lineno} imports {node.names[0].name.split('.')[0]}")
+        elif isinstance(node, ast.ImportFrom) and any(_names_module(node.module or "", late) for late in _LATE_IMPORT_MODULES):
+            violations.append(f"{label}:{node.lineno} imports from {(node.module or '').split('.')[0]}")
+        elif isinstance(node, ast.Import) and any(alias.name == "shared" for alias in node.names):
+            violations.append(f"{label}:{node.lineno} imports the bare `shared` package")
+        elif isinstance(node, ast.Attribute) and node.attr in _LATE_IMPORT_ATTRS:
+            violations.append(f"{label}:{node.lineno} calls .{node.attr}")
+        elif isinstance(node, ast.Name) and node.id in ("importlib", "__import__", "import_module", "resolve_name", "shared"):
+            violations.append(f"{label}:{node.lineno} uses {node.id}")
+    return violations
+
+
+def test_no_smuggled_imports_in_registry_modules():
+    violations = [
+        violation
+        for module in REGISTRY_MODULES
+        for violation in _smuggled_import_violations((REPO / module).read_text(), module)
+    ]
     assert not violations, "late-import mechanisms in registry modules:\n" + "\n".join(violations)
+
+
+@pytest.mark.parametrize(
+    ("source", "reason"),
+    [
+        ("import shared\n", "imports the bare `shared` package"),
+        ("import shared.garmin_client\n\n\ndef f():\n    return shared.garmin_registry.call\n", "uses shared"),
+        ("from importlib import import_module\n", "imports from importlib"),
+        ("import importlib\n", "imports importlib"),
+        ("import importlib.util\n", "imports importlib"),
+        (
+            "import importlib\n\n\ndef f():\n    return importlib.import_module('shared.garmin_registry')\n",
+            "uses importlib",
+        ),
+        (
+            "from importlib import import_module\n\n\ndef f():\n    return import_module('shared.garmin_registry')\n",
+            "uses import_module",
+        ),
+        ('def f():\n    return __import__("shared.garmin_registry")\n', "uses __import__"),
+        ('import builtins\n\n\ndef f():\n    return builtins.__import__("shared.garmin_registry")\n', "calls .__import__"),
+        (
+            'import pkgutil\n\n\ndef f():\n    return pkgutil.resolve_name("shared.garmin_registry:call")\n',
+            "calls .resolve_name",
+        ),
+        ("from . import x\n", "relative import"),
+    ],
+    ids=[
+        "bare-shared",
+        "submodule-then-attribute",
+        "from-importlib",
+        "import-importlib",
+        "dotted-importlib",
+        "importlib-name",
+        "import-module-name",
+        "dunder-import",
+        "builtins-attribute",
+        "pkgutil-attribute",
+        "relative",
+    ],
+)
+def test_the_smuggle_checker_flags_each_known_spelling(source, reason):
+    """A checker that only ever sees clean sources proves nothing; each door it
+    claims to close is tried here on purpose."""
+    violations = _smuggled_import_violations(source, "probe")
+    assert any(reason in violation for violation in violations), f"expected {reason!r}, got {violations}"
+
+
+def test_the_smuggle_checker_accepts_the_house_import_style():
+    assert _smuggled_import_violations("from shared import garmin_registry_common\n", "probe") == []
 
 
 def _tree_listing(root: Path) -> list[str]:
     return sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if "__pycache__" not in p.parts)
 
 
-@pytest.mark.parametrize("module", IMPORTABLE_MODULES)
+@pytest.mark.parametrize("module", ORDER)
 def test_each_registry_module_imports_alone_in_a_fresh_interpreter(module, tmp_path):
     """The import-order-cycle guard: importing the legacy module first (as both
     lifespans do) must not blow up, and no module may depend on a sibling

@@ -2,7 +2,8 @@
 
 A leaf: it imports only the standard library and the registry's bounded error
 types, so :mod:`shared.garmin_registry_runtime` and the facade can both read
-their limits and clock formatting from here without either importing the other.
+their limits and clock formatting from here without runtime having to reach
+back into the facade for them.
 """
 
 from __future__ import annotations

@@ -25,7 +25,7 @@ import inspect
 import logging
 import os
 import shutil
-import time  # noqa: F401 - public registry clock/monkeypatch seam
+import time  # public registry clock/monkeypatch seam
 import uuid
 from contextlib import AbstractAsyncContextManager
 from pathlib import Path
@@ -55,7 +55,7 @@ from shared.garmin_registry_runtime import (
     _record_auth_success,
     _token_store_has_content,
     _validate_link_target,
-    _wait_for_call_permit,
+    _wait_for_call_permit,  # also read by garmin_registry_legacy at call time
     actor_has_effective_manage,
     check_link_attempt_quota,
     reserve_call_permit,
@@ -98,7 +98,11 @@ def resolve_token_dir(person_id: int, generation: int) -> Path:
 
 
 def _person_lock_path(person_id: int) -> Path:
-    """A stable lock survives a token-directory replacement on re-link."""
+    """A stable lock survives a token-directory replacement on re-link.
+
+    :func:`person_flock` already refuses a non-positive id before any lock is
+    taken; the check here only protects a direct caller (belt and braces).
+    """
     if person_id < 1:
         raise ValueError("person_id must be a positive integer")
     return _ensure_token_root() / f".person-{person_id}.lock"

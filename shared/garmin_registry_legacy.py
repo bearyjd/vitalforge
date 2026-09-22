@@ -61,6 +61,7 @@ async def bootstrap_legacy_token_store() -> bool:
     try:
         canonical_email = garmin_registry_common.canonical_email(legacy_email)
     except GarminLinkInputError:
+        logger.info("Legacy Garmin token-store adoption skipped: GARMIN_EMAIL is empty")
         return False
     try:
         async with garmin_registry.legacy_store_flock():

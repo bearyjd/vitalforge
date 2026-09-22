@@ -21,8 +21,18 @@ def test_canonical_email_rejects_non_string_and_blank_input(bad):
         garmin_registry_common.canonical_email(bad)
 
 
-def test_canonical_email_strips_and_casefolds():
-    assert garmin_registry_common.canonical_email("  Foo@Example.COM ") == "foo@example.com"
+@pytest.mark.parametrize(
+    ("raw", "canonical"),
+    [("  Foo@Example.COM ", "foo@example.com"), ("Straße@Example.test", "strasse@example.test")],
+    ids=["ascii", "casefold-not-lower"],
+)
+def test_canonical_email_strips_and_casefolds(raw, canonical):
+    """Pins the canonicalisation the DB identity key (`garmin_links.garmin_email`)
+    and the link-conflict lookup currently rely on: `casefold`, which also
+    collapses e.g. `ß` -> `ss` where `lower()` would not. Whether the provider
+    login should receive this canonical form rather than the user's stripped
+    input is tracked in #70; this test takes no position on that."""
+    assert garmin_registry_common.canonical_email(raw) == canonical
 
 
 @pytest.mark.parametrize(
