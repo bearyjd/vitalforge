@@ -10,7 +10,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 REGISTRY_ERROR_CODES = frozenset({"auth_failed", "rate_limited", "network", "unknown"})
-_ERROR_CODES = REGISTRY_ERROR_CODES  # alias; remove after the next release
 
 LEGACY_GARMIN_TARGET_RETIRED_ERROR = "legacy_target_retired"
 
@@ -66,7 +65,7 @@ class GarminAuthenticationError(GarminRegistryError):
     """A link could not resume its token store without exposing why."""
 
     def __init__(self, code: str):
-        self.code = code if code in _ERROR_CODES else "unknown"
+        self.code = code if code in REGISTRY_ERROR_CODES else "unknown"
         super().__init__("Garmin authentication failed")
 
 
@@ -74,7 +73,7 @@ class GarminOperationError(GarminRegistryError):
     """A Garmin operation failed without surfacing its raw exception text."""
 
     def __init__(self, code: str):
-        self.code = code if code in _ERROR_CODES else "unknown"
+        self.code = code if code in REGISTRY_ERROR_CODES else "unknown"
         super().__init__("Garmin operation failed")
 
 

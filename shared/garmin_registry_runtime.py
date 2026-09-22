@@ -1,8 +1,17 @@
-"""Durable registry admission and legacy-store helpers.
+"""Durable registry admission, auth stamps, and link-row publication.
 
-The public API remains in :mod:`shared.garmin_registry`.  These helpers read
-their mutable configuration and collaborators from that facade at call time so
-existing startup code and test monkeypatch seams keep their exact behaviour.
+The public API remains in :mod:`shared.garmin_registry`, which imports these
+helpers at the top and re-exports the ones tests and
+:mod:`shared.garmin_registry_legacy` reach for (see ``FACADE_PATCH_POINTS`` in
+``tests/test_registry_layering.py``).  This
+module sits beneath it: it reads its limits and clock from
+:mod:`shared.garmin_registry_common` and its error types from
+:mod:`shared.garmin_registry_errors`, and never imports the facade.  The
+``time`` and ``asyncio`` it calls are the same module objects the facade
+exposes as monkeypatch seams, so a test that freezes the clock with
+``setattr(garmin_registry.time, "time", ...)`` -- the stdlib module's
+attribute, not the ``time`` name on the facade -- freezes the permit clock
+here too.
 """
 
 from __future__ import annotations
@@ -10,8 +19,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-import os
 import re
+import time
 from pathlib import Path
 
 from garminconnect import (
@@ -22,29 +31,25 @@ from garminconnect import (
 from garminconnect.client import token_file_path
 from garminconnect.exceptions import GarminConnectNotFoundError
 
-from shared import garmin_client
+from shared import garmin_registry_common
 from shared.database import get_db
+from shared.garmin_registry_errors import (
+    REGISTRY_ERROR_CODES,
+    GarminLink,
+    GarminLinkAttemptRateLimited,
+    GarminLinkConflict,
+    GarminNotLinked,
+    GarminOperationError,
+    GarminRateLimited,
+    GarminSessionExpired,
+)
 
 logger = logging.getLogger(__name__)
 
-# One-time marker in ``auth_migrations`` (the same table
-# ``shared.auth.bootstrap_migrated_token`` uses).  ``assert_schema_understood``
-# only reads ``schema_migrations``, so an older image ignores this marker
-# instead of boot-looping on it.
-_LEGACY_ADOPTION_MARKER = "legacy-garth-store-adopted"
-_LEGACY_GENERATION = 1
 # garminconnect only carries an HTTP status in its message text ("API Error
 # 401 - ...", "Mobile login: HTTP 403 (...)", "Widget embed returned 429").
 # Parsing that text is not logging it.
 _HTTP_STATUS_IN_MESSAGE_RE = re.compile(r"(?:HTTP|API Error|returned)\s+(\d{3})\b")
-
-
-def _registry():
-    # Delayed to avoid a facade/import cycle and to retain its public patch
-    # points (GARTH_TOKEN_DIR, time, asyncio, and error classes).
-    from shared import garmin_registry
-
-    return garmin_registry
 
 
 def _error_code(exc: Exception) -> str:
@@ -157,7 +162,6 @@ def _error_code_from_type(exc: Exception) -> str:
 
 async def reserve_call_permit() -> None:
     """Consume one durable global leaky-bucket slot or raise retry-after."""
-    registry = _registry()
     db = await get_db(isolation_level=None)
     try:
         await db.execute("BEGIN IMMEDIATE")
@@ -169,8 +173,8 @@ async def reserve_call_permit() -> None:
         ).fetchone()
         if row is None:
             raise RuntimeError("Garmin call budget is unavailable")
-        now = registry.time.time()
-        interval = registry._call_interval_seconds()
+        now = time.time()
+        interval = garmin_registry_common.call_interval_seconds()
         next_allowed_at = float(row["next_allowed_at"])
         if next_allowed_at > now + interval:
             # A reservation only ever writes ``now + interval``, so a slot
@@ -180,7 +184,7 @@ async def reserve_call_permit() -> None:
             next_allowed_at = now
         if next_allowed_at > now:
             await db.rollback()
-            raise registry.GarminRateLimited(min(60, max(1, math.ceil(next_allowed_at - now))))
+            raise GarminRateLimited(min(60, max(1, math.ceil(next_allowed_at - now))))
         await db.execute(
             "UPDATE garmin_call_budget SET next_allowed_at = ? WHERE singleton = 1",
             (now + interval,),
@@ -203,29 +207,27 @@ async def _wait_for_call_permit(deadline_seconds: float | None = None) -> None:
     waits indefinitely, which is only appropriate for a logical operation
     already in flight (a cold call's post-login operation).
     """
-    registry = _registry()
     slept = 0.0
     while True:
         try:
-            await registry.reserve_call_permit()
+            await reserve_call_permit()
             return
-        except registry.GarminRateLimited as exc:
+        except GarminRateLimited as exc:
             if deadline_seconds is not None and slept + exc.retry_after > deadline_seconds:
                 raise
             slept += exc.retry_after
-            await registry.asyncio.sleep(exc.retry_after)
+            await asyncio.sleep(exc.retry_after)
 
 
 async def reserve_link_attempt(user_id: int) -> None:
     """Reserve one of a user's three credential-link attempts per 15 minutes."""
-    registry = _registry()
     user_id = int(user_id)
     if user_id < 1:
         raise ValueError("user_id must be a positive integer")
     db = await get_db(isolation_level=None)
     try:
         await db.execute("BEGIN IMMEDIATE")
-        now = registry.time.time()
+        now = time.time()
         row = await (
             await db.execute(
                 """
@@ -248,19 +250,19 @@ async def reserve_link_attempt(user_id: int) -> None:
             retained = sorted(
                 float(value)
                 for value in (row["attempted_at_1"], row["attempted_at_2"], row["attempted_at_3"])
-                if value is not None and float(value) >= now - registry._LINK_ATTEMPT_WINDOW_SECONDS
+                if value is not None and float(value) >= now - garmin_registry_common.LINK_ATTEMPT_WINDOW_SECONDS
             )
-            if len(retained) >= registry._LINK_ATTEMPT_LIMIT:
+            if len(retained) >= garmin_registry_common.LINK_ATTEMPT_LIMIT:
                 await db.rollback()
-                raise registry.GarminLinkAttemptRateLimited(
+                raise GarminLinkAttemptRateLimited(
                     min(
-                        registry._LINK_ATTEMPT_WINDOW_SECONDS,
-                        max(1, math.ceil(retained[0] + registry._LINK_ATTEMPT_WINDOW_SECONDS - now)),
+                        garmin_registry_common.LINK_ATTEMPT_WINDOW_SECONDS,
+                        max(1, math.ceil(retained[0] + garmin_registry_common.LINK_ATTEMPT_WINDOW_SECONDS - now)),
                     )
                 )
             retained.append(now)
             retained.sort()
-            slots = retained + [None] * (registry._LINK_ATTEMPT_LIMIT - len(retained))
+            slots = retained + [None] * (garmin_registry_common.LINK_ATTEMPT_LIMIT - len(retained))
             await db.execute(
                 """
                 UPDATE garmin_link_attempts
@@ -286,7 +288,6 @@ async def check_link_attempt_quota(user_id: int) -> None:
     preflight only prevents a known fourth attempt from starving unrelated
     Garmin work while preserving that race-safe final reservation.
     """
-    registry = _registry()
     user_id = int(user_id)
     if user_id < 1:
         raise ValueError("user_id must be a positive integer")
@@ -303,18 +304,18 @@ async def check_link_attempt_quota(user_id: int) -> None:
         ).fetchone()
         if row is None:
             return
-        now = registry.time.time()
+        now = time.time()
         retained = [
             float(value)
             for value in (row["attempted_at_1"], row["attempted_at_2"], row["attempted_at_3"])
-            if value is not None and float(value) >= now - registry._LINK_ATTEMPT_WINDOW_SECONDS
+            if value is not None and float(value) >= now - garmin_registry_common.LINK_ATTEMPT_WINDOW_SECONDS
         ]
-        if len(retained) >= registry._LINK_ATTEMPT_LIMIT:
+        if len(retained) >= garmin_registry_common.LINK_ATTEMPT_LIMIT:
             oldest = min(retained)
-            raise registry.GarminLinkAttemptRateLimited(
+            raise GarminLinkAttemptRateLimited(
                 min(
-                    registry._LINK_ATTEMPT_WINDOW_SECONDS,
-                    max(1, math.ceil(oldest + registry._LINK_ATTEMPT_WINDOW_SECONDS - now)),
+                    garmin_registry_common.LINK_ATTEMPT_WINDOW_SECONDS,
+                    max(1, math.ceil(oldest + garmin_registry_common.LINK_ATTEMPT_WINDOW_SECONDS - now)),
                 )
             )
     finally:
@@ -354,7 +355,6 @@ async def _load_link(person_id: int):
 
 
 async def _record_auth_success(person_id: int, generation: int) -> None:
-    registry = _registry()
     db = await get_db()
     try:
         await db.execute(
@@ -362,7 +362,7 @@ async def _record_auth_success(person_id: int, generation: int) -> None:
             UPDATE garmin_links SET last_auth_ok = ?, last_auth_error = NULL, last_auth_error_at = NULL
             WHERE person_id = ? AND generation = ?
             """,
-            (registry._utc_now(), person_id, generation),
+            (garmin_registry_common.utc_now(), person_id, generation),
         )
         await db.commit()
     finally:
@@ -370,8 +370,7 @@ async def _record_auth_success(person_id: int, generation: int) -> None:
 
 
 async def _record_auth_failure(person_id: int, generation: int, code: str) -> None:
-    registry = _registry()
-    safe_code = code if code in registry._ERROR_CODES else "unknown"
+    safe_code = code if code in REGISTRY_ERROR_CODES else "unknown"
     db = await get_db()
     try:
         await db.execute(
@@ -379,20 +378,126 @@ async def _record_auth_failure(person_id: int, generation: int, code: str) -> No
             UPDATE garmin_links SET last_auth_error = ?, last_auth_error_at = ?
             WHERE person_id = ? AND generation = ?
             """,
-            (safe_code, registry._utc_now(), person_id, generation),
+            (safe_code, garmin_registry_common.utc_now(), person_id, generation),
         )
         await db.commit()
     finally:
         await db.close()
 
 
-def _looks_like_legacy_token_store(path: Path) -> bool:
-    """Check garminconnect's exact legacy token path without reading it."""
+async def _validate_link_target(person_id: int, actor_id: int, session_version: int) -> None:
+    """Reject a stale actor or unreachable target before sending credentials.
+
+    This is deliberately repeated by :func:`_publish_link` in its immediate
+    transaction.  The first check prevents an already-invalid request from
+    reaching Garmin; the second closes the interval while the credential login
+    runs without retaining a database transaction across that network call.
+    """
+    db = await get_db()
     try:
-        token_path = token_file_path(str(path))
-        return path.is_dir() and token_path.is_file() and not token_path.is_symlink()
-    except (OSError, ValueError):
-        return False
+        actor = await (
+            await db.execute(
+                "SELECT 1 FROM users WHERE id = ? AND session_version = ?", (actor_id, session_version)
+            )
+        ).fetchone()
+        if actor is None:
+            raise GarminSessionExpired()
+        person = await (
+            await db.execute(
+                "SELECT 1 FROM persons WHERE id = ? AND archived_at IS NULL", (person_id,)
+            )
+        ).fetchone()
+        if person is None:
+            raise GarminNotLinked(person_id)
+    finally:
+        await db.close()
+
+
+async def _publish_link(
+    person_id: int,
+    actor_id: int,
+    session_version: int,
+    canonical_email: str,
+    generation: int,
+) -> GarminLink:
+    """Atomically re-verify the actor and the reserved generation, then publish the link."""
+    db = await get_db(isolation_level=None)
+    try:
+        await db.execute("BEGIN IMMEDIATE")
+        if not await actor_has_effective_manage(db, actor_id, session_version, person_id):
+            await db.rollback()
+            raise GarminSessionExpired()
+        person = await (
+            await db.execute(
+                "SELECT 1 FROM persons WHERE id = ? AND archived_at IS NULL", (person_id,)
+            )
+        ).fetchone()
+        if person is None:
+            await db.rollback()
+            raise GarminNotLinked(person_id)
+        conflict = await (
+            await db.execute(
+                "SELECT person_id FROM garmin_links WHERE garmin_email = ?", (canonical_email,)
+            )
+        ).fetchone()
+        if conflict is not None and conflict["person_id"] != person_id:
+            await db.rollback()
+            raise GarminLinkConflict()
+
+        ledger = await (
+            await db.execute(
+                "SELECT generation FROM garmin_link_generations WHERE person_id = ?", (person_id,)
+            )
+        ).fetchone()
+        current = await (
+            await db.execute("SELECT generation FROM garmin_links WHERE person_id = ?", (person_id,))
+        ).fetchone()
+        # ``generation`` was reserved in the ledger before the credential
+        # login (shared.garmin_registry._reserve_generation).  The person flock keeps that stable
+        # across lifecycle callers; refuse, rather than publish a staged
+        # client under a surprise generation, if a direct DB writer moved the
+        # ledger or published a newer link while the login was running.
+        reserved = ledger is not None and int(ledger["generation"]) == generation
+        superseded = current is not None and int(current["generation"]) >= generation
+        if not reserved or superseded:
+            await db.rollback()
+            logger.warning(
+                "Garmin link publication for person %s refused: generation reservation changed",
+                person_id,
+            )
+            raise GarminOperationError("unknown")
+
+        now = garmin_registry_common.utc_now()
+        await db.execute(
+            """
+            INSERT INTO garmin_links
+                (person_id, state, garmin_email, generation, linked_at, linked_by,
+                 updated_at, last_auth_ok, last_auth_error, last_auth_error_at)
+            VALUES (?, 'linked', ?, ?, ?, ?, ?, ?, NULL, NULL)
+            ON CONFLICT(person_id) DO UPDATE SET
+                state = 'linked', garmin_email = excluded.garmin_email,
+                generation = excluded.generation, linked_at = excluded.linked_at,
+                linked_by = excluded.linked_by, updated_at = excluded.updated_at,
+                last_auth_ok = excluded.last_auth_ok, last_auth_error = NULL,
+                last_auth_error_at = NULL
+            """,
+            (person_id, canonical_email, generation, now, actor_id, now, now),
+        )
+        await db.execute(
+            """
+            INSERT INTO garmin_link_generations (person_id, generation) VALUES (?, ?)
+            ON CONFLICT(person_id) DO UPDATE SET generation = excluded.generation
+            """,
+            (person_id, generation),
+        )
+        await db.commit()
+        return GarminLink(person_id, generation, "linked")
+    except BaseException:
+        if db.in_transaction:
+            await db.rollback()
+        raise
+    finally:
+        await db.close()
 
 
 def _token_store_has_content(path: Path) -> bool:
@@ -407,305 +512,3 @@ def _token_store_has_content(path: Path) -> bool:
         return token_path.is_file() and not token_path.is_symlink() and token_path.stat().st_size > 0
     except (OSError, ValueError):
         return False
-
-
-def resolve_token_dir(person_id: int, generation: int) -> Path:
-    """Every durable link resumes from its own immutable generation directory."""
-    return _registry()._generation_token_dir(int(person_id), int(generation))
-
-
-async def bootstrap_legacy_token_store() -> bool:
-    """Adopt a verified pre-Phase-3 flat token store for the primary person, once.
-
-    Adoption moves ``<root>/garmin_tokens.json`` under the primary person's
-    ``generation-1`` directory and publishes an ordinary ``linked`` row, then
-    records :data:`_LEGACY_ADOPTION_MARKER` in ``auth_migrations`` in the
-    same transaction.  The marker is what makes this one-time: it survives
-    unlink, re-link, archive, and even a restored backup of the flat store.
-    """
-    registry = _registry()
-    try:
-        root = registry._ensure_token_root()
-    except OSError:
-        logger.warning("Legacy Garmin token-store adoption could not prepare its token root")
-        return False
-    legacy_email = os.getenv("GARMIN_EMAIL")
-    if not isinstance(legacy_email, str):
-        logger.info("Legacy Garmin token-store adoption skipped: GARMIN_EMAIL is not set")
-        return False
-    try:
-        canonical_email = registry._canonical_email(legacy_email)
-    except registry.GarminLinkInputError:
-        return False
-    try:
-        async with registry.legacy_store_flock():
-            return await _adopt_legacy_store_locked(root, canonical_email)
-    except registry.GarminRateLimited:
-        logger.info(
-            "Legacy Garmin token-store adoption could not get a Garmin call permit; "
-            "it is retried at the next boot"
-        )
-        return False
-    except Exception as exc:
-        logger.warning("Legacy Garmin token-store adoption was not completed (%s)", type(exc).__name__)
-        return False
-
-
-async def _adopt_legacy_store_locked(root: Path, canonical_email: str) -> bool:
-    """The adoption decision tree; the caller holds ``legacy_store_flock``.
-
-    Lock order is ``legacy_store_flock`` -> ``person_flock``, and nothing
-    takes them the other way round: ``link()``, ``unlink()``, ``call()`` and
-    the archive route hold only ``person_flock``.  The person flock is what
-    keeps a route-driven link for the same person from publishing its own
-    ``generation-1`` while the flat store is being verified and moved; the
-    primary is therefore re-checked once the flock is held, since a link may
-    have reserved its generation in the meantime.
-    """
-    registry = _registry()
-    if await _legacy_adoption_recorded():
-        logger.info("Legacy Garmin token-store adoption skipped: marker already recorded")
-        return False
-    person_id = await _adoptable_primary_person(canonical_email)
-    if person_id is None:
-        logger.info(
-            "Legacy Garmin token-store adoption skipped: no primary person is adoptable "
-            "(no primary, or the primary already has lifecycle state / an email conflict)"
-        )
-        return False
-    async with registry.person_flock(person_id):
-        if await _adoptable_primary_person(canonical_email) != person_id:
-            logger.info(
-                "Legacy Garmin token-store adoption skipped for person %s: it gained "
-                "lifecycle state while its lock was being acquired",
-                person_id,
-            )
-            return False
-        return await _adopt_for_person_locked(person_id, canonical_email, root)
-
-
-async def _adopt_for_person_locked(person_id: int, canonical_email: str, root: Path) -> bool:
-    """Both flocks are held.  The moved-store branch exists for a process
-    killed between the file move and the database commit: the flat store is
-    already under ``generation-1`` and only the publication is missing."""
-    registry = _registry()
-    durable = registry._generation_token_dir(person_id, _LEGACY_GENERATION)
-    if _looks_like_legacy_token_store(durable):
-        if not await _verify_token_store(person_id, canonical_email, durable):
-            return False
-        published = await _publish_legacy_adoption(person_id, canonical_email)
-        if published:
-            logger.info(
-                "Adopted the legacy Garmin token store for person %s as generation 1", person_id
-            )
-        return published
-    await _warn_about_orphaned_moved_stores(root, person_id)
-    if not _looks_like_legacy_token_store(root):
-        logger.info("Legacy Garmin token-store adoption skipped: no flat token store is present")
-        return False
-    return await _adopt_flat_store(person_id, canonical_email, root, durable)
-
-
-def _moved_store_person_ids(root: Path) -> list[int]:
-    """Person ids owning a ``generation-1`` token file, from names alone."""
-    person_ids: list[int] = []
-    for token_path in root.glob("person-*/generation-1/garmin_tokens.json"):
-        suffix = token_path.parent.parent.name.removeprefix("person-")
-        if suffix.isdigit():
-            person_ids.append(int(suffix))
-    return person_ids
-
-
-async def _warn_about_orphaned_moved_stores(root: Path, primary_id: int) -> None:
-    """Log-only: name a moved store that a change of primary orphaned.
-
-    A crash between the move and the commit leaves the flat store under the
-    then-primary's ``generation-1`` with no ledger row.  If a different person
-    is primary by the next boot, the recovery branch never looks there again;
-    an operator has to decide what that file is, so it is named, never read
-    or deleted.
-    """
-    candidates = [pid for pid in await asyncio.to_thread(_moved_store_person_ids, root) if pid != primary_id]
-    if not candidates:
-        return
-    db = await get_db()
-    try:
-        for person_id in candidates:
-            ledger = await (
-                await db.execute("SELECT 1 FROM garmin_link_generations WHERE person_id = ?", (person_id,))
-            ).fetchone()
-            if ledger is None:
-                logger.warning(
-                    "Legacy Garmin token store moved for person %s was never published; leaving it in place",
-                    person_id,
-                )
-    finally:
-        await db.close()
-
-
-async def _adopt_flat_store(person_id: int, canonical_email: str, root: Path, durable: Path) -> bool:
-    """Verify, move, then publish; a failed publication puts the file back.
-
-    A cancellation never does: after the commit the ``linked`` row expects
-    the file under ``generation-1``, and before it the moved file is exactly
-    what the interrupted-adoption branch of :func:`_adopt_for_person_locked`
-    completes at the next boot.
-    """
-    if not await _verify_token_store(person_id, canonical_email, root):
-        return False
-    source = token_file_path(str(root))
-    target = token_file_path(str(durable))
-    await asyncio.to_thread(_move_token_file, source, target)
-    try:
-        published = await _publish_legacy_adoption(person_id, canonical_email)
-    except Exception:
-        await asyncio.to_thread(_restore_token_file, target, source)
-        raise
-    if not published:
-        await asyncio.to_thread(_restore_token_file, target, source)
-    else:
-        logger.info("Adopted the legacy Garmin token store for person %s as generation 1", person_id)
-    return published
-
-
-async def _verify_token_store(person_id: int, canonical_email: str, token_dir: Path) -> bool:
-    """Resume a token store once, then drop the client so nothing dumps there later.
-
-    The verification client's SDK persistence path is ``token_dir``; a cached
-    copy would silently re-dump refreshed tokens to the flat root after the
-    move.  A cold :func:`shared.garmin_registry.call` re-logs-in from the
-    durable directory instead.
-    """
-    registry = _registry()
-    # A busy permit is worth a short wait rather than a whole boot cycle.
-    # This sleeps while holding both the legacy-store and the primary's
-    # person flock, so the bound is deliberately a few intervals, not open.
-    await _wait_for_call_permit(deadline_seconds=3 * registry._call_interval_seconds())
-    try:
-        await asyncio.to_thread(
-            garmin_client.authenticate, person_id, _LEGACY_GENERATION, token_dir, canonical_email, None
-        )
-    except Exception as exc:
-        logger.warning(
-            "Legacy Garmin token store could not be verified (%s); leaving it unbound", type(exc).__name__
-        )
-        return False
-    finally:
-        garmin_client.forget(person_id, _LEGACY_GENERATION)
-    return True
-
-
-def _move_token_file(source: Path, target: Path) -> None:
-    """Move the flat store into its private generation directory atomically.
-
-    Like :func:`shared.garmin_registry._install_staged_token_dir` it never
-    replaces an existing file: a token file already at ``target`` belongs to
-    a published generation, and the flat store is then residue.
-    """
-    garmin_client._ensure_token_dir(target.parent)
-    target.parent.parent.chmod(0o700)  # person-<id>/ is registry-owned; tighten it even if it pre-existed
-    if target.exists() or target.is_symlink():
-        raise FileExistsError("generation token file already exists")
-    os.replace(source, target)
-
-
-def _restore_token_file(target: Path, source: Path) -> None:
-    """Best effort: put a moved flat store back so the next boot can retry."""
-    try:
-        if target.is_file() and not source.exists():
-            os.replace(target, source)
-    except OSError as exc:
-        logger.warning(
-            "Legacy Garmin token store could not be restored after a failed adoption (%s)",
-            type(exc).__name__,
-        )
-
-
-async def _legacy_adoption_recorded() -> bool:
-    db = await get_db()
-    try:
-        return await _legacy_adoption_recorded_in(db)
-    finally:
-        await db.close()
-
-
-async def _legacy_adoption_recorded_in(db) -> bool:
-    row = await (
-        await db.execute("SELECT 1 FROM auth_migrations WHERE name = ?", (_LEGACY_ADOPTION_MARKER,))
-    ).fetchone()
-    return row is not None
-
-
-async def _adoptable_primary_person(canonical_email: str) -> int | None:
-    db = await get_db()
-    try:
-        return await _adoptable_primary_person_in(db, canonical_email)
-    finally:
-        await db.close()
-
-
-async def _adoptable_primary_person_in(db, canonical_email: str) -> int | None:
-    """The primary person's id while the new lifecycle has never touched it.
-
-    A link row, a generation-ledger row, or another person owning the address
-    all mean the per-person lifecycle already has authority over this person;
-    the flat store is then stale residue, never a credential to revive.  The
-    ledger check is also what keeps the moved-store recovery branch honest: a
-    route-driven link reserves its generation before logging in, so a
-    ``generation-1`` directory with no ledger row can only be an interrupted
-    adoption.
-    """
-    primary = await (await db.execute("SELECT id FROM persons WHERE is_primary = 1")).fetchone()
-    if primary is None:
-        return None
-    person_id = int(primary["id"])
-    existing = await (
-        await db.execute("SELECT 1 FROM garmin_links WHERE person_id = ?", (person_id,))
-    ).fetchone()
-    ledger = await (
-        await db.execute("SELECT 1 FROM garmin_link_generations WHERE person_id = ?", (person_id,))
-    ).fetchone()
-    conflict = await (
-        await db.execute("SELECT 1 FROM garmin_links WHERE garmin_email = ?", (canonical_email,))
-    ).fetchone()
-    if existing is not None or ledger is not None or conflict is not None:
-        return None
-    return person_id
-
-
-async def _publish_legacy_adoption(person_id: int, canonical_email: str) -> bool:
-    """Publish the adopted store as a ``linked`` generation 1 with its marker."""
-    registry = _registry()
-    db = await get_db(isolation_level=None)
-    try:
-        await db.execute("BEGIN IMMEDIATE")
-        if await _legacy_adoption_recorded_in(db) or (
-            await _adoptable_primary_person_in(db, canonical_email) != person_id
-        ):
-            await db.rollback()
-            return False
-        now = registry._utc_now()
-        await db.execute(
-            """
-            INSERT INTO garmin_links
-                (person_id, state, garmin_email, generation, linked_at, updated_at, last_auth_ok)
-            VALUES (?, 'linked', ?, ?, ?, ?, ?)
-            """,
-            (person_id, canonical_email, _LEGACY_GENERATION, now, now, now),
-        )
-        await db.execute(
-            "INSERT INTO garmin_link_generations (person_id, generation) VALUES (?, ?)",
-            (person_id, _LEGACY_GENERATION),
-        )
-        await db.execute(
-            "INSERT INTO auth_migrations (name, completed_at) VALUES (?, ?)",
-            (_LEGACY_ADOPTION_MARKER, now),
-        )
-        await db.commit()
-        return True
-    except BaseException:
-        if db.in_transaction:
-            await db.rollback()
-        raise
-    finally:
-        await db.close()

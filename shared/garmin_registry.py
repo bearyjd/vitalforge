@@ -4,6 +4,18 @@
 state.  Code that touches Garmin must instead call :func:`call`; that makes a
 durable rate admission, a fresh link read, and a stable person lock one
 operation rather than conventions individual routes can forget.
+
+This is the top of the registry proper and its one public surface: the
+token-directory helpers and ``GARTH_TOKEN_DIR`` live here because tests and
+conftest monkeypatch them here, and the link lifecycle and :func:`call` sit
+beside them.  Admission, auth stamps and link-row publication come from
+:mod:`shared.garmin_registry_runtime`; constants and pure helpers from
+:mod:`shared.garmin_registry_common`; error types and locks from their own
+leaves -- every one imported at the top, none importing back.  The locks are
+root-agnostic: :func:`person_flock` and :func:`legacy_store_flock` are built
+here, on :func:`shared.garmin_registry_locks.flock_scope`, because their lock
+files live under ``GARTH_TOKEN_DIR`` too.  The one-time flat-store adoption in
+:mod:`shared.garmin_registry_legacy` imports this module, never the reverse.
 """
 
 from __future__ import annotations
@@ -13,22 +25,21 @@ import inspect
 import logging
 import os
 import shutil
-import time  # noqa: F401 - public registry clock/monkeypatch seam
+import time  # public registry clock/monkeypatch seam
 import uuid
-from datetime import datetime, timezone
+from contextlib import AbstractAsyncContextManager
 from pathlib import Path
 from typing import Awaitable, Callable, TypeVar
 
 from garminconnect import Garmin
 
-from shared import garmin_client
+from shared import garmin_client, garmin_registry_common, garmin_registry_locks
 from shared.database import get_db
 from shared.garmin_registry_errors import (
-    _ERROR_CODES,  # noqa: F401 - runtime helpers read it through this facade
     GarminAuthenticationError,
     GarminLink,
     GarminLinkAttemptRateLimited,  # noqa: F401 - public facade export
-    GarminLinkConflict,
+    GarminLinkConflict,  # noqa: F401 - public facade export
     GarminLinkInputError,
     GarminNotLinked,
     GarminOperationError,
@@ -36,23 +47,19 @@ from shared.garmin_registry_errors import (
     GarminRegistryError,
     GarminSessionExpired,
 )
-from shared.garmin_registry_locks import (
-    legacy_store_flock,  # noqa: F401 - public facade export
-    person_flock,
-)
 from shared.garmin_registry_runtime import (
     _error_code,
     _load_link,
+    _publish_link,
     _record_auth_failure,
     _record_auth_success,
     _token_store_has_content,
-    _wait_for_call_permit,
+    _validate_link_target,
+    _wait_for_call_permit,  # also read by garmin_registry_legacy at call time
     actor_has_effective_manage,
-    bootstrap_legacy_token_store,  # noqa: F401 - public facade export
     check_link_attempt_quota,
     reserve_call_permit,
     reserve_link_attempt,
-    resolve_token_dir,
 )
 
 logger = logging.getLogger(__name__)
@@ -60,28 +67,6 @@ logger = logging.getLogger(__name__)
 GARTH_TOKEN_DIR = Path(os.getenv("GARTH_TOKEN_DIR", "/app/data/.garth"))
 
 _T = TypeVar("_T")
-# 'legacy_bound' / 'legacy_disabled' are retired: boot-time adoption now moves
-# the flat store under person-<id>/generation-1/ and publishes 'linked'.  The
-# DDL still tolerates the old values (SQLite cannot alter a CHECK), so a row
-# carrying one is simply not usable until it is re-linked.
-_VALID_LINK_STATES = frozenset({"linked"})
-_LINK_ATTEMPT_LIMIT = 3
-_LINK_ATTEMPT_WINDOW_SECONDS = 15 * 60
-# The longest call() may sleep for a permit while holding a person flock.
-_MAX_INTERACTIVE_WAIT_SECONDS = 30.0
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def _call_interval_seconds() -> float:
-    """Read the deployment interval defensively, clamped to one minute."""
-    try:
-        configured = float(os.getenv("GARMIN_MIN_CALL_INTERVAL_SECONDS", "2"))
-    except ValueError:
-        configured = 2.0
-    return min(60.0, max(1.0, configured))
 
 
 def _ensure_token_root() -> Path:
@@ -89,16 +74,6 @@ def _ensure_token_root() -> Path:
     GARTH_TOKEN_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
     GARTH_TOKEN_DIR.chmod(0o700)
     return GARTH_TOKEN_DIR
-
-
-def _canonical_email(email: str) -> str:
-    """Canonicalize account identity without attempting email validation."""
-    if not isinstance(email, str):
-        raise GarminLinkInputError()
-    canonical = email.strip().casefold()
-    if not canonical:
-        raise GarminLinkInputError()
-    return canonical
 
 
 def _staging_token_dir(person_id: int, generation: int) -> Path:
@@ -115,6 +90,50 @@ def _person_token_root(person_id: int) -> Path:
 
 def _generation_token_dir(person_id: int, generation: int) -> Path:
     return _person_token_root(person_id) / f"generation-{generation}"
+
+
+def resolve_token_dir(person_id: int, generation: int) -> Path:
+    """Every durable link resumes from its own immutable generation directory."""
+    return _generation_token_dir(int(person_id), int(generation))
+
+
+def _person_lock_path(person_id: int) -> Path:
+    """A stable lock survives a token-directory replacement on re-link.
+
+    :func:`person_flock` already refuses a non-positive id before any lock is
+    taken; the check here only protects a direct caller (belt and braces).
+    """
+    if person_id < 1:
+        raise ValueError("person_id must be a positive integer")
+    return _ensure_token_root() / f".person-{person_id}.lock"
+
+
+def person_flock(person_id: int) -> AbstractAsyncContextManager[None]:
+    """Serialize all operations for a person across both service processes.
+
+    Lifecycle routes use the same public context manager, so unlink/re-link
+    cannot swap a token directory while :func:`call` is authenticating or
+    using it.  flock is released if a process dies; the file is intentionally
+    retained as lock infrastructure, not a sentinel.  A non-positive id is
+    refused here, before any process-local lock is taken.
+    """
+    person_id = int(person_id)
+    if person_id < 1:
+        raise ValueError("person_id must be a positive integer")
+    return garmin_registry_locks.flock_scope(
+        garmin_registry_locks.person_lock_key(person_id), lambda: _person_lock_path(person_id)
+    )
+
+
+def legacy_store_flock() -> AbstractAsyncContextManager[None]:
+    """Serialize the one-time flat-store adoption across both services.
+
+    The lock belongs beside the historic flat store, not inside any person's
+    directory: before adoption there is deliberately no person-owned path.
+    """
+    return garmin_registry_locks.flock_scope(
+        garmin_registry_locks.LEGACY_STORE_LOCK_KEY, lambda: _ensure_token_root() / ".legacy-bootstrap.lock"
+    )
 
 
 def _remove_token_dir(path: Path) -> None:
@@ -255,121 +274,6 @@ async def _reserve_generation(person_id: int) -> int:
         await db.close()
 
 
-async def _validate_link_target(person_id: int, actor_id: int, session_version: int) -> None:
-    """Reject a stale actor or unreachable target before sending credentials.
-
-    This is deliberately repeated by :func:`_publish_link` in its immediate
-    transaction.  The first check prevents an already-invalid request from
-    reaching Garmin; the second closes the interval while the credential login
-    runs without retaining a database transaction across that network call.
-    """
-    db = await get_db()
-    try:
-        actor = await (
-            await db.execute(
-                "SELECT 1 FROM users WHERE id = ? AND session_version = ?", (actor_id, session_version)
-            )
-        ).fetchone()
-        if actor is None:
-            raise GarminSessionExpired()
-        person = await (
-            await db.execute(
-                "SELECT 1 FROM persons WHERE id = ? AND archived_at IS NULL", (person_id,)
-            )
-        ).fetchone()
-        if person is None:
-            raise GarminNotLinked(person_id)
-    finally:
-        await db.close()
-
-
-async def _publish_link(
-    person_id: int,
-    actor_id: int,
-    session_version: int,
-    canonical_email: str,
-    generation: int,
-) -> GarminLink:
-    """Atomically verify the actor, allocate generation, and publish a link."""
-    db = await get_db(isolation_level=None)
-    try:
-        await db.execute("BEGIN IMMEDIATE")
-        if not await actor_has_effective_manage(db, actor_id, session_version, person_id):
-            await db.rollback()
-            raise GarminSessionExpired()
-        person = await (
-            await db.execute(
-                "SELECT 1 FROM persons WHERE id = ? AND archived_at IS NULL", (person_id,)
-            )
-        ).fetchone()
-        if person is None:
-            await db.rollback()
-            raise GarminNotLinked(person_id)
-        conflict = await (
-            await db.execute(
-                "SELECT person_id FROM garmin_links WHERE garmin_email = ?", (canonical_email,)
-            )
-        ).fetchone()
-        if conflict is not None and conflict["person_id"] != person_id:
-            await db.rollback()
-            raise GarminLinkConflict()
-
-        ledger = await (
-            await db.execute(
-                "SELECT generation FROM garmin_link_generations WHERE person_id = ?", (person_id,)
-            )
-        ).fetchone()
-        current = await (
-            await db.execute("SELECT generation FROM garmin_links WHERE person_id = ?", (person_id,))
-        ).fetchone()
-        # ``generation`` was reserved in the ledger before the credential
-        # login (_reserve_generation).  The person flock keeps that stable
-        # across lifecycle callers; refuse, rather than publish a staged
-        # client under a surprise generation, if a direct DB writer moved the
-        # ledger or published a newer link while the login was running.
-        reserved = ledger is not None and int(ledger["generation"]) == generation
-        superseded = current is not None and int(current["generation"]) >= generation
-        if not reserved or superseded:
-            await db.rollback()
-            logger.warning(
-                "Garmin link publication for person %s refused: generation reservation changed",
-                person_id,
-            )
-            raise GarminOperationError("unknown")
-
-        now = _utc_now()
-        await db.execute(
-            """
-            INSERT INTO garmin_links
-                (person_id, state, garmin_email, generation, linked_at, linked_by,
-                 updated_at, last_auth_ok, last_auth_error, last_auth_error_at)
-            VALUES (?, 'linked', ?, ?, ?, ?, ?, ?, NULL, NULL)
-            ON CONFLICT(person_id) DO UPDATE SET
-                state = 'linked', garmin_email = excluded.garmin_email,
-                generation = excluded.generation, linked_at = excluded.linked_at,
-                linked_by = excluded.linked_by, updated_at = excluded.updated_at,
-                last_auth_ok = excluded.last_auth_ok, last_auth_error = NULL,
-                last_auth_error_at = NULL
-            """,
-            (person_id, canonical_email, generation, now, actor_id, now, now),
-        )
-        await db.execute(
-            """
-            INSERT INTO garmin_link_generations (person_id, generation) VALUES (?, ?)
-            ON CONFLICT(person_id) DO UPDATE SET generation = excluded.generation
-            """,
-            (person_id, generation),
-        )
-        await db.commit()
-        return GarminLink(person_id, generation, "linked")
-    except BaseException:
-        if db.in_transaction:
-            await db.rollback()
-        raise
-    finally:
-        await db.close()
-
-
 async def link(
     person_id: int,
     actor_id: int,
@@ -389,7 +293,7 @@ async def link(
     session_version = int(session_version)
     if person_id < 1 or actor_id < 1 or session_version < 1 or not isinstance(password, str) or not password:
         raise GarminLinkInputError()
-    canonical_email = _canonical_email(email)
+    canonical_email = garmin_registry_common.canonical_email(email)
 
     try:
         # A known exhausted attempt window must not consume the deployment-wide
@@ -654,7 +558,8 @@ async def call(
     instead of failing on every other tap.  That sleep happens while holding
     the person flock, so same-person lifecycle routes and the scheduled sync
     wait behind it; the budget is therefore clamped to
-    :data:`_MAX_INTERACTIVE_WAIT_SECONDS` whatever the caller asks for.
+    :data:`shared.garmin_registry_common.MAX_INTERACTIVE_WAIT_SECONDS` whatever
+    the caller asks for.
     """
     person_id = int(person_id)
     if person_id < 1:
@@ -662,7 +567,7 @@ async def call(
     max_wait_seconds = float(max_wait_seconds)
     if not max_wait_seconds >= 0.0:  # also rejects NaN
         raise ValueError("max_wait_seconds must be a non-negative number")
-    max_wait_seconds = min(max_wait_seconds, _MAX_INTERACTIVE_WAIT_SECONDS)
+    max_wait_seconds = min(max_wait_seconds, garmin_registry_common.MAX_INTERACTIVE_WAIT_SECONDS)
     try:
         async with person_flock(person_id):
             generation, email = await _usable_link(person_id)
@@ -698,7 +603,7 @@ async def call(
 async def _usable_link(person_id: int) -> tuple[int, str]:
     """Read the durable link under the flock, evicting any cache for a dead one."""
     link = await _load_link(person_id)
-    if link is None or link["state"] not in _VALID_LINK_STATES:
+    if link is None or link["state"] not in garmin_registry_common.VALID_LINK_STATES:
         garmin_client.forget(person_id)
         raise GarminNotLinked(person_id)
     email = link["garmin_email"]

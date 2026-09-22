@@ -23,7 +23,7 @@ from shared.database import (
     get_db,
     init_db,
 )
-from shared.garmin_registry import bootstrap_legacy_token_store
+from shared.garmin_registry_legacy import bootstrap_legacy_token_store
 from shared.garmin_routes import add_garmin_routes
 from shared.persons_admin import add_person_routes
 from vitalforge_dashboard.correlations import compute_cell
