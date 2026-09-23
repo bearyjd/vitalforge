@@ -617,7 +617,12 @@ def _post_login_deadline(max_wait_seconds: float, started: float) -> float:
     interval's wait, and the caller's retry would just repeat the login.  The
     ceiling still wins, because this wait is held under the person flock and
     that bound is what :func:`call` promises: a deployment whose interval is
-    above the ceiling keeps the refusal, and its caller retries warm.
+    above the ceiling keeps the refusal, and its caller retries warm.  The
+    grace is one of THIS process's intervals, so it guarantees a retry only
+    against a slot this process could have written; in a mixed-interval
+    deployment the blocking slot may be a longer-interval peer's, and the
+    refusal stands.  That is the same trade the ceiling makes, and the warm
+    retry still skips the login.
 
     Without one (``max_wait_seconds == 0``: the scheduled sync through
     :func:`call_paced`, the activity push), the wait is capped rather than
@@ -649,7 +654,7 @@ async def _usable_link(person_id: int) -> tuple[int, str]:
 
 
 async def _resume_link(
-    person_id: int, generation: int, email: str, *, deadline_seconds: float | None = None
+    person_id: int, generation: int, email: str, *, deadline_seconds: float
 ) -> Garmin:
     """Cold-load a durable generation's token store and take its second
     permit within the caller's remaining budget."""

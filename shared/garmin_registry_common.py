@@ -20,7 +20,10 @@ from shared.garmin_registry_errors import GarminLinkInputError
 VALID_LINK_STATES = frozenset({"linked"})
 LINK_ATTEMPT_LIMIT = 3
 LINK_ATTEMPT_WINDOW_SECONDS = 15 * 60
-# The longest call() may sleep for a permit while holding a person flock.
+# The longest call() may sleep for ANY ONE permit while holding a person
+# flock.  A cold call takes two (before the credential login and after it),
+# each bounded by this, with an untimed provider login between them -- so the
+# flock-hold ceiling is two of these plus that login, not one.
 MAX_INTERACTIVE_WAIT_SECONDS = 30.0
 # The largest interval a deployment can configure, and so the largest slot any
 # writer can put in the shared budget.  reserve_call_permit's clock-regression

@@ -208,14 +208,15 @@ async def reserve_call_permit() -> None:
         await db.close()
 
 
-async def _wait_for_call_permit(deadline_seconds: float | None = None) -> None:
+async def _wait_for_call_permit(deadline_seconds: float) -> None:
     """Wait for a shared permit, sleeping ``retry_after`` between attempts.
 
     ``deadline_seconds`` bounds the total time spent sleeping: when the next
-    sleep would exceed it, the last ``GarminRateLimited`` is raised so an
-    interactive caller can answer with its usual retry response.  ``None``
-    waits indefinitely, which is only appropriate for a logical operation
-    already in flight (a cold call's post-login operation).
+    sleep would exceed it, the last ``GarminRateLimited`` is raised so the
+    caller can answer with its usual retry response.  It is required, and
+    every wait is finite: each of these waits happens while the caller holds
+    a person flock, so an unbounded one lets a starved permit pin that person
+    (see :func:`shared.garmin_registry._post_login_deadline`).
     """
     slept = 0.0
     while True:
@@ -223,7 +224,7 @@ async def _wait_for_call_permit(deadline_seconds: float | None = None) -> None:
             await reserve_call_permit()
             return
         except GarminRateLimited as exc:
-            if deadline_seconds is not None and slept + exc.retry_after > deadline_seconds:
+            if slept + exc.retry_after > deadline_seconds:
                 raise
             slept += exc.retry_after
             await asyncio.sleep(exc.retry_after)
