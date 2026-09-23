@@ -559,7 +559,9 @@ async def call(
     the person flock, so same-person lifecycle routes and the scheduled sync
     wait behind it; the budget is therefore clamped to
     :data:`shared.garmin_registry_common.MAX_INTERACTIVE_WAIT_SECONDS` whatever
-    the caller asks for.
+    the caller asks for.  A cold call's second permit is bounded separately
+    (:func:`_post_login_deadline`): the budget does not decide whether the
+    operation a successful login just paid for is allowed to run.
     """
     person_id = int(person_id)
     if person_id < 1:
@@ -585,10 +587,9 @@ async def call(
             if garmin_client.is_authenticated(person_id, generation):
                 client = garmin_client.get_client(person_id, generation)
             else:
-                remaining = (
-                    max(0.0, max_wait_seconds - (time.monotonic() - started)) if max_wait_seconds > 0.0 else None
+                client = await _resume_link(
+                    person_id, generation, email, deadline_seconds=_post_login_deadline(max_wait_seconds, started)
                 )
-                client = await _resume_link(person_id, generation, email, deadline_seconds=remaining)
             return await _run_operation(person_id, generation, client, op)
     except GarminRegistryError:
         raise
@@ -598,6 +599,40 @@ async def call(
         # failure, so callers receive a bounded, path-free error.
         logger.warning("Garmin call for person %s failed outside its bounded errors (%s)", person_id, type(exc).__name__)
         raise GarminOperationError("unknown") from None
+
+
+def _post_login_deadline(max_wait_seconds: float, started: float) -> float:
+    """How long a cold call may wait for its SECOND permit, in seconds.
+
+    Both arms are finite on purpose: this wait happens while holding the
+    person flock, so an open-ended one lets a starved permit pin the person
+    while every same-person route queues behind it.
+
+    With a caller budget, the remainder is floored at one interval -- but
+    never past
+    :data:`shared.garmin_registry_common.MAX_INTERACTIVE_WAIT_SECONDS`.  The
+    budget is measured from before the first permit, so the login itself can
+    consume all of it; refusing then would throw away a successful login --
+    with its cached client and its ``last_auth_ok`` stamp -- for want of one
+    interval's wait, and the caller's retry would just repeat the login.  The
+    ceiling still wins, because this wait is held under the person flock and
+    that bound is what :func:`call` promises: a deployment whose interval is
+    above the ceiling keeps the refusal, and its caller retries warm.
+
+    Without one (``max_wait_seconds == 0``: the scheduled sync through
+    :func:`call_paced`, the activity push), the wait is capped rather than
+    unbounded.  Giving up releases the flock and returns the same
+    ``GarminRateLimited`` the first permit already raises, which
+    :func:`call_paced` retries.
+    """
+    if max_wait_seconds > 0.0:
+        remaining = max(0.0, max_wait_seconds - (time.monotonic() - started))
+        grace = min(
+            garmin_registry_common.call_interval_seconds(),
+            garmin_registry_common.MAX_INTERACTIVE_WAIT_SECONDS,
+        )
+        return max(remaining, grace)
+    return garmin_registry_common.MAX_INTERACTIVE_WAIT_SECONDS
 
 
 async def _usable_link(person_id: int) -> tuple[int, str]:

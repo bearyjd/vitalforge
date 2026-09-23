@@ -176,11 +176,21 @@ async def reserve_call_permit() -> None:
         now = time.time()
         interval = garmin_registry_common.call_interval_seconds()
         next_allowed_at = float(row["next_allowed_at"])
-        if next_allowed_at > now + interval:
+        if next_allowed_at > now + garmin_registry_common.MAX_CALL_INTERVAL_SECONDS:
             # A reservation only ever writes ``now + interval``, so a slot
-            # further ahead than that is a clock regression (or a shortened
-            # interval).  Honouring it would freeze every Garmin call until
+            # further ahead than any writer could produce is a clock
+            # regression.  Honouring it would freeze every Garmin call until
             # the wall clock caught up; treat the slot as free instead.
+            #
+            # The bound is the same ceiling ``call_interval_seconds()`` clamps
+            # to -- read from the one constant so the two cannot drift -- NOT
+            # this process's ``interval``:
+            # the two services share one budget and may be configured with
+            # different intervals, so a service running a shorter one would
+            # classify every slot its peer legitimately wrote as a regression
+            # and grant itself a permit immediately -- turning the
+            # deployment-wide budget into a per-service one, with no log and
+            # no error.
             next_allowed_at = now
         if next_allowed_at > now:
             await db.rollback()
