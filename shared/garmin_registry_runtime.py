@@ -191,6 +191,11 @@ async def reserve_call_permit() -> None:
             # and grant itself a permit immediately -- turning the
             # deployment-wide budget into a per-service one, with no log and
             # no error.
+            #
+            # The trade: a backwards clock step smaller than the ceiling is
+            # now honoured rather than discarded, so calls stall until the
+            # clock catches up.  That stall is bounded by the ceiling and
+            # self-healing, which a silently unshared budget is not.
             next_allowed_at = now
         if next_allowed_at > now:
             await db.rollback()
