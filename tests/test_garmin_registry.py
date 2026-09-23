@@ -16,7 +16,7 @@ from garminconnect import (
 from garminconnect.exceptions import GarminConnectNotFoundError
 from httpx import ASGITransport, AsyncClient
 
-from shared import garmin_client, garmin_registry, garmin_registry_legacy
+from shared import garmin_client, garmin_registry, garmin_registry_common, garmin_registry_legacy
 from shared.auth import create_session_cookie
 from shared.database import get_db, get_primary_person_id
 from shared.persons_admin import add_person_routes
@@ -244,6 +244,22 @@ async def test_call_permit_treats_a_slot_beyond_one_interval_as_clock_skew(initi
         await garmin_registry.reserve_call_permit()
 
 
+async def test_call_permit_honours_a_slot_written_with_a_longer_peer_interval(initialized_db, monkeypatch):
+    """The skew guard must not be relative to THIS process's interval: the two
+    services share one budget, and a service configured with a shorter
+    interval would otherwise treat every slot its peer wrote as a regression
+    and grant itself a permit immediately."""
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
+    monkeypatch.setenv("GARMIN_MIN_CALL_INTERVAL_SECONDS", "2")
+    await _set_next_allowed_at(130.0)  # a peer running a 30-second interval
+
+    with pytest.raises(garmin_registry.GarminRateLimited) as exc_info:
+        await garmin_registry.reserve_call_permit()
+
+    assert exc_info.value.retry_after == 30
+    assert await _next_allowed_at() == 130.0, "the peer's slot must be left alone"
+
+
 @pytest.mark.parametrize(
     "max_wait_seconds, expected_sleeps, outcome",
     (
@@ -288,22 +304,27 @@ async def test_call_waits_for_a_permit_only_within_its_budget(
 async def test_cold_call_bounds_its_post_login_permit_by_the_remaining_budget(
     initialized_db, monkeypatch, tmp_path
 ):
+    """A budget still stops the post-login wait when the slot keeps moving.
+
+    The floor in :func:`shared.garmin_registry._post_login_deadline` buys one
+    interval of grace, not an open-ended wait: with the peer service taking
+    every slot this one frees, the budget is what ends it.
+    """
     person_id = await get_primary_person_id()
-    await _link(person_id)
-    generation_dir = tmp_path / "garth" / f"person-{person_id}" / "generation-1"
-    generation_dir.parent.mkdir(parents=True)
-    _write_fake_token_store(generation_dir)
+    await _cold_link(person_id, tmp_path)
     calls: list[tuple[int, int]] = []
     monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _fake_auth(calls))
-    monkeypatch.setenv("GARMIN_MIN_CALL_INTERVAL_SECONDS", "60")
-    now = 1_000.0
-    monkeypatch.setattr(garmin_registry.time, "time", lambda: now)
+    monkeypatch.setenv("GARMIN_MIN_CALL_INTERVAL_SECONDS", "2")
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: clock["now"])
     slept: list[float] = []
 
     async def fake_sleep(seconds):
-        nonlocal now
         slept.append(seconds)
-        now += seconds
+        clock["now"] += seconds
+        if len(slept) > _RUNAWAY_SLEEPS:
+            raise _UnboundedWait(f"the post-login wait slept {len(slept)} times without a bound")
+        await _set_next_allowed_at(clock["now"] + 2.0)  # the peer took the freed slot
 
     monkeypatch.setattr(garmin_registry.asyncio, "sleep", fake_sleep)
     await _set_next_allowed_at(0.0)  # first permit is free; the login consumes it
@@ -314,6 +335,162 @@ async def test_cold_call_bounds_its_post_login_permit_by_the_remaining_budget(
     assert calls == [(person_id, 1)], "the cold login happened"
     assert sum(slept) <= 5.0, f"post-login wait exceeded the budget: slept {slept}"
     assert garmin_client.is_authenticated(person_id, 1), "the warm client is kept for the retry"
+
+
+_RUNAWAY_SLEEPS = 100
+
+
+class _UnboundedWait(AssertionError):
+    """Raised by a fake sleep when a wait that must be bounded is not."""
+
+
+async def _cold_link(person_id: int, tmp_path) -> None:
+    """A durable link whose generation-1 token store exists but is not cached,
+    so the next call() takes the cold path and spends two permits."""
+    await _link(person_id)
+    generation_dir = tmp_path / "garth" / f"person-{person_id}" / "generation-1"
+    generation_dir.parent.mkdir(parents=True)
+    _write_fake_token_store(generation_dir)
+
+
+async def test_cold_call_gets_one_interval_of_grace_for_its_post_login_permit(
+    initialized_db, monkeypatch, tmp_path
+):
+    """A budget the login itself consumed must not refuse the operation it
+    just logged in for: the post-login permit is floored at one interval, so
+    a successful login is always followed by at least one retry."""
+    person_id = await get_primary_person_id()
+    await _cold_link(person_id, tmp_path)
+    auth_calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _fake_auth(auth_calls))
+    clock = {"now": 100.0}
+    slept: list[float] = []
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: clock["now"])
+    monkeypatch.setenv("GARMIN_MIN_CALL_INTERVAL_SECONDS", "2")
+    await _set_next_allowed_at(0.0)  # the first permit is free; the login spends it
+
+    async def advance(seconds: float) -> None:
+        slept.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(garmin_registry.asyncio, "sleep", advance)
+
+    # A budget smaller than one interval: today the post-login wait refuses.
+    assert await garmin_registry.call(person_id, lambda client: client.generation, max_wait_seconds=1.0) == 1
+
+    assert auth_calls == [(person_id, 1)], "the cold login happened"
+    assert slept == [2], "the post-login permit got exactly its one interval of grace"
+    assert sum(slept) <= 1.0 + 2.0, f"grace exceeded the budget plus one interval: {slept}"
+
+
+async def test_cold_call_with_no_budget_bounds_its_post_login_wait(initialized_db, monkeypatch, tmp_path):
+    """`max_wait_seconds=0` (the scheduled sync, the activity push) must not
+    wait for the second permit without end: that wait happens inside the
+    person flock, so an unbounded one pins the person while the other service
+    keeps taking the slot."""
+    person_id = await get_primary_person_id()
+    await _cold_link(person_id, tmp_path)
+    monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _fake_auth([]))
+    clock = {"now": 100.0}
+    slept: list[float] = []
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: clock["now"])
+    monkeypatch.setenv("GARMIN_MIN_CALL_INTERVAL_SECONDS", "2")
+    await _set_next_allowed_at(0.0)  # the first permit is free; the login spends it
+
+    async def advance(seconds: float) -> None:
+        slept.append(seconds)
+        clock["now"] += seconds
+        if len(slept) > _RUNAWAY_SLEEPS:
+            raise _UnboundedWait(f"the post-login wait slept {len(slept)} times without a bound")
+        # The other service takes every slot this one frees.
+        await _set_next_allowed_at(clock["now"] + 2.0)
+
+    monkeypatch.setattr(garmin_registry.asyncio, "sleep", advance)
+
+    with pytest.raises(garmin_registry.GarminRateLimited):
+        await garmin_registry.call(person_id, lambda _client: pytest.fail("must not reach Garmin"))
+
+    # Exact, not `<=`: the cap is the thing under test. A smaller bound -- or
+    # none at all (deadline 0 refuses on the first busy slot) -- would also be
+    # "bounded", and would make every cold paced read fail the moment another
+    # call owns the slot.
+    assert sum(slept) == garmin_registry_common.MAX_INTERACTIVE_WAIT_SECONDS, (
+        f"the post-login wait slept {sum(slept)}s, not the full cap"
+    )
+    assert len(slept) == 15, f"expected 15 two-second waits inside the 30s cap, got {slept}"
+
+
+async def test_the_post_login_floor_cannot_push_the_flock_past_the_interactive_ceiling(
+    initialized_db, monkeypatch, tmp_path
+):
+    """One interval of grace, but never more than the interactive ceiling.
+
+    The ceiling exists because this wait is held under ``person_flock`` -- a
+    deployment configured with an interval above it must not be able to pin a
+    person for longer than the bound :func:`shared.garmin_registry.call`'s own
+    docstring promises. Above the ceiling the post-login refusal simply
+    returns, which a caller retries warm.
+    """
+    person_id = await get_primary_person_id()
+    await _cold_link(person_id, tmp_path)
+    auth_calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _fake_auth(auth_calls))
+    clock = {"now": 100.0}
+    slept: list[float] = []
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: clock["now"])
+    monkeypatch.setenv("GARMIN_MIN_CALL_INTERVAL_SECONDS", "60")  # above the ceiling
+    await _set_next_allowed_at(0.0)  # the first permit is free; the login spends it
+
+    async def advance(seconds: float) -> None:
+        slept.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(garmin_registry.asyncio, "sleep", advance)
+
+    refusal = None
+    try:
+        await garmin_registry.call(person_id, lambda _c: "never", max_wait_seconds=5.0)
+    except garmin_registry.GarminRateLimited as exc:
+        refusal = exc
+
+    # The bound is asserted before the outcome: holding the flock too long is
+    # the failure under test, and it is invisible if the outcome is checked first.
+    assert sum(slept) <= garmin_registry_common.MAX_INTERACTIVE_WAIT_SECONDS, (
+        f"the post-login wait held the person flock for {sum(slept)}s, over the "
+        f"{garmin_registry_common.MAX_INTERACTIVE_WAIT_SECONDS}s ceiling"
+    )
+    assert refusal is not None, "an interval above the ceiling cannot buy a longer wait; it refuses"
+    assert auth_calls == [(person_id, 1)], "the cold login still happened"
+    assert garmin_client.is_authenticated(person_id, 1), "the warm client is kept for the retry"
+
+
+async def test_a_bounded_post_login_refusal_releases_the_person_flock(initialized_db, monkeypatch, tmp_path):
+    """The bound only helps if the flock is free afterwards -- that is the
+    whole point of capping the wait rather than holding the person."""
+    person_id = await get_primary_person_id()
+    await _cold_link(person_id, tmp_path)
+    monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _fake_auth([]))
+    clock = {"now": 100.0}
+    slept: list[float] = []
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: clock["now"])
+    monkeypatch.setenv("GARMIN_MIN_CALL_INTERVAL_SECONDS", "2")
+    await _set_next_allowed_at(0.0)
+
+    async def advance(seconds: float) -> None:
+        slept.append(seconds)
+        clock["now"] += seconds
+        if len(slept) > _RUNAWAY_SLEEPS:
+            raise _UnboundedWait(f"the post-login wait slept {len(slept)} times without a bound")
+        await _set_next_allowed_at(clock["now"] + 2.0)
+
+    monkeypatch.setattr(garmin_registry.asyncio, "sleep", advance)
+
+    with pytest.raises(garmin_registry.GarminRateLimited):
+        await garmin_registry.call(person_id, lambda _client: pytest.fail("must not reach Garmin"))
+
+    async with asyncio.timeout(2):
+        async with garmin_registry.person_flock(person_id):
+            pass
 
 
 @pytest.mark.parametrize("budget", (-1, float("nan")))

@@ -176,11 +176,26 @@ async def reserve_call_permit() -> None:
         now = time.time()
         interval = garmin_registry_common.call_interval_seconds()
         next_allowed_at = float(row["next_allowed_at"])
-        if next_allowed_at > now + interval:
+        if next_allowed_at > now + garmin_registry_common.MAX_CALL_INTERVAL_SECONDS:
             # A reservation only ever writes ``now + interval``, so a slot
-            # further ahead than that is a clock regression (or a shortened
-            # interval).  Honouring it would freeze every Garmin call until
+            # further ahead than any writer could produce is a clock
+            # regression.  Honouring it would freeze every Garmin call until
             # the wall clock caught up; treat the slot as free instead.
+            #
+            # The bound is the same ceiling ``call_interval_seconds()`` clamps
+            # to -- read from the one constant so the two cannot drift -- NOT
+            # this process's ``interval``:
+            # the two services share one budget and may be configured with
+            # different intervals, so a service running a shorter one would
+            # classify every slot its peer legitimately wrote as a regression
+            # and grant itself a permit immediately -- turning the
+            # deployment-wide budget into a per-service one, with no log and
+            # no error.
+            #
+            # The trade: a backwards clock step smaller than the ceiling is
+            # now honoured rather than discarded, so calls stall until the
+            # clock catches up.  That stall is bounded by the ceiling and
+            # self-healing, which a silently unshared budget is not.
             next_allowed_at = now
         if next_allowed_at > now:
             await db.rollback()
@@ -198,14 +213,15 @@ async def reserve_call_permit() -> None:
         await db.close()
 
 
-async def _wait_for_call_permit(deadline_seconds: float | None = None) -> None:
+async def _wait_for_call_permit(deadline_seconds: float) -> None:
     """Wait for a shared permit, sleeping ``retry_after`` between attempts.
 
     ``deadline_seconds`` bounds the total time spent sleeping: when the next
-    sleep would exceed it, the last ``GarminRateLimited`` is raised so an
-    interactive caller can answer with its usual retry response.  ``None``
-    waits indefinitely, which is only appropriate for a logical operation
-    already in flight (a cold call's post-login operation).
+    sleep would exceed it, the last ``GarminRateLimited`` is raised so the
+    caller can answer with its usual retry response.  It is required, and
+    every wait is finite: each of these waits happens while the caller holds
+    a person flock, so an unbounded one lets a starved permit pin that person
+    (see :func:`shared.garmin_registry._post_login_deadline`).
     """
     slept = 0.0
     while True:
@@ -213,7 +229,7 @@ async def _wait_for_call_permit(deadline_seconds: float | None = None) -> None:
             await reserve_call_permit()
             return
         except GarminRateLimited as exc:
-            if deadline_seconds is not None and slept + exc.retry_after > deadline_seconds:
+            if slept + exc.retry_after > deadline_seconds:
                 raise
             slept += exc.retry_after
             await asyncio.sleep(exc.retry_after)

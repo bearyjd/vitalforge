@@ -37,7 +37,12 @@ def test_canonical_email_strips_and_casefolds(raw, canonical):
 
 @pytest.mark.parametrize(
     ("configured", "expected"),
-    [("0.1", 1.0), ("500", 60.0), ("abc", 2.0), (None, 2.0)],
+    [
+        ("0.1", 1.0),
+        ("500", garmin_registry_common.MAX_CALL_INTERVAL_SECONDS),
+        ("abc", 2.0),
+        (None, 2.0),
+    ],
     ids=["clamped-up", "clamped-down", "unparseable", "unset"],
 )
 def test_call_interval_seconds_clamps_and_defaults(monkeypatch, configured, expected):
@@ -46,6 +51,18 @@ def test_call_interval_seconds_clamps_and_defaults(monkeypatch, configured, expe
     else:
         monkeypatch.setenv("GARMIN_MIN_CALL_INTERVAL_SECONDS", configured)
     assert garmin_registry_common.call_interval_seconds() == expected
+
+
+def test_the_clamp_honours_the_exported_call_interval_ceiling(monkeypatch):
+    """`reserve_call_permit`'s clock-regression guard treats a slot beyond
+    `MAX_CALL_INTERVAL_SECONDS` as skew, which is only correct while the clamp
+    here cannot produce one. Pin the coupling: a clamp re-hardcoded above the
+    exported ceiling would make the guard reject slots a peer legitimately
+    wrote, with nothing else failing."""
+    monkeypatch.setenv(
+        "GARMIN_MIN_CALL_INTERVAL_SECONDS", str(garmin_registry_common.MAX_CALL_INTERVAL_SECONDS * 10)
+    )
+    assert garmin_registry_common.call_interval_seconds() == garmin_registry_common.MAX_CALL_INTERVAL_SECONDS
 
 
 def test_utc_now_is_a_second_precision_zulu_timestamp():
