@@ -133,6 +133,10 @@ def _refused_root(shape: str, tmp_path: Path, monkeypatch) -> tuple[str, str]:
     if shape == "foreign-symlink":
         monkeypatch.setattr(garmin_registry_common, "_trusted_symlink_owner", lambda uid: False)
         return str(_symlinked_root(tmp_path)[0]), "a symlink owned by another user"
+    if shape == "unexpandable-home":
+        # Not ``~name`` (a backslash follows the ``~``), so it reaches
+        # expanduser(), which raises RuntimeError on 3.12 and 3.14 alike.
+        return "~\\x", "RuntimeError"
     # Not one of the normalizer's own refusals: an OSError whose text carries
     # the path, which must never reach the log.
     regular = tmp_path / "regular-file"
@@ -251,6 +255,28 @@ def test_only_root_and_this_process_own_a_trusted_symlink():
     assert not trusted(other)
 
 
+def test_dotdot_cannot_carry_a_foreign_symlink_past_the_owner_walk(monkeypatch, tmp_path):
+    """realpath collapses ``..`` lexically, but the walk lstats kernel paths:
+    past a missing component every prefix is ENOENT, so ``missing/../link``
+    would reach a symlink the walk never checked."""
+    real = tmp_path / "real"
+    real.mkdir()
+    (tmp_path / "link").symlink_to(real, target_is_directory=True)
+    monkeypatch.setattr(garmin_registry_common, "_trusted_symlink_owner", lambda uid: False)
+
+    with pytest.raises(garmin_registry_common.TokenRootRefused, match=r"^a '\.\.' component$"):
+        _normalize(tmp_path / "missing" / ".." / "link")
+
+
+def test_dotdot_is_refused_even_through_real_directories(tmp_path):
+    """The documented tradeoff: a legitimate ``a/../b`` fails closed too."""
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+
+    with pytest.raises(garmin_registry_common.TokenRootRefused, match=r"^a '\.\.' component$"):
+        _normalize(tmp_path / "a" / ".." / "b")
+
+
 def test_a_symlink_loop_is_refused_by_name(tmp_path):
     """On 3.12 ``Path.resolve()`` raises RuntimeError on a loop, path in the
     message; realpath does not, so the loop is found and named here."""
@@ -262,7 +288,9 @@ def test_a_symlink_loop_is_refused_by_name(tmp_path):
         _normalize(loop / "garth")
 
 
-@pytest.mark.parametrize("shape", ["symlink-loop", "other-users-home", "foreign-symlink", "under-a-regular-file"])
+@pytest.mark.parametrize(
+    "shape", ["symlink-loop", "other-users-home", "foreign-symlink", "unexpandable-home", "under-a-regular-file"]
+)
 def test_an_unusable_root_fails_closed_with_a_path_free_error(shape, monkeypatch, tmp_path, caplog):
     configured, reason = _refused_root(shape, tmp_path, monkeypatch)
     monkeypatch.setenv("GARTH_TOKEN_DIR", configured)
@@ -392,11 +420,14 @@ async def test_legacy_adoption_through_a_symlinked_ancestor_root(initialized_db,
     assert _GarthFaithfulGarmin.logins == ["resume"], "adoption verifies by resuming, never by a credential login"
 
 
-async def test_an_unusable_root_degrades_a_weigh_in_to_a_local_save(weight_app_module, monkeypatch):
-    """The fail-closed root reaches the routes as a bounded ``unknown``: the
-    person flock's OSError is wrapped by call(), never a 500."""
+async def test_an_unusable_root_degrades_a_weigh_in_to_a_local_save(weight_app_module, monkeypatch, caplog):
+    """A refused root must cost a weigh-in only its Garmin push: the reading
+    saves locally and reports ``unknown``.  The route has its own catch-all,
+    so the response alone cannot show who bounded the error; the registry's
+    log line pins that call() itself wrapped the person flock's OSError."""
     monkeypatch.setattr(garmin_registry, "call", _REAL_CALL)
     monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", None)
+    caplog.set_level(logging.WARNING, logger=_REGISTRY_LOGGER)
     transport = ASGITransport(app=weight_app_module.app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 170.0, "unit": "lbs"})
@@ -409,6 +440,27 @@ async def test_an_unusable_root_degrades_a_weigh_in_to_a_local_save(weight_app_m
     assert body["garmin_error"] == "unknown"
     assert [entry["synced_to_garmin"] for entry in recent.json()] == [False]
     assert _GarthFaithfulGarmin.logins == []
+    wrapped = [r.getMessage() for r in caplog.records if r.name == _REGISTRY_LOGGER]
+    assert any(m.endswith("failed outside its bounded errors (OSError)") for m in wrapped), wrapped
+
+
+async def test_both_services_boot_with_garmin_disabled_when_the_root_was_refused(
+    weight_app_module, dashboard_app_module, monkeypatch
+):
+    """The outage the fail-closed root exists to prevent: with the root refused
+    at import, boot's adoption step must decline, not raise out of either
+    lifespan."""
+
+    async def _no_scheduled_sync(lock, registry):
+        return None
+
+    monkeypatch.setattr(dashboard_app_module, "scheduled_sync", _no_scheduled_sync)
+    monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", None)
+
+    assert await garmin_registry_legacy.bootstrap_legacy_token_store() is False
+    for module in (weight_app_module, dashboard_app_module):
+        async with module.app.router.lifespan_context(module.app):
+            pass
 
 
 # -- below the root: left to garminconnect ----------------------------------------
