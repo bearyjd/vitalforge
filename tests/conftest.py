@@ -215,7 +215,8 @@ def tmp_db_path(tmp_path, monkeypatch):
     alone changes nothing. Without this, the live-server fixtures (whose
     lifespans call `bootstrap_legacy_token_store()`) would probe
     /app/data/.garth.
-    `_ensure_token_root()` reads the module global directly, the token-path
+    `_ensure_token_root()` re-reads and normalizes the module global on every
+    call (`~` expanded, symlinked ancestors resolved), the token-path
     and lock-path helpers all go through it, and `garmin_registry_legacy`
     calls it as a facade attribute at adoption time, so this one patch covers
     every consumer.
