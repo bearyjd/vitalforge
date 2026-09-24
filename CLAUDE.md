@@ -35,7 +35,8 @@ shared/                   # imported by BOTH services as a real installed packag
                           # legacy_store_flock, call/call_paced. Imports common/runtime/errors/locks
                           # at the top; none of those imports it back (tests/test_registry_layering.py)
   garmin_registry_common.py  # leaf: link-state / attempt-limit constants, utc_now, canonical_email,
-                             # call_interval_seconds; imports only garmin_registry_errors
+                             # call_interval_seconds, normalize_token_root (+ TokenRootRefused, the
+                             # import-time GARTH_TOKEN_DIR check); imports only garmin_registry_errors
   garmin_registry_runtime.py # call permits, link-attempt quota, auth stamps, error classification,
                              # link-row publication (_publish_link); never imports the facade
   garmin_registry_legacy.py  # one-time legacy .garth flat-store adoption (bootstrap_legacy_token_store);
