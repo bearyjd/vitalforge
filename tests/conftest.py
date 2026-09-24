@@ -215,19 +215,22 @@ def tmp_db_path(tmp_path, monkeypatch):
     alone changes nothing. Without this, the live-server fixtures (whose
     lifespans call `bootstrap_legacy_token_store()`) would probe
     /app/data/.garth.
-    `_ensure_token_root()` re-reads and normalizes the module global on every
-    call (`~` expanded, symlinked ancestors resolved), the token-path
-    and lock-path helpers all go through it, and `garmin_registry_legacy`
-    calls it as a facade attribute at adoption time, so this one patch covers
-    every consumer.
+    The env value is normalized once, at import; a patched value is used as
+    given, so this one is passed through the same normalizer.
+    `_ensure_token_root()` re-reads the module global on every call, the
+    token-path and lock-path helpers all go through it, and
+    `garmin_registry_legacy` calls it as a facade attribute at adoption time,
+    so this one patch covers every consumer.
     """
-    from shared import database, garmin_registry
+    from shared import database, garmin_registry, garmin_registry_common
 
     db_path = tmp_path / "vf-test.db"
     monkeypatch.setattr(database, "DB_PATH", db_path)
     monkeypatch.setenv("DB_PATH", str(db_path))
     monkeypatch.setenv("GARTH_TOKEN_DIR", str(tmp_path / "garth"))
-    monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", tmp_path / "garth")
+    monkeypatch.setattr(
+        garmin_registry, "GARTH_TOKEN_DIR", garmin_registry_common.normalize_token_root(tmp_path / "garth")
+    )
     return db_path
 
 

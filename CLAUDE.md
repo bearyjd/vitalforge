@@ -103,9 +103,11 @@ docker-compose.prod.yml   # PROD — pulls prebuilt images from Docker Hub / GHC
   directory to run either service against an isolated database without touching the real
   `/app/data` volume. Both are read at import time; in tests, patch the module attribute
   (`tests/conftest.py::tmp_db_path` does), not just the env var. `GARTH_TOKEN_DIR` is
-  normalized (`~` expanded, symlinked ancestors resolved) at import and again in
-  `_ensure_token_root()`, because garminconnect's `token_file_path` expands `~` and refuses
-  any symlinked ancestor; `check_token_root()` warns at boot if the two ever disagree.
+  normalized ONCE, at import (`garmin_registry_common.normalize_token_root`): `~` expanded,
+  `~name` refused, the root AND its ancestors resolved, symlinks owned by another user refused;
+  a patched value is used as given. An unusable value logs a boot ERROR and disables Garmin
+  (the global is `None`) instead of crashing; `check_token_root()` warns if garth and the
+  registry disagree. Under compose the root must live under `/app/data`: `~` is `/app`, the image.
 - **`shared/garmin_registry.call` is the only Garmin boundary.** Nothing else may
   authenticate or hold a Garmin client: `call()` resolves the person's durable link, picks
   the `(person_id, generation)` client (cold-loading tokens from that generation's directory
