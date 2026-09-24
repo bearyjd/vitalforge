@@ -105,7 +105,7 @@ docker-compose.prod.yml   # PROD — pulls prebuilt images from Docker Hub / GHC
   `/app/data` volume. Both are read at import time; in tests, patch the module attribute
   (`tests/conftest.py::tmp_db_path` does), not just the env var. `GARTH_TOKEN_DIR` is
   normalized ONCE, at import (`garmin_registry_common.normalize_token_root`): `~` expanded,
-  `~name` refused, the root AND its ancestors resolved, symlinks owned by another user refused;
+  `~name` and `..` refused, the root AND its ancestors resolved, symlinks owned by another user refused;
   a patched value is used as given. An unusable value logs a boot ERROR and disables Garmin
   (the global is `None`) instead of crashing; `check_token_root()` warns if garth and the
   registry disagree. Under compose the root must live under `/app/data`: `~` is `/app`, the image.
@@ -145,7 +145,8 @@ curl http://localhost:8086/health   # {"status": "ok", "service": "vitalforge-da
 
 # Running a single service without Docker (matches Dockerfile CMD, from repo root):
 pip install -r vitalforge_weight/requirements.txt
-DB_PATH=/tmp/vf-test.db GARTH_TOKEN_DIR=/tmp/vf-garth \
+VF_TMP=$(mktemp -d)   # private (0700): never a guessable name in a shared /tmp
+DB_PATH=$VF_TMP/vf-test.db GARTH_TOKEN_DIR=$VF_TMP/garth \
   uvicorn vitalforge_weight.app:app --host 0.0.0.0 --port 8085 --no-proxy-headers
 
 # Lint and test (repo root; mirrors .github/workflows/docker.yml's `test` job).
