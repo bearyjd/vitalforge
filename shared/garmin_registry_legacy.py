@@ -54,6 +54,10 @@ async def bootstrap_legacy_token_store() -> bool:
     except OSError:
         logger.warning("Legacy Garmin token-store adoption could not prepare its token root")
         return False
+    # Runs every boot in both services, from the registry step both lifespans
+    # already take: if bootstrap_legacy_token_store is retired, move this call
+    # into both lifespans.
+    garmin_registry.check_token_root()
     legacy_email = os.getenv("GARMIN_EMAIL")
     if not isinstance(legacy_email, str):
         logger.info("Legacy Garmin token-store adoption skipped: GARMIN_EMAIL is not set")

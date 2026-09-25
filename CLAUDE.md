@@ -35,7 +35,8 @@ shared/                   # imported by BOTH services as a real installed packag
                           # legacy_store_flock, call/call_paced. Imports common/runtime/errors/locks
                           # at the top; none of those imports it back (tests/test_registry_layering.py)
   garmin_registry_common.py  # leaf: link-state / attempt-limit constants, utc_now, canonical_email,
-                             # call_interval_seconds; imports only garmin_registry_errors
+                             # call_interval_seconds, normalize_token_root (+ TokenRootRefused, the
+                             # import-time GARTH_TOKEN_DIR check); imports only garmin_registry_errors
   garmin_registry_runtime.py # call permits, link-attempt quota, auth stamps, error classification,
                              # link-row publication (_publish_link); never imports the facade
   garmin_registry_legacy.py  # one-time legacy .garth flat-store adoption (bootstrap_legacy_token_store);
@@ -102,7 +103,12 @@ docker-compose.prod.yml   # PROD — pulls prebuilt images from Docker Hub / GHC
   `shared/garmin_registry.py`), defaulting to `/app/data/...`. Point these at a scratch
   directory to run either service against an isolated database without touching the real
   `/app/data` volume. Both are read at import time; in tests, patch the module attribute
-  (`tests/conftest.py::tmp_db_path` does), not just the env var.
+  (`tests/conftest.py::tmp_db_path` does), not just the env var. `GARTH_TOKEN_DIR` is
+  normalized ONCE, at import (`garmin_registry_common.normalize_token_root`): `~` expanded,
+  `~name` and `..` refused, the root AND its ancestors resolved, symlinks owned by another user refused;
+  a patched value is used as given. An unusable value logs a boot ERROR and disables Garmin
+  (the global is `None`) instead of crashing; `check_token_root()` warns if garth and the
+  registry disagree. Under compose the root must live under `/app/data`: `~` is `/app`, the image.
 - **`shared/garmin_registry.call` is the only Garmin boundary.** Nothing else may
   authenticate or hold a Garmin client: `call()` resolves the person's durable link, picks
   the `(person_id, generation)` client (cold-loading tokens from that generation's directory
@@ -139,7 +145,8 @@ curl http://localhost:8086/health   # {"status": "ok", "service": "vitalforge-da
 
 # Running a single service without Docker (matches Dockerfile CMD, from repo root):
 pip install -r vitalforge_weight/requirements.txt
-DB_PATH=/tmp/vf-test.db GARTH_TOKEN_DIR=/tmp/vf-garth \
+VF_TMP=$(mktemp -d)   # private (0700): never a guessable name in a shared /tmp
+DB_PATH=$VF_TMP/vf-test.db GARTH_TOKEN_DIR=$VF_TMP/garth \
   uvicorn vitalforge_weight.app:app --host 0.0.0.0 --port 8085 --no-proxy-headers
 
 # Lint and test (repo root; mirrors .github/workflows/docker.yml's `test` job).

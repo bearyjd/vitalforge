@@ -3,13 +3,18 @@
 A leaf: it imports only the standard library and the registry's bounded error
 types, so :mod:`shared.garmin_registry_runtime` and the facade can both read
 their limits and clock formatting from here without runtime having to reach
-back into the facade for them.
+back into the facade for them.  The token-root normalizer lives here too: it is
+pure path logic the facade runs once, at import.
 """
 
 from __future__ import annotations
 
+import errno
 import os
+import re
+import stat
 from datetime import datetime, timezone
+from pathlib import Path
 
 from shared.garmin_registry_errors import GarminLinkInputError
 
@@ -53,3 +58,70 @@ def canonical_email(email: str) -> str:
     if not canonical:
         raise GarminLinkInputError()
     return canonical
+
+
+# garminconnect refuses a ``~name`` token path (its private _OTHER_USER_HOME_RE);
+# the same pattern, owned here, because expanduser() would erase the ``~name``.
+_OTHER_USER_HOME = re.compile(r"^~[^/\\]")
+
+
+class TokenRootRefused(ValueError):
+    """A configured token root refused for a fixed reason; the message never
+    carries the path, so it is safe to log."""
+
+
+def _trusted_symlink_owner(uid: int) -> bool:
+    """Who may own a symlink the token root passes through: root or this process."""
+    return uid in (0, os.geteuid())
+
+
+def _stat_if_present(path: Path, *, follow_symlinks: bool) -> os.stat_result | None:
+    """None for a path not created yet (a first boot); a loop is a refusal."""
+    try:
+        return os.stat(path, follow_symlinks=follow_symlinks)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise TokenRootRefused("a symlink loop") from None
+        raise
+
+
+def normalize_token_root(raw: str | os.PathLike[str]) -> Path:
+    """The directory garth itself will address for a configured token root.
+
+    garminconnect's ``token_file_path`` expands ``~``, refuses ``~name`` and
+    refuses a path with any symlinked ancestor, so the literal value split the
+    registry's paths from garth's (#73).  The facade calls this once, at
+    import; the result is used as given from then on.
+
+    Resolving would also launder a symlink another user planted at or above
+    the root.  Handed the literal path, garminconnect's guard refused both;
+    the kernel's ``protected_symlinks`` refuses only a trailing follow, so
+    it also refused one AT the root, never one above it.  That posture is
+    kept: every symlink in the configured path's own chain, walked top-down,
+    must be owned by root or this process -- as the legitimate ones are:
+    macOS ``/tmp`` and ``/var``, Silverblue ``/home``, an operator's own
+    volume link.  ``~name``, a ``..`` component and a symlink loop are
+    refused outright.  Limits: a symlink inside a trusted symlink's TARGET
+    is not checked, and the check and the realpath are a boot-time TOCTOU
+    pair.  Everything below the root is left to garminconnect's refusal on
+    garth's own I/O.  ``os.path.realpath``, not ``Path.resolve()``: on 3.12
+    the latter raises RuntimeError, path in the message, on a symlink loop;
+    a loop is refused here by name instead.  A bare ``~`` with no resolvable
+    home raises RuntimeError to the caller.
+    """
+    text = os.fspath(raw)
+    if _OTHER_USER_HOME.match(text):
+        raise TokenRootRefused("another user's home")
+    configured = Path(text).expanduser().absolute()
+    # realpath collapses '..' lexically; the lstat walk cannot follow it past a missing component.
+    if ".." in configured.parts:
+        raise TokenRootRefused("a '..' component")
+    for component in (*reversed(configured.parents), configured):
+        found = _stat_if_present(component, follow_symlinks=False)
+        if found is not None and stat.S_ISLNK(found.st_mode) and not _trusted_symlink_owner(found.st_uid):
+            raise TokenRootRefused("a symlink owned by another user")
+    root = Path(os.path.realpath(configured))
+    _stat_if_present(root, follow_symlinks=True)  # non-strict realpath leaves a loop in place
+    return root

@@ -86,6 +86,8 @@ FACADE_PATCH_POINTS = (
     "_remove_person_token_root",
     "_ensure_token_root",
     "_generation_token_dir",
+    "check_token_root",
+    "token_file_path",
 )
 
 

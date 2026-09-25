@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Awaitable, Callable, TypeVar
 
 from garminconnect import Garmin
+from garminconnect.client import token_file_path  # read by check_token_root; tests patch it here
 
 from shared import garmin_client, garmin_registry_common, garmin_registry_locks
 from shared.database import get_db
@@ -64,16 +65,57 @@ from shared.garmin_registry_runtime import (
 
 logger = logging.getLogger(__name__)
 
-GARTH_TOKEN_DIR = Path(os.getenv("GARTH_TOKEN_DIR", "/app/data/.garth"))
+
+def _configured_token_root() -> Path | None:
+    """The environment's root, normalized once: None disables Garmin instead of
+    crashing both services at import.  Only the normalizer's own fixed refusals
+    are logged by text; an OSError or RuntimeError carries the path."""
+    try:
+        return garmin_registry_common.normalize_token_root(os.getenv("GARTH_TOKEN_DIR", "/app/data/.garth"))
+    except (OSError, RuntimeError, ValueError) as exc:
+        reason = str(exc) if isinstance(exc, garmin_registry_common.TokenRootRefused) else type(exc).__name__
+        logger.error("GARTH_TOKEN_DIR is unusable (%s); Garmin features are disabled", reason)
+        return None
+
+
+GARTH_TOKEN_DIR: Path | None = _configured_token_root()
 
 _T = TypeVar("_T")
 
 
 def _ensure_token_root() -> Path:
-    """Make the root private even when it existed before this release."""
-    GARTH_TOKEN_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
-    GARTH_TOKEN_DIR.chmod(0o700)
-    return GARTH_TOKEN_DIR
+    """Make the root private even when it existed before this release.
+
+    Used as import resolved it: re-resolving per call would hand garth a
+    symlink swapped in after boot, which its own ancestor check refuses.
+    """
+    root = GARTH_TOKEN_DIR
+    if root is None:
+        raise OSError("Garmin token root is unusable")
+    root.mkdir(parents=True, mode=0o700, exist_ok=True)
+    root.chmod(0o700)
+    return root
+
+
+def check_token_root() -> bool:
+    """Warn, path-free, when garminconnect would not use the registry's root:
+    the guard against garth/registry drift (a garminconnect upgrade changing
+    ``token_file_path``'s rules) whose only other symptom is every login
+    failing as ``unknown``.  Returns the verdict; never raises for either check.
+    """
+    try:
+        root = _ensure_token_root()
+        agrees = token_file_path(str(root)).parent == root
+        reason = "another directory"
+    except (OSError, RuntimeError, ValueError) as exc:
+        agrees, reason = False, type(exc).__name__
+    if not agrees:
+        logger.warning(
+            "Garmin token root is not a directory garminconnect will use (%s); "
+            "every Garmin login will fail until GARTH_TOKEN_DIR is fixed",
+            reason,
+        )
+    return agrees
 
 
 def _staging_token_dir(person_id: int, generation: int) -> Path:
