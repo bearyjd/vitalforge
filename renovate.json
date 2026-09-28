@@ -1,0 +1,22 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "automerge": false,
+  "schedule": ["before 6am on monday"],
+  "prConcurrentLimit": 3,
+  "packageRules": [
+    {
+      "description": "pyproject.toml pins Python to >=3.12,<3.13 on purpose (CI and both Dockerfiles match); bump this by hand once that ceiling is deliberately raised.",
+      "matchDepNames": ["python"],
+      "matchManagers": ["dockerfile", "github-actions"],
+      "enabled": false
+    },
+    {
+      "description": "One weekly PR for routine patch/minor bumps instead of one each. Major bumps are not matched here, so each still gets its own PR.",
+      "matchUpdateTypes": ["patch", "minor"],
+      "groupName": "weekly dependency updates"
+    }
+  ]
+}
