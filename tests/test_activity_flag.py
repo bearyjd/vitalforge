@@ -2,7 +2,7 @@
 
 The exerciseSets request payload's JSON field names are UNVERIFIED: a grep for
 `repetitionCount`, `setType` and `exerciseSets` across the whole installed
-garminconnect 0.3.11 tree returns only the two method definitions. It is also
+garminconnect 0.3.11 tree (re-checked on 0.3.16) returns only the two method definitions. It is also
 unknown whether Garmin accepts exercise sets on a MANUALLY created activity at
 all. Shipping that on by default would 400 every session, so it ships off, and
 these tests pin both the default and the parse.

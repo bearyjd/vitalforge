@@ -31,8 +31,10 @@ directory (see `backend.md`).
 
 - `fastapi`, `uvicorn` — web framework/server (both services)
 - `aiosqlite` — async SQLite driver
-- `garminconnect` — Garmin Connect client (garth-based OAuth); pinned `==0.3.11` (was
-  `>=0.2.38`) for `add_body_composition` support
+- `garminconnect` — Garmin Connect client (garth-based OAuth); pinned `==0.3.16` (0.3.11
+  was the first exact pin, replacing `>=0.2.38`, for `add_body_composition` support); the
+  exact version is asserted in `tests/test_garmin_client_api.py`, so bumps get their own
+  Renovate PR
 - `itsdangerous` — signed session cookies
 - `jinja2` — server-rendered templates
 - `anthropic` — optional LLM layer (dashboard only)

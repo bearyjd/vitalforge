@@ -185,7 +185,7 @@ def build_exercise_sets_payload(exercises: list[dict], start_local: datetime) ->
 
     THE FIELD NAMES HERE ARE UNVERIFIED. A grep for `repetitionCount`,
     `setType` and `exerciseSets` across the whole installed garminconnect
-    0.3.11 tree returns only the two method definitions -- the JSON keys
+    0.3.11 tree (re-checked on 0.3.16) returns only the two method definitions -- the JSON keys
     appear nowhere in the package or its metadata. This shape is inferred
     from the set_activity_exercise_sets docstring (which documents
     `exercises[].category` / `exercises[].name` and Garmin's 400 "Invalid

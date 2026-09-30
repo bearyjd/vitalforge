@@ -29,12 +29,16 @@ _SYNTHETIC_DI_REFRESH_TOKEN = "test-refresh-token"
 
 
 def test_installed_garminconnect_version_matches_tokenstore_contract():
-    """The token-store assertions below are deliberately pinned to 0.3.11.
+    """The token-store assertions below are deliberately pinned to 0.3.16.
 
     A dependency upgrade must explicitly re-validate this contract instead of
-    silently inheriting assertions written for an older client.
+    silently inheriting assertions written for an older client. Re-validated
+    for 0.3.11 -> 0.3.16 by diffing the two wheels: client.py changes only
+    MFA/logout state handling (dump/load, token_file_path and the tokenstore
+    resume path are byte-identical); __init__.py adds endpoints and makes
+    _load_profile_and_settings retry a profile with no displayName.
     """
-    assert version("garminconnect") == "0.3.11"
+    assert version("garminconnect") == "0.3.16"
 
 
 def test_garmin_constructor_accepts_email_and_password():
@@ -61,7 +65,7 @@ def test_garmin_client_has_no_garth_attribute():
 
 
 def test_directory_tokenstore_uses_garmin_tokens_json(tmp_path):
-    """garminconnect 0.3.11 maps a directory to one fixed token filename.
+    """garminconnect (0.3.11 through 0.3.16) maps a directory to one fixed token filename.
 
     Phase 3 must give each linked person a distinct directory, rather than
     inventing a filename or sharing the deployment-wide legacy directory.
