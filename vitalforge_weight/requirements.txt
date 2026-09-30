@@ -5,11 +5,11 @@
 # be applied without moving fastapi too. 0.120 was the first release admitting
 # starlette 0.49.x; this goes to current instead, because 0.49.x is already far
 # behind and only the current line audits clean. See issue #37.
-fastapi==0.141.1
-starlette==1.6.0
-uvicorn[standard]==0.34.0
+fastapi==0.142.2
+starlette==1.7.0
+uvicorn[standard]==0.54.0
 jinja2==3.1.6
-aiosqlite==0.21.0
+aiosqlite==0.22.1
 # Exact-pinned deliberately: 0.2.38->0.3.11 was a breaking rewrite (dropped
 # `garth`, changed the auth/token-persistence API) that broke shared/
 # garmin_client.py silently until 2026-08-22 -- see that file's authenticate()
