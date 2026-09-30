@@ -118,7 +118,7 @@ class WeightIn(BaseModel):
         return self
 
 
-# The 47 parent exercise categories garminconnect 0.3.11 ships. Validated
+# The 47 parent exercise categories garminconnect ships (unchanged 0.3.11 -> 0.3.16). Validated
 # HERE, at the model layer, rather than discovered as a Garmin 400 "Invalid
 # Sub-Category Passed" halfway through a push that has already created the
 # activity. Frozen into a set at import time: CATEGORIES is a plain list in
