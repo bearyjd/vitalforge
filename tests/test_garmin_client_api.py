@@ -229,6 +229,7 @@ def test_real_write_path_error_text_classifies(status, code, monkeypatch):
     eviction, no relink prompt). No network I/O: the session is a stub and
     the refresh/header helpers are no-ops.
     """
+    from garminconnect import GarminConnectConnectionError
     from garminconnect.client import Client
 
     from shared.garmin_registry_runtime import _error_code
@@ -239,8 +240,13 @@ def test_real_write_path_error_text_classifies(status, code, monkeypatch):
     monkeypatch.setattr(Client, "get_api_headers", lambda self: {})
     monkeypatch.setattr(Client, "_refresh_session", lambda self: None)
 
-    with pytest.raises(Exception) as caught:
+    with pytest.raises(GarminConnectConnectionError) as caught:
         client.post("connectapi", "/weight-service/user-weight", json={}, api=True)
 
-    assert session.calls >= 1, "the stub session was never reached"
+    # Text is all _error_code has here. If a future version attaches the
+    # response, classification may still work, but via a different path --
+    # re-read _error_code before loosening this.
+    assert getattr(caught.value, "response", None) is None
+    # A 401 takes the refresh-and-retry path: exactly one retry.
+    assert session.calls == (2 if status == 401 else 1)
     assert _error_code(caught.value) == code, repr(caught.value)
