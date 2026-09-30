@@ -36,7 +36,9 @@ def test_installed_garminconnect_version_matches_tokenstore_contract():
     for 0.3.11 -> 0.3.16 by diffing the two wheels: client.py changes only
     MFA/logout state handling (dump/load, token_file_path and the tokenstore
     resume path are byte-identical); __init__.py adds endpoints and makes
-    _load_profile_and_settings retry a profile with no displayName.
+    _load_profile_and_settings retry a profile with no displayName, then fall
+    back to the username (the account email) as display_name, and
+    _require_display_name reload the profile once before failing.
     """
     assert version("garminconnect") == "0.3.16"
 
@@ -189,3 +191,56 @@ def test_ensure_token_dir_creates_missing_ancestors_privately(tmp_path):
 
     assert oct((tmp_path / "garth" / "person-7").stat().st_mode & 0o777) == oct(0o700)
     assert oct(generation.stat().st_mode & 0o777) == oct(0o700)
+
+
+class _StubResponse:
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+        self.text = '{"message": "stub"}'
+
+    def json(self) -> dict:
+        return {"message": "stub"}
+
+
+class _StubSession:
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+        self.calls = 0
+
+    def request(self, method, url, **kwargs):
+        self.calls += 1
+        return _StubResponse(self.status_code)
+
+
+@pytest.mark.parametrize(
+    "status, code",
+    ((401, "auth_failed"), (403, "network"), (429, "rate_limited")),
+)
+def test_real_write_path_error_text_classifies(status, code, monkeypatch):
+    """Issue #65: the write path's error MESSAGE is what classification reads.
+
+    ``add_body_composition`` and ``create_manual_activity`` go through the
+    undecorated ``Client.post -> Client._run_request``, whose failure is a
+    ``GarminConnectConnectionError("API Error NNN ...")`` with no ``.response``,
+    so ``_error_code`` has only the text to go on. The parametrized cases in
+    test_garmin_registry.py hand-build that string; this drives the REAL
+    library code through a stubbed session, so a bump that rewords it fails
+    here instead of silently turning write-path 401s into ``network`` (no
+    eviction, no relink prompt). No network I/O: the session is a stub and
+    the refresh/header helpers are no-ops.
+    """
+    from garminconnect.client import Client
+
+    from shared.garmin_registry_runtime import _error_code
+
+    client = Client()
+    session = _StubSession(status)
+    monkeypatch.setattr(client, "_api_session", session, raising=False)
+    monkeypatch.setattr(Client, "get_api_headers", lambda self: {})
+    monkeypatch.setattr(Client, "_refresh_session", lambda self: None)
+
+    with pytest.raises(Exception) as caught:
+        client.post("connectapi", "/weight-service/user-weight", json={}, api=True)
+
+    assert session.calls >= 1, "the stub session was never reached"
+    assert _error_code(caught.value) == code, repr(caught.value)

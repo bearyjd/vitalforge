@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 # the exact failure the claim exists to prevent. The push runs in a worker
 # thread (garmin_registry.call hands a synchronous op to asyncio.to_thread),
 # so other requests DO run while it is in flight; what keeps them from
-# re-claiming is that garminconnect==0.3.11 bounds every request itself.
+# re-claiming is that garminconnect (==0.3.16; re-checked from 0.3.11) bounds every request itself.
 # Both weight and activity pushes go through the UNDECORATED
 # Client.post -> Client._run_request path (client.py), not the decorated
 # Client.connectapi retry wrapper the sync *reads* use: one request at
@@ -37,7 +37,8 @@ logger = logging.getLogger(__name__)
 # between attempts (3*15 + 2*1 = 47 s each, 94 s for both), plus one more
 # possible proactive _refresh_session() before that (~30 s) -- about 124 s
 # on top of the warm-push figure, ~185 s worst case. Both are well inside
-# these 600 s. Re-check those library defaults when bumping garminconnect;
+# these 600 s. (0.3.16 also retries a profile with no displayName inside that
+# same three-attempt loop, so the bound is unchanged.) Re-check those library defaults when bumping garminconnect;
 # shared/garmin_client.py constructs Garmin() with them unchanged.
 #
 # Do NOT try to enforce this from the loop with asyncio.wait_for around the
