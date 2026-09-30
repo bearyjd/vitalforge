@@ -14,8 +14,9 @@
       "enabled": false
     },
     {
-      "description": "One weekly PR for routine patch/minor bumps instead of one each. Major bumps are not matched here, so each still gets its own PR.",
+      "description": "One weekly PR for routine patch/minor bumps instead of one each. Major bumps are not matched here, so each still gets its own PR. garminconnect is excluded: it is the only Garmin boundary and tests/test_garmin_client_api.py pins its exact version as a token-store contract tripwire, so it always gets its own PR and its re-validation never blocks routine bumps.",
       "matchUpdateTypes": ["patch", "minor"],
+      "matchDepNames": ["!garminconnect"],
       "groupName": "weekly dependency updates"
     }
   ]
