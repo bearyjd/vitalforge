@@ -202,3 +202,83 @@ def test_weight_trend_chart_height_settles(page, weight_live_server):
     # settles, just at whatever the layout happens to give it.
     assert wrap_height == "140px", f"trend chart wrapper must keep its fixed height, got {wrap_height}"
     assert errors == []
+
+
+def _chart_values(page):
+    return page.evaluate("Chart.getChart(document.getElementById('trendChart')).data.datasets[0].data")
+
+
+def _wait_for_chart(page):
+    page.wait_for_selector("#trendSection", state="visible")
+    page.wait_for_function(
+        "typeof Chart !== 'undefined' && Chart.getChart(document.getElementById('trendChart')) !== undefined",
+        timeout=5000,
+    )
+
+
+@pytest.mark.playwright
+def test_weight_unit_toggle_refreshes_recent_list_and_trend_chart(page, weight_live_server):
+    """Issue #76: both loaders read `currentUnit` only when they render, so the
+    toggle has to re-run them -- otherwise the Recent list and the chart keep
+    the previous unit's numbers under the newly selected unit."""
+    _seed_recent_weigh_ins()
+    errors = _collect_console_errors(page)
+
+    page.goto(f"{weight_live_server}{PERSON_PREFIX}/")
+    page.wait_for_selector("#recentList .recent-item")
+    _wait_for_chart(page)
+
+    first_weight = page.locator("#recentList .recent-weight").first
+    assert first_weight.inner_text() == "180 lbs"
+    lbs_values = _chart_values(page)
+
+    page.locator(".unit-btn[data-unit='kg']").click()
+    page.wait_for_function(
+        "document.querySelector('#recentList .recent-weight').textContent.trim().endsWith(' kg')",
+        timeout=5000,
+    )
+    page.wait_for_function(
+        "(prev) => JSON.stringify(Chart.getChart(document.getElementById('trendChart')).data.datasets[0].data)"
+        " !== JSON.stringify(prev)",
+        arg=lbs_values,
+        timeout=5000,
+    )
+
+    kg_text = first_weight.inner_text()
+    assert abs(float(kg_text.split()[0]) - 180.0 * 0.45359237) < 0.1, kg_text
+    kg_values = _chart_values(page)
+    assert len(kg_values) == len(lbs_values)
+    for kg, lbs in zip(kg_values, lbs_values):
+        assert abs(kg - lbs * 0.45359237) < 0.1, (kg_values, lbs_values)
+
+    page.locator(".unit-btn[data-unit='lbs']").click()
+    page.wait_for_function(
+        "document.querySelector('#recentList .recent-weight').textContent.trim() === '180 lbs'",
+        timeout=5000,
+    )
+    assert errors == []
+
+
+@pytest.mark.playwright
+def test_weight_delete_refreshes_trend_chart(page, weight_live_server):
+    """Deleting a weigh-in reloaded the Recent list but left the deleted
+    point on the trend chart until something else reloaded it."""
+    _seed_recent_weigh_ins()
+    page.on("dialog", lambda dialog: dialog.accept())
+
+    page.goto(f"{weight_live_server}{PERSON_PREFIX}/")
+    page.wait_for_selector("#recentList .recent-item")
+    _wait_for_chart(page)
+    assert len(_chart_values(page)) == 3
+
+    page.locator("#recentList .recent-item").first.locator(".delete-btn").click()
+    page.wait_for_function(
+        "Chart.getChart(document.getElementById('trendChart')).data.datasets[0].data.length === 2",
+        timeout=5000,
+    )
+
+    # Below two points there is no trend: the section hides and the stale
+    # chart is destroyed rather than left showing the deleted entry.
+    page.locator("#recentList .recent-item").first.locator(".delete-btn").click()
+    page.wait_for_selector("#trendSection", state="hidden", timeout=5000)
+    assert page.evaluate("Chart.getChart(document.getElementById('trendChart')) === undefined")

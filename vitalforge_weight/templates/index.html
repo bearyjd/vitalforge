@@ -295,9 +295,13 @@
 
         unitBtns.forEach(btn => {
             btn.addEventListener("click", () => {
+                if (btn.dataset.unit === currentUnit) return;
                 unitBtns.forEach(b => b.classList.remove("active"));
                 btn.classList.add("active");
                 currentUnit = btn.dataset.unit;
+                // Both read currentUnit only when they render (#76).
+                loadRecent();
+                loadTrendChart();
             });
         });
 
@@ -360,6 +364,7 @@
                 if (res.ok) {
                     showToast("Deleted", "success");
                     loadRecent();
+                    loadTrendChart();
                 } else {
                     showToast("Failed to delete", "error");
                 }
@@ -419,9 +424,16 @@
             try {
                 const res = await fetch(`${API_BASE}/weight/trend`);
                 const data = await res.json();
-                if (data.length < 2) return;
+                const section = document.getElementById("trendSection");
+                if (data.length < 2) {
+                    // A delete can take the trend below two points; drop the
+                    // stale chart rather than leave the deleted entry on it.
+                    if (trendChart) { trendChart.destroy(); trendChart = null; }
+                    section.style.display = "none";
+                    return;
+                }
 
-                document.getElementById("trendSection").style.display = "";
+                section.style.display = "";
                 const sorted = data;
                 const labels = sorted.map(e => {
                     const d = new Date(e.timestamp);
