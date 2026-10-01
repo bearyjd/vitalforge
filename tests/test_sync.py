@@ -376,9 +376,11 @@ async def _drive_scheduler(monkeypatch, ticks: int, outcome=None):
 
     async def fake_run_sync(days, *, person_id):
         calls.append((person_id, days))
-        if len(calls) >= ticks:
+        if len(calls) == ticks:
             done.set()
             await asyncio.Event().wait()  # park here; the test cancels us
+        if len(calls) > ticks:
+            return "success"  # never park twice: see _cancel
         result = outcome(person_id, len(calls) - 1) if outcome else "success"
         await _set_sync_status(person_id, f"2026-10-01T00:00:{next(clock):02d}+00:00")
         return result
@@ -388,10 +390,23 @@ async def _drive_scheduler(monkeypatch, ticks: int, outcome=None):
     try:
         await asyncio.wait_for(done.wait(), timeout=5)
     finally:
-        task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
+        await _cancel(task)
     return calls
+
+
+async def _cancel(task: asyncio.Task) -> None:
+    """Cleanup that cannot hang the suite. A scheduler that wrongly swallowed
+    cancellation can still be stopped while it sleeps between ticks (that
+    await is outside its try), so keep cancelling until one lands there.
+    asyncio.wait, not wait_for: on timeout wait_for re-cancels and then
+    AWAITS the task, which hangs on exactly that broken scheduler.
+    test_cancelling_the_scheduler_mid_sync_releases_everything is what
+    asserts a single cancel is enough."""
+    for _ in range(100):
+        if task.done():
+            return
+        task.cancel()
+        await asyncio.wait({task}, timeout=0.05)
 
 
 async def test_scheduled_sync_rotates_every_linked_person_oldest_first(initialized_db, monkeypatch):
@@ -447,18 +462,95 @@ async def test_scheduled_sync_skips_a_person_in_backoff(initialized_db, monkeypa
     assert [person_id for person_id, _ in calls] == [second, second]
 
 
-async def test_an_interrupted_backfill_is_retried_as_a_backfill(initialized_db, monkeypatch):
+@pytest.mark.parametrize("stopped", ("network", "link_required", "auth_failed", "unknown"))
+async def test_a_cheaply_interrupted_backfill_is_retried_as_a_backfill(initialized_db, monkeypatch, stopped):
     """run_sync writes last_sync_time even when it stops early, so a
     'has a row' rule would demote a half-done backfill to 3-day runs and
-    the rest of the 90 days would never be fetched."""
+    the rest of the 90 days would never be fetched. These results stop at
+    the first Garmin call, so retrying the backfill costs about one call."""
     primary = await get_primary_person_id()
     await _link(primary)
 
     calls = await _drive_scheduler(
-        monkeypatch, ticks=3, outcome=lambda _p, i: "rate_limited" if i == 0 else "success"
+        monkeypatch, ticks=3, outcome=lambda _p, i: stopped if i == 0 else "success"
     )
 
     assert calls == [(primary, 90), (primary, 90), (primary, 3)]
+
+
+async def test_a_rate_limited_backfill_is_demoted_not_retried(initialized_db, monkeypatch):
+    """Nothing writes backoff_until yet, so retrying a 90-day scan into a
+    throttled account on every rotation would keep re-hitting the 429. A
+    throttled backfill drops to the incremental window, as the old boot
+    backfill did."""
+    primary = await get_primary_person_id()
+    await _link(primary)
+
+    calls = await _drive_scheduler(monkeypatch, ticks=3, outcome=lambda _p, _i: "rate_limited")
+
+    assert calls == [(primary, 90), (primary, 3), (primary, 3)]
+
+
+async def test_a_failed_tick_record_preserves_backoff_until(initialized_db):
+    """_record_failed_tick must UPDATE, not REPLACE: a REPLACE resets every
+    column it does not name, and clearing an active backoff_until is how a
+    rate limit turns into a ban (see run_sync's sync_status write)."""
+    from datetime import datetime, timezone
+
+    primary = await get_primary_person_id()
+    await _set_sync_status(primary, "2026-09-01T00:00:00+00:00", backoff_until="2999-01-01T00:00:00+00:00")
+
+    await sync._record_failed_tick(primary, datetime(2026, 10, 1, tzinfo=timezone.utc), 90)
+
+    db = await get_db()
+    try:
+        row = await (
+            await db.execute(
+                "SELECT last_sync_time, last_sync_result, last_sync_days, backoff_until "
+                "FROM sync_status WHERE person_id = ?",
+                (primary,),
+            )
+        ).fetchone()
+    finally:
+        await db.close()
+    assert dict(row) == {
+        "last_sync_time": "2026-10-01T00:00:00+00:00",
+        "last_sync_result": "error",
+        "last_sync_days": 90,
+        "backoff_until": "2999-01-01T00:00:00+00:00",
+    }
+
+
+async def test_cancelling_the_scheduler_mid_sync_releases_everything(initialized_db, monkeypatch):
+    """The lifespan cancels scheduled_sync on shutdown, often mid-run. The
+    cancel must end the task -- not be recorded as an 'error' tick and
+    swallowed -- and must release the lock and the syncing registration."""
+    primary = await get_primary_person_id()
+    await _link(primary)
+    lock = asyncio.Lock()
+    registry = sync.SyncRegistry()
+    started = asyncio.Event()
+
+    async def parked_run_sync(days, *, person_id):
+        if not started.is_set():
+            started.set()
+            await asyncio.Event().wait()  # park once; see _cancel
+
+    monkeypatch.setattr(sync, "run_sync", parked_run_sync)
+    task = asyncio.create_task(sync.scheduled_sync(lock, registry))
+    await asyncio.wait_for(started.wait(), timeout=5)
+    assert primary in registry and lock.locked()
+
+    task.cancel()
+    await asyncio.wait({task}, timeout=5)
+    one_cancel_was_enough = task.done()
+    await _cancel(task)  # cleanup if it was not
+
+    assert one_cancel_was_enough, "scheduled_sync swallowed its cancellation and kept running"
+    assert task.cancelled()
+    assert not lock.locked()
+    assert primary not in registry
+    assert await _sync_status(primary) is None, "a cancel must not be recorded as a failed tick"
 
 
 async def test_a_raising_sync_does_not_starve_the_next_person(initialized_db, monkeypatch, caplog):
@@ -479,17 +571,16 @@ async def test_a_raising_sync_does_not_starve_the_next_person(initialized_db, mo
         calls.append(person_id)
         if person_id == primary:
             raise RuntimeError("boom before sync_status was written")
-        done.set()
-        await asyncio.Event().wait()
+        if not done.is_set():
+            done.set()
+            await asyncio.Event().wait()  # park once; see _cancel
 
     monkeypatch.setattr(sync, "run_sync", fake_run_sync)
     task = asyncio.create_task(sync.scheduled_sync(asyncio.Lock(), sync.SyncRegistry()))
     try:
         await asyncio.wait_for(done.wait(), timeout=5)
     finally:
-        task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
+        await _cancel(task)
 
     assert calls == [primary, second]
     assert (await _sync_status(primary))["last_sync_result"] == "error"

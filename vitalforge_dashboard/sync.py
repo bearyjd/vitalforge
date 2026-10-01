@@ -17,9 +17,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 SYNC_INTERVAL_HOURS = int(os.getenv("SYNC_INTERVAL_HOURS", "2"))
-# A person's first scheduled sync after boot, and every one after it until it
-# completes, re-scans this many days; run_sync skips dates already stored, so
-# a re-scan mostly costs reads. Later ticks fetch only the recent window.
+# A person's first scheduled sync after boot re-scans this many days (and so
+# does every later one, until a re-scan finishes -- see _RETRY_BACKFILL_RESULTS).
+# run_sync skips a past date only when ALL its metric tables have it, and a
+# metric a device never reports never gets a row, so a re-scan is NOT just
+# local reads: it can re-fetch most of the window from Garmin (up to ~7 calls
+# per date) under the shared _sync_lock. That is the cost the single-person
+# boot backfill always had; it is now paid once per linked person, one tick
+# at a time. Later ticks fetch only the recent window.
 SYNC_BACKFILL_DAYS = 90
 SYNC_INCREMENTAL_DAYS = 3
 # Operation errors that make every further read of this run pointless: a
@@ -31,6 +36,13 @@ _TERMINAL_OPERATION_CODES = frozenset({"auth_failed", "rate_limited"})
 # code it failed with -- there is no session to continue on -- but only
 # ``auth_failed`` asks the person to relink; the rest retry next sync.
 _STOPPED_RESULTS = frozenset({"link_required", "auth_failed", "rate_limited", "network", "unknown"})
+# Results after which the next tick retries the backfill instead of moving to
+# the incremental window. Each of these stops run_sync at its first Garmin
+# call, so a retry costs about one call. "rate_limited" is deliberately NOT
+# here: until a 429 sets backoff_until, re-running 90 days into a throttled
+# account every rotation is how a rate limit becomes a ban -- so a throttled
+# backfill is demoted to the incremental window, as the old boot backfill was.
+_RETRY_BACKFILL_RESULTS = _STOPPED_RESULTS - {"rate_limited"}
 
 
 async def has_usable_garmin_link(person_id: int) -> bool:
@@ -472,6 +484,11 @@ async def next_person_to_sync(now_iso: str) -> int | None:
     `has_usable_garmin_link`'s (`state = 'linked'`): the retired
     `legacy_bound`/`legacy_disabled` states are never synced from. A person
     inside `backoff_until` is skipped until it passes.
+
+    Both comparisons are TEXT comparisons, which equal time order only
+    because every writer stores `datetime.now(timezone.utc).isoformat()`
+    (a `+00:00` suffix). A future backoff_until writer must use the same
+    form -- a `Z` suffix or a naive timestamp would compare wrongly.
     """
     db = await get_db()
     try:
@@ -541,10 +558,10 @@ async def _sync_next_person(lock: asyncio.Lock, registry: SyncRegistry, backfill
             return
         finally:
             registry.release(person_id)
-        # A backfill that stopped early (rate limit, network, relink needed)
-        # is retried as a backfill next time rather than demoted to the
+        # A backfill that stopped early on a cheap failure (network, relink
+        # needed) is retried as a backfill rather than demoted to the
         # incremental window, or the rest of its days would never be fetched.
-        if result not in _STOPPED_RESULTS:
+        if result not in _RETRY_BACKFILL_RESULTS:
             backfilled.add(person_id)
 
 
@@ -558,9 +575,10 @@ async def scheduled_sync(lock: asyncio.Lock, registry: SyncRegistry) -> None:
     overlaps a tick, such as a manual sync.
 
     The first tick runs at boot. Each person's first scheduled sync after
-    boot is a SYNC_BACKFILL_DAYS re-scan, repeated until one completes; at
-    one linked person that is exactly the old boot backfill followed by
-    3-day runs.
+    boot is a SYNC_BACKFILL_DAYS re-scan, retried while it stops early on a
+    cheap failure (_RETRY_BACKFILL_RESULTS); after it completes or is
+    rate-limited, 3-day runs. At one linked person that is the old boot
+    backfill followed by 3-day runs, plus the cheap-failure retry.
 
     Takes the same lock `/api/sync`'s manual trigger holds during `run_sync`
     (see vitalforge_dashboard/app.py's `_sync_lock`) -- every write goes
