@@ -21,8 +21,8 @@ SYNC_INTERVAL_HOURS = int(os.getenv("SYNC_INTERVAL_HOURS", "2"))
 # does every later one, until a re-scan finishes -- see _RETRY_BACKFILL_RESULTS).
 # run_sync skips a past date only when ALL its metric tables have it, and a
 # metric a device never reports never gets a row, so a re-scan is NOT just
-# local reads: it can re-fetch most of the window from Garmin (up to ~7 calls
-# per date) under the shared _sync_lock. That is the cost the single-person
+# local reads: it can re-fetch most of the window from Garmin (6 reads per
+# date, plus one weight-history call per run) under the shared _sync_lock. That is the cost the single-person
 # boot backfill always had; it is now paid once per linked person, one tick
 # at a time. Later ticks fetch only the recent window.
 SYNC_BACKFILL_DAYS = 90
@@ -37,8 +37,9 @@ _TERMINAL_OPERATION_CODES = frozenset({"auth_failed", "rate_limited"})
 # ``auth_failed`` asks the person to relink; the rest retry next sync.
 _STOPPED_RESULTS = frozenset({"link_required", "auth_failed", "rate_limited", "network", "unknown"})
 # Results after which the next tick retries the backfill instead of moving to
-# the incremental window. Each of these stops run_sync at its first Garmin
-# call, so a retry costs about one call. "rate_limited" is deliberately NOT
+# the incremental window. Each stops run_sync at its first FAILING call; while
+# the failure persists that is the token reload at the start of the run, so a
+# retry costs about one call (link_required costs none). "rate_limited" is deliberately NOT
 # here: until a 429 sets backoff_until, re-running 90 days into a throttled
 # account every rotation is how a rate limit becomes a ban -- so a throttled
 # backfill is demoted to the incremental window, as the old boot backfill was.

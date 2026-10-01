@@ -380,7 +380,10 @@ async def _drive_scheduler(monkeypatch, ticks: int, outcome=None):
             done.set()
             await asyncio.Event().wait()  # park here; the test cancels us
         if len(calls) > ticks:
-            return "success"  # never park twice: see _cancel
+            # Reachable only if a change broke cancellation: the parked call
+            # above swallowed its cancel and the loop ticked again. Never
+            # park twice, so _cancel can still stop it (see _cancel).
+            return "success"
         result = outcome(person_id, len(calls) - 1) if outcome else "success"
         await _set_sync_status(person_id, f"2026-10-01T00:00:{next(clock):02d}+00:00")
         return result
@@ -407,6 +410,7 @@ async def _cancel(task: asyncio.Task) -> None:
             return
         task.cancel()
         await asyncio.wait({task}, timeout=0.05)
+    assert task.done(), "scheduled_sync could not be stopped"
 
 
 async def test_scheduled_sync_rotates_every_linked_person_oldest_first(initialized_db, monkeypatch):
