@@ -89,7 +89,13 @@ which metric names are queryable — adding a new metric requires updating this 
 
 ## Background jobs
 
-- `scheduled_sync()` (`sync.py`): on startup runs a 90-day backfill, then loops
-  `run_sync(days=3)` every `SYNC_INTERVAL_HOURS` (default 2h). Errors are logged, loop
-  continues. `run_sync` skips dates already present in every metric table (incremental),
-  except "today" which is always re-fetched.
+- `scheduled_sync()` (`sync.py`): one tick at startup, then one every
+  `SYNC_INTERVAL_HOURS` (default 2h). Each tick syncs ONE person:
+  `next_person_to_sync()` picks the linked (`state = 'linked'`), non-archived person
+  outside `backoff_until` with the oldest `sync_status.last_sync_time` (never-synced
+  first) -- a derived round-robin, no stored cursor (spec §e.3). So each person refreshes
+  every `SYNC_INTERVAL_HOURS × N`. A person's first sync after boot is a 90-day
+  re-scan, repeated until one completes without stopping early; later ones are 3 days.
+  A run that raises is recorded as `error` so the cursor moves on. `run_sync` skips
+  dates already present in every metric table (incremental), except "today" which is
+  always re-fetched.
