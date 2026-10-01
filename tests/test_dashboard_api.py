@@ -274,7 +274,18 @@ async def test_the_scheduled_backfill_registers_itself_as_syncing(
         await release.wait()
 
     monkeypatch.setattr(sync_module, "run_sync", _slow_run_sync)
-    monkeypatch.setattr(sync_module, "has_usable_garmin_link", usable_garmin_link)
+    # A real link row: the scheduler's cursor reads garmin_links in SQL, so
+    # patching has_usable_garmin_link would not make this person eligible.
+    db = await get_db()
+    try:
+        await db.execute(
+            "INSERT INTO garmin_links (person_id, state, garmin_email, generation, linked_at, updated_at) "
+            "VALUES (?, 'linked', 'owner@example.test', 1, '2026-09-14T00:00:00Z', '2026-09-14T00:00:00Z')",
+            (person_id,),
+        )
+        await db.commit()
+    finally:
+        await db.close()
     task = asyncio.create_task(
         sync_module.scheduled_sync(dashboard_app_module._sync_lock, registry)
     )

@@ -36,17 +36,12 @@ SERVICES = [
 #   shared/database.py        -- defines it, and ensure_primary_person_grant()
 #                                uses it as startup bootstrap before any admin
 #                                exists to own the person.
-#   vitalforge_dashboard/sync.py -- scheduled_sync has no request. Phase 4's
-#                                round-robin cursor replaces this; until then
-#                                the shim is the honest answer, and saying so
-#                                here is what stops Phase 4 leaking forward.
 #   scripts/seed_db.py        -- a CLI tool. There is no request and no
 #                                caller to authorize; --person addresses a
 #                                person explicitly and this is only the
 #                                default when it is omitted.
 _ALLOWED_SHIM_FILES = {
     "shared/database.py",
-    "vitalforge_dashboard/sync.py",
     "scripts/seed_db.py",
 }
 

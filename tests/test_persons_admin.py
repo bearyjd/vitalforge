@@ -384,7 +384,7 @@ async def test_promoting_the_already_primary_person_is_a_no_op(client):
 
 async def test_patch_refuses_to_demote_without_a_replacement(client):
     """There must always be exactly one primary: get_primary_person_id()
-    raises when there is none, and scheduled_sync still depends on it."""
+    raises when there is none, and startup bootstrap still depends on it."""
     _, cookies = await _as("root", role="admin")
     current = await primary_person_id()
     resp = await client.patch(

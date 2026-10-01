@@ -17,6 +17,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 SYNC_INTERVAL_HOURS = int(os.getenv("SYNC_INTERVAL_HOURS", "2"))
+# A person's first scheduled sync after boot re-scans this many days (and so
+# does every later one, until a re-scan finishes -- see _RETRY_BACKFILL_RESULTS).
+# run_sync skips a past date only when ALL its metric tables have it, and a
+# metric a device never reports never gets a row, so a re-scan is NOT just
+# local reads: it can re-fetch most of the window from Garmin (6 reads per
+# date, plus one weight-history call per run) under the shared _sync_lock. That is the cost the single-person
+# boot backfill always had; it is now paid once per linked person, one tick
+# at a time. Later ticks fetch only the recent window.
+SYNC_BACKFILL_DAYS = 90
+SYNC_INCREMENTAL_DAYS = 3
 # Operation errors that make every further read of this run pointless: a
 # rejected session fails each of them the same way, and a throttled account
 # (a provider 429) gets worse with every extra call.
@@ -26,6 +36,14 @@ _TERMINAL_OPERATION_CODES = frozenset({"auth_failed", "rate_limited"})
 # code it failed with -- there is no session to continue on -- but only
 # ``auth_failed`` asks the person to relink; the rest retry next sync.
 _STOPPED_RESULTS = frozenset({"link_required", "auth_failed", "rate_limited", "network", "unknown"})
+# Results after which the next tick retries the backfill instead of moving to
+# the incremental window. Each stops run_sync at its first FAILING call; while
+# the failure persists that is the token reload at the start of the run, so a
+# retry costs about one call (link_required costs none). "rate_limited" is deliberately NOT
+# here: until a 429 sets backoff_until, re-running 90 days into a throttled
+# account every rotation is how a rate limit becomes a ban -- so a throttled
+# backfill is demoted to the incremental window, as the old boot backfill was.
+_RETRY_BACKFILL_RESULTS = _STOPPED_RESULTS - {"rate_limited"}
 
 
 async def has_usable_garmin_link(person_id: int) -> bool:
@@ -457,49 +475,125 @@ class SyncRegistry:
             self._counts.pop(person_id, None)
 
 
+async def next_person_to_sync(now_iso: str) -> int | None:
+    """The linked person whose sync is most overdue, or None.
+
+    Spec §e.3's derived cursor: no stored rotation state, just the oldest
+    `sync_status.last_sync_time` (a person with no row goes first, ties by
+    id), so it survives restarts and self-heals as persons are added,
+    archived, linked or unlinked. The link predicate is
+    `has_usable_garmin_link`'s (`state = 'linked'`): the retired
+    `legacy_bound`/`legacy_disabled` states are never synced from. A person
+    inside `backoff_until` is skipped until it passes.
+
+    Both comparisons are TEXT comparisons, which equal time order only
+    because every writer stores `datetime.now(timezone.utc).isoformat()`
+    (a `+00:00` suffix). A future backoff_until writer must use the same
+    form -- a `Z` suffix or a naive timestamp would compare wrongly.
+    """
+    db = await get_db()
+    try:
+        row = await (
+            await db.execute(
+                """
+                SELECT p.id
+                FROM persons p
+                JOIN garmin_links g ON g.person_id = p.id AND g.state = 'linked'
+                LEFT JOIN sync_status s ON s.person_id = p.id
+                WHERE p.archived_at IS NULL
+                  AND (s.backoff_until IS NULL OR s.backoff_until <= ?)
+                ORDER BY s.last_sync_time IS NOT NULL, s.last_sync_time ASC, p.id ASC
+                LIMIT 1
+                """,
+                (now_iso,),
+            )
+        ).fetchone()
+    finally:
+        await db.close()
+    return row["id"] if row else None
+
+
+async def _record_failed_tick(person_id: int, started_at: datetime, days: int) -> None:
+    """Advance a person whose run_sync raised before writing sync_status.
+
+    Without this their last_sync_time never moves, and the oldest-first
+    cursor would pick them again on every tick while everyone else starves.
+    Same ON CONFLICT shape as run_sync, so backoff_until is preserved.
+    """
+    db = await get_db()
+    try:
+        await db.execute(
+            "INSERT INTO sync_status (person_id, last_sync_time, last_sync_result, last_sync_days) "
+            "VALUES (?, ?, 'error', ?) "
+            "ON CONFLICT (person_id) DO UPDATE SET "
+            "last_sync_time = excluded.last_sync_time, "
+            "last_sync_result = excluded.last_sync_result, "
+            "last_sync_days = excluded.last_sync_days",
+            (person_id, started_at.isoformat(), days),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def _sync_next_person(lock: asyncio.Lock, registry: SyncRegistry, backfilled: set[int]) -> None:
+    """One scheduler tick: sync the most overdue linked person, if any.
+
+    The person is chosen INSIDE the lock, so a manual sync that held it
+    has already written its sync_status and no longer looks overdue.
+    """
+    async with lock:
+        started_at = datetime.now(timezone.utc)
+        person_id = await next_person_to_sync(started_at.isoformat())
+        if person_id is None:
+            logger.info("Scheduled sync: no linked person is due")
+            return
+        days = SYNC_INCREMENTAL_DAYS if person_id in backfilled else SYNC_BACKFILL_DAYS
+        logger.info("Scheduled sync for person %s, %d days", person_id, days)
+        registry.acquire(person_id)
+        try:
+            result = await run_sync(days=days, person_id=person_id)
+        except Exception:
+            logger.exception("Scheduled sync failed for person %s", person_id)
+            await _record_failed_tick(person_id, started_at, days)
+            return
+        finally:
+            registry.release(person_id)
+        # A backfill that stopped early on a cheap failure (network, relink
+        # needed) is retried as a backfill rather than demoted to the
+        # incremental window, or the rest of its days would never be fetched.
+        if result not in _RETRY_BACKFILL_RESULTS:
+            backfilled.add(person_id)
+
+
 async def scheduled_sync(lock: asyncio.Lock, registry: SyncRegistry) -> None:
-    """Background loop that syncs every SYNC_INTERVAL_HOURS.
+    """Background loop: every SYNC_INTERVAL_HOURS, sync ONE linked person.
+
+    Spec §e.2's round-robin (E2): one person per tick keeps each burst at a
+    single person's size however many are linked, so each person's refresh
+    interval is SYNC_INTERVAL_HOURS x N. The deployment-wide Garmin call
+    permit (shared/garmin_registry) is the backstop for anything that
+    overlaps a tick, such as a manual sync.
+
+    The first tick runs at boot. Each person's first scheduled sync after
+    boot is a SYNC_BACKFILL_DAYS re-scan, retried while it stops early on a
+    cheap failure (_RETRY_BACKFILL_RESULTS); after it completes or is
+    rate-limited, 3-day runs. At one linked person that is the old boot
+    backfill followed by 3-day runs, plus the cheap-failure retry.
 
     Takes the same lock `/api/sync`'s manual trigger holds during `run_sync`
-    (see vitalforge_dashboard/app.py's `_sync_lock`) -- every write here goes
+    (see vitalforge_dashboard/app.py's `_sync_lock`) -- every write goes
     through `upsert()`'s last-writer-wins INSERT OR REPLACE, so without
-    shared serialization a manual sync and this backfill/scheduled loop can
-    interleave and let an older pull silently overwrite a newer one.
+    shared serialization a manual sync and a scheduled one can interleave and
+    let an older pull silently overwrite a newer one.
 
     `registry` is required, not optional: see SyncRegistry's docstring for what
     a writer that forgets to register looks like from the dashboard.
     """
-    from shared.database import get_primary_person_id
-
-    # Initial backfill of 90 days
-    logger.info("Running initial 90-day backfill...")
-    try:
-        person_id = await get_primary_person_id()
-        if not await has_usable_garmin_link(person_id):
-            logger.info("Skipping initial sync: primary person has no Garmin link")
-        else:
-            registry.acquire(person_id)
-            try:
-                async with lock:
-                    await run_sync(days=90, person_id=person_id)
-            finally:
-                registry.release(person_id)
-    except Exception as e:
-        logger.error("Initial backfill failed: %s", e)
-
+    backfilled: set[int] = set()
     while True:
-        await asyncio.sleep(SYNC_INTERVAL_HOURS * 3600)
         try:
-            person_id = await get_primary_person_id()
-            if not await has_usable_garmin_link(person_id):
-                logger.info("Skipping scheduled sync: primary person has no Garmin link")
-                continue
-            logger.info("Running scheduled sync...")
-            registry.acquire(person_id)
-            try:
-                async with lock:
-                    await run_sync(days=3, person_id=person_id)
-            finally:
-                registry.release(person_id)
-        except Exception as e:
-            logger.error("Scheduled sync failed: %s", e)
+            await _sync_next_person(lock, registry, backfilled)
+        except Exception:
+            logger.exception("Scheduled sync tick failed")
+        await asyncio.sleep(SYNC_INTERVAL_HOURS * 3600)
