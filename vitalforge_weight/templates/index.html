@@ -292,12 +292,21 @@
         const configuredTz = "{{ tz }}";
         const tzOption = configuredTz ? { timeZone: configuredTz } : {};
         let trendChart = null;
+        // Toggle, delete and submit can each start a reload while another is
+        // in flight; only the newest call of each loader may render, so an
+        // older response arriving late cannot overwrite a fresher one.
+        let recentSeq = 0;
+        let trendSeq = 0;
 
         unitBtns.forEach(btn => {
             btn.addEventListener("click", () => {
+                if (btn.dataset.unit === currentUnit) return;
                 unitBtns.forEach(b => b.classList.remove("active"));
                 btn.classList.add("active");
                 currentUnit = btn.dataset.unit;
+                // Both read currentUnit only when they render (#76).
+                loadRecent();
+                loadTrendChart();
             });
         });
 
@@ -326,9 +335,11 @@
         }
 
         async function loadRecent() {
+            const seq = ++recentSeq;
             try {
                 const res = await fetch(`${API_BASE}/weight/recent`);
                 const data = await res.json();
+                if (seq !== recentSeq) return;
                 if (data.length === 0) {
                     recentList.innerHTML = '<li class="empty-state">No weigh-ins yet</li>';
                     return;
@@ -349,6 +360,7 @@
                     </li>`;
                 }).join("");
             } catch (e) {
+                if (seq !== recentSeq) return;
                 recentList.innerHTML = '<li class="empty-state">Failed to load</li>';
             }
         }
@@ -360,6 +372,7 @@
                 if (res.ok) {
                     showToast("Deleted", "success");
                     loadRecent();
+                    loadTrendChart();
                 } else {
                     showToast("Failed to delete", "error");
                 }
@@ -416,12 +429,21 @@
 
         // Trend chart
         async function loadTrendChart() {
+            const seq = ++trendSeq;
             try {
                 const res = await fetch(`${API_BASE}/weight/trend`);
                 const data = await res.json();
-                if (data.length < 2) return;
+                if (seq !== trendSeq) return;
+                const section = document.getElementById("trendSection");
+                if (data.length < 2) {
+                    // A delete can take the trend below two points; drop the
+                    // stale chart rather than leave the deleted entry on it.
+                    if (trendChart) { trendChart.destroy(); trendChart = null; }
+                    section.style.display = "none";
+                    return;
+                }
 
-                document.getElementById("trendSection").style.display = "";
+                section.style.display = "";
                 const sorted = data;
                 const labels = sorted.map(e => {
                     const d = new Date(e.timestamp);
@@ -456,7 +478,9 @@
                         }
                     }
                 });
-            } catch {}
+            } catch (e) {
+                console.error("Failed to load weight trend", e);
+            }
         }
 
         // Load recent entries on page load

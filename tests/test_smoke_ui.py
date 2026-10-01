@@ -202,3 +202,137 @@ def test_weight_trend_chart_height_settles(page, weight_live_server):
     # settles, just at whatever the layout happens to give it.
     assert wrap_height == "140px", f"trend chart wrapper must keep its fixed height, got {wrap_height}"
     assert errors == []
+
+
+def _chart_values(page):
+    return page.evaluate("Chart.getChart(document.getElementById('trendChart')).data.datasets[0].data")
+
+
+def _wait_for_chart(page):
+    page.wait_for_selector("#trendSection", state="visible")
+    page.wait_for_function(
+        "typeof Chart !== 'undefined' && Chart.getChart(document.getElementById('trendChart')) !== undefined",
+        timeout=5000,
+    )
+
+
+@pytest.mark.playwright
+def test_weight_unit_toggle_refreshes_recent_list_and_trend_chart(page, weight_live_server):
+    """Issue #76: both loaders read `currentUnit` only when they render, so the
+    toggle has to re-run them -- otherwise the Recent list and the chart keep
+    the previous unit's numbers under the newly selected unit."""
+    _seed_recent_weigh_ins()
+    errors = _collect_console_errors(page)
+
+    page.goto(f"{weight_live_server}{PERSON_PREFIX}/")
+    page.wait_for_selector("#recentList .recent-item")
+    _wait_for_chart(page)
+
+    first_weight = page.locator("#recentList .recent-weight").first
+    assert first_weight.inner_text() == "180 lbs"
+    lbs_values = _chart_values(page)
+
+    page.locator(".unit-btn[data-unit='kg']").click()
+    page.wait_for_function(
+        "document.querySelector('#recentList .recent-weight').textContent.trim().endsWith(' kg')",
+        timeout=5000,
+    )
+    page.wait_for_function(
+        "(prev) => JSON.stringify(Chart.getChart(document.getElementById('trendChart')).data.datasets[0].data)"
+        " !== JSON.stringify(prev)",
+        arg=lbs_values,
+        timeout=5000,
+    )
+
+    kg_text = first_weight.inner_text()
+    assert abs(float(kg_text.split()[0]) - 180.0 * 0.45359237) < 0.1, kg_text
+    kg_values = _chart_values(page)
+    assert len(kg_values) == len(lbs_values)
+    for kg, lbs in zip(kg_values, lbs_values):
+        assert abs(kg - lbs * 0.45359237) < 0.1, (kg_values, lbs_values)
+
+    page.locator(".unit-btn[data-unit='lbs']").click()
+    page.wait_for_function(
+        "document.querySelector('#recentList .recent-weight').textContent.trim() === '180 lbs'",
+        timeout=5000,
+    )
+    assert errors == []
+
+
+@pytest.mark.playwright
+def test_weight_delete_refreshes_trend_chart(page, weight_live_server):
+    """Deleting a weigh-in reloaded the Recent list but left the deleted
+    point on the trend chart until something else reloaded it."""
+    _seed_recent_weigh_ins()
+    page.on("dialog", lambda dialog: dialog.accept())
+
+    page.goto(f"{weight_live_server}{PERSON_PREFIX}/")
+    page.wait_for_selector("#recentList .recent-item")
+    _wait_for_chart(page)
+    assert len(_chart_values(page)) == 3
+
+    page.locator("#recentList .recent-item").first.locator(".delete-btn").click()
+    page.wait_for_function(
+        "Chart.getChart(document.getElementById('trendChart')).data.datasets[0].data.length === 2",
+        timeout=5000,
+    )
+
+    # Below two points there is no trend: the section hides and the stale
+    # chart is destroyed rather than left showing the deleted entry. Wait for
+    # the Recent list to drop the first row before clicking the next one.
+    page.wait_for_function("document.querySelectorAll('#recentList .recent-item').length === 2", timeout=5000)
+    page.locator("#recentList .recent-item").first.locator(".delete-btn").click()
+    page.wait_for_selector("#trendSection", state="hidden", timeout=5000)
+    assert page.evaluate("Chart.getChart(document.getElementById('trendChart')) === undefined")
+
+
+@pytest.mark.playwright
+def test_weight_recent_list_ignores_a_late_stale_response(page, weight_live_server):
+    """Toggle, delete and submit each start a reload; an older response that
+    lands after a newer one must not overwrite it. The first post-load
+    /weight/recent request is held, a second one renders, then the held one
+    is released with a body the page must ignore."""
+    _seed_recent_weigh_ins()
+    page.goto(f"{weight_live_server}{PERSON_PREFIX}/")
+    page.wait_for_selector("#recentList .recent-item")
+
+    held = []
+
+    def hold_first(route):
+        if not held:
+            held.append(route)
+        else:
+            route.continue_()
+
+    page.route("**/weight/recent", hold_first)
+    # Count /weight/recent bodies the page has finished handling. The counter
+    # bumps in a macrotask queued after json() resolves, so it runs only after
+    # the loader's own continuation (a microtask) has rendered -- or bailed.
+    page.evaluate(
+        """() => {
+            window.__recentHandled = 0;
+            const json = Response.prototype.json;
+            Response.prototype.json = async function () {
+                const body = await json.call(this);
+                if (this.url.endsWith("/weight/recent")) {
+                    setTimeout(() => { window.__recentHandled += 1; }, 0);
+                }
+                return body;
+            };
+        }"""
+    )
+
+    page.locator(".unit-btn[data-unit='kg']").click()  # request A: held
+    page.locator(".unit-btn[data-unit='lbs']").click()  # request B: renders
+    # Wait for B to be HANDLED, not for "180 lbs" -- the first load already
+    # shows that, so a text wait would release A before B lands and B would
+    # then overwrite A for the wrong reason.
+    page.wait_for_function("window.__recentHandled >= 1", timeout=5000)
+    assert len(held) == 1, "the first reload was never intercepted"
+
+    stale = '[{"id": 999, "weight_lbs": 999, "weight_kg": 453.1, "timestamp": "2026-01-01T00:00:00+00:00", "synced_to_garmin": false}]'
+    held[0].fulfill(status=200, content_type="application/json", body=stale)
+    page.wait_for_function("window.__recentHandled >= 2", timeout=5000)
+
+    assert page.locator("#recentList .recent-weight").first.inner_text() == "180 lbs"
+    assert page.locator("#recentList .recent-item").count() == 3
