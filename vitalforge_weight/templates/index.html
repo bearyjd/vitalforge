@@ -292,6 +292,11 @@
         const configuredTz = "{{ tz }}";
         const tzOption = configuredTz ? { timeZone: configuredTz } : {};
         let trendChart = null;
+        // Toggle, delete and submit can each start a reload while another is
+        // in flight; only the newest call of each loader may render, so an
+        // older response arriving late cannot overwrite a fresher one.
+        let recentSeq = 0;
+        let trendSeq = 0;
 
         unitBtns.forEach(btn => {
             btn.addEventListener("click", () => {
@@ -330,9 +335,11 @@
         }
 
         async function loadRecent() {
+            const seq = ++recentSeq;
             try {
                 const res = await fetch(`${API_BASE}/weight/recent`);
                 const data = await res.json();
+                if (seq !== recentSeq) return;
                 if (data.length === 0) {
                     recentList.innerHTML = '<li class="empty-state">No weigh-ins yet</li>';
                     return;
@@ -353,6 +360,7 @@
                     </li>`;
                 }).join("");
             } catch (e) {
+                if (seq !== recentSeq) return;
                 recentList.innerHTML = '<li class="empty-state">Failed to load</li>';
             }
         }
@@ -421,9 +429,11 @@
 
         // Trend chart
         async function loadTrendChart() {
+            const seq = ++trendSeq;
             try {
                 const res = await fetch(`${API_BASE}/weight/trend`);
                 const data = await res.json();
+                if (seq !== trendSeq) return;
                 const section = document.getElementById("trendSection");
                 if (data.length < 2) {
                     // A delete can take the trend below two points; drop the
@@ -468,7 +478,9 @@
                         }
                     }
                 });
-            } catch {}
+            } catch (e) {
+                console.error("Failed to load weight trend", e);
+            }
         }
 
         // Load recent entries on page load

@@ -278,7 +278,61 @@ def test_weight_delete_refreshes_trend_chart(page, weight_live_server):
     )
 
     # Below two points there is no trend: the section hides and the stale
-    # chart is destroyed rather than left showing the deleted entry.
+    # chart is destroyed rather than left showing the deleted entry. Wait for
+    # the Recent list to drop the first row before clicking the next one.
+    page.wait_for_function("document.querySelectorAll('#recentList .recent-item').length === 2", timeout=5000)
     page.locator("#recentList .recent-item").first.locator(".delete-btn").click()
     page.wait_for_selector("#trendSection", state="hidden", timeout=5000)
     assert page.evaluate("Chart.getChart(document.getElementById('trendChart')) === undefined")
+
+
+@pytest.mark.playwright
+def test_weight_recent_list_ignores_a_late_stale_response(page, weight_live_server):
+    """Toggle, delete and submit each start a reload; an older response that
+    lands after a newer one must not overwrite it. The first post-load
+    /weight/recent request is held, a second one renders, then the held one
+    is released with a body the page must ignore."""
+    _seed_recent_weigh_ins()
+    page.goto(f"{weight_live_server}{PERSON_PREFIX}/")
+    page.wait_for_selector("#recentList .recent-item")
+
+    held = []
+
+    def hold_first(route):
+        if not held:
+            held.append(route)
+        else:
+            route.continue_()
+
+    page.route("**/weight/recent", hold_first)
+    # Count /weight/recent bodies the page has finished handling. The counter
+    # bumps in a macrotask queued after json() resolves, so it runs only after
+    # the loader's own continuation (a microtask) has rendered -- or bailed.
+    page.evaluate(
+        """() => {
+            window.__recentHandled = 0;
+            const json = Response.prototype.json;
+            Response.prototype.json = async function () {
+                const body = await json.call(this);
+                if (this.url.endsWith("/weight/recent")) {
+                    setTimeout(() => { window.__recentHandled += 1; }, 0);
+                }
+                return body;
+            };
+        }"""
+    )
+
+    page.locator(".unit-btn[data-unit='kg']").click()  # request A: held
+    page.locator(".unit-btn[data-unit='lbs']").click()  # request B: renders
+    # Wait for B to be HANDLED, not for "180 lbs" -- the first load already
+    # shows that, so a text wait would release A before B lands and B would
+    # then overwrite A for the wrong reason.
+    page.wait_for_function("window.__recentHandled >= 1", timeout=5000)
+    assert len(held) == 1, "the first reload was never intercepted"
+
+    stale = '[{"id": 999, "weight_lbs": 999, "weight_kg": 453.1, "timestamp": "2026-01-01T00:00:00+00:00", "synced_to_garmin": false}]'
+    held[0].fulfill(status=200, content_type="application/json", body=stale)
+    page.wait_for_function("window.__recentHandled >= 2", timeout=5000)
+
+    assert page.locator("#recentList .recent-weight").first.inner_text() == "180 lbs"
+    assert page.locator("#recentList .recent-item").count() == 3
