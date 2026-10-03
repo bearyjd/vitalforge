@@ -24,11 +24,13 @@ from shared.garmin_registry_errors import (
 from vitalforge_weight.activity_garmin import (
     ActivityPushOutcome,
     _activity_name,
+    _exercise_sets_enabled,
     _mark_activity_outcome_unknown,
     _push_activity,
     _read_activity_outcome,
     _reconcile_activity,
     _record_activity_garmin_outcome,
+    _retry_activity_sets,
     bounded_garmin_error,
 )
 from vitalforge_weight.garmin_claim import _garmin_claim_is_live
@@ -252,6 +254,7 @@ def add_activity_routes(app):
                 # A row that did not exist a moment ago has no ambiguous earlier
                 # attempt to reconcile against.
                 should_reconcile = False
+                should_retry_sets = False
             else:
                 # First-write-wins: the stored payload is never modified.
                 row_id = existing["id"]
@@ -296,15 +299,38 @@ def add_activity_routes(app):
                     and not is_retired_global_target
                     and outcome.garmin_status == "unknown"
                 )
+                # Issue #66: the activity is on Garmin and the row points at it,
+                # but the follow-up sets upload failed. Re-send ONLY the sets to
+                # that stored id -- never create_manual_activity, never a change
+                # to garmin_status. Without a stored id there is nothing to
+                # address, and with the flag off the sets path stays dormant.
+                # A non-NULL garmin_name_prefix marks a pre-Phase-3 cross-person
+                # override row created after cb529e6 (the only writer that ever
+                # set it): its activity lives in the retired global account.
+                # Migration 003 retired only its pending/failed/unknown rows, so
+                # a SYNCED one reaches here and must not be sent through this
+                # person's own link. Override rows from the c5d31e4..cb529e6
+                # window predate the column, carry a NULL prefix, and lost
+                # garmin_target in 003, so this guard cannot recognise them.
+                should_retry_sets = (
+                    data.push_to_garmin
+                    and not is_retired_global_target
+                    and existing["garmin_name_prefix"] is None
+                    and outcome.garmin_status == "synced"
+                    and outcome.garmin_sets_status == "failed"
+                    and bool(outcome.garmin_activity_id)
+                    and _exercise_sets_enabled()
+                )
 
-                if (should_push or should_reconcile) and _garmin_claim_is_live(
+                if (should_push or should_reconcile or should_retry_sets) and _garmin_claim_is_live(
                     existing["garmin_claimed_at"], now_dt
                 ):
                     # Someone else is mid-push. On a retryable row report
                     # 'pending' rather than the stored status: a push really is in
                     # flight, and echoing a stale 'failed' would invite an
                     # immediate retry into the same race. An 'unknown' row keeps
-                    # saying 'unknown', because that is still true.
+                    # saying 'unknown', and a sets retry keeps saying
+                    # synced/failed, because that is still true.
                     logger.info(
                         "Session %s already has a live Garmin push claim (%s); not pushing again",
                         data.session_id, existing["garmin_claimed_at"],
@@ -313,6 +339,7 @@ def add_activity_routes(app):
                         outcome = replace(outcome, garmin_status="pending", garmin_error=None)
                     should_push = False
                     should_reconcile = False
+                    should_retry_sets = False
                 elif should_push:
                     if existing["garmin_claimed_at"] is not None:
                         # Only reachable when the previous claimant died mid-push:
@@ -334,11 +361,12 @@ def add_activity_routes(app):
                         (now, now, row_id),
                     )
                     outcome = replace(outcome, garmin_status="pending", garmin_error=None)
-                elif should_reconcile:
+                elif should_reconcile or should_retry_sets:
                     # Claim without touching the status: it must stay 'unknown'
                     # for as long as it is unknown, so that a crash during
                     # reconciliation cannot leave behind a row that looks
-                    # ordinarily retryable.
+                    # ordinarily retryable. A sets retry likewise leaves a
+                    # 'synced' row 'synced' -- the activity exists either way.
                     await db.execute(
                         "UPDATE strength_sessions SET garmin_claimed_at = ?, updated_at = ? WHERE id = ?",
                         (now, now, row_id),
@@ -352,7 +380,19 @@ def add_activity_routes(app):
                     data.session_id, row_id, conflicts,
                 )
 
-            if should_push or should_reconcile:
+            if should_retry_sets:
+                # Stored payload and stored id only; garmin_status and the id
+                # are carried through unchanged into the recorded outcome.
+                outcome = replace(
+                    outcome,
+                    garmin_sets_status=await _retry_activity_sets(
+                        person_id=person_id,
+                        activity_id=existing["garmin_activity_id"],
+                        start_time_utc=existing["start_time_utc"],
+                        exercises_json=existing["exercises_json"],
+                    ),
+                )
+            elif should_push or should_reconcile:
                 # Act on the STORED payload, never the incoming one.
                 # First-write-wins means the row is the truth, and on a retry the
                 # incoming body may legitimately differ -- pushing the newer body
@@ -408,6 +448,7 @@ def add_activity_routes(app):
                         exercises_json=stored["exercises_json"],
                     )
 
+            if should_push or should_reconcile or should_retry_sets:
                 try:
                     await _record_activity_garmin_outcome(db, row_id, outcome)
                 except Exception:
@@ -422,7 +463,11 @@ def add_activity_routes(app):
                         "recording a bounded unknown outcome.",
                         row_id, data.session_id,
                     )
-                    if outcome.garmin_status in ("synced", "unknown"):
+                    # Not on a sets retry: that row already points at its
+                    # activity, so there is nothing unrecorded on Garmin, and
+                    # 'unknown' would only strand a synced session. Its claim
+                    # ages out and the row stays synced/failed, retryable.
+                    if not should_retry_sets and outcome.garmin_status in ("synced", "unknown"):
                         # An activity may exist on Garmin that this row does not
                         # point at, and the row currently reads 'pending', which
                         # IS retryable -- so once the claim ages out something
