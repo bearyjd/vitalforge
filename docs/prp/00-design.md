@@ -986,9 +986,9 @@ upload.
 > and other requests keep running while it is in flight. The pinned
 > `garminconnect==0.3.16` bounds each request itself (15 s per request, one session
 > refresh and one retry on a 401), so a warm push is about 60 s worst case and a
-> cold push (client not yet cached, so a login first) about 455 s. The push claim
-> (`_GARMIN_CLAIM_TIMEOUT_SECONDS`) is 600 s, which stays inside that bound only
-> while no push can outlive it. The arithmetic, the reasons not to wrap the
+> cold push (client not yet cached, so a login first) about 455 s. That worst case
+> fits inside the 600 s push claim (`_GARMIN_CLAIM_TIMEOUT_SECONDS`), and the claim
+> is only safe while no push can outlive it. The arithmetic, the reasons not to wrap the
 > operation in `asyncio.wait_for`, and the rule for re-checking it when
 > `garminconnect` is bumped are in the header comment of
 > `vitalforge_weight/garmin_claim.py`; read that, not this section, for the numbers.
