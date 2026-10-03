@@ -508,7 +508,9 @@ same mechanism, D5 not reopened:
   protected auth flow); and it is **synchronous** — `push_weight` is not a
   coroutine and `app.py:87` calls it without `await` inside an `async def` — so
   `asyncio.wait_for` cannot bound it either. Moving the push after `COMMIT`
-  removes the requirement instead of satisfying it. For the record, the cost this
+  removes the requirement instead of satisfying it. (Superseded since: the push now
+  runs in a worker thread via `garmin_registry.call`; see `00-design.md` §3.7 and
+  `vitalforge_weight/garmin_claim.py`.) For the record, the cost this
   avoids is 5× what an earlier draft pasted; reproduced against `get_db()` as
   written:
 

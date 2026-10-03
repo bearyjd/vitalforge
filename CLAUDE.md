@@ -52,7 +52,7 @@ vitalforge_dashboard/     # port 8086 — reads synced metrics, runs sync.py + r
 nginx/nginx.conf          # optional reverse proxy for subdomain routing (not used by docker-compose*.yml directly)
 docker-compose.yml        # DEV — builds images from source (context: repo root, per-service Dockerfile)
 docker-compose.prod.yml   # PROD — pulls prebuilt images from Docker Hub / GHCR, no build step
-.github/workflows/docker.yml  # CI: builds + pushes images on push to main / tags. No test step exists.
+.github/workflows/docker.yml  # CI: tests, then builds images (pushes only on main / tags, not on PRs)
 ```
 
 ## Human-judgment chokepoints (now codified)
@@ -146,20 +146,21 @@ curl http://localhost:8086/health   # {"status": "ok", "service": "vitalforge-da
 # Running a single service without Docker (matches Dockerfile CMD, from repo root):
 pip install -r vitalforge_weight/requirements.txt
 VF_TMP=$(mktemp -d)   # private (0700): never a guessable name in a shared /tmp
-DB_PATH=$VF_TMP/vf-test.db GARTH_TOKEN_DIR=$VF_TMP/garth \
+DB_PATH="$VF_TMP/vf-test.db" GARTH_TOKEN_DIR="$VF_TMP/garth" \
   uvicorn vitalforge_weight.app:app --host 0.0.0.0 --port 8085 --no-proxy-headers
+rm -rf "$VF_TMP"      # when done (after Ctrl-C): the scratch DB and token dir are throwaway
 
 # Lint and test (repo root; mirrors .github/workflows/docker.yml's `test` job).
 # Use a venv, not the system/global Python — installing these into a shared interpreter
 # that other tools (e.g. an LLM proxy, MCP servers) also use WILL downgrade packages like
 # starlette/jinja2 out from under them:
-python3 -m venv .venv && source .venv/bin/activate
+python3.12 -m venv .venv && source .venv/bin/activate
 pip install -r vitalforge_weight/requirements.txt -r vitalforge_dashboard/requirements.txt
 pip install pytest pytest-asyncio httpx ruff playwright pytest-playwright pip-audit
 pip install -e .
 ruff check .
-pip-audit -r vitalforge_weight/requirements.txt -r vitalforge_dashboard/requirements.txt
 pytest -q
+pip-audit -r vitalforge_weight/requirements.txt -r vitalforge_dashboard/requirements.txt
 
 # UI smoke tests (Playwright) — excluded from the default `pytest -q` run, see below:
 playwright install --with-deps chromium   # `--with-deps` needs apt; on non-apt systems
@@ -181,8 +182,8 @@ the same session (`RuntimeError: Runner.run() cannot be called from a running ev
 loop`). Never remove that `addopts` line or merge the two suites into one `pytest`
 invocation — run `pytest -q -m playwright` as a genuinely separate process instead (see
 `tests/live_server.py` and `tests/test_smoke_ui.py`).
-`.github/workflows/docker.yml` has a `test` job (`ruff check .`, then `pip-audit`, then
-`pytest -q`, then a separate Playwright-browser-install step and `pytest -q -m
+`.github/workflows/docker.yml` has a `test` job (`ruff check .`, then a "no scratch or tool-output files tracked" check, then
+`pytest -q`, then `pip-audit`, then a separate Playwright-browser-install step and `pytest -q -m
 playwright`) that gates `build-and-push` via `needs: test` — a failing lint, audit or
 test blocks the image push. **`pip-audit` is scoped to the two `requirements.txt` files,
 not the installed environment**: it still resolves and audits their transitive
