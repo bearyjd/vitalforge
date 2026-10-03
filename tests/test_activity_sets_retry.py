@@ -450,7 +450,32 @@ async def test_outcome_write_failure_never_downgrades_a_synced_row(
     assert fake_garmin_client.created_activities == []
     # Reports the durable state, not the in-memory hope.
     assert resp.json()["garmin_status"] == "synced"
-    assert resp.json()["garmin_sets_status"] == row["garmin_sets_status"]
+    assert row["garmin_sets_status"] == "failed"
+    assert resp.json()["garmin_sets_status"] == "failed"
+    # Intended: the claim is HELD and ages out after the claim timeout, the
+    # same as the push path's 'failed' exit. Re-sending sets is a
+    # replace-all PUT, so the later retry it allows is harmless.
+    assert row["garmin_claimed_at"] is not None
+
+
+async def test_no_categorised_exercise_records_not_attempted(client, fake_garmin_client, sets_on):
+    """Nothing to send is not a failure: sets move to 'not_attempted', no
+    Garmin call is made, and the row leaves the retry set (no loop)."""
+    person_id = await get_primary_person_id()
+    await seed_synced_row(person_id, exercises_json='[{"name": "Mystery Move", "sets": 3, "reps": 10}]')
+
+    first = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
+    second = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
+
+    assert first.json()["garmin_status"] == "synced"
+    assert first.json()["garmin_sets_status"] == "not_attempted"
+    assert second.json()["garmin_sets_status"] == "not_attempted"
+    assert fake_garmin_client.registry_calls == []
+    assert fake_garmin_client.created_activities == []
+    row = await fetch_row(person_id)
+    assert row["garmin_status"] == "synced"
+    assert row["garmin_sets_status"] == "not_attempted"
+    assert row["garmin_claimed_at"] is None
 
 
 async def test_other_persons_identical_session_is_untouched(client, fake_garmin_client, sets_on):
