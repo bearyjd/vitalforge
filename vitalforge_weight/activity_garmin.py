@@ -348,12 +348,24 @@ async def _push_activity(
     if not _exercise_sets_enabled():
         return ActivityPushOutcome("synced", activity_id, None, "not_attempted")
 
+    sets_status = await _attach_exercise_sets(
+        person_id=person_id, activity_id=activity_id, exercises=exercises, start_local=start_local
+    )
+    return ActivityPushOutcome("synced", activity_id, None, sets_status)
+
+
+async def _attach_exercise_sets(*, person_id: int, activity_id: str, exercises, start_local: datetime) -> str:
+    """Upload exercise sets to an EXISTING activity. NEVER RAISES.
+
+    Returns the garmin_sets_status to record. Shared by the first push and the
+    issue #66 retry, so the two cannot drift in payload or error handling.
+    """
     try:
         payload = build_exercise_sets_payload(exercises, start_local)
         if not payload["exerciseSets"]:
             # Every exercise lacked a garmin_category. Nothing to send, and
             # nothing failed.
-            return ActivityPushOutcome("synced", activity_id, None, "not_attempted")
+            return "not_attempted"
         def attach_sets(client):
             token = _operation_client.set(client)
             try:
@@ -369,16 +381,38 @@ async def _push_activity(
             activity_id,
             _registry_failure_code(e),
         )
-        return ActivityPushOutcome("synced", activity_id, None, "failed")
+        return "failed"
     except Exception:
         # Only garmin_sets_status degrades. garmin_status stays 'synced'
         # because the activity itself genuinely exists on Garmin -- flipping
         # it to 'failed' would make the client re-POST and create a SECOND
         # activity for the same session.
         logger.error("Failed to push exercise sets for activity %s (%s)", activity_id, _SETS_UPLOAD_FAILED)
-        return ActivityPushOutcome("synced", activity_id, None, "failed")
+        return "failed"
 
-    return ActivityPushOutcome("synced", activity_id, None, "synced")
+    return "synced"
+
+
+async def _retry_activity_sets(
+    *, person_id: int, activity_id: str, start_time_utc: str, exercises_json: str
+) -> str:
+    """Re-send exercise sets for an activity Garmin ALREADY HAS. NEVER RAISES.
+
+    Issue #66: the sets call failed after create_manual_activity succeeded.
+    This never creates an activity -- the stored garmin_activity_id is the
+    only target -- so a retry can at worst leave the sets 'failed' again,
+    never file a duplicate. Takes raw stored strings and parses them inside
+    the try, for the same 500-over-durable-data reason _push_activity does.
+    """
+    try:
+        exercises = json.loads(exercises_json)
+        start_local = datetime.fromisoformat(start_time_utc).astimezone(ZoneInfo(_garmin_time_zone()))
+    except Exception:
+        logger.error("Could not prepare the exercise-set retry (%s)", _PREPARATION_FAILED)
+        return "failed"
+    return await _attach_exercise_sets(
+        person_id=person_id, activity_id=activity_id, exercises=exercises, start_local=start_local
+    )
 
 
 async def _reconcile_activity(
