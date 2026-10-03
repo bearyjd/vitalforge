@@ -26,7 +26,7 @@ rewrites the table and reopens an interruption window on upgrade).
 | `training_load` | `date` (PK) | acute_load, chronic_load, load_ratio |
 | `steps` | `date` (PK) | single `value` column |
 | `active_calories` | `date` (PK) | single `value` column |
-| `sync_status` | `id` (CHECK id=1, singleton row) | last_sync_time, last_sync_result, last_sync_days |
+| `sync_status` | `person_id` (PK, one row per person) | last_sync_time, last_sync_result, last_sync_days, backoff_until, backoff_streak (Garmin 429 backoff; nullable, NULL streak reads as 0; written only by `sync.py::_write_sync_status`) |
 
 ## Relationships
 
