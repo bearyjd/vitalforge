@@ -644,6 +644,7 @@ async def test_the_backoff_never_exceeds_6_hours(initialized_db, monkeypatch):
     assert state["backoff_streak"] == 41
     until = datetime.fromisoformat(state["backoff_until"])
     assert until <= datetime.now(timezone.utc) + timedelta(hours=6)
+    assert until >= datetime.now(timezone.utc) + timedelta(hours=5, minutes=59), "the cap is 6 h, not less"
 
 
 @pytest.mark.parametrize(
@@ -699,12 +700,60 @@ async def test_a_successful_sync_clears_the_backoff(initialized_db, fake_garmin_
     assert state["last_sync_result"] == "success"
 
 
-async def test_a_sync_that_only_skipped_some_metrics_clears_the_backoff(initialized_db, monkeypatch):
-    """'completed with N errors' means Garmin answered the account; a
+async def test_a_sync_where_every_call_failed_leaves_the_backoff_alone(initialized_db, monkeypatch):
+    """'completed with N errors' is not evidence the throttle lifted when NO
+    call succeeded (every read a 403/network failure): clearing the backoff
+    there would let a dead connection erase a ban in progress."""
+    person_id = await get_primary_person_id()
+    until = "2999-01-01T00:00:00+00:00"
+    await _seed_backoff(person_id, streak=2, until=until)
+    _stop_every_read_with(monkeypatch, garmin_registry.GarminOperationError("network"))
+
+    result = await sync.run_sync(days=1, person_id=person_id)
+
+    assert result.startswith("completed with")
+    state = await _backoff_state(person_id)
+    assert state["backoff_until"] == until and state["backoff_streak"] == 2
+
+
+async def test_a_sync_that_only_skipped_some_metrics_clears_the_backoff(
+    initialized_db, fake_garmin_client, monkeypatch
+):
+    """Garmin answered the account (every read but one succeeded); one
     skipped metric is not a throttle."""
     person_id = await get_primary_person_id()
     await _seed_backoff(person_id, streak=2, until="2999-01-01T00:00:00+00:00")
-    _stop_every_read_with(monkeypatch, garmin_registry.GarminOperationError("network"))
+    real_call_paced = fake_garmin_client.registry_call
+
+    async def one_metric_fails(person_id, operation):
+        if "get_hrv_data" in operation.__code__.co_names:
+            raise garmin_registry.GarminOperationError("network")
+        return await real_call_paced(person_id, operation)
+
+    monkeypatch.setattr(sync.garmin_registry, "call_paced", one_metric_fails)
+
+    result = await sync.run_sync(days=1, person_id=person_id)
+
+    assert result.startswith("completed with")
+    state = await _backoff_state(person_id)
+    assert state["backoff_until"] is None and state["backoff_streak"] is None
+
+
+async def test_an_answered_weight_history_read_counts_as_garmin_answering(
+    initialized_db, fake_garmin_client, monkeypatch
+):
+    """Every per-date metric read fails but the weight-history range read
+    succeeds: Garmin did answer, so the backoff clears."""
+    person_id = await get_primary_person_id()
+    await _seed_backoff(person_id, streak=2, until="2999-01-01T00:00:00+00:00")
+    real_call_paced = fake_garmin_client.registry_call
+
+    async def only_weight_history_answers(person_id, operation):
+        if "get_weigh_ins" in operation.__code__.co_names:
+            return await real_call_paced(person_id, operation)
+        raise garmin_registry.GarminOperationError("network")
+
+    monkeypatch.setattr(sync.garmin_registry, "call_paced", only_weight_history_answers)
 
     result = await sync.run_sync(days=1, person_id=person_id)
 
@@ -725,13 +774,15 @@ async def test_the_rotation_skips_a_throttled_person_until_the_backoff_passes(in
     assert await sync.next_person_to_sync((now + timedelta(minutes=16)).isoformat()) == person_id
 
 
-async def test_a_rate_limited_backfill_is_retried_as_a_backfill_once_the_backoff_passes(
+async def test_a_rate_limited_backfill_is_retried_once_then_demoted(
     initialized_db, monkeypatch
 ):
-    """With a backoff gating the retry, a throttled 90-day backfill no longer
-    needs demoting to the incremental window: the next attempt waits out the
-    backoff and then resumes the backfill (run_sync skips dates it already
-    stored)."""
+    """The backoff decides WHEN a throttled backfill is retried; this decides
+    HOW MANY times. run_sync skips a past date only when EVERY metric table has
+    it, so a device that never reports some metric re-fetches the same dates
+    on each attempt and never finishes: retrying forever would re-burst into
+    a 429 every time the backoff expires. Two consecutive throttled backfills
+    drop to the incremental window (what main did after one)."""
     person_id = await get_primary_person_id()
     await _link(person_id)
     _stop_every_read_with(monkeypatch, garmin_registry.GarminOperationError("rate_limited"))
@@ -743,15 +794,57 @@ async def test_a_rate_limited_backfill_is_retried_as_a_backfill_once_the_backoff
         return await real_run_sync(days=days, person_id=person_id)
 
     monkeypatch.setattr(sync, "run_sync", spy)
-    lock, registry, backfilled = asyncio.Lock(), sync.SyncRegistry(), set()
+    lock, registry, backfilled, throttled = asyncio.Lock(), sync.SyncRegistry(), set(), {}
 
-    await sync._sync_next_person(lock, registry, backfilled)
+    await sync._sync_next_person(lock, registry, backfilled, throttled)
     assert days_seen == [90]
 
-    await sync._sync_next_person(lock, registry, backfilled)
+    await sync._sync_next_person(lock, registry, backfilled, throttled)
     assert days_seen == [90], "ran again inside the backoff"
 
     await _seed_backoff(person_id, streak=1, until="2026-09-01T00:00:00+00:00")  # expired
-    await sync._sync_next_person(lock, registry, backfilled)
-    assert days_seen == [90, 90], "the backfill was demoted instead of retried"
+    await sync._sync_next_person(lock, registry, backfilled, throttled)
+    assert days_seen == [90, 90], "the backfill was demoted after ONE 429 instead of retried"
+    assert (await _backoff_state(person_id))["backoff_streak"] == 2
+
+    await _seed_backoff(person_id, streak=2, until="2026-09-01T00:00:00+00:00")  # expired again
+    await sync._sync_next_person(lock, registry, backfilled, throttled)
+    assert days_seen == [90, 90, 3], "a backfill throttled twice in a row must drop to the incremental window"
+
+
+@pytest.mark.parametrize(
+    "outcomes, expected_days",
+    (
+        # Two throttled backfills in a row demote; the third run is incremental.
+        (["rate_limited", "rate_limited", "success", "success"], [90, 90, 3, 3]),
+        # Any other result in between resets the count: a 429, a network blip,
+        # then 429 again is NOT two in a row.
+        (["rate_limited", "network", "rate_limited", "rate_limited", "success"], [90, 90, 90, 90, 3]),
+    ),
+)
+async def test_only_consecutive_throttled_backfills_are_demoted(
+    initialized_db, monkeypatch, outcomes, expected_days
+):
+    primary = await get_primary_person_id()
+    await _link(primary)
+
+    calls = await _drive_scheduler(
+        monkeypatch, ticks=len(outcomes), outcome=lambda _p, i: outcomes[i]
+    )
+
+    assert [days for _, days in calls] == expected_days
+
+
+async def test_concurrent_status_writes_do_not_lose_a_streak_increment(initialized_db):
+    """Two writers racing the read-then-write must serialize: without a write
+    transaction both read streak NULL and both write 1, so a second 429 would
+    leave the backoff a doubling short."""
+    person_id = await get_primary_person_id()
+    started = datetime.now(timezone.utc)
+
+    await asyncio.gather(
+        sync._write_sync_status(person_id, started, "rate_limited", 3),
+        sync._write_sync_status(person_id, started, "rate_limited", 3),
+    )
+
     assert (await _backoff_state(person_id))["backoff_streak"] == 2

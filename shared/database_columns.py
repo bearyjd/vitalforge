@@ -66,7 +66,7 @@ WEIGHT_HISTORY_ADDITIVE_COLUMNS = [
 ]
 
 STRENGTH_SESSIONS_ADDITIVE_COLUMNS = [
-    # See the column comment in the strength_sessions CREATE TABLE below.
+    # See the column comment in shared/database.py's strength_sessions CREATE TABLE.
     "garmin_name_prefix TEXT",
 ]
 
