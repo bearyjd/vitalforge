@@ -31,7 +31,12 @@ def person_lock_key(person_id: int) -> LockKey:
 
 
 # Runs on a default-executor thread with no timeout: one thread per key whose
-# flock the other process holds (scaling note only; persons are single-digit).
+# flock the other process holds.  A holder needs a pool thread too (at least
+# to release, in _close_lock_handle), so if EACH service is waiting on as many
+# distinct people's locks as its pool has threads (min(32, cpu+4); about ten
+# people's Garmin calls at once across both services), both services hang
+# until restarted.  Reproduced in review; main behaves the same.  See the
+# follow-up issue on lock-waiter threads.
 def _acquire_lock(lock_path: Path):
     handle = open(lock_path, "a")
     try:
@@ -115,7 +120,11 @@ def _close_acquired_handle_when_done(task: asyncio.Task) -> None:
 
 
 async def _close_lock_handle(handle) -> None:
-    """Close a flock descriptor even if cleanup itself is cancelled twice."""
+    """Close a flock descriptor even if cleanup itself is cancelled twice.
+
+    This release needs a default-executor thread; see :func:`_acquire_lock`
+    for the hang that causes when waiters fill the pool.
+    """
     close_task = asyncio.create_task(asyncio.to_thread(handle.close))
     try:
         await asyncio.shield(close_task)
