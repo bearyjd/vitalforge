@@ -149,7 +149,7 @@ def _moved_store_person_ids(root: Path) -> list[int]:
     person_ids: list[int] = []
     for token_path in root.glob(f"{person_prefix}*/{generation_dir}/garmin_tokens.json"):
         suffix = token_path.parent.parent.name.removeprefix(person_prefix)
-        if suffix.isdigit():
+        if suffix.isascii() and suffix.isdecimal():  # isdigit() admits '²' (int() rejects it) and '٣'
             person_ids.append(int(suffix))
     return person_ids
 

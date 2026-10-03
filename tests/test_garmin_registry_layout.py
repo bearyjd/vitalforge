@@ -18,3 +18,14 @@ def test_the_moved_store_glob_follows_the_facade_layout(monkeypatch, tmp_path):
 
     assert store.relative_to(tmp_path).as_posix() == "member-7/gen-1"
     assert garmin_registry_legacy._moved_store_person_ids(tmp_path) == [7]
+
+
+def test_the_moved_store_scan_reads_only_ascii_decimal_person_ids(tmp_path):
+    """`isdigit()` accepts `²` (which int() rejects, aborting the adoption)
+    and `٣` (which int() maps to 3, misattributing the store)."""
+    for name in ("person-5", "person-²", "person-٣", "person-+4"):
+        store = tmp_path / name / "generation-1"
+        store.mkdir(parents=True)
+        (store / "garmin_tokens.json").write_text("{}", encoding="ascii")
+
+    assert garmin_registry_legacy._moved_store_person_ids(tmp_path) == [5]
