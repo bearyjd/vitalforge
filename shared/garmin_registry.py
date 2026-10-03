@@ -67,15 +67,8 @@ logger = logging.getLogger(__name__)
 
 
 def _configured_token_root() -> Path | None:
-    """The environment's root, normalized once: None disables Garmin instead of
-    crashing both services at import.  Only the normalizer's own fixed refusals
-    are logged by text; an OSError or RuntimeError carries the path."""
-    try:
-        return garmin_registry_common.normalize_token_root(os.getenv("GARTH_TOKEN_DIR", "/app/data/.garth"))
-    except (OSError, RuntimeError, ValueError) as exc:
-        reason = str(exc) if isinstance(exc, garmin_registry_common.TokenRootRefused) else type(exc).__name__
-        logger.error("GARTH_TOKEN_DIR is unusable (%s); Garmin features are disabled", reason)
-        return None
+    """Import's root, or None to disable Garmin (``garmin_registry_common``)."""
+    return garmin_registry_common.configured_token_root(logger)
 
 
 GARTH_TOKEN_DIR: Path | None = _configured_token_root()
@@ -101,11 +94,14 @@ def check_token_root() -> bool:
     """Warn, path-free, when garminconnect would not use the registry's root:
     the guard against garth/registry drift (a garminconnect upgrade changing
     ``token_file_path``'s rules) whose only other symptom is every login
-    failing as ``unknown``.  Returns the verdict; never raises for either check.
+    failing as ``unknown``.  Probes the root and the names garth receives
+    beneath it (a generation and a staging directory), creating neither.
+    Returns the verdict; never raises for either check.
     """
     try:
         root = _ensure_token_root()
-        agrees = token_file_path(str(root)).parent == root
+        probes = (root, _generation_token_dir(1, 1), root / _staging_dir_name(1, 1, "probe"))
+        agrees = all(token_file_path(str(probe)).parent == probe for probe in probes)
         reason = "another directory"
     except (OSError, RuntimeError, ValueError) as exc:
         agrees, reason = False, type(exc).__name__
@@ -118,9 +114,13 @@ def check_token_root() -> bool:
     return agrees
 
 
+def _staging_dir_name(person_id: int, generation: int, nonce: str) -> str:
+    return f".person-{person_id}-generation-{generation}-{nonce}.staging"
+
+
 def _staging_token_dir(person_id: int, generation: int) -> Path:
     root = _ensure_token_root()
-    path = root / f".person-{person_id}-generation-{generation}-{uuid.uuid4().hex}.staging"
+    path = root / _staging_dir_name(person_id, generation, uuid.uuid4().hex)
     path.mkdir(mode=0o700)
     path.chmod(0o700)
     return path

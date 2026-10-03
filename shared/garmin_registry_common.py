@@ -10,6 +10,7 @@ pure path logic the facade runs once, at import.
 from __future__ import annotations
 
 import errno
+import logging
 import os
 import re
 import stat
@@ -133,4 +134,74 @@ def normalize_token_root(raw: str | os.PathLike[str]) -> Path:
             raise TokenRootRefused("a symlink owned by another user")
     root = Path(os.path.realpath(configured))
     _stat_if_present(root, follow_symlinks=True)  # non-strict realpath leaves a loop in place
+    _refuse_a_shared_directory(root)
+    return root
+
+
+def _refuse_a_shared_directory(root: Path) -> None:
+    """The registry chmods its root 0700 and keeps lock files in it, so ``/``,
+    $HOME (a bare ``~``) or the cwd (``.``; the image's /app under compose)
+    would be mutated.  Compared resolved to resolved; a home or cwd that
+    cannot be resolved matches nothing rather than disabling Garmin.  Every
+    match is named: in the image HOME and the cwd are both /app."""
+    locations = (("the filesystem root", lambda: "/"), ("the working directory", os.getcwd),
+                 ("the home directory", Path.home))
+    matched = []
+    for reason, locate in locations:
+        try:
+            directory = Path(os.path.realpath(locate()))
+        except (OSError, RuntimeError, KeyError):
+            continue
+        if root == directory:
+            matched.append(reason)
+    if matched:
+        raise TokenRootRefused(" and ".join(matched))
+
+
+def _is_trusted_sticky(found: os.stat_result) -> bool:
+    """A sticky directory owned by root (``/tmp``) or by this process: others
+    may write it, but cannot rename or remove an entry they do not own, and
+    its owner is already trusted.  One owned by any other user is not."""
+    return found.st_uid in (0, os.geteuid()) and bool(found.st_mode & stat.S_ISVTX)
+
+
+def first_writable_ancestor(root: Path) -> Path | None:
+    """The highest existing ancestor of ``root`` (not the root itself, which
+    the registry makes 0700) that is group- or other-writable, unless it is a
+    sticky directory root or this process owns.  Advisory only: refusing would reject a
+    root-owned 0775 ``/srv``.  A missing ancestor ends the walk; never raises."""
+    for ancestor in reversed(root.parents):
+        try:
+            found = os.stat(ancestor)
+        except OSError:
+            return None
+        if found.st_mode & (stat.S_IWGRP | stat.S_IWOTH) and not _is_trusted_sticky(found):
+            return ancestor
+    return None
+
+
+DEFAULT_TOKEN_ROOT = "/app/data/.garth"
+
+
+def configured_token_root(logger: logging.Logger) -> Path | None:
+    """The environment's root, normalized once: None disables Garmin instead of
+    crashing both services at import.  Only the normalizer's own fixed refusals
+    are logged by text; an OSError or RuntimeError carries the path.  Logs
+    through the caller's ``logger`` (the facade's), where boot errors belong.
+    A blank value (compose's ``${GARTH_TOKEN_DIR:-}``) is unset, not the cwd.
+    A writable ancestor is only warned about, by its (repr'd) path."""
+    configured = os.getenv("GARTH_TOKEN_DIR", "")
+    try:
+        root = normalize_token_root(configured if configured.strip() else DEFAULT_TOKEN_ROOT)
+    except (OSError, RuntimeError, ValueError) as exc:
+        reason = str(exc) if isinstance(exc, TokenRootRefused) else type(exc).__name__
+        logger.error("GARTH_TOKEN_DIR is unusable (%s); Garmin features are disabled", reason)
+        return None
+    writable = first_writable_ancestor(root)
+    if writable is not None:
+        logger.warning(
+            "GARTH_TOKEN_DIR is below a directory other users can write (%r); "
+            "another local user could replace the token root",
+            str(writable),
+        )
     return root
