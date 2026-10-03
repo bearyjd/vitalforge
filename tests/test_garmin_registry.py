@@ -558,6 +558,24 @@ async def test_call_evicts_a_stale_generation_before_running_the_operation(initi
     assert (person_id, 2) in garmin_client._clients
 
 
+async def test_call_awaits_an_async_operation(initialized_db):
+    """The real call() (not conftest's fake) accepts an ``async def`` op: the
+    worker thread returns its coroutine and call() awaits it on the loop."""
+    person_id = await get_primary_person_id()
+    await _link(person_id)
+    garmin_client._clients[(person_id, 1)] = _FakeClient(1)
+    loop_thread = threading.get_ident()
+    ran_on: list[int] = []
+
+    async def operation(client):
+        ran_on.append(threading.get_ident())
+        await asyncio.sleep(0)
+        return client.generation
+
+    assert await garmin_registry.call(person_id, operation) == 1
+    assert ran_on == [loop_thread], "the coroutine body runs on the event loop"
+
+
 async def test_clients_with_identical_generations_never_cross_person_boundaries(initialized_db, monkeypatch):
     first_person = await get_primary_person_id()
     second_person = await seed_person("second-person")
