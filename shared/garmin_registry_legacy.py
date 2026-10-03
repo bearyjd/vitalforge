@@ -164,19 +164,23 @@ async def _warn_about_orphaned_moved_stores(root: Path, primary_id: int) -> None
     candidates = [pid for pid in await asyncio.to_thread(_moved_store_person_ids, root) if pid != primary_id]
     if not candidates:
         return
+    placeholders = ", ".join("?" for _ in candidates)  # only "?" markers; the ids are bound
     db = await get_db()
     try:
-        for person_id in candidates:
-            ledger = await (
-                await db.execute("SELECT 1 FROM garmin_link_generations WHERE person_id = ?", (person_id,))
-            ).fetchone()
-            if ledger is None:
-                logger.warning(
-                    "Legacy Garmin token store moved for person %s was never published; leaving it in place",
-                    person_id,
-                )
+        rows = await (
+            await db.execute(
+                f"SELECT person_id FROM garmin_link_generations WHERE person_id IN ({placeholders})", candidates
+            )
+        ).fetchall()
     finally:
         await db.close()
+    published = {int(row["person_id"]) for row in rows}
+    for person_id in candidates:
+        if person_id not in published:
+            logger.warning(
+                "Legacy Garmin token store moved for person %s was never published; leaving it in place",
+                person_id,
+            )
 
 
 async def _adopt_flat_store(person_id: int, canonical_email: str, root: Path, durable: Path) -> bool:
