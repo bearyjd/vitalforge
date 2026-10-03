@@ -46,11 +46,13 @@ BACKOFF_CAP = timedelta(hours=6)
 # What _record_failed_tick stores for a run that raised before it could record
 # its own result.
 FAILED_TICK_RESULT = "error"
-# A backfill throttled this many times IN A ROW is demoted to the incremental
-# window. run_sync skips a past date only when EVERY metric table has it, so a
-# device that never reports some metric re-fetches the same dates on each
-# attempt and never finishes; without a cap a 429 mid-scan would re-burst into
-# the throttle every time its backoff expires.
+# A backfill throttled this many times (since boot) is demoted to the
+# incremental window. run_sync skips a past date only when EVERY metric table
+# has it, so a device that never reports some metric re-fetches the same dates
+# on each attempt and never finishes; without a cap a 429 mid-scan would
+# re-burst into the throttle every time its backoff expires. Only a 429 moves
+# the count: a failed login or a network blip says nothing about the throttle,
+# so it must not reset it (alternating one with a 429 would never reach the cap).
 MAX_THROTTLED_BACKFILLS = 2
 
 
@@ -647,11 +649,11 @@ async def _sync_next_person(
         # retried as a backfill rather than demoted to the incremental window,
         # or the rest of its days would never be fetched. After a 429 the
         # person's backoff decides WHEN they are picked again; this decides
-        # how often: MAX_THROTTLED_BACKFILLS throttled backfills IN A ROW drop
-        # to the incremental window (see that constant for why).
-        throttled_runs = throttled.get(person_id, 0) + 1 if result == "rate_limited" else 0
-        throttled[person_id] = throttled_runs
-        if result not in _STOPPED_RESULTS or throttled_runs >= MAX_THROTTLED_BACKFILLS:
+        # how often: after MAX_THROTTLED_BACKFILLS throttled backfills they
+        # drop to the incremental window (see that constant for why).
+        if result == "rate_limited":
+            throttled[person_id] = throttled.get(person_id, 0) + 1
+        if result not in _STOPPED_RESULTS or throttled.get(person_id, 0) >= MAX_THROTTLED_BACKFILLS:
             backfilled.add(person_id)
 
 
@@ -667,8 +669,8 @@ async def scheduled_sync(lock: asyncio.Lock, registry: SyncRegistry) -> None:
     The first tick runs at boot. Each person's first scheduled sync after
     boot is a SYNC_BACKFILL_DAYS re-scan, retried while it stops early (a
     429 additionally puts the person in backoff, see _next_backoff, and
-    MAX_THROTTLED_BACKFILLS of them in a row give up on the backfill); once
-    one completes, 3-day runs. At one linked person that is the old boot backfill
+    MAX_THROTTLED_BACKFILLS of them give up on the backfill); once one
+    completes, 3-day runs. At one linked person that is the old boot backfill
     followed by 3-day runs, plus the retry.
 
     Takes the same lock `/api/sync`'s manual trigger holds during `run_sync`
@@ -681,7 +683,7 @@ async def scheduled_sync(lock: asyncio.Lock, registry: SyncRegistry) -> None:
     a writer that forgets to register looks like from the dashboard.
     """
     backfilled: set[int] = set()
-    throttled: dict[int, int] = {}  # consecutive throttled backfills per person
+    throttled: dict[int, int] = {}  # throttled (429) backfills per person since boot
     while True:
         try:
             await _sync_next_person(lock, registry, backfilled, throttled)

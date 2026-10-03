@@ -781,8 +781,8 @@ async def test_a_rate_limited_backfill_is_retried_once_then_demoted(
     HOW MANY times. run_sync skips a past date only when EVERY metric table has
     it, so a device that never reports some metric re-fetches the same dates
     on each attempt and never finishes: retrying forever would re-burst into
-    a 429 every time the backoff expires. Two consecutive throttled backfills
-    drop to the incremental window (what main did after one)."""
+    a 429 every time the backoff expires. Two throttled backfills drop to the
+    incremental window (what main did after one)."""
     person_id = await get_primary_person_id()
     await _link(person_id)
     _stop_every_read_with(monkeypatch, garmin_registry.GarminOperationError("rate_limited"))
@@ -809,20 +809,22 @@ async def test_a_rate_limited_backfill_is_retried_once_then_demoted(
 
     await _seed_backoff(person_id, streak=2, until="2026-09-01T00:00:00+00:00")  # expired again
     await sync._sync_next_person(lock, registry, backfilled, throttled)
-    assert days_seen == [90, 90, 3], "a backfill throttled twice in a row must drop to the incremental window"
+    assert days_seen == [90, 90, 3], "a backfill throttled twice must drop to the incremental window"
 
 
 @pytest.mark.parametrize(
     "outcomes, expected_days",
     (
-        # Two throttled backfills in a row demote; the third run is incremental.
+        # Two throttled backfills demote; the third run is incremental.
         (["rate_limited", "rate_limited", "success", "success"], [90, 90, 3, 3]),
-        # Any other result in between resets the count: a 429, a network blip,
-        # then 429 again is NOT two in a row.
-        (["rate_limited", "network", "rate_limited", "rate_limited", "success"], [90, 90, 90, 90, 3]),
+        # A failed login / network blip in between does NOT reset the count: it
+        # says nothing about the throttle, and alternating one with a 429 must
+        # still reach the cap (this was an unbounded 61-call burst every
+        # second rotation).
+        (["rate_limited", "network", "rate_limited", "success", "success"], [90, 90, 90, 3, 3]),
     ),
 )
-async def test_only_consecutive_throttled_backfills_are_demoted(
+async def test_throttled_backfills_are_demoted_whatever_happens_between_them(
     initialized_db, monkeypatch, outcomes, expected_days
 ):
     primary = await get_primary_person_id()

@@ -96,7 +96,7 @@ which metric names are queryable — adding a new metric requires updating this 
   first) -- a derived round-robin, no stored cursor (spec §e.3). So each person refreshes
   every `SYNC_INTERVAL_HOURS × N`. A person's first sync after boot is a 90-day
   re-scan, repeated until one completes without stopping early, or is throttled
-  (`rate_limited`) twice in a row (`MAX_THROTTLED_BACKFILLS`: past dates are only skipped
+  (`rate_limited`) twice (`MAX_THROTTLED_BACKFILLS`; other stops do not reset it: past dates are only skipped
   when every metric table has them, so a device missing a metric would re-burst forever);
   later ones are 3 days.
   A run that raises is recorded as `error` so the cursor moves on. **429 backoff:** a
