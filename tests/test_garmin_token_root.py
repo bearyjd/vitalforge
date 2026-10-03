@@ -195,8 +195,7 @@ def _import_registry_in_a_fresh_interpreter(home: Path, garth_token_dir: str) ->
 
 def test_tilde_is_expanded_to_the_directory_garth_uses(monkeypatch, tmp_path):
     home = tmp_path / "home"
-    assert _normalize("~") == home
-    assert _normalize("~/garth") == home / "garth"
+    assert _normalize("~/garth") == home / "garth"  # a bare "~" is refused: the hardening tests
     monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", _normalize("~/garth"))
 
     assert garmin_registry._ensure_token_root() == home / "garth"
