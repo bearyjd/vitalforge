@@ -335,9 +335,11 @@ async def test_response_never_echoes_a_credential(client):
 
     NOTE the deliberate limit of this test: it proves no route ECHOES the
     caller's credential. It does NOT prove the responses are credential-free
-    in general -- `garmin_error` carries a caught exception's string verbatim
-    by design (PRP §4.1), so anything garminconnect puts in an exception
-    message reaches both this body and the stored row.
+    in general. `garmin_error` itself no longer carries exception text: the
+    activity and weight paths both return only fixed codes
+    (`activity_garmin.bounded_garmin_error`, the weight route's constants),
+    and the detail goes to the server log. Keep it that way; do not echo a
+    caught exception's string into the field.
     """
     user_id = await seed_user("alice")
     _, raw = await seed_token(user_id, label="alice-token")
