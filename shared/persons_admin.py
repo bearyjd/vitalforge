@@ -36,6 +36,7 @@ another table's id verifies that row inside the same transaction rather than
 trusting a `REFERENCES` clause that does not fire.
 """
 
+import contextlib
 import logging
 from datetime import datetime, timezone
 from typing import Literal
@@ -353,8 +354,16 @@ def add_person_routes(app):
         # This is the same cross-process lifecycle boundary used by a Garmin
         # call, link, and unlink.  Holding it through both the durable state
         # change and cleanup prevents an in-flight call from authenticating a
-        # token store after this route has archived its owner.
-        async with garmin_registry.person_flock(person_id):
+        # token store after this route has archived its owner.  With an
+        # unusable token root (None: Garmin disabled at boot) no call can be
+        # in flight and the lock file has nowhere to live, so archive proceeds
+        # without it rather than failing as a bare 500.
+        lifecycle_lock = (
+            garmin_registry.person_flock(person_id)
+            if garmin_registry.GARTH_TOKEN_DIR is not None
+            else contextlib.nullcontext()
+        )
+        async with lifecycle_lock:
             db = await get_db()
             try:
                 await db.execute("BEGIN IMMEDIATE")

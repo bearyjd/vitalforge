@@ -512,6 +512,42 @@ async def test_archiving_deletes_a_normal_garmin_link_and_its_owned_token_store(
     assert not any(key[0] == person_id for key in garmin_client._clients)
 
 
+async def test_archiving_succeeds_while_garmin_is_disabled_by_an_unusable_root(client, monkeypatch, caplog):
+    """A refused GARTH_TOKEN_DIR leaves the root None. No Garmin call can be in
+    flight then, so the person flock (whose lock file lives under the root) is
+    skipped instead of turning the archive into a bare 500 (#70)."""
+    _, cookies = await _as("root", role="admin")
+    person_id = (await client.post("/api/persons", json={"display_name": "Bryn"}, cookies=cookies)).json()["id"]
+    await _seed_garmin_link(person_id, "linked")
+    garmin_client._clients[(person_id, 1)] = object()
+    monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", None)
+    caplog.set_level(logging.WARNING)
+
+    response = await client.post(f"/api/persons/{person_id}/archive", cookies=cookies)
+
+    assert response.status_code == 200
+    assert response.json()["archived_at"]
+    assert await _fetchone("SELECT archived_at FROM persons WHERE id = ?", (person_id,)) is not None
+    assert await _fetchone("SELECT 1 FROM garmin_links WHERE person_id = ?", (person_id,)) is None
+    assert not any(key[0] == person_id for key in garmin_client._clients)
+    # The token directories cannot be reached; a later archive retries them.
+    assert "Archived person's Garmin token cleanup did not complete" in caplog.text
+
+
+async def test_archiving_still_takes_the_person_flock_when_the_root_is_usable(client, monkeypatch):
+    """The skip is for a None root only: with a root, archive serializes with
+    call/link/unlink on the person's lock file as before."""
+    _, cookies = await _as("root", role="admin")
+    person_id = (await client.post("/api/persons", json={"display_name": "Bryn"}, cookies=cookies)).json()["id"]
+    lock_file = garmin_registry.GARTH_TOKEN_DIR / f".person-{person_id}.lock"
+    assert not lock_file.exists()
+
+    response = await client.post(f"/api/persons/{person_id}/archive", cookies=cookies)
+
+    assert response.status_code == 200
+    assert lock_file.is_file(), "archive no longer took the person flock"
+
+
 async def test_archiving_deletes_a_retired_legacy_bound_row_without_touching_the_flat_root(client):
     """A row from the release that wrote 'legacy_bound' goes like any other;
     the flat root is never this person's to remove, and the one-time adoption
