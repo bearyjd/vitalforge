@@ -36,7 +36,7 @@ def person_lock_key(person_id: int) -> LockKey:
 # distinct people's locks as its pool has threads (min(32, cpu+4); about ten
 # people's Garmin calls at once across both services), both services hang
 # until restarted.  Reproduced in review; main behaves the same.  See the
-# follow-up issue on lock-waiter threads.
+# #95.
 def _acquire_lock(lock_path: Path):
     handle = open(lock_path, "a")
     try:
