@@ -305,10 +305,13 @@ def add_activity_routes(app):
                 # to garmin_status. Without a stored id there is nothing to
                 # address, and with the flag off the sets path stays dormant.
                 # A non-NULL garmin_name_prefix marks a pre-Phase-3 cross-person
-                # override row (the only writer that ever set it): its activity
-                # lives in the retired global account. Migration 003 retired
-                # only its pending/failed/unknown rows, so a SYNCED one reaches
-                # here and must not be sent through this person's own link.
+                # override row created after cb529e6 (the only writer that ever
+                # set it): its activity lives in the retired global account.
+                # Migration 003 retired only its pending/failed/unknown rows, so
+                # a SYNCED one reaches here and must not be sent through this
+                # person's own link. Override rows from the c5d31e4..cb529e6
+                # window predate the column, carry a NULL prefix, and lost
+                # garmin_target in 003, so this guard cannot recognise them.
                 should_retry_sets = (
                     data.push_to_garmin
                     and not is_retired_global_target
