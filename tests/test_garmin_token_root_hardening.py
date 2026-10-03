@@ -143,6 +143,22 @@ def test_a_subdirectory_of_a_shared_directory_is_accepted(configured, expected, 
     assert not expected.exists(), "normalizing must not create the root"
 
 
+@pytest.mark.parametrize("configured", [".", "~", "app"])
+def test_a_root_that_is_both_home_and_cwd_names_both(configured, monkeypatch, tmp_path):
+    """In the image HOME and the cwd are both /app: ``GARTH_TOKEN_DIR=.`` must
+    not be reported as only "the home directory"."""
+    app = tmp_path / "app"
+    app.mkdir()
+    monkeypatch.setenv("HOME", str(app))
+    monkeypatch.chdir(app)
+    configured = str(app) if configured == "app" else configured
+
+    with pytest.raises(
+        garmin_registry_common.TokenRootRefused, match="^the working directory and the home directory$"
+    ):
+        _normalize(configured)
+
+
 def test_the_home_refusal_compares_resolved_paths(monkeypatch, tmp_path):
     """Silverblue's /home -> /var/home: a root naming home's real path must be
     refused even though HOME spells it through a symlink, and vice versa."""

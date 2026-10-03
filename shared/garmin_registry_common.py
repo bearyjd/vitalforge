@@ -142,16 +142,20 @@ def _refuse_a_shared_directory(root: Path) -> None:
     """The registry chmods its root 0700 and keeps lock files in it, so ``/``,
     $HOME (a bare ``~``) or the cwd (``.``; the image's /app under compose)
     would be mutated.  Compared resolved to resolved; a home or cwd that
-    cannot be resolved matches nothing rather than disabling Garmin."""
-    locations = (("the filesystem root", lambda: "/"), ("the home directory", Path.home),
-                 ("the working directory", os.getcwd))
+    cannot be resolved matches nothing rather than disabling Garmin.  Every
+    match is named: in the image HOME and the cwd are both /app."""
+    locations = (("the filesystem root", lambda: "/"), ("the working directory", os.getcwd),
+                 ("the home directory", Path.home))
+    matched = []
     for reason, locate in locations:
         try:
             directory = Path(os.path.realpath(locate()))
         except (OSError, RuntimeError, KeyError):
             continue
         if root == directory:
-            raise TokenRootRefused(reason)
+            matched.append(reason)
+    if matched:
+        raise TokenRootRefused(" and ".join(matched))
 
 
 def _is_trusted_sticky(found: os.stat_result) -> bool:
