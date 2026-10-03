@@ -35,8 +35,7 @@ def person_lock_key(person_id: int) -> LockKey:
 # to release, in _close_lock_handle), so if EACH service is waiting on as many
 # distinct people's locks as its pool has threads (min(32, cpu+4); about ten
 # people's Garmin calls at once across both services), both services hang
-# until restarted.  Reproduced in review; main behaves the same.  See the
-# #95.
+# until restarted.  Reproduced in review; main behaves the same.  See #95.
 def _acquire_lock(lock_path: Path):
     handle = open(lock_path, "a")
     try:
