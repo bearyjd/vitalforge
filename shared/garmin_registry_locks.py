@@ -88,6 +88,9 @@ async def flock_scope(local_key: LockKey, lock_path: Callable[[], Path]) -> Asyn
     """
     local_lock = _process_local_lock(local_key)
     async with local_lock:
+        # Usually no flock is held here.  Inside the boot-time adoption the
+        # legacy-store flock is (person_flock nests in it); harmless, as the
+        # other service can add at most one waiting thread on that lock.
         path = await asyncio.to_thread(lock_path)
         acquire_task = asyncio.create_task(asyncio.to_thread(_acquire_lock, path))
         try:
