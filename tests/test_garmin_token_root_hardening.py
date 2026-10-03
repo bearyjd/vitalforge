@@ -54,6 +54,31 @@ def test_prod_default_root_is_unchanged(monkeypatch, caplog):
     assert _normalize("/app/data/garth-tokens") == Path("/app/data/garth-tokens")
 
 
+def test_an_image_shaped_root_boots_quietly_with_garmin_enabled(_tmp_is_trusted, monkeypatch, tmp_path, caplog):
+    """/app does not exist on a test host, so the test above cannot see the
+    ancestor walk or the HOME/cwd refusals act on a real tree.  This one
+    builds the image's shape under tmp_path -- a service-owned 0755
+    ``app/data`` chain with HOME and the cwd both at ``app`` -- and requires
+    no ERROR, no WARNING, a usable root and a passing boot probe."""
+    app = _volume(tmp_path, 0o755)
+    app = app.rename(tmp_path / "app")
+    data = app / "data"
+    data.mkdir()
+    data.chmod(0o755)
+    monkeypatch.setenv("HOME", str(app))
+    monkeypatch.chdir(app)
+    monkeypatch.setenv("GARTH_TOKEN_DIR", str(data / ".garth"))
+    caplog.set_level(logging.INFO)
+
+    root = garmin_registry._configured_token_root()
+
+    assert root == data / ".garth"
+    assert garmin_registry_common.first_writable_ancestor(root) is None
+    monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", root)
+    assert garmin_registry.check_token_root() is True
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
 @pytest.mark.parametrize("blank", ["", " ", "\t\n "])
 def test_a_blank_root_is_treated_as_unset(blank, monkeypatch, caplog):
     """``GARTH_TOKEN_DIR=${GARTH_TOKEN_DIR:-}`` in compose passes an empty
