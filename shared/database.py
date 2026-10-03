@@ -12,8 +12,9 @@ from shared.database_columns import (
     WEIGHT_HISTORY_ADDITIVE_COLUMNS,
     WEIGHT_LOG_ADDITIVE_COLUMNS,
 )
+from shared.env_paths import refuse_leading_tilde
 
-DB_PATH = Path(os.getenv("DB_PATH", "/app/data/fitness.db"))
+DB_PATH = Path(refuse_leading_tilde("DB_PATH", os.getenv("DB_PATH", "/app/data/fitness.db")))
 
 
 async def _add_columns(db, table: str, column_ddls: list[str]):
