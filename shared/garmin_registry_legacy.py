@@ -282,7 +282,9 @@ async def _adoptable_primary_person_in(db, canonical_email: str) -> int | None:
     ``generation-1`` directory with no ledger row can only be an interrupted
     adoption.
     """
-    primary = await (await db.execute("SELECT id FROM persons WHERE is_primary = 1")).fetchone()
+    primary = await (
+        await db.execute("SELECT id FROM persons WHERE is_primary = 1 AND archived_at IS NULL")
+    ).fetchone()
     if primary is None:
         return None
     person_id = int(primary["id"])

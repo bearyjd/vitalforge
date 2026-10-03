@@ -1323,6 +1323,33 @@ async def test_marker_blocks_re_adoption_for_a_different_primary(initialized_db,
     assert (root / "garmin_tokens.json").is_file()
 
 
+async def test_bootstrap_never_adopts_for_an_archived_primary(initialized_db, monkeypatch, tmp_path):
+    """Every route-driven publication requires ``archived_at IS NULL``; an
+    archived primary (a hand-edited database) must not receive the flat store,
+    get a ``linked`` row no route can reach, or burn the one-time marker."""
+    root = _flat_store(tmp_path)
+    person_id = await get_primary_person_id()
+    calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", root)
+    monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _fake_auth(calls))
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
+    monkeypatch.setenv("GARMIN_EMAIL", f"person-{person_id}@example.test")
+    db = await get_db()
+    try:
+        await db.execute("UPDATE persons SET archived_at = '2026-09-15T00:00:00Z' WHERE id = ?", (person_id,))
+        await db.commit()
+    finally:
+        await db.close()
+
+    assert await garmin_registry_legacy.bootstrap_legacy_token_store() is False
+
+    assert calls == [], "an archived primary's adoption reached Garmin"
+    assert await _link_row(person_id) is None
+    assert not await _adoption_marker_recorded()
+    assert (root / "garmin_tokens.json").is_file()
+    assert not garmin_registry._person_token_root(person_id).exists()
+
+
 async def test_bootstrap_waits_for_a_busy_permit_instead_of_deferring(initialized_db, monkeypatch, tmp_path):
     """Adoption is one boot-time verification; a permit one interval away is
     worth a short wait, not a whole boot cycle."""
