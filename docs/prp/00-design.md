@@ -981,7 +981,7 @@ upload.
 
 > **Current model (supersedes the paragraph above; the ordering decision below is
 > unchanged).** The `shared.garmin_client.push_weight` wrapper no longer exists.
-> The route calls `garmin_registry.call(person_id, operation, ...)`, which hands the
+> The route calls `garmin_registry.call(person_id, op, *, max_wait_seconds=0.0)`, which hands the
 > synchronous operation to `asyncio.to_thread`, so the push runs in a worker thread
 > and other requests keep running while it is in flight. The pinned
 > `garminconnect==0.3.16` bounds each request itself (15 s per request, one session
