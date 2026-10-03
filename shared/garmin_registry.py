@@ -720,7 +720,7 @@ async def _resume_link(
     return client
 
 
-async def _note_operation_failure(person_id: int, generation: int, exc: BaseException) -> str:
+async def _note_operation_failure(person_id: int, generation: int, exc: Exception) -> str:
     """Classify a provider failure and drop a session it says is dead.
 
     A 401/403 from a normal operation means this cached session is no
