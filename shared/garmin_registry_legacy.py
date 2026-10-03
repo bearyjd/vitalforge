@@ -93,7 +93,7 @@ async def _adopt_legacy_store_locked(root: Path, canonical_email: str) -> bool:
     have reserved its generation in the meantime.
     """
     if await _legacy_adoption_recorded():
-        if _looks_like_legacy_token_store(root):
+        if await asyncio.to_thread(_looks_like_legacy_token_store, root):
             # Live credential residue (e.g. a restored .garth backup): named,
             # never read, adopted or deleted -- an operator decides what it is.
             logger.warning(
@@ -125,8 +125,9 @@ async def _adopt_for_person_locked(person_id: int, canonical_email: str, root: P
     """Both flocks are held.  The moved-store branch exists for a process
     killed between the file move and the database commit: the flat store is
     already under ``generation-1`` and only the publication is missing."""
-    durable = garmin_registry.resolve_token_dir(person_id, _LEGACY_GENERATION)
-    if _looks_like_legacy_token_store(durable):
+    # Filesystem checks (and resolve_token_dir's root mkdir/chmod) stay off the loop.
+    durable = await asyncio.to_thread(garmin_registry.resolve_token_dir, person_id, _LEGACY_GENERATION)
+    if await asyncio.to_thread(_looks_like_legacy_token_store, durable):
         if not await _verify_token_store(person_id, canonical_email, durable):
             return False
         published = await _publish_legacy_adoption(person_id, canonical_email)
@@ -136,7 +137,7 @@ async def _adopt_for_person_locked(person_id: int, canonical_email: str, root: P
             )
         return published
     await _warn_about_orphaned_moved_stores(root, person_id)
-    if not _looks_like_legacy_token_store(root):
+    if not await asyncio.to_thread(_looks_like_legacy_token_store, root):
         logger.info("Legacy Garmin token-store adoption skipped: no flat token store is present")
         return False
     return await _adopt_flat_store(person_id, canonical_email, root, durable)

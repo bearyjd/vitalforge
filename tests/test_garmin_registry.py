@@ -834,6 +834,44 @@ async def test_bootstrap_adopts_a_verified_flat_store_once_by_moving_it(
     assert ledger["generation"] == 1
 
 
+@pytest.mark.parametrize("marker_first", [False, True], ids=["adopting", "marker-recorded"])
+async def test_adoption_does_its_filesystem_checks_off_the_event_loop(
+    initialized_db, monkeypatch, tmp_path, marker_first
+):
+    """Under both flocks the stats and the token-root mkdir/chmod run on a
+    worker thread, not on the loop the other lifespan steps share."""
+    root = _flat_store(tmp_path)
+    person_id = await get_primary_person_id()
+    monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", root)
+    monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _fake_auth([]))
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
+    monkeypatch.setenv("GARMIN_EMAIL", f"person-{person_id}@example.test")
+    if marker_first:
+        assert await garmin_registry_legacy.bootstrap_legacy_token_store() is True
+        (root / "garmin_tokens.json").write_text("{}", encoding="ascii")
+    loop_thread = threading.get_ident()
+    ran_on: dict[str, list[int]] = {"looks_like": [], "resolve_token_dir": []}
+    real_looks_like = garmin_registry_legacy._looks_like_legacy_token_store
+    real_resolve = garmin_registry.resolve_token_dir
+
+    def looks_like(path):
+        ran_on["looks_like"].append(threading.get_ident())
+        return real_looks_like(path)
+
+    def resolve(*args):
+        ran_on["resolve_token_dir"].append(threading.get_ident())
+        return real_resolve(*args)
+
+    monkeypatch.setattr(garmin_registry_legacy, "_looks_like_legacy_token_store", looks_like)
+    monkeypatch.setattr(garmin_registry, "resolve_token_dir", resolve)
+
+    assert await garmin_registry_legacy.bootstrap_legacy_token_store() is (not marker_first)
+
+    assert ran_on["looks_like"], "the flat-store check was never consulted"
+    assert marker_first or ran_on["resolve_token_dir"], "the durable directory was never resolved"
+    assert loop_thread not in ran_on["looks_like"] + ran_on["resolve_token_dir"], ran_on
+
+
 async def test_bootstrap_logs_the_skip_reason_when_no_flat_store_exists(
     initialized_db, monkeypatch, tmp_path, caplog
 ):
