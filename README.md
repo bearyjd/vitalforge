@@ -156,7 +156,7 @@ with `{"status": "link_required", ...}` and nothing is started. Synced metrics:
 - Training load
 - Steps and active calories
 
-All of the above are synced, stored, and queryable via `/api/metrics/{name}` (see
+All of the above are synced, stored, and queryable via `/p/{slug}/api/metrics/{name}` (see
 [API Reference](#api-reference)). The dashboard UI currently charts weight and body fat
 only — body water, bone mass, and muscle mass are not yet rendered as charts, though the
 data is there for anyone querying the API directly.
@@ -464,7 +464,7 @@ Log weight from your Android phone using Tasker without opening the browser.
    - Input Type: `Decimal`
 3. Add action: **Net > HTTP Request**
    - Method: `POST`
-   - URL: `https://weight.yourdomain.com/api/weight`
+   - URL: `https://weight.yourdomain.com/p/YOUR_SLUG/api/weight`
    - Headers: `Content-Type: application/json`
    - Body: `{"weight": %input, "unit": "lbs"}`
    - If using auth, add header: `Authorization: Bearer YOUR_API_TOKEN`
@@ -506,16 +506,25 @@ If you don't use Tasker, the free "NFC Tools" app can open a URL on tap:
 
 ## API Reference
 
+Person-scoped routes live under `/p/{slug}/` (`{slug}` is the person's slug; the caller needs
+a grant on that person, see [People and access](#people-and-access)). `/health`, `/auth/*`
+and `/api/persons*` are global. The Garmin link routes are listed under
+[Linking Garmin](#linking-garmin).
+
 ### Weight Service (port 8085)
 
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/health` | Health check |
-| `GET` | `/` | Weight entry UI |
-| `POST` | `/api/weight` | Log weight and optional body composition (see below) |
-| `GET` | `/api/weight/recent` | Last 10 weigh-ins |
-| `GET` | `/api/weight/trend` | Last 30 days for trend chart |
-| `DELETE` | `/api/weight/{id}` | Delete a weigh-in |
+| `GET` | `/` | Redirects to the caller's own person page |
+| `GET` | `/p/{slug}/` | Weight entry UI |
+| `POST` | `/p/{slug}/api/weight` | Log weight and optional body composition (see below) |
+| `GET` | `/p/{slug}/api/weight/recent` | Last 10 weigh-ins |
+| `GET` | `/p/{slug}/api/weight/trend` | Last 30 days for trend chart |
+| `DELETE` | `/p/{slug}/api/weight/{id}` | Delete a weigh-in |
+| `POST` | `/p/{slug}/api/activity` | Store a completed strength session (`202`) |
+| `GET` | `/p/{slug}/api/activity/{session_id}` | One stored strength session by its client-generated id |
+| `GET` | `/p/{slug}/api/strength-sessions` | Stored strength sessions, newest first |
 
 **Body composition.** All composition fields are optional and independent of each other:
 
@@ -564,14 +573,22 @@ the same weigh-in rather than a new one:
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/health` | Health check |
-| `GET` | `/` | Dashboard UI |
-| `POST` | `/api/sync?days=7` | Trigger manual Garmin sync; `200 {"status": "link_required", "store_only": true, "message": ...}` when the person has no Garmin link (nothing is started) |
-| `GET` | `/api/sync/status` | Last sync time and status |
-| `GET` | `/api/metrics/{name}?days=30` | Time series data with 7-day moving average |
-| `GET` | `/api/recommendations` | AI-powered health recommendations |
-| `GET` | `/api/recommendations/rules-only` | Rules engine output without LLM |
-| `GET` | `/api/correlations?metrics=a,b,c&days=30&lag=0&min_pairs=5` | Ad-hoc cross-metric correlation matrix |
-| `GET` | `/api/export?metric=all\|{name}&days=30&format=csv\|json` | Download metric data as a CSV or JSON file |
+| `GET` | `/` | Redirects to the caller's own person dashboard |
+| `GET` | `/p/{slug}/` | Dashboard UI |
+| `POST` | `/p/{slug}/api/sync?days=7` | Trigger manual Garmin sync; `200 {"status": "link_required", "store_only": true, "message": ...}` when the person has no Garmin link (nothing is started) |
+| `GET` | `/p/{slug}/api/sync/status` | Last sync time and status |
+| `GET` | `/p/{slug}/api/metrics/{name}?days=30` | Time series data with 7-day moving average |
+| `GET` | `/p/{slug}/api/recommendations` | AI-powered health recommendations |
+| `GET` | `/p/{slug}/api/recommendations/rules-only` | Rules engine output without LLM |
+| `GET` | `/p/{slug}/api/correlations?metrics=a,b,c&days=30&lag=0&min_pairs=5` | Ad-hoc cross-metric correlation matrix |
+| `GET` | `/p/{slug}/api/export?metric=all\|{name}&days=30&format=csv\|json` | Download metric data as a CSV or JSON file |
+| `GET` | `/p/{slug}/api/readiness` | Composite readiness/recovery score (0-100) |
+| `POST` / `GET` | `/p/{slug}/api/goals` | Create / list the caller's goals |
+| `GET` / `PATCH` | `/p/{slug}/api/goals/{id}` | Read / update one goal |
+| `DELETE` | `/api/goals/{id}` | Delete a goal. Account-scoped, not person-scoped, so it is the one goals route outside `/p/{slug}/` |
+| `POST` | `/p/{slug}/api/import/activity` | Import a local FIT activity file |
+| `GET` | `/p/{slug}/api/activities` | Imported FIT activities |
+| `GET` | `/p/{slug}/api/activities/{id}` | One imported activity |
 
 Available metrics: `sleep_duration`, `sleep_score`, `resting_hr`, `hrv`, `body_battery`, `body_battery_low`, `stress`, `vo2max`, `weight`, `body_fat`, `body_water`, `bone_mass`, `muscle_mass`, `training_load`, `steps`, `active_calories`
 
@@ -580,7 +597,7 @@ request fields' storage convention, confirmed against a real Garmin read-back �
 `docs/prp/00-design.md` §3.5/§4.3 and `docs/prp/03-live-validation.md`); `body_fat` and
 `body_water` are plain percentages, same as the request fields they come from.
 
-**Correlations.** `/api/correlations` returns a row-major NxN Pearson correlation matrix
+**Correlations.** `/p/{slug}/api/correlations` returns a row-major NxN Pearson correlation matrix
 (`cells[i][j] = {"r": float|null, "n": int}`) across any subset of the metrics above —
 `weight_log` (the raw, timestamp-keyed weigh-in log) is deliberately not queryable here since
 every other metric is date-keyed and the alignment is a plain date inner-join. `lag` shifts
