@@ -93,6 +93,14 @@ async def _adopt_legacy_store_locked(root: Path, canonical_email: str) -> bool:
     have reserved its generation in the meantime.
     """
     if await _legacy_adoption_recorded():
+        if _looks_like_legacy_token_store(root):
+            # Live credential residue (e.g. a restored .garth backup): named,
+            # never read, adopted or deleted -- an operator decides what it is.
+            logger.warning(
+                "Legacy Garmin token store %s is back at the token root after adoption; "
+                "it is never used and is left in place for an operator to remove",
+                token_file_path(str(root)).name,
+            )
         logger.info("Legacy Garmin token-store adoption skipped: marker already recorded")
         return False
     person_id = await _adoptable_primary_person(canonical_email)

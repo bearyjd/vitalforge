@@ -932,6 +932,50 @@ async def test_bootstrap_never_re_adopts_after_unlink_even_if_the_flat_store_ret
     assert (root / "garmin_tokens.json").is_file(), "an un-adoptable store is left where it was"
 
 
+async def test_bootstrap_warns_about_a_flat_store_restored_after_the_marker(
+    initialized_db, monkeypatch, tmp_path, caplog
+):
+    """A restored volume backup (post-marker database, pre-adoption ``.garth``)
+    puts a live credential back at the root. Boot names it at WARNING; it
+    never reads, adopts or deletes it."""
+    root = _flat_store(tmp_path)
+    person_id = await get_primary_person_id()
+    calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", root)
+    monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _fake_auth(calls))
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
+    monkeypatch.setenv("GARMIN_EMAIL", f"person-{person_id}@example.test")
+    assert await garmin_registry_legacy.bootstrap_legacy_token_store() is True
+    restored = root / "garmin_tokens.json"
+    restored.write_text('{"token": "restored-secret-value"}', encoding="ascii")
+    caplog.set_level(logging.INFO, logger="shared.garmin_registry_legacy")
+
+    assert await garmin_registry_legacy.bootstrap_legacy_token_store() is False
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("garmin_tokens.json" in message for message in warnings), warnings
+    assert "restored-secret-value" not in caplog.text
+    assert str(root) not in caplog.text
+    assert restored.read_text(encoding="ascii") == '{"token": "restored-secret-value"}'
+    assert calls == [(person_id, 1)], "the restored store must never be verified"
+
+
+async def test_bootstrap_after_the_marker_does_not_warn_without_a_flat_store(
+    initialized_db, monkeypatch, tmp_path, caplog
+):
+    root = _flat_store(tmp_path)
+    person_id = await get_primary_person_id()
+    monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", root)
+    monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _fake_auth([]))
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
+    monkeypatch.setenv("GARMIN_EMAIL", f"person-{person_id}@example.test")
+    assert await garmin_registry_legacy.bootstrap_legacy_token_store() is True
+    caplog.set_level(logging.WARNING, logger="shared.garmin_registry_legacy")
+
+    assert await garmin_registry_legacy.bootstrap_legacy_token_store() is False
+    assert caplog.records == []
+
+
 async def test_bootstrap_completes_an_interrupted_adoption_without_moving_again(
     initialized_db, monkeypatch, tmp_path
 ):
