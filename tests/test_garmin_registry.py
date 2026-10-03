@@ -337,6 +337,37 @@ async def test_cold_call_bounds_its_post_login_permit_by_the_remaining_budget(
     assert garmin_client.is_authenticated(person_id, 1), "the warm client is kept for the retry"
 
 
+async def test_cold_call_waits_past_one_interval_when_its_budget_covers_it(initialized_db, monkeypatch, tmp_path):
+    """The other arm of the post-login bound: a remaining budget LARGER than
+    one interval is honoured, not cut down to the grace. The peer pushes the
+    slot two intervals out during the login, and the operation still runs
+    after one longer sleep."""
+    person_id = await get_primary_person_id()
+    await _cold_link(person_id, tmp_path)
+    monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _fake_auth([]))
+    monkeypatch.setenv("GARMIN_MIN_CALL_INTERVAL_SECONDS", "2")
+    clock = {"now": 100.0}
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: clock["now"])
+    slept: list[float] = []
+
+    async def advance(seconds: float) -> None:
+        slept.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(garmin_registry.asyncio, "sleep", advance)
+    real_record_success = garmin_registry._record_auth_success
+
+    async def peer_takes_two_slots(*args):
+        await real_record_success(*args)
+        await _set_next_allowed_at(clock["now"] + 4.0)
+
+    monkeypatch.setattr(garmin_registry, "_record_auth_success", peer_takes_two_slots)
+    await _set_next_allowed_at(0.0)  # the first permit is free; the login spends it
+
+    assert await garmin_registry.call(person_id, lambda client: client.generation, max_wait_seconds=10.0) == 1
+    assert slept == [4], f"expected one four-second wait inside the ten-second budget, got {slept}"
+
+
 _RUNAWAY_SLEEPS = 100
 
 
