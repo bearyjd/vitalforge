@@ -2459,6 +2459,73 @@ async def test_call_cleans_post_publication_crash_stale_generation_directory(ini
     assert new_dir.exists()
 
 
+async def _durable_generation_two(person_id: int) -> None:
+    await _link(person_id, generation=2)
+    db = await get_db()
+    try:
+        await db.execute("INSERT INTO garmin_link_generations VALUES (?, 2)", (person_id,))
+        await db.commit()
+    finally:
+        await db.close()
+    new_dir = garmin_registry._generation_token_dir(person_id, 2)
+    new_dir.mkdir(parents=True, mode=0o700)
+    (new_dir / "garmin_tokens.json").touch()
+    garmin_client._clients[(person_id, 2)] = _FakeClient(2)
+
+
+async def test_call_sweep_skips_a_symlinked_generation_directory(initialized_db, monkeypatch, tmp_path, caplog):
+    """A ``generation-N`` symlink (a backup-restore artefact) is neither swept
+    nor allowed to fail the request: rmtree refuses symlinks, and the target
+    may be anything."""
+    person_id = await get_primary_person_id()
+    await _durable_generation_two(person_id)
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    (target / "keep.txt").write_text("keep", encoding="ascii")
+    link = garmin_registry._generation_token_dir(person_id, 1)
+    link.symlink_to(target, target_is_directory=True)
+    removed: list = []
+    real_remove = garmin_registry._remove_token_dir
+
+    def spy_remove(path):
+        removed.append(path)
+        real_remove(path)
+
+    monkeypatch.setattr(garmin_registry, "_remove_token_dir", spy_remove)
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
+    caplog.set_level(logging.WARNING, logger="shared.garmin_registry")
+
+    assert await garmin_registry.call(person_id, lambda client: client.generation) == 2
+    assert link not in removed, "the sweep must skip a symlink, not try to remove it"
+    assert caplog.records == []
+    assert link.is_symlink()
+    assert (target / "keep.txt").read_text(encoding="ascii") == "keep"
+
+
+async def test_call_survives_an_obsolete_generation_it_cannot_remove(initialized_db, monkeypatch, caplog):
+    """The sweep is best effort, like _remove_superseded_generation: an
+    undeletable obsolete generation is inert residue, not a failed request."""
+    person_id = await get_primary_person_id()
+    await _durable_generation_two(person_id)
+    old_dir = garmin_registry._generation_token_dir(person_id, 1)
+    old_dir.mkdir(mode=0o700)
+    real_remove = garmin_registry._remove_token_dir
+
+    def stubborn_remove(path):
+        if path == old_dir:
+            raise PermissionError("directory-detail-must-not-escape")
+        real_remove(path)
+
+    monkeypatch.setattr(garmin_registry, "_remove_token_dir", stubborn_remove)
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
+    caplog.set_level(logging.WARNING, logger="shared.garmin_registry")
+
+    assert await garmin_registry.call(person_id, lambda client: client.generation) == 2
+    assert old_dir.exists()
+    assert "PermissionError" in caplog.text
+    assert "directory-detail" not in caplog.text
+
+
 
 def _with_response(exc: Exception, status_code: int) -> Exception:
     class _Response:

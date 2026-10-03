@@ -253,26 +253,24 @@ async def forget_and_remove_person_token_store(person_id: int) -> None:
 
 
 def _sweep_unreferenced_generation_dirs(person_id: int, durable_generation: int | None) -> None:
-    """Delete only obsolete immutable generations while caller owns the flock.
+    """Best effort, under the caller's flock: delete obsolete generations only.
 
-    Staging directories live beside ``person-<id>`` rather than beneath it,
-    and are intentionally outside this sweep.  A durable generation is never
-    removed, even if its contents are incomplete; deleting it would turn a
-    recoverable token-store failure into a wrong-account fallback.
-    """
-    person_root = _person_token_root(person_id)
-    if not person_root.is_dir():
-        return
-    for child in person_root.iterdir():
-        if not child.is_dir() or not child.name.startswith(garmin_registry_common.GENERATION_DIR_PREFIX):
+    Staging lives beside ``person-<id>``, outside this sweep; a symlink is skipped; a durable
+    generation is kept even if incomplete (else a recoverable failure becomes a wrong-account fallback)."""
+    person_root, prefix = _person_token_root(person_id), garmin_registry_common.GENERATION_DIR_PREFIX
+    for child in person_root.iterdir() if person_root.is_dir() else ():
+        if child.is_symlink() or not child.is_dir() or not child.name.startswith(prefix):
             continue
         try:
-            generation = int(child.name.removeprefix(garmin_registry_common.GENERATION_DIR_PREFIX))
+            generation = int(child.name.removeprefix(prefix))
         except ValueError:
             continue
         if generation < 1 or generation == durable_generation:
             continue
-        _remove_token_dir(child)
+        try:
+            _remove_token_dir(child)
+        except Exception as exc:  # inert residue, as in _remove_superseded_generation
+            logger.warning("Obsolete Garmin generation cleanup for person %s failed (%s)", person_id, type(exc).__name__)
 
 
 async def _next_generation(db, person_id: int) -> int:
