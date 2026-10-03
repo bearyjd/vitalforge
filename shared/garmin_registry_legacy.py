@@ -144,9 +144,11 @@ async def _adopt_for_person_locked(person_id: int, canonical_email: str, root: P
 
 def _moved_store_person_ids(root: Path) -> list[int]:
     """Person ids owning a ``generation-1`` token file, from names alone."""
+    person_prefix = garmin_registry_common.PERSON_DIR_PREFIX
+    generation_dir = f"{garmin_registry_common.GENERATION_DIR_PREFIX}{_LEGACY_GENERATION}"
     person_ids: list[int] = []
-    for token_path in root.glob("person-*/generation-1/garmin_tokens.json"):
-        suffix = token_path.parent.parent.name.removeprefix("person-")
+    for token_path in root.glob(f"{person_prefix}*/{generation_dir}/garmin_tokens.json"):
+        suffix = token_path.parent.parent.name.removeprefix(person_prefix)
         if suffix.isdigit():
             person_ids.append(int(suffix))
     return person_ids

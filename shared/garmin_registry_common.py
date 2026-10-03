@@ -35,6 +35,10 @@ MAX_INTERACTIVE_WAIT_SECONDS = 30.0
 # guard is only correct while its ceiling is this same value, which is why both
 # read it from here rather than repeating the literal.
 MAX_CALL_INTERVAL_SECONDS = 60.0
+# The durable token layout, <root>/person-<id>/generation-<n>/: the facade
+# builds and cleans these paths, and the legacy adoption globs them.
+PERSON_DIR_PREFIX = "person-"
+GENERATION_DIR_PREFIX = "generation-"
 
 
 def utc_now() -> str:

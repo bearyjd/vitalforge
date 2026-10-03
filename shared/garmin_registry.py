@@ -127,11 +127,11 @@ def _staging_token_dir(person_id: int, generation: int) -> Path:
 
 
 def _person_token_root(person_id: int) -> Path:
-    return _ensure_token_root() / f"person-{person_id}"
+    return _ensure_token_root() / f"{garmin_registry_common.PERSON_DIR_PREFIX}{person_id}"
 
 
 def _generation_token_dir(person_id: int, generation: int) -> Path:
-    return _person_token_root(person_id) / f"generation-{generation}"
+    return _person_token_root(person_id) / f"{garmin_registry_common.GENERATION_DIR_PREFIX}{generation}"
 
 
 def resolve_token_dir(person_id: int, generation: int) -> Path:
@@ -184,8 +184,8 @@ def _remove_token_dir(path: Path) -> None:
     is_stage = path.parent == root and path.name.startswith(".person-")
     is_generation = (
         path.parent.parent == root
-        and path.parent.name.startswith("person-")
-        and path.name.startswith("generation-")
+        and path.parent.name.startswith(garmin_registry_common.PERSON_DIR_PREFIX)
+        and path.name.startswith(garmin_registry_common.GENERATION_DIR_PREFIX)
     )
     if not (is_stage or is_generation):
         raise RuntimeError("refusing unsafe Garmin token cleanup")
@@ -214,7 +214,7 @@ def _remove_person_token_root(person_id: int) -> None:
         raise RuntimeError("refusing unsafe Garmin token cleanup")
     root = _ensure_token_root()
     path = _person_token_root(person_id)
-    if path.parent != root or path.name != f"person-{person_id}":
+    if path.parent != root or path.name != f"{garmin_registry_common.PERSON_DIR_PREFIX}{person_id}":
         raise RuntimeError("refusing unsafe Garmin token cleanup")
     if path.exists():
         shutil.rmtree(path)
@@ -264,10 +264,10 @@ def _sweep_unreferenced_generation_dirs(person_id: int, durable_generation: int 
     if not person_root.is_dir():
         return
     for child in person_root.iterdir():
-        if not child.is_dir() or not child.name.startswith("generation-"):
+        if not child.is_dir() or not child.name.startswith(garmin_registry_common.GENERATION_DIR_PREFIX):
             continue
         try:
-            generation = int(child.name.removeprefix("generation-"))
+            generation = int(child.name.removeprefix(garmin_registry_common.GENERATION_DIR_PREFIX))
         except ValueError:
             continue
         if generation < 1 or generation == durable_generation:
