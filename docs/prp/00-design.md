@@ -972,14 +972,26 @@ sub-case 1 or 3.
 read → push → write ordering would have put the Garmin HTTP upload *inside* the
 write transaction, and the only thing making that acceptable was a requirement
 that the call carry an explicit timeout shorter than SQLite's busy timeout.
-**That mitigation names a mechanism that does not exist**: `add_body_composition`
-has no `timeout` parameter, nor does `Garmin.__init__`; the call bottoms out in
-garth's session, which is adjacent to the auth flow the ground rules protect. It
-is also **synchronous** — `push_weight` is not a coroutine and
-`vitalforge-weight/app.py:87` calls it with no `await` inside an `async def`
-route — so `asyncio.wait_for` could not bound it either, and for the duration of
-the upload the weight service's whole event loop is blocked, not merely its write
-lock.
+**That mitigation named a mechanism that did not exist at the time**:
+`add_body_composition` had no `timeout` parameter, nor did `Garmin.__init__`, and
+the call was **synchronous** — `shared.garmin_client.push_weight` was not a
+coroutine and the route called it with no `await`, so `asyncio.wait_for` could not
+bound it either and the whole event loop was blocked for the duration of the
+upload.
+
+> **Current model (supersedes the paragraph above; the ordering decision below is
+> unchanged).** The `shared.garmin_client.push_weight` wrapper no longer exists.
+> The route calls `garmin_registry.call(person_id, operation, ...)`, which hands the
+> synchronous operation to `asyncio.to_thread`, so the push runs in a worker thread
+> and other requests keep running while it is in flight. The pinned
+> `garminconnect==0.3.16` bounds each request itself (15 s per request, one session
+> refresh and one retry on a 401), so a warm push is about 60 s worst case and a
+> cold push (client not yet cached, so a login first) about 455 s. The push claim
+> (`_GARMIN_CLAIM_TIMEOUT_SECONDS`) is 600 s, which stays inside that bound only
+> while no push can outlive it. The arithmetic, the reasons not to wrap the
+> operation in `asyncio.wait_for`, and the rule for re-checking it when
+> `garminconnect` is bumped are in the header comment of
+> `vitalforge_weight/garmin_claim.py`; read that, not this section, for the numbers.
 
 With this ordering the lock covers only local DB work, so **no timeout mechanism
 is needed at all.** The cost it replaces was real and 5× larger than an earlier
@@ -1723,7 +1735,9 @@ index on a quantised `(weight_grams, timestamp)` bucket, letting SQLite arbitrat
    explicit call timeout. **No such timeout exists**: neither
    `add_body_composition` nor `Garmin.__init__` takes one, the call bottoms out
    in garth's session (adjacent to the protected auth flow), and it is
-   synchronous, so `asyncio.wait_for` cannot bound it either. The ordering is now
+   synchronous, so `asyncio.wait_for` cannot bound it either (as of that revision;
+   the push now runs in a worker thread with SDK per-request timeouts and a 600 s
+   claim, see the "Current model" note under §3.7's Ordering). The ordering is now
    **read → write → commit → push → update-flag**, which removes the need for any
    timeout mechanism because the lock never spans the network call.
 
