@@ -304,9 +304,15 @@ def add_activity_routes(app):
                 # that stored id -- never create_manual_activity, never a change
                 # to garmin_status. Without a stored id there is nothing to
                 # address, and with the flag off the sets path stays dormant.
+                # A non-NULL garmin_name_prefix marks a pre-Phase-3 cross-person
+                # override row (the only writer that ever set it): its activity
+                # lives in the retired global account. Migration 003 retired
+                # only its pending/failed/unknown rows, so a SYNCED one reaches
+                # here and must not be sent through this person's own link.
                 should_retry_sets = (
                     data.push_to_garmin
                     and not is_retired_global_target
+                    and existing["garmin_name_prefix"] is None
                     and outcome.garmin_status == "synced"
                     and outcome.garmin_sets_status == "failed"
                     and bool(outcome.garmin_activity_id)

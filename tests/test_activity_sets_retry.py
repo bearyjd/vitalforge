@@ -71,18 +71,22 @@ async def seed_synced_row(
     garmin_activity_id: str | None = STORED_ACTIVITY_ID,
     garmin_sets_status: str = "failed",
     garmin_claimed_at: str | None = None,
+    garmin_status: str = "synced",
+    garmin_error: str | None = None,
+    garmin_name_prefix: str | None = None,
+    exercises_json: str = EXERCISES_JSON,
 ) -> None:
     now = datetime.now(timezone.utc).isoformat()
     db = await get_db()
     try:
         await db.execute(
             "INSERT INTO strength_sessions (person_id, session_id, session_label, start_time_utc, "
-            "duration_seconds, exercises_json, garmin_status, garmin_activity_id, garmin_sets_status, "
-            "garmin_claimed_at, created_at, updated_at) "
-            "VALUES (?, ?, 'Lower A', ?, 2520, ?, 'synced', ?, ?, ?, ?, ?)",
+            "duration_seconds, exercises_json, garmin_status, garmin_activity_id, garmin_error, "
+            "garmin_sets_status, garmin_claimed_at, garmin_name_prefix, created_at, updated_at) "
+            "VALUES (?, ?, 'Lower A', ?, 2520, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                person_id, session_id, START, EXERCISES_JSON, garmin_activity_id,
-                garmin_sets_status, garmin_claimed_at, now, now,
+                person_id, session_id, START, exercises_json, garmin_status, garmin_activity_id,
+                garmin_error, garmin_sets_status, garmin_claimed_at, garmin_name_prefix, now, now,
             ),
         )
         await db.commit()
@@ -293,6 +297,25 @@ async def test_sets_not_failed_is_not_retried(client, fake_garmin_client, sets_o
     assert resp.json()["garmin_sets_status"] == sets_status
     assert fake_garmin_client.registry_calls == []
     assert fake_garmin_client.created_activities == []
+
+
+async def test_legacy_cross_account_row_is_not_retried(client, fake_garmin_client, sets_on):
+    """A non-NULL garmin_name_prefix marks a pre-Phase-3 override row whose
+    activity lives in the retired global Garmin account. Migration 003 only
+    retired its pending/failed/unknown rows, so a synced one must be refused
+    here rather than sent through this person's own link."""
+    person_id = await get_primary_person_id()
+    await seed_synced_row(person_id, garmin_name_prefix="Son")
+
+    resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
+
+    assert resp.status_code == 200
+    assert resp.json()["garmin_status"] == "synced"
+    assert resp.json()["garmin_sets_status"] == "failed"
+    assert fake_garmin_client.registry_calls == []
+    row = await fetch_row(person_id)
+    assert row["garmin_sets_status"] == "failed"
+    assert row["garmin_claimed_at"] is None
 
 
 async def test_push_to_garmin_false_does_not_retry(client, fake_garmin_client, sets_on):
