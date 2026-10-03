@@ -11,6 +11,7 @@ guard fails here rather than hanging a boot.
 """
 
 import asyncio
+import threading
 
 import pytest
 
@@ -92,3 +93,24 @@ async def test_flock_scope_releases_the_local_lock_when_the_lock_path_raises(tmp
     async with asyncio.timeout(2):
         async with garmin_registry.person_flock(1):
             pass
+
+
+async def test_flock_scope_prepares_its_lock_path_off_the_event_loop(tmp_path):
+    """`lock_path()` may mkdir/chmod the token root; that runs on a worker
+    thread, still under the process-local lock."""
+    loop_thread = threading.get_ident()
+    local_lock_held: list[bool] = []
+    ran_on: list[int] = []
+    key = garmin_registry_locks.person_lock_key(99)
+    local_lock = garmin_registry_locks._process_local_lock(key)
+
+    def lock_path():
+        ran_on.append(threading.get_ident())
+        local_lock_held.append(local_lock.locked())
+        return tmp_path / "probe.lock"
+
+    async with asyncio.timeout(2):
+        async with garmin_registry_locks.flock_scope(key, lock_path):
+            pass
+    assert ran_on and ran_on[0] != loop_thread, "lock_path() ran on the event loop thread"
+    assert local_lock_held == [True], "lock_path() must still run under the process-local lock"

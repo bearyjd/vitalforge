@@ -69,9 +69,10 @@ async def flock_scope(local_key: LockKey, lock_path: Callable[[], Path]) -> Asyn
     The process-local lock comes first because flock alone does not make two
     descriptors in one process wait for each other (see
     :func:`_process_local_lock`); ``lock_path`` is only called once it is
-    held, so a path that has to prepare its directory does so serialized per
-    key.  flock is released if a process dies; the file is intentionally
-    retained as lock infrastructure, not a sentinel.
+    held, on a worker thread, so a path that has to prepare its directory
+    does so serialized per key and off the loop.  flock is released if a
+    process dies; the file is intentionally retained as lock infrastructure,
+    not a sentinel.
 
     ``local_key`` is structural: :data:`LEGACY_STORE_LOCK_KEY` for the
     flat-store adoption and :func:`person_lock_key` for a person share
@@ -82,7 +83,7 @@ async def flock_scope(local_key: LockKey, lock_path: Callable[[], Path]) -> Asyn
     """
     local_lock = _process_local_lock(local_key)
     async with local_lock:
-        path = lock_path()
+        path = await asyncio.to_thread(lock_path)
         acquire_task = asyncio.create_task(asyncio.to_thread(_acquire_lock, path))
         try:
             handle = await asyncio.shield(acquire_task)
