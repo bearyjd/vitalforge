@@ -10,6 +10,7 @@ pure path logic the facade runs once, at import.
 from __future__ import annotations
 
 import errno
+import logging
 import os
 import re
 import stat
@@ -134,3 +135,16 @@ def normalize_token_root(raw: str | os.PathLike[str]) -> Path:
     root = Path(os.path.realpath(configured))
     _stat_if_present(root, follow_symlinks=True)  # non-strict realpath leaves a loop in place
     return root
+
+
+def configured_token_root(logger: logging.Logger) -> Path | None:
+    """The environment's root, normalized once: None disables Garmin instead of
+    crashing both services at import.  Only the normalizer's own fixed refusals
+    are logged by text; an OSError or RuntimeError carries the path.  Logs
+    through the caller's ``logger`` (the facade's), where boot errors belong."""
+    try:
+        return normalize_token_root(os.getenv("GARTH_TOKEN_DIR", "/app/data/.garth"))
+    except (OSError, RuntimeError, ValueError) as exc:
+        reason = str(exc) if isinstance(exc, TokenRootRefused) else type(exc).__name__
+        logger.error("GARTH_TOKEN_DIR is unusable (%s); Garmin features are disabled", reason)
+        return None

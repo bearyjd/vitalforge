@@ -67,15 +67,8 @@ logger = logging.getLogger(__name__)
 
 
 def _configured_token_root() -> Path | None:
-    """The environment's root, normalized once: None disables Garmin instead of
-    crashing both services at import.  Only the normalizer's own fixed refusals
-    are logged by text; an OSError or RuntimeError carries the path."""
-    try:
-        return garmin_registry_common.normalize_token_root(os.getenv("GARTH_TOKEN_DIR", "/app/data/.garth"))
-    except (OSError, RuntimeError, ValueError) as exc:
-        reason = str(exc) if isinstance(exc, garmin_registry_common.TokenRootRefused) else type(exc).__name__
-        logger.error("GARTH_TOKEN_DIR is unusable (%s); Garmin features are disabled", reason)
-        return None
+    """Import's root, or None to disable Garmin (``garmin_registry_common``)."""
+    return garmin_registry_common.configured_token_root(logger)
 
 
 GARTH_TOKEN_DIR: Path | None = _configured_token_root()
