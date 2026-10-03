@@ -270,7 +270,7 @@ def _sweep_unreferenced_generation_dirs(person_id: int, durable_generation: int 
         try:
             _remove_token_dir(child)
         except Exception as exc:  # inert residue, as in _remove_superseded_generation
-            logger.warning("Obsolete Garmin generation cleanup for person %s failed (%s)", person_id, type(exc).__name__)
+            logger.warning("Obsolete Garmin generation %s cleanup for person %s failed (%s)", generation, person_id, type(exc).__name__)
 
 
 async def _next_generation(db, person_id: int) -> int:

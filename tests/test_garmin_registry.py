@@ -2533,6 +2533,7 @@ async def test_call_survives_an_obsolete_generation_it_cannot_remove(initialized
     assert await garmin_registry.call(person_id, lambda client: client.generation) == 2
     assert old_dir.exists()
     assert "PermissionError" in caplog.text
+    assert "generation 1 " in caplog.text, "the warning names which generation is left behind"
     assert "directory-detail" not in caplog.text
 
 
