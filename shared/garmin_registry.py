@@ -181,7 +181,7 @@ def legacy_store_flock() -> AbstractAsyncContextManager[None]:
 def _remove_token_dir(path: Path) -> None:
     """Remove a registry-owned stage or generation directory, never GARTH root."""
     root = _ensure_token_root()
-    is_stage = path.parent == root and path.name.startswith(".person-")
+    is_stage = path.parent == root and path.name.startswith(".person-") and path.name.endswith(".staging")
     is_generation = (
         path.parent.parent == root
         and path.parent.name.startswith(garmin_registry_common.PERSON_DIR_PREFIX)
