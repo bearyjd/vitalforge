@@ -97,9 +97,8 @@ async def _adopt_legacy_store_locked(root: Path, canonical_email: str) -> bool:
             # Live credential residue (e.g. a restored .garth backup): named,
             # never read, adopted or deleted -- an operator decides what it is.
             logger.warning(
-                "Legacy Garmin token store %s is back at the token root after adoption; "
-                "it is never used and is left in place for an operator to remove",
-                token_file_path(str(root)).name,
+                "Legacy Garmin token store garmin_tokens.json is back at the token root after adoption; "
+                "it is never used and is left in place for an operator to remove"
             )
         logger.info("Legacy Garmin token-store adoption skipped: marker already recorded")
         return False

@@ -864,12 +864,22 @@ async def test_adoption_does_its_filesystem_checks_off_the_event_loop(
 
     monkeypatch.setattr(garmin_registry_legacy, "_looks_like_legacy_token_store", looks_like)
     monkeypatch.setattr(garmin_registry, "resolve_token_dir", resolve)
+    real_token_file_path = garmin_registry_legacy.token_file_path
+    token_path_threads: list[int] = []
+
+    def token_file_path(path):  # lstats every ancestor
+        token_path_threads.append(threading.get_ident())
+        return real_token_file_path(path)
+
+    monkeypatch.setattr(garmin_registry_legacy, "token_file_path", token_file_path)
 
     assert await garmin_registry_legacy.bootstrap_legacy_token_store() is (not marker_first)
 
     assert ran_on["looks_like"], "the flat-store check was never consulted"
     assert marker_first or ran_on["resolve_token_dir"], "the durable directory was never resolved"
     assert loop_thread not in ran_on["looks_like"] + ran_on["resolve_token_dir"], ran_on
+    if marker_first:  # the residue warning names a fixed file; it never resolves a path on the loop
+        assert loop_thread not in token_path_threads, "token_file_path ran on the event loop"
 
 
 async def test_bootstrap_logs_the_skip_reason_when_no_flat_store_exists(
