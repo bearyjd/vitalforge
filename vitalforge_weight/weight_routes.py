@@ -111,6 +111,11 @@ _WEIGHT_LOG_EXISTING_ROW_COLUMNS = (
 # How long an interactive Garmin push may wait for the global call permit.
 _INTERACTIVE_PERMIT_WAIT_SECONDS = 10.0
 
+# garmin_error is echoed to the client, so like the activity path it carries
+# only fixed codes; exception text (a stored value, a database path) is logged.
+_TIMESTAMP_UNPARSEABLE = "weight_timestamp_unparseable"
+_OUTCOME_RECORD_FAILED = "weight_outcome_record_failed"
+
 
 async def _push_composition(
     person_id: int, weight_grams: int, timestamp: datetime, composition: dict
@@ -534,7 +539,8 @@ def add_weight_routes(app):
                     try:
                         original_ts = datetime.fromisoformat(existing["timestamp"])
                     except ValueError as e:
-                        garmin_error = f"could not parse stored timestamp for Garmin push: {e}"
+                        logger.warning("Stored timestamp of row %s is unparseable for a Garmin push: %s", row_id, e)
+                        garmin_error = _TIMESTAMP_UNPARSEABLE
                     else:
                         garmin_error = await _push_composition(
                             person_id, existing["weight_grams"], original_ts, merged
@@ -566,7 +572,7 @@ def add_weight_routes(app):
             except Exception as e:
                 logger.error("Post-commit sync-flag update failed for row %s: %s", row_id, e)
                 if garmin_error is None:
-                    garmin_error = f"sync status update failed: {e}"
+                    garmin_error = _OUTCOME_RECORD_FAILED
                 synced = False
         finally:
             await db.close()

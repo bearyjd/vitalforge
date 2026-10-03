@@ -448,6 +448,8 @@ async def test_unparseable_stored_timestamp_still_persists_sync_failure(client, 
     body = resp.json()
     assert body["synced_to_garmin"] is False
     assert len(fake_garmin_client.pushed_weights) == 0
+    # A fixed code, never the parser's message (which quotes the stored value).
+    assert body["garmin_error"] == "weight_timestamp_unparseable"
 
     db = await get_db()
     try:
@@ -494,3 +496,39 @@ async def test_two_persons_same_second_similar_weight_produce_two_rows(initializ
         assert (await cursor.fetchone())[0] == 2
     finally:
         await db.close()
+
+
+class _FailingSyncFlagUpdate:
+    """A connection whose post-push synced_to_garmin UPDATE fails with text
+    that must never reach the client (it can carry a path)."""
+
+    def __init__(self, db):
+        self._db = db
+
+    def __getattr__(self, name):
+        return getattr(self._db, name)
+
+    async def execute(self, sql, *args, **kwargs):
+        if sql.startswith("UPDATE weight_log SET synced_to_garmin"):
+            raise RuntimeError("disk I/O error at /app/data/fitness.db")
+        return await self._db.execute(sql, *args, **kwargs)
+
+
+async def test_post_commit_sync_flag_failure_reports_a_fixed_code(
+    client, fake_garmin_client, weight_routes_module, monkeypatch, caplog
+):
+    real_get_db = weight_routes_module.get_db
+
+    async def failing_get_db(*args, **kwargs):
+        return _FailingSyncFlagUpdate(await real_get_db(*args, **kwargs))
+
+    monkeypatch.setattr(weight_routes_module, "get_db", failing_get_db)
+    with caplog.at_level(logging.ERROR, logger=weight_routes_module.logger.name):
+        resp = await client.post(f"{PERSON_PREFIX}/api/weight", json={"weight": 180.0, "unit": "lbs"})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["synced_to_garmin"] is False
+    assert body["garmin_error"] == "weight_outcome_record_failed"
+    assert "/app/data" not in resp.text
+    assert "disk I/O error" in caplog.text, "the detail is still logged server-side"
