@@ -514,8 +514,9 @@ async def test_archiving_deletes_a_normal_garmin_link_and_its_owned_token_store(
 
 async def test_archiving_succeeds_while_garmin_is_disabled_by_an_unusable_root(client, monkeypatch, caplog):
     """A refused GARTH_TOKEN_DIR leaves the root None. No Garmin call can be in
-    flight then, so the person flock (whose lock file lives under the root) is
-    skipped instead of turning the archive into a bare 500 (#70)."""
+    flight within this service then, so the person flock (whose lock file lives
+    under the root) is skipped instead of turning the archive into a bare 500
+    (#70)."""
     _, cookies = await _as("root", role="admin")
     person_id = (await client.post("/api/persons", json={"display_name": "Bryn"}, cookies=cookies)).json()["id"]
     await _seed_garmin_link(person_id, "linked")
@@ -530,8 +531,13 @@ async def test_archiving_succeeds_while_garmin_is_disabled_by_an_unusable_root(c
     assert await _fetchone("SELECT archived_at FROM persons WHERE id = ?", (person_id,)) is not None
     assert await _fetchone("SELECT 1 FROM garmin_links WHERE person_id = ?", (person_id,)) is None
     assert not any(key[0] == person_id for key in garmin_client._clients)
-    # The token directories cannot be reached; a later archive retries them.
-    assert "Archived person's Garmin token cleanup did not complete" in caplog.text
+    # The token directories cannot be reached: the operator must be told they
+    # are still on disk and what to do, not just that "cleanup" failed.
+    warnings = [r.getMessage() for r in caplog.records if r.name == "shared.persons_admin"]
+    assert warnings == [
+        "Archived person's Garmin token directories were NOT removed: GARTH_TOKEN_DIR is unusable. "
+        "Fix GARTH_TOKEN_DIR, then re-run the archive (or remove the person's token directories by hand)"
+    ]
 
 
 async def test_archiving_still_takes_the_person_flock_when_the_root_is_usable(client, monkeypatch):
