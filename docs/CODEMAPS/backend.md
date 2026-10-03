@@ -60,7 +60,7 @@ GET  /health                          -> {"status":"ok","service":"vitalforge-da
 GET  /                                -> templates/index.html (Jinja2)
 POST /api/sync?days=1..90             -> asyncio.create_task(run_sync) if not already
                                           running (asyncio.Lock); returns immediately
-GET  /api/sync/status                 -> SELECT sync_status WHERE id=1
+GET  /api/sync/status                 -> SELECT sync_status WHERE person_id = ?
 GET  /api/metrics/{metric_name}       -> METRIC_TABLES[name] lookup -> SELECT + 7d
                                           moving average; 400 if name not in METRIC_TABLES
 GET  /api/recommendations?refresh=    -> recommendations.get_recommendations(force=)
@@ -95,7 +95,17 @@ which metric names are queryable — adding a new metric requires updating this 
   outside `backoff_until` with the oldest `sync_status.last_sync_time` (never-synced
   first) -- a derived round-robin, no stored cursor (spec §e.3). So each person refreshes
   every `SYNC_INTERVAL_HOURS × N`. A person's first sync after boot is a 90-day
-  re-scan, repeated until one completes without stopping early; later ones are 3 days.
-  A run that raises is recorded as `error` so the cursor moves on. `run_sync` skips
+  re-scan, repeated until one completes without stopping early, or is throttled
+  (`rate_limited`) twice (`MAX_THROTTLED_BACKFILLS`; other stops do not reset it: past dates are only skipped
+  when every metric table has them, so a device missing a metric would re-burst forever);
+  later ones are 3 days.
+  A run that raises is recorded as `error` so the cursor moves on. **429 backoff:** a
+  `rate_limited` result sets `backoff_until = now + 15 min × 2^(streak−1)` (capped at 6 h)
+  and bumps `sync_status.backoff_streak`; a run that got answers (success, or errors where at
+  least one Garmin read succeeded) clears both; "completed with N errors" where EVERY read
+  failed leaves them; any other stop (network, relink, rejected session) and a crash
+  leave them as they were. One writer, `sync.py::_write_sync_status`, shared by `run_sync`
+  and the scheduler's failed-tick record, so a manual sync's 429 counts too (manual sync
+  itself is not gated by the backoff). `run_sync` skips
   dates already present in every metric table (incremental), except "today" which is
   always re-fetched.

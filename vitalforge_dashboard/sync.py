@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -18,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 SYNC_INTERVAL_HOURS = int(os.getenv("SYNC_INTERVAL_HOURS", "2"))
 # A person's first scheduled sync after boot re-scans this many days (and so
-# does every later one, until a re-scan finishes -- see _RETRY_BACKFILL_RESULTS).
+# does every later one, until a re-scan runs without stopping early).
 # run_sync skips a past date only when ALL its metric tables have it, and a
 # metric a device never reports never gets a row, so a re-scan is NOT just
 # local reads: it can re-fetch most of the window from Garmin (6 reads per
@@ -36,14 +37,23 @@ _TERMINAL_OPERATION_CODES = frozenset({"auth_failed", "rate_limited"})
 # code it failed with -- there is no session to continue on -- but only
 # ``auth_failed`` asks the person to relink; the rest retry next sync.
 _STOPPED_RESULTS = frozenset({"link_required", "auth_failed", "rate_limited", "network", "unknown"})
-# Results after which the next tick retries the backfill instead of moving to
-# the incremental window. Each stops run_sync at its first FAILING call; while
-# the failure persists that is the token reload at the start of the run, so a
-# retry costs about one call (link_required costs none). "rate_limited" is deliberately NOT
-# here: until a 429 sets backoff_until, re-running 90 days into a throttled
-# account every rotation is how a rate limit becomes a ban -- so a throttled
-# backfill is demoted to the incremental window, as the old boot backfill was.
-_RETRY_BACKFILL_RESULTS = _STOPPED_RESULTS - {"rate_limited"}
+# Garmin 429 backoff (spec §e.3): a person whose sync was rate limited is left
+# alone for BACKOFF_BASE, doubling with each consecutive 429 up to BACKOFF_CAP.
+# Persisted in sync_status.backoff_until/backoff_streak so a restart does not
+# reset it -- restart loops are how a rate limit turns into a ban.
+BACKOFF_BASE = timedelta(minutes=15)
+BACKOFF_CAP = timedelta(hours=6)
+# What _record_failed_tick stores for a run that raised before it could record
+# its own result.
+FAILED_TICK_RESULT = "error"
+# A backfill throttled this many times (since boot) is demoted to the
+# incremental window. run_sync skips a past date only when EVERY metric table
+# has it, so a device that never reports some metric re-fetches the same dates
+# on each attempt and never finishes; without a cap a 429 mid-scan would
+# re-burst into the throttle every time its backoff expires. Only a 429 moves
+# the count: a failed login or a network blip says nothing about the throttle,
+# so it must not reset it (alternating one with a 429 would never reach the cap).
+MAX_THROTTLED_BACKFILLS = 2
 
 
 async def has_usable_garmin_link(person_id: int) -> bool:
@@ -120,8 +130,18 @@ def _stop_reason(exc: Exception) -> str | None:
     return None
 
 
+@dataclass
+class _Reads:
+    """Outcome of one date's Garmin reads: which were skipped, how many were
+    answered. run_sync needs the second to tell 'Garmin answered, a metric
+    or two failed' (not a throttle) from 'every call failed' (no evidence)."""
+
+    skipped: list[str] = field(default_factory=list)
+    answered: int = 0
+
+
 async def _fetch_metric(
-    person_id: int, label: str, op: Callable[[Garmin], Any], skipped: list[str]
+    person_id: int, label: str, op: Callable[[Garmin], Any], reads: _Reads
 ) -> Any | None:
     """Read one metric; a failed read is skipped so the rest of the date syncs.
 
@@ -130,7 +150,9 @@ async def _fetch_metric(
     name -- never provider text -- and the metric is left for the next sync.
     """
     try:
-        return await garmin_registry.call_paced(person_id, op)
+        value = await garmin_registry.call_paced(person_id, op)
+        reads.answered += 1
+        return value
     except garmin_registry.GarminOperationError as exc:
         if _stop_reason(exc) is not None:
             raise
@@ -139,20 +161,21 @@ async def _fetch_metric(
         raise
     except Exception as exc:
         logger.warning("Skipping %s for person %s (%s)", label, person_id, type(exc).__name__)
-    skipped.append(label)
+    reads.skipped.append(label)
     return None
 
 
-async def sync_date(date_str: str, person_id: int) -> int:
+async def sync_date(date_str: str, person_id: int) -> _Reads:
     """Pull all metrics from Garmin for a single date and store them.
 
-    Returns how many metrics were skipped because their read failed, so
-    ``run_sync`` can still report a partial date honestly.
+    Returns the date's :class:`_Reads`: the metrics skipped because their
+    read failed (so ``run_sync`` can still report a partial date honestly)
+    and how many reads Garmin answered.
     """
-    skipped: list[str] = []
+    reads = _Reads()
 
     # --- Sleep ---
-    sleep = await _fetch_metric(person_id, "sleep", lambda client: client.get_sleep_data(date_str), skipped)
+    sleep = await _fetch_metric(person_id, "sleep", lambda client: client.get_sleep_data(date_str), reads)
     if sleep and isinstance(sleep, dict):
         # garminconnect wraps sleep data under dailySleepDTO
         dto = sleep.get("dailySleepDTO", sleep)
@@ -171,7 +194,7 @@ async def sync_date(date_str: str, person_id: int) -> int:
 
     # --- User summary (steps, calories, RHR) ---
     summary = await _fetch_metric(
-        person_id, "user summary", lambda client: client.get_user_summary(date_str), skipped
+        person_id, "user summary", lambda client: client.get_user_summary(date_str), reads
     )
     if summary and isinstance(summary, dict):
         rhr = summary.get("restingHeartRate")
@@ -187,7 +210,7 @@ async def sync_date(date_str: str, person_id: int) -> int:
             await upsert("active_calories", date_str, person_id, value=active_cal)
 
     # --- HRV ---
-    hrv = await _fetch_metric(person_id, "hrv", lambda client: client.get_hrv_data(date_str), skipped)
+    hrv = await _fetch_metric(person_id, "hrv", lambda client: client.get_hrv_data(date_str), reads)
     if hrv and isinstance(hrv, dict):
         hrv_summary = hrv.get("hrvSummary", hrv)
         if isinstance(hrv_summary, dict):
@@ -202,7 +225,7 @@ async def sync_date(date_str: str, person_id: int) -> int:
                 )
 
     # --- Body Battery ---
-    bb = await _fetch_metric(person_id, "body battery", lambda client: client.get_body_battery(date_str), skipped)
+    bb = await _fetch_metric(person_id, "body battery", lambda client: client.get_body_battery(date_str), reads)
     if bb:
         entry = bb[0] if isinstance(bb, list) and bb else bb
         if isinstance(entry, dict):
@@ -232,7 +255,7 @@ async def sync_date(date_str: str, person_id: int) -> int:
                 )
 
     # --- Stress ---
-    stress = await _fetch_metric(person_id, "stress", lambda client: client.get_stress_data(date_str), skipped)
+    stress = await _fetch_metric(person_id, "stress", lambda client: client.get_stress_data(date_str), reads)
     if stress and isinstance(stress, dict):
         # garminconnect uses avgStressLevel / overallStressLevel
         avg_stress = stress.get("avgStressLevel") or stress.get("overallStressLevel")
@@ -249,7 +272,7 @@ async def sync_date(date_str: str, person_id: int) -> int:
 
     # --- VO2 Max (from training status, since get_max_metrics often returns null) ---
     training = await _fetch_metric(
-        person_id, "training status", lambda client: client.get_training_status(date_str), skipped
+        person_id, "training status", lambda client: client.get_training_status(date_str), reads
     )
     if training and isinstance(training, dict):
         # Extract VO2 Max from training status
@@ -298,7 +321,7 @@ async def sync_date(date_str: str, person_id: int) -> int:
                     load_ratio=training.get("loadRatio") or (agg.get("loadRatio") if isinstance(agg, dict) else None),
                 )
 
-    return len(skipped)
+    return reads
 
 
 async def sync_weight_history(start_date: str, end_date: str, person_id: int) -> None:
@@ -337,12 +360,102 @@ async def sync_weight_history(start_date: str, end_date: str, person_id: int) ->
                 )
 
 
+def backoff_delay(streak: int) -> timedelta:
+    """How long to leave a person alone after their `streak`-th consecutive 429:
+    15 minutes, doubling, capped at 6 hours."""
+    if streak < 1:
+        raise ValueError(f"backoff streak must be >= 1, got {streak}")
+    # Clamp the exponent: the cap is reached at 2**5 and nothing is gained by
+    # shifting further.
+    return min(BACKOFF_CAP, BACKOFF_BASE * 2 ** min(streak - 1, 16))
+
+
+def _next_backoff(
+    result: str, until: str | None, streak: int | None, now: datetime, *, answered: bool = True
+) -> tuple[str | None, int | None]:
+    """The (backoff_until, backoff_streak) a sync leaves behind.
+
+    Only a 429 is evidence about the throttle, so only it moves the streak
+    up. Any other early stop (a network blip, a relink prompt, a rejected
+    session) and a run that crashed say nothing about it: the backoff is left
+    exactly as it was, so flapping connectivity can neither erase a ban in
+    progress nor grow it. A run that got answers (success, or only skipped
+    metrics) means the account is not throttled: both are cleared -- but only
+    if Garmin actually answered something. "completed with N errors" where
+    EVERY read failed (a 403, a network error) is no evidence either way, so
+    `answered=False` leaves the backoff as it was.
+
+    `backoff_until` is TEXT compared against `datetime.now(timezone.utc)
+    .isoformat()` by next_person_to_sync, so it must be written in that form.
+    """
+    if result == "rate_limited":
+        streak = (streak or 0) + 1
+        return (now + backoff_delay(streak)).isoformat(), streak
+    if result in _STOPPED_RESULTS or result == FAILED_TICK_RESULT or not answered:
+        return until, streak
+    return None, None
+
+
+async def _write_sync_status(
+    person_id: int, started_at: datetime, result: str, days: int, *, answered: bool = True
+) -> None:
+    """The one place sync_status is written (run_sync and _record_failed_tick).
+
+    Reads the person's current backoff, derives the next one from `result`,
+    and upserts every column in one statement, inside BEGIN IMMEDIATE so the
+    read-then-write is atomic: today every caller holds the dashboard's
+    `_sync_lock` and there is one worker, but nothing in the database should
+    depend on that (two writers reading streak NULL would both write 1 and
+    lose an escalation). ON CONFLICT DO UPDATE, not INSERT OR REPLACE:
+    REPLACE deletes the row and reinserts it, so every column absent from
+    the statement would silently revert to its default.
+    """
+    now = datetime.now(timezone.utc)
+    db = await get_db(isolation_level=None)
+    try:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            row = await (
+                await db.execute(
+                    "SELECT backoff_until, backoff_streak FROM sync_status WHERE person_id = ?", (person_id,)
+                )
+            ).fetchone()
+            until, streak = _next_backoff(
+                result,
+                row["backoff_until"] if row else None,
+                row["backoff_streak"] if row else None,
+                now,
+                answered=answered,
+            )
+            await db.execute(
+                "INSERT INTO sync_status "
+                "(person_id, last_sync_time, last_sync_result, last_sync_days, backoff_until, backoff_streak) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT (person_id) DO UPDATE SET "
+                "last_sync_time = excluded.last_sync_time, "
+                "last_sync_result = excluded.last_sync_result, "
+                "last_sync_days = excluded.last_sync_days, "
+                "backoff_until = excluded.backoff_until, "
+                "backoff_streak = excluded.backoff_streak",
+                (person_id, started_at.isoformat(), result, days, until, streak),
+            )
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+    finally:
+        await db.close()
+    if result == "rate_limited":
+        logger.warning("Garmin rate limited person %s; backing off until %s (streak %s)", person_id, until, streak)
+
+
 async def run_sync(days: int = 7, *, person_id: int) -> str:
     """Run a full sync for the given number of days back from today."""
     logger.info("Starting sync for person %s, last %d days", person_id, days)
     start_time = datetime.now(timezone.utc)
     result = "success"
     errors = 0
+    answered = 0  # Garmin reads that succeeded: the only evidence a throttle has lifted
 
     today = datetime.now(timezone.utc).date()
     dates = [(today - timedelta(days=i)).isoformat() for i in range(days)]
@@ -367,7 +480,9 @@ async def run_sync(days: int = 7, *, person_id: int) -> str:
                 continue
 
         try:
-            errors += await sync_date(date_str, person_id)
+            date_reads = await sync_date(date_str, person_id)
+            errors += len(date_reads.skipped)
+            answered += date_reads.answered
         except garmin_registry.GarminRegistryError as exc:
             # A scheduled run can race an unlink after its initial link
             # check; a token store can stop resuming; the provider can reject
@@ -392,6 +507,7 @@ async def run_sync(days: int = 7, *, person_id: int) -> str:
         try:
             start_date = (today - timedelta(days=days)).isoformat()
             await sync_weight_history(start_date, today_str, person_id)
+            answered += 1
         except garmin_registry.GarminRegistryError as exc:
             stop = _stop_reason(exc)
             if stop is None:
@@ -411,26 +527,7 @@ async def run_sync(days: int = 7, *, person_id: int) -> str:
     elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
     logger.info("Sync completed in %.1fs — %s", elapsed, result)
 
-    db = await get_db()
-    try:
-        # ON CONFLICT DO UPDATE, not INSERT OR REPLACE: REPLACE deletes the
-        # row and reinserts it, so every column absent from the statement
-        # silently reverts to its default. backoff_until (spec §e, the
-        # Garmin 429 backoff) is exactly such a column -- a plain REPLACE
-        # here would clear an active backoff on every single sync, which is
-        # how a rate limit turns into a ban.
-        await db.execute(
-            "INSERT INTO sync_status (person_id, last_sync_time, last_sync_result, last_sync_days) "
-            "VALUES (?, ?, ?, ?) "
-            "ON CONFLICT (person_id) DO UPDATE SET "
-            "last_sync_time = excluded.last_sync_time, "
-            "last_sync_result = excluded.last_sync_result, "
-            "last_sync_days = excluded.last_sync_days",
-            (person_id, start_time.isoformat(), result, days),
-        )
-        await db.commit()
-    finally:
-        await db.close()
+    await _write_sync_status(person_id, start_time, result, days, answered=answered > 0)
 
     return result
 
@@ -518,25 +615,14 @@ async def _record_failed_tick(person_id: int, started_at: datetime, days: int) -
 
     Without this their last_sync_time never moves, and the oldest-first
     cursor would pick them again on every tick while everyone else starves.
-    Same ON CONFLICT shape as run_sync, so backoff_until is preserved.
+    A crash says nothing about the throttle, so any active backoff is kept.
     """
-    db = await get_db()
-    try:
-        await db.execute(
-            "INSERT INTO sync_status (person_id, last_sync_time, last_sync_result, last_sync_days) "
-            "VALUES (?, ?, 'error', ?) "
-            "ON CONFLICT (person_id) DO UPDATE SET "
-            "last_sync_time = excluded.last_sync_time, "
-            "last_sync_result = excluded.last_sync_result, "
-            "last_sync_days = excluded.last_sync_days",
-            (person_id, started_at.isoformat(), days),
-        )
-        await db.commit()
-    finally:
-        await db.close()
+    await _write_sync_status(person_id, started_at, FAILED_TICK_RESULT, days)
 
 
-async def _sync_next_person(lock: asyncio.Lock, registry: SyncRegistry, backfilled: set[int]) -> None:
+async def _sync_next_person(
+    lock: asyncio.Lock, registry: SyncRegistry, backfilled: set[int], throttled: dict[int, int]
+) -> None:
     """One scheduler tick: sync the most overdue linked person, if any.
 
     The person is chosen INSIDE the lock, so a manual sync that held it
@@ -559,10 +645,15 @@ async def _sync_next_person(lock: asyncio.Lock, registry: SyncRegistry, backfill
             return
         finally:
             registry.release(person_id)
-        # A backfill that stopped early on a cheap failure (network, relink
-        # needed) is retried as a backfill rather than demoted to the
-        # incremental window, or the rest of its days would never be fetched.
-        if result not in _RETRY_BACKFILL_RESULTS:
+        # A backfill that stopped early (network, relink needed, a 429) is
+        # retried as a backfill rather than demoted to the incremental window,
+        # or the rest of its days would never be fetched. After a 429 the
+        # person's backoff decides WHEN they are picked again; this decides
+        # how often: after MAX_THROTTLED_BACKFILLS throttled backfills they
+        # drop to the incremental window (see that constant for why).
+        if result == "rate_limited":
+            throttled[person_id] = throttled.get(person_id, 0) + 1
+        if result not in _STOPPED_RESULTS or throttled.get(person_id, 0) >= MAX_THROTTLED_BACKFILLS:
             backfilled.add(person_id)
 
 
@@ -576,10 +667,11 @@ async def scheduled_sync(lock: asyncio.Lock, registry: SyncRegistry) -> None:
     overlaps a tick, such as a manual sync.
 
     The first tick runs at boot. Each person's first scheduled sync after
-    boot is a SYNC_BACKFILL_DAYS re-scan, retried while it stops early on a
-    cheap failure (_RETRY_BACKFILL_RESULTS); after it completes or is
-    rate-limited, 3-day runs. At one linked person that is the old boot
-    backfill followed by 3-day runs, plus the cheap-failure retry.
+    boot is a SYNC_BACKFILL_DAYS re-scan, retried while it stops early (a
+    429 additionally puts the person in backoff, see _next_backoff, and
+    MAX_THROTTLED_BACKFILLS of them give up on the backfill); once one
+    completes, 3-day runs. At one linked person that is the old boot backfill
+    followed by 3-day runs, plus the retry.
 
     Takes the same lock `/api/sync`'s manual trigger holds during `run_sync`
     (see vitalforge_dashboard/app.py's `_sync_lock`) -- every write goes
@@ -591,9 +683,10 @@ async def scheduled_sync(lock: asyncio.Lock, registry: SyncRegistry) -> None:
     a writer that forgets to register looks like from the dashboard.
     """
     backfilled: set[int] = set()
+    throttled: dict[int, int] = {}  # throttled (429) backfills per person since boot
     while True:
         try:
-            await _sync_next_person(lock, registry, backfilled)
+            await _sync_next_person(lock, registry, backfilled, throttled)
         except Exception:
             logger.exception("Scheduled sync tick failed")
         await asyncio.sleep(SYNC_INTERVAL_HOURS * 3600)

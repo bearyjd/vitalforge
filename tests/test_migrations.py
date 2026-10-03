@@ -1664,3 +1664,76 @@ async def test_pre_003_snapshot_is_taken_only_while_garmin_target_exists(tmp_pat
     snapshot.unlink()
     await database.init_db()
     assert not snapshot.exists(), "snapshot re-taken after the column it guards was already removed"
+
+
+# --- #88: sync_status.backoff_streak -------------------------------------------
+#
+# Added with _add_columns AFTER the migrations, not in init_db's DDL block:
+# migration 001 drops and recreates sync_status with its five original
+# columns, so a column added earlier would be erased on the very boot that
+# upgrades a pre-001 database -- and run_sync would then fail writing it.
+
+
+async def _sync_status_columns() -> dict[str, tuple]:
+    db = await database.get_db()
+    try:
+        info = await (await db.execute("PRAGMA table_info(sync_status)")).fetchall()
+    finally:
+        await db.close()
+    return {r["name"]: (r["type"], r["notnull"], r["dflt_value"], r["pk"]) for r in info}
+
+
+@pytest.mark.asyncio
+async def test_backoff_streak_survives_the_pre_001_rebuild(production_schema_db):
+    await database.init_db()
+
+    columns = await _sync_status_columns()
+    assert columns["backoff_streak"] == ("INTEGER", 0, None, 0), "nullable, no default, so NULL reads as 0"
+
+
+@pytest.mark.asyncio
+async def test_backoff_streak_is_added_to_an_already_migrated_database(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "migrated.db")
+    await database.init_db()
+    db = await database.get_db()
+    try:
+        await db.execute("ALTER TABLE sync_status DROP COLUMN backoff_streak")  # the pre-#88 shape
+        await db.commit()
+    finally:
+        await db.close()
+    assert "backoff_streak" not in await _sync_status_columns()
+
+    await database.init_db()
+    await database.init_db()  # and a second boot is a no-op, not a duplicate-column error
+
+    assert "backoff_streak" in await _sync_status_columns()
+
+
+@pytest.mark.asyncio
+async def test_the_previous_image_can_still_write_sync_status(tmp_path, monkeypatch):
+    """Rollback safety. The pre-#88 image's run_sync upserts four columns and
+    never names backoff_streak; the extra nullable column must not break it,
+    and the ON CONFLICT form must not clear what it does not name."""
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "rollback.db")
+    await database.init_db()
+    person_id = await database.get_primary_person_id()
+    db = await database.get_db()
+    try:
+        await db.execute(
+            "INSERT INTO sync_status (person_id, backoff_until, backoff_streak) VALUES (?, ?, ?)",
+            (person_id, "2999-01-01T00:00:00+00:00", 3),
+        )
+        await db.execute(
+            "INSERT INTO sync_status (person_id, last_sync_time, last_sync_result, last_sync_days) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT (person_id) DO UPDATE SET "
+            "last_sync_time = excluded.last_sync_time, last_sync_result = excluded.last_sync_result, "
+            "last_sync_days = excluded.last_sync_days",
+            (person_id, "2026-10-02T00:00:00+00:00", "success", 3),
+        )
+        await db.commit()
+        row = await (
+            await db.execute("SELECT backoff_until, backoff_streak FROM sync_status WHERE person_id = ?", (person_id,))
+        ).fetchone()
+    finally:
+        await db.close()
+    assert (row["backoff_until"], row["backoff_streak"]) == ("2999-01-01T00:00:00+00:00", 3)

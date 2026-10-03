@@ -5,84 +5,15 @@ from pathlib import Path
 import aiosqlite
 
 from shared.database_bootstrap import _attribute_orphaned_weight_log_rows
+from shared.database_columns import (
+    STRENGTH_SESSIONS_ADDITIVE_COLUMNS,
+    SYNC_STATUS_ADDITIVE_COLUMNS,
+    USERS_ADDITIVE_COLUMNS,
+    WEIGHT_HISTORY_ADDITIVE_COLUMNS,
+    WEIGHT_LOG_ADDITIVE_COLUMNS,
+)
 
 DB_PATH = Path(os.getenv("DB_PATH", "/app/data/fitness.db"))
-
-# Additive columns for weight_log's body-composition intake (Track B). Every
-# entry here must stay nullable with no non-constant DEFAULT -- not because a
-# table rewrite is interruption-unsafe (it isn't: SQLite's CREATE/COPY/DROP/
-# RENAME sequence rolls back cleanly inside BEGIN IMMEDIATE, verified in
-# tests/test_migration_gating_assumptions.py), but because a constant-default
-# ADD COLUMN needs no migration runner at all -- it's a fast, metadata-only
-# change -- while a genuine schema change (e.g. a non-constant default, or
-# changing a PRIMARY KEY) does, and belongs in shared/migrations.py instead
-# of here. See docs/prp/00-design.md SS5.4 and
-# docs/superpowers/specs/2026-08-25-family-multitenancy-design.md Appendix A
-# for the full reasoning and the migration that first needed the runner.
-_WEIGHT_LOG_ADDITIVE_COLUMNS = [
-    "body_fat_pct REAL",
-    "body_water_pct REAL",
-    "muscle_pct REAL",
-    "bone_mass_kg REAL",
-    "source TEXT",
-    "person_id INTEGER",
-    # Client-generated idempotency key (A6, docs/prp/00-design.md SS4.4 in the
-    # Bascule repo). NULL for every pre-existing row and for any client that
-    # still doesn't send one -- those fall back to the timestamp+weight-window
-    # dedup below, unchanged. Enforced unique per person by
-    # idx_weight_log_person_client_id (a partial index, so NULLs -- the
-    # overwhelming majority of rows -- are excluded).
-    "client_id TEXT",
-    # Bascule's V2Shaper has sent these three since it was written; WeightIn
-    # had nowhere to put them until now (extra="forbid" 422'd the whole
-    # request the moment one was ever populated). bmr/amr are kcal/day.
-    "bmi REAL",
-    "bmr REAL",
-    "amr REAL",
-    # UTC ISO instant at which some request claimed the right to push this row
-    # to Garmin, or NULL when no push is in flight. post_weight decides whether
-    # to push INSIDE its BEGIN IMMEDIATE but performs the push after the commit
-    # (the push is synchronous and must not be held across the write lock), and
-    # it writes synced_to_garmin only once that push returns -- through two
-    # awaits that yield. Without a claim, a concurrent identical retry resumes
-    # in that gap, reads synced_to_garmin still 0, and files a SECOND weigh-in.
-    # The claim is taken inside the same transaction that reads the row, so a
-    # blocked request sees it the instant it can see the row. Cleared when the
-    # outcome is recorded; a claim older than _GARMIN_CLAIM_TIMEOUT_SECONDS is
-    # treated as stale (the claiming process died) so a crash mid-push cannot
-    # strand a row unpushable forever. Additive, not a rebuild: weight_log is
-    # deployed, keeps its own `id` primary key, and so cannot go in
-    # migrations._REBUILD_TABLES.
-    "garmin_claimed_at TEXT",
-]
-
-# Additive columns for weight_history's Garmin-sourced composition read path
-# (B5). Unit-suffixed per docs/prp/00-design.md SS3.5/SS4.3 -- the B3 live
-# checkpoint confirmed Garmin returns boneMass/muscleMass in grams, so these
-# must be `_g`, not `_kg` (mixing this up with weight_log's `_kg` convention
-# is exactly the silent lbs/kg-style bug the suffix exists to prevent).
-_WEIGHT_HISTORY_ADDITIVE_COLUMNS = [
-    "body_water REAL",
-    "bone_mass_g REAL",
-    "muscle_mass_g REAL",
-]
-
-# Additive column for the users table -- incremented on password change so
-# every previously-issued session cookie for that account (which embeds the
-# version at issue time) stops validating immediately, instead of staying
-# valid until its 30-day expiry regardless of the password change (fix-review
-# finding). `DEFAULT 1` is a constant, not the non-constant-default case the
-# comment above warns about -- SQLite's ALTER TABLE ADD COLUMN with a
-# constant default is a fast, metadata-only change, not a table rewrite.
-_STRENGTH_SESSIONS_ADDITIVE_COLUMNS = [
-    # See the column comment in the strength_sessions CREATE TABLE below.
-    "garmin_name_prefix TEXT",
-]
-
-_USERS_ADDITIVE_COLUMNS = [
-    "session_version INTEGER NOT NULL DEFAULT 1",
-    "default_person_id INTEGER",
-]
 
 
 async def _add_columns(db, table: str, column_ddls: list[str]):
@@ -186,7 +117,7 @@ async def init_db():
 
         # Additive migration for weight_log on databases that already exist
         # (a fresh DB already has these columns from the CREATE TABLE above).
-        await _add_columns(db, "weight_log", _WEIGHT_LOG_ADDITIVE_COLUMNS)
+        await _add_columns(db, "weight_log", WEIGHT_LOG_ADDITIVE_COLUMNS)
 
         # Belt-and-suspenders: the request-path BEGIN IMMEDIATE transaction
         # (vitalforge_weight/app.py post_weight) already serializes the
@@ -294,7 +225,7 @@ async def init_db():
         # Additive migration for weight_history on databases that already
         # exist (a fresh DB already has these columns from the CREATE TABLE
         # above).
-        await _add_columns(db, "weight_history", _WEIGHT_HISTORY_ADDITIVE_COLUMNS)
+        await _add_columns(db, "weight_history", WEIGHT_HISTORY_ADDITIVE_COLUMNS)
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -310,7 +241,7 @@ async def init_db():
         # Additive migration for users on databases that already have the
         # table from an earlier commit of this same branch (a fresh DB
         # already has the column from the CREATE TABLE above).
-        await _add_columns(db, "users", _USERS_ADDITIVE_COLUMNS)
+        await _add_columns(db, "users", USERS_ADDITIVE_COLUMNS)
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS persons (
@@ -531,7 +462,8 @@ async def init_db():
                 last_sync_time TEXT,
                 last_sync_result TEXT,
                 last_sync_days INTEGER,
-                backoff_until  TEXT
+                backoff_until  TEXT,
+                backoff_streak INTEGER
             )
         """)
 
@@ -686,7 +618,7 @@ async def init_db():
         # database. strength_sessions shipped before this column existed, so it
         # needs both paths -- CREATE TABLE for new databases, ALTER for the ones
         # already running.
-        await _add_columns(db, "strength_sessions", _STRENGTH_SESSIONS_ADDITIVE_COLUMNS)
+        await _add_columns(db, "strength_sessions", STRENGTH_SESSIONS_ADDITIVE_COLUMNS)
 
         # Durable one-time markers for shared/migrations.py's run_migration().
         await db.execute(SCHEMA_MIGRATIONS_TABLE_SQL)
@@ -712,6 +644,19 @@ async def init_db():
     await ensure_pre_migration_snapshot(_STRENGTH_SESSIONS_SNAPSHOT_NAME, _needs_strength_sessions_rebuild)
     await run_migration("003-strength-sessions-remove-garmin-target", _apply_strength_sessions_remove_garmin_target)
     await run_migration("004-strength-sessions-redact-garmin-errors", _apply_strength_sessions_redact_garmin_errors)
+
+    # AFTER the migrations, not with the _add_columns calls in the DDL block:
+    # 001 drops and recreates sync_status with its original five columns, so a
+    # column added earlier would be erased on the very boot that upgrades a
+    # pre-001 database and the first sync would fail writing it. It is
+    # additive and attempt-and-swallow, so both services running it at once
+    # is safe; it needs no marker and no snapshot (nothing is rebuilt), and
+    # an older image still boots against the extra nullable column.
+    db = await get_db()
+    try:
+        await _add_columns(db, "sync_status", SYNC_STATUS_ADDITIVE_COLUMNS)
+    finally:
+        await db.close()
 
     # After the migrations, because it needs the primary person 001 creates.
     await _attribute_orphaned_weight_log_rows()

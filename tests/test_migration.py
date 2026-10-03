@@ -13,6 +13,7 @@ import aiosqlite
 import pytest
 
 from shared import database
+from shared.database_columns import WEIGHT_LOG_ADDITIVE_COLUMNS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -85,7 +86,7 @@ async def test_duplicate_column_error_swallowed_but_others_propagate():
             pass
 
     # no exception -- swallowed (duplicate_column_name is caught and ignored)
-    await database._add_columns(DuplicateDB(), "weight_log", database._WEIGHT_LOG_ADDITIVE_COLUMNS)
+    await database._add_columns(DuplicateDB(), "weight_log", WEIGHT_LOG_ADDITIVE_COLUMNS)
 
     class OtherErrorDB:
         async def execute(self, sql):
@@ -98,7 +99,7 @@ async def test_duplicate_column_error_swallowed_but_others_propagate():
 
     # database is locked must propagate (not swallowed)
     with pytest.raises(aiosqlite.OperationalError, match="database is locked"):
-        await database._add_columns(OtherErrorDB(), "weight_log", database._WEIGHT_LOG_ADDITIVE_COLUMNS)
+        await database._add_columns(OtherErrorDB(), "weight_log", WEIGHT_LOG_ADDITIVE_COLUMNS)
 
 
 async def test_existing_rows_have_null_composition_after_migration(production_schema_db):
