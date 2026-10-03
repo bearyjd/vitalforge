@@ -9,6 +9,8 @@ warning.  Like the sibling file, HOME and the cwd live in ``tmp_path`` so a
 """
 
 import logging
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -223,6 +225,108 @@ def test_probe_names_are_the_registrys_own_and_nothing_is_created(monkeypatch, t
     assert [p.name.startswith(".person-1-generation-1-") for p in staging] == [True]
     assert sorted(root.iterdir()) == [], "the probe created something under the root"
     assert _registry_records(caplog, logging.WARNING) == []
+
+
+# -- item 6: advisory ancestor check ------------------------------------------------
+
+
+_ANCESTOR_WARNING = "GARTH_TOKEN_DIR is below a directory other users can write ({!r}); another local user could replace the token root"
+
+
+@pytest.fixture
+def _tmp_is_trusted(monkeypatch):
+    """The real exemption is a ROOT-owned sticky directory, and a test cannot
+    make one; this sandbox's /tmp is even owned by an unmapped uid.  Exempt
+    every sticky directory this process does not own (so the real /tmp above
+    tmp_path, whoever owns it), keeping a self-owned sticky one reportable.
+    ``_is_trusted_sticky`` itself is pinned against fabricated stats below."""
+    real = garmin_registry_common._is_trusted_sticky
+
+    def trusted(found):
+        return real(found) or (bool(found.st_mode & stat.S_ISVTX) and found.st_uid != os.geteuid())
+
+    monkeypatch.setattr(garmin_registry_common, "_is_trusted_sticky", trusted)
+
+
+def _volume(tmp_path: Path, *modes: int) -> Path:
+    """tmp_path/v0/v1/... with each level chmod'ed; returns the deepest."""
+    directory = tmp_path
+    for depth, mode in enumerate(modes):
+        directory = directory / f"v{depth}"
+        directory.mkdir()
+        directory.chmod(mode)
+    return directory
+
+
+@pytest.mark.parametrize("mode", [0o775, 0o757, 0o777, 0o1777], ids=["group-w", "other-w", "both-w", "self-owned-sticky"])
+def test_a_writable_ancestor_is_named(mode, _tmp_is_trusted, tmp_path):
+    writable = _volume(tmp_path, mode)
+    root = _volume(writable, 0o755) / "garth"
+
+    assert garmin_registry_common.first_writable_ancestor(root) == writable
+
+
+def test_only_the_highest_writable_ancestor_is_named(_tmp_is_trusted, tmp_path):
+    root = _volume(tmp_path, 0o777, 0o775) / "garth"
+
+    assert garmin_registry_common.first_writable_ancestor(root) == tmp_path / "v0"
+
+
+def test_private_ancestors_and_a_writable_root_itself_are_not_reported(_tmp_is_trusted, tmp_path):
+    """The root is chmod'ed 0700 by the registry; only what is above it counts.
+    A missing ancestor (first boot) ends the walk quietly."""
+    root = _volume(tmp_path, 0o755, 0o700, 0o777)
+
+    assert garmin_registry_common.first_writable_ancestor(root) is None
+    assert garmin_registry_common.first_writable_ancestor(tmp_path / "missing" / "garth") is None
+    (tmp_path / "regular-file").write_text("", encoding="ascii")
+    assert garmin_registry_common.first_writable_ancestor(tmp_path / "regular-file" / "x" / "garth") is None, (
+        "an advisory check must never raise (NotADirectoryError here)"
+    )
+
+
+def _stat(mode: int, uid: int) -> os.stat_result:
+    return os.stat_result((stat.S_IFDIR | mode, 0, 0, 0, uid, 0, 0, 0, 0, 0))
+
+
+def test_only_a_root_owned_sticky_directory_is_exempt():
+    trusted = garmin_registry_common._is_trusted_sticky
+    other = os.geteuid() or 1000
+
+    assert trusted(_stat(0o1777, 0))
+    assert not trusted(_stat(0o0777, 0)), "not sticky"
+    assert not trusted(_stat(0o1777, other)), "sticky but not root's"
+
+
+def test_boot_warns_naming_the_ancestor_and_still_uses_the_root(_tmp_is_trusted, monkeypatch, tmp_path, caplog):
+    writable = _volume(tmp_path, 0o777)
+    configured = writable / "garth"
+    monkeypatch.setenv("GARTH_TOKEN_DIR", str(configured))
+    caplog.set_level(logging.WARNING)
+
+    assert garmin_registry._configured_token_root() == configured
+    assert _registry_records(caplog, logging.WARNING) == [_ANCESTOR_WARNING.format(str(writable))]
+    assert not configured.exists()
+
+
+def test_boot_does_not_warn_for_private_ancestors(_tmp_is_trusted, monkeypatch, tmp_path, caplog):
+    configured = _volume(tmp_path, 0o755) / "garth"
+    monkeypatch.setenv("GARTH_TOKEN_DIR", str(configured))
+    caplog.set_level(logging.WARNING)
+
+    assert garmin_registry._configured_token_root() == configured
+    assert _registry_records(caplog, logging.WARNING) == []
+
+
+def test_the_ancestor_warning_cannot_forge_a_log_line(_tmp_is_trusted, monkeypatch, tmp_path, caplog):
+    writable = tmp_path / "evil\nERROR forged"
+    writable.mkdir()
+    writable.chmod(0o777)
+    monkeypatch.setenv("GARTH_TOKEN_DIR", str(writable / "garth"))
+    caplog.set_level(logging.WARNING)
+
+    assert garmin_registry._configured_token_root() == writable / "garth"
+    assert all("\n" not in message for message in _registry_records(caplog, logging.WARNING))
 
 
 def _raise(exc: BaseException):

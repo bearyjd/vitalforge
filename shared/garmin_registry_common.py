@@ -154,6 +154,27 @@ def _refuse_a_shared_directory(root: Path) -> None:
             raise TokenRootRefused(reason)
 
 
+def _is_trusted_sticky(found: os.stat_result) -> bool:
+    """A root-owned sticky directory (``/tmp``): others may write it, but cannot
+    rename or remove an entry they do not own."""
+    return found.st_uid == 0 and bool(found.st_mode & stat.S_ISVTX)
+
+
+def first_writable_ancestor(root: Path) -> Path | None:
+    """The highest existing ancestor of ``root`` (not the root itself, which
+    the registry makes 0700) that is group- or other-writable, unless it is a
+    root-owned sticky directory.  Advisory only: refusing would reject a
+    root-owned 0775 ``/srv``.  A missing ancestor ends the walk; never raises."""
+    for ancestor in reversed(root.parents):
+        try:
+            found = os.stat(ancestor)
+        except OSError:
+            return None
+        if found.st_mode & (stat.S_IWGRP | stat.S_IWOTH) and not _is_trusted_sticky(found):
+            return ancestor
+    return None
+
+
 DEFAULT_TOKEN_ROOT = "/app/data/.garth"
 
 
@@ -162,11 +183,20 @@ def configured_token_root(logger: logging.Logger) -> Path | None:
     crashing both services at import.  Only the normalizer's own fixed refusals
     are logged by text; an OSError or RuntimeError carries the path.  Logs
     through the caller's ``logger`` (the facade's), where boot errors belong.
-    A blank value (compose's ``${GARTH_TOKEN_DIR:-}``) is unset, not the cwd."""
+    A blank value (compose's ``${GARTH_TOKEN_DIR:-}``) is unset, not the cwd.
+    A writable ancestor is only warned about, by its (repr'd) path."""
     configured = os.getenv("GARTH_TOKEN_DIR", "")
     try:
-        return normalize_token_root(configured if configured.strip() else DEFAULT_TOKEN_ROOT)
+        root = normalize_token_root(configured if configured.strip() else DEFAULT_TOKEN_ROOT)
     except (OSError, RuntimeError, ValueError) as exc:
         reason = str(exc) if isinstance(exc, TokenRootRefused) else type(exc).__name__
         logger.error("GARTH_TOKEN_DIR is unusable (%s); Garmin features are disabled", reason)
         return None
+    writable = first_writable_ancestor(root)
+    if writable is not None:
+        logger.warning(
+            "GARTH_TOKEN_DIR is below a directory other users can write (%r); "
+            "another local user could replace the token root",
+            str(writable),
+        )
+    return root
