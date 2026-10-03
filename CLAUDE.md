@@ -146,8 +146,9 @@ curl http://localhost:8086/health   # {"status": "ok", "service": "vitalforge-da
 # Running a single service without Docker (matches Dockerfile CMD, from repo root):
 pip install -r vitalforge_weight/requirements.txt
 VF_TMP=$(mktemp -d)   # private (0700): never a guessable name in a shared /tmp
-DB_PATH=$VF_TMP/vf-test.db GARTH_TOKEN_DIR=$VF_TMP/garth \
+DB_PATH="$VF_TMP/vf-test.db" GARTH_TOKEN_DIR="$VF_TMP/garth" \
   uvicorn vitalforge_weight.app:app --host 0.0.0.0 --port 8085 --no-proxy-headers
+rm -rf "$VF_TMP"      # when done (after Ctrl-C): the scratch DB and token dir are throwaway
 
 # Lint and test (repo root; mirrors .github/workflows/docker.yml's `test` job).
 # Use a venv, not the system/global Python — installing these into a shared interpreter
