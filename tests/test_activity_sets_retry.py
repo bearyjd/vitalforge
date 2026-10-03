@@ -223,6 +223,31 @@ async def test_registry_failure_on_retry_uses_bounded_code(
     assert row["garmin_claimed_at"] is None
 
 
+async def test_unparsable_stored_exercises_does_not_500_on_sets_retry(client, fake_garmin_client, sets_on):
+    """The stored payload is parsed inside the retry's own try: a row Python
+    cannot read degrades to sets 'failed', never a 500 over durable data."""
+    person_id = await get_primary_person_id()
+    await seed_synced_row(person_id)
+    db = await get_db()
+    try:
+        await db.execute("UPDATE strength_sessions SET exercises_json = 'not json'")
+        await db.commit()
+    finally:
+        await db.close()
+
+    resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
+
+    assert resp.status_code == 200
+    assert resp.json()["garmin_status"] == "synced"
+    assert resp.json()["garmin_sets_status"] == "failed"
+    assert fake_garmin_client.registry_calls == []
+    assert fake_garmin_client.created_activities == []
+    row = await fetch_row(person_id)
+    assert row["garmin_status"] == "synced"
+    assert row["garmin_sets_status"] == "failed"
+    assert row["garmin_claimed_at"] is None
+
+
 async def test_flag_off_does_not_retry(client, fake_garmin_client, monkeypatch):
     monkeypatch.delenv("VITALFORGE_GARMIN_EXERCISE_SETS", raising=False)
     person_id = await get_primary_person_id()
