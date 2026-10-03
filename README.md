@@ -518,8 +518,10 @@ If you don't use Tasker, the free "NFC Tools" app can open a URL on tap:
 
 Person-scoped routes live under `/p/{slug}/` (`{slug}` is the person's slug; the caller needs
 a grant on that person, see [People and access](#people-and-access)). `/health`, `/auth/*`
-and `/api/persons*` are global; the account, token and administration routes are described in
-[Authentication](#authentication) and [People and access](#people-and-access). The Garmin
+and `/api/persons*` are global. [Authentication](#authentication) and
+[People and access](#people-and-access) cover `/auth/account`, `/auth/admin/users` and
+`/auth/admin/persons`; the `/api/persons*` routes (`shared/persons_admin.py`) are not
+documented in this README. The Garmin
 link routes are listed under [Linking Garmin](#linking-garmin).
 
 ### Weight Service (port 8085)
