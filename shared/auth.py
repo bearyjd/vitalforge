@@ -517,6 +517,9 @@ def _step_up_retry_after(user_id: int, now: float) -> int | None:
         return None
     while failures and failures[0] <= now - _STEP_UP_WINDOW_SECONDS:
         failures.popleft()
+    if not failures:
+        _step_up_failures.pop(user_id, None)
+        return None
     if len(failures) < _STEP_UP_FAILURE_LIMIT:
         return None
     return max(1, int(failures[0] + _STEP_UP_WINDOW_SECONDS - now) + 1)
