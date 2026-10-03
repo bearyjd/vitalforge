@@ -318,6 +318,34 @@ async def test_legacy_cross_account_row_is_not_retried(client, fake_garmin_clien
     assert row["garmin_claimed_at"] is None
 
 
+@pytest.mark.parametrize("status", ["unknown", "failed", "pending"])
+async def test_only_a_synced_activity_gets_a_sets_retry(client, fake_garmin_client, sets_on, status):
+    """A non-synced row carrying a stale id and sets 'failed' must take its
+    own branch (reconcile for 'unknown', push for 'failed'/'pending'), never
+    the sets retry -- which would win the if/elif and skip reconciliation."""
+    person_id = await get_primary_person_id()
+    await seed_synced_row(person_id, garmin_status=status)
+
+    await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
+
+    assert STORED_ACTIVITY_ID not in [p["activity_id"] for p in fake_garmin_client.pushed_exercise_sets]
+    if status == "unknown":
+        assert len(fake_garmin_client.activity_lookups) == 1
+
+
+async def test_retired_global_target_row_is_not_retried(client, fake_garmin_client, sets_on):
+    from shared.garmin_registry_errors import LEGACY_GARMIN_TARGET_RETIRED_ERROR
+
+    person_id = await get_primary_person_id()
+    await seed_synced_row(person_id, garmin_error=LEGACY_GARMIN_TARGET_RETIRED_ERROR)
+
+    resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=BODY)
+
+    assert resp.json()["garmin_sets_status"] == "failed"
+    assert fake_garmin_client.registry_calls == []
+    assert (await fetch_row(person_id))["garmin_claimed_at"] is None
+
+
 async def test_push_to_garmin_false_does_not_retry(client, fake_garmin_client, sets_on):
     """Same shape as the push and reconcile branches: a re-POST that says
     not to push never reaches Garmin."""
