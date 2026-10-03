@@ -113,13 +113,14 @@ def normalize_token_root(raw: str | os.PathLike[str]) -> Path:
     must be owned by root or this process -- as the legitimate ones are:
     macOS ``/tmp`` and ``/var``, Silverblue ``/home``, an operator's own
     volume link.  ``~name``, a ``..`` component and a symlink loop are
-    refused outright.  Limits: a symlink inside a trusted symlink's TARGET
-    is not checked, and the check and the realpath are a boot-time TOCTOU
-    pair.  Everything below the root is left to garminconnect's refusal on
-    garth's own I/O.  ``os.path.realpath``, not ``Path.resolve()``: on 3.12
-    the latter raises RuntimeError, path in the message, on a symlink loop;
-    a loop is refused here by name instead.  A bare ``~`` with no resolvable
-    home raises RuntimeError to the caller.
+    refused outright, as is a root that resolves to ``/``, ``$HOME`` or the
+    cwd (see :func:`_refuse_a_shared_directory`).  Limits: a symlink inside a
+    trusted symlink's TARGET is not checked, and the check and the realpath
+    are a boot-time TOCTOU pair.  Everything below the root is left to
+    garminconnect's refusal on garth's own I/O.  ``os.path.realpath``, not
+    ``Path.resolve()``: on 3.12 the latter raises RuntimeError, path in the
+    message, on a symlink loop; a loop is refused here by name instead.  A
+    bare ``~`` with no resolvable home raises RuntimeError to the caller.
     """
     text = os.fspath(raw)
     if _OTHER_USER_HOME.match(text):
