@@ -30,6 +30,12 @@ def person_lock_key(person_id: int) -> LockKey:
     return ("person", person_id)
 
 
+# Runs on a default-executor thread with no timeout: one thread per key whose
+# flock the other process holds.  A holder needs a pool thread too (at least
+# to release, in _close_lock_handle), so if EACH service is waiting on as many
+# distinct people's locks as its pool has threads (min(32, cpu+4); about ten
+# people's Garmin calls at once across both services), both services hang
+# until restarted.  Reproduced in review; main behaves the same.  See #95.
 def _acquire_lock(lock_path: Path):
     handle = open(lock_path, "a")
     try:
@@ -67,9 +73,10 @@ async def flock_scope(local_key: LockKey, lock_path: Callable[[], Path]) -> Asyn
     The process-local lock comes first because flock alone does not make two
     descriptors in one process wait for each other (see
     :func:`_process_local_lock`); ``lock_path`` is only called once it is
-    held, so a path that has to prepare its directory does so serialized per
-    key.  flock is released if a process dies; the file is intentionally
-    retained as lock infrastructure, not a sentinel.
+    held, on a worker thread, so a path that has to prepare its directory
+    does so serialized per key and off the loop.  flock is released if a
+    process dies; the file is intentionally retained as lock infrastructure,
+    not a sentinel.
 
     ``local_key`` is structural: :data:`LEGACY_STORE_LOCK_KEY` for the
     flat-store adoption and :func:`person_lock_key` for a person share
@@ -80,7 +87,10 @@ async def flock_scope(local_key: LockKey, lock_path: Callable[[], Path]) -> Asyn
     """
     local_lock = _process_local_lock(local_key)
     async with local_lock:
-        path = lock_path()
+        # Usually no flock is held here.  Inside the boot-time adoption the
+        # legacy-store flock is (person_flock nests in it); harmless, as the
+        # other service can add at most one waiting thread on that lock.
+        path = await asyncio.to_thread(lock_path)
         acquire_task = asyncio.create_task(asyncio.to_thread(_acquire_lock, path))
         try:
             handle = await asyncio.shield(acquire_task)
@@ -112,7 +122,11 @@ def _close_acquired_handle_when_done(task: asyncio.Task) -> None:
 
 
 async def _close_lock_handle(handle) -> None:
-    """Close a flock descriptor even if cleanup itself is cancelled twice."""
+    """Close a flock descriptor even if cleanup itself is cancelled twice.
+
+    This release needs a default-executor thread; see :func:`_acquire_lock`
+    for the hang that causes when waiters fill the pool.
+    """
     close_task = asyncio.create_task(asyncio.to_thread(handle.close))
     try:
         await asyncio.shield(close_task)

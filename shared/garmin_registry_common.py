@@ -35,6 +35,10 @@ MAX_INTERACTIVE_WAIT_SECONDS = 30.0
 # guard is only correct while its ceiling is this same value, which is why both
 # read it from here rather than repeating the literal.
 MAX_CALL_INTERVAL_SECONDS = 60.0
+# The durable token layout, <root>/person-<id>/generation-<n>/: the facade
+# builds and cleans these paths, and the legacy adoption globs them.
+PERSON_DIR_PREFIX = "person-"
+GENERATION_DIR_PREFIX = "generation-"
 
 
 def utc_now() -> str:
@@ -54,6 +58,11 @@ def canonical_email(email: str) -> str:
     """Canonicalize account identity without attempting email validation."""
     if not isinstance(email, str):
         raise GarminLinkInputError()
+    # casefold, deliberately kept.  This string is the garmin_links uniqueness
+    # key AND what link() hands to Garmin's login (not the user's own input).
+    # casefold also folds non-ASCII (``ß`` -> ``ss``; tests/test_garmin_registry_common.py
+    # pins that), which would change the address Garmin sees.  Accepted because
+    # Garmin accounts are ASCII in practice, where casefold() equals lower().
     canonical = email.strip().casefold()
     if not canonical:
         raise GarminLinkInputError()

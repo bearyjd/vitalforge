@@ -337,6 +337,37 @@ async def test_cold_call_bounds_its_post_login_permit_by_the_remaining_budget(
     assert garmin_client.is_authenticated(person_id, 1), "the warm client is kept for the retry"
 
 
+async def test_cold_call_waits_past_one_interval_when_its_budget_covers_it(initialized_db, monkeypatch, tmp_path):
+    """The other arm of the post-login bound: a remaining budget LARGER than
+    one interval is honoured, not cut down to the grace. The peer pushes the
+    slot two intervals out during the login, and the operation still runs
+    after one longer sleep."""
+    person_id = await get_primary_person_id()
+    await _cold_link(person_id, tmp_path)
+    monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _fake_auth([]))
+    monkeypatch.setenv("GARMIN_MIN_CALL_INTERVAL_SECONDS", "2")
+    clock = {"now": 100.0}
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: clock["now"])
+    slept: list[float] = []
+
+    async def advance(seconds: float) -> None:
+        slept.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(garmin_registry.asyncio, "sleep", advance)
+    real_record_success = garmin_registry._record_auth_success
+
+    async def peer_takes_two_slots(*args):
+        await real_record_success(*args)
+        await _set_next_allowed_at(clock["now"] + 4.0)
+
+    monkeypatch.setattr(garmin_registry, "_record_auth_success", peer_takes_two_slots)
+    await _set_next_allowed_at(0.0)  # the first permit is free; the login spends it
+
+    assert await garmin_registry.call(person_id, lambda client: client.generation, max_wait_seconds=10.0) == 1
+    assert slept == [4], f"expected one four-second wait inside the ten-second budget, got {slept}"
+
+
 _RUNAWAY_SLEEPS = 100
 
 
@@ -556,6 +587,24 @@ async def test_call_evicts_a_stale_generation_before_running_the_operation(initi
     assert calls == [(person_id, 2)]
     assert (person_id, 1) not in garmin_client._clients
     assert (person_id, 2) in garmin_client._clients
+
+
+async def test_call_awaits_an_async_operation(initialized_db):
+    """The real call() (not conftest's fake) accepts an ``async def`` op: the
+    worker thread returns its coroutine and call() awaits it on the loop."""
+    person_id = await get_primary_person_id()
+    await _link(person_id)
+    garmin_client._clients[(person_id, 1)] = _FakeClient(1)
+    loop_thread = threading.get_ident()
+    ran_on: list[int] = []
+
+    async def operation(client):
+        ran_on.append(threading.get_ident())
+        await asyncio.sleep(0)
+        return client.generation
+
+    assert await garmin_registry.call(person_id, operation) == 1
+    assert ran_on == [loop_thread], "the coroutine body runs on the event loop"
 
 
 async def test_clients_with_identical_generations_never_cross_person_boundaries(initialized_db, monkeypatch):
@@ -785,6 +834,54 @@ async def test_bootstrap_adopts_a_verified_flat_store_once_by_moving_it(
     assert ledger["generation"] == 1
 
 
+@pytest.mark.parametrize("marker_first", [False, True], ids=["adopting", "marker-recorded"])
+async def test_adoption_does_its_filesystem_checks_off_the_event_loop(
+    initialized_db, monkeypatch, tmp_path, marker_first
+):
+    """Under both flocks the stats and the token-root mkdir/chmod run on a
+    worker thread, not on the loop the other lifespan steps share."""
+    root = _flat_store(tmp_path)
+    person_id = await get_primary_person_id()
+    monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", root)
+    monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _fake_auth([]))
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
+    monkeypatch.setenv("GARMIN_EMAIL", f"person-{person_id}@example.test")
+    if marker_first:
+        assert await garmin_registry_legacy.bootstrap_legacy_token_store() is True
+        (root / "garmin_tokens.json").write_text("{}", encoding="ascii")
+    loop_thread = threading.get_ident()
+    ran_on: dict[str, list[int]] = {"looks_like": [], "resolve_token_dir": []}
+    real_looks_like = garmin_registry_legacy._looks_like_legacy_token_store
+    real_resolve = garmin_registry.resolve_token_dir
+
+    def looks_like(path):
+        ran_on["looks_like"].append(threading.get_ident())
+        return real_looks_like(path)
+
+    def resolve(*args):
+        ran_on["resolve_token_dir"].append(threading.get_ident())
+        return real_resolve(*args)
+
+    monkeypatch.setattr(garmin_registry_legacy, "_looks_like_legacy_token_store", looks_like)
+    monkeypatch.setattr(garmin_registry, "resolve_token_dir", resolve)
+    real_token_file_path = garmin_registry_legacy.token_file_path
+    token_path_threads: list[int] = []
+
+    def token_file_path(path):  # lstats every ancestor
+        token_path_threads.append(threading.get_ident())
+        return real_token_file_path(path)
+
+    monkeypatch.setattr(garmin_registry_legacy, "token_file_path", token_file_path)
+
+    assert await garmin_registry_legacy.bootstrap_legacy_token_store() is (not marker_first)
+
+    assert ran_on["looks_like"], "the flat-store check was never consulted"
+    assert marker_first or ran_on["resolve_token_dir"], "the durable directory was never resolved"
+    assert loop_thread not in ran_on["looks_like"] + ran_on["resolve_token_dir"], ran_on
+    if marker_first:  # the residue warning names a fixed file; it never resolves a path on the loop
+        assert loop_thread not in token_path_threads, "token_file_path ran on the event loop"
+
+
 async def test_bootstrap_logs_the_skip_reason_when_no_flat_store_exists(
     initialized_db, monkeypatch, tmp_path, caplog
 ):
@@ -881,6 +978,50 @@ async def test_bootstrap_never_re_adopts_after_unlink_even_if_the_flat_store_ret
     assert calls == [(person_id, 1)], "the flat store must never be verified again"
     assert await _link_row(person_id) is None
     assert (root / "garmin_tokens.json").is_file(), "an un-adoptable store is left where it was"
+
+
+async def test_bootstrap_warns_about_a_flat_store_restored_after_the_marker(
+    initialized_db, monkeypatch, tmp_path, caplog
+):
+    """A restored volume backup (post-marker database, pre-adoption ``.garth``)
+    puts a live credential back at the root. Boot names it at WARNING; it
+    never reads, adopts or deletes it."""
+    root = _flat_store(tmp_path)
+    person_id = await get_primary_person_id()
+    calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", root)
+    monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _fake_auth(calls))
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
+    monkeypatch.setenv("GARMIN_EMAIL", f"person-{person_id}@example.test")
+    assert await garmin_registry_legacy.bootstrap_legacy_token_store() is True
+    restored = root / "garmin_tokens.json"
+    restored.write_text('{"token": "restored-secret-value"}', encoding="ascii")
+    caplog.set_level(logging.INFO, logger="shared.garmin_registry_legacy")
+
+    assert await garmin_registry_legacy.bootstrap_legacy_token_store() is False
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("garmin_tokens.json" in message for message in warnings), warnings
+    assert "restored-secret-value" not in caplog.text
+    assert str(root) not in caplog.text
+    assert restored.read_text(encoding="ascii") == '{"token": "restored-secret-value"}'
+    assert calls == [(person_id, 1)], "the restored store must never be verified"
+
+
+async def test_bootstrap_after_the_marker_does_not_warn_without_a_flat_store(
+    initialized_db, monkeypatch, tmp_path, caplog
+):
+    root = _flat_store(tmp_path)
+    person_id = await get_primary_person_id()
+    monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", root)
+    monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _fake_auth([]))
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
+    monkeypatch.setenv("GARMIN_EMAIL", f"person-{person_id}@example.test")
+    assert await garmin_registry_legacy.bootstrap_legacy_token_store() is True
+    caplog.set_level(logging.WARNING, logger="shared.garmin_registry_legacy")
+
+    assert await garmin_registry_legacy.bootstrap_legacy_token_store() is False
+    assert caplog.records == []
 
 
 async def test_bootstrap_completes_an_interrupted_adoption_without_moving_again(
@@ -1272,6 +1413,33 @@ async def test_marker_blocks_re_adoption_for_a_different_primary(initialized_db,
     assert await _link_row(second) is None
     assert not garmin_registry._person_token_root(second).exists()
     assert (root / "garmin_tokens.json").is_file()
+
+
+async def test_bootstrap_never_adopts_for_an_archived_primary(initialized_db, monkeypatch, tmp_path):
+    """Every route-driven publication requires ``archived_at IS NULL``; an
+    archived primary (a hand-edited database) must not receive the flat store,
+    get a ``linked`` row no route can reach, or burn the one-time marker."""
+    root = _flat_store(tmp_path)
+    person_id = await get_primary_person_id()
+    calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", root)
+    monkeypatch.setattr(garmin_registry.garmin_client, "authenticate", _fake_auth(calls))
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
+    monkeypatch.setenv("GARMIN_EMAIL", f"person-{person_id}@example.test")
+    db = await get_db()
+    try:
+        await db.execute("UPDATE persons SET archived_at = '2026-09-15T00:00:00Z' WHERE id = ?", (person_id,))
+        await db.commit()
+    finally:
+        await db.close()
+
+    assert await garmin_registry_legacy.bootstrap_legacy_token_store() is False
+
+    assert calls == [], "an archived primary's adoption reached Garmin"
+    assert await _link_row(person_id) is None
+    assert not await _adoption_marker_recorded()
+    assert (root / "garmin_tokens.json").is_file()
+    assert not garmin_registry._person_token_root(person_id).exists()
 
 
 async def test_bootstrap_waits_for_a_busy_permit_instead_of_deferring(initialized_db, monkeypatch, tmp_path):
@@ -2299,6 +2467,74 @@ async def test_call_cleans_post_publication_crash_stale_generation_directory(ini
     assert await garmin_registry.call(person_id, lambda client: client.generation) == 2
     assert not old_dir.exists()
     assert new_dir.exists()
+
+
+async def _durable_generation_two(person_id: int) -> None:
+    await _link(person_id, generation=2)
+    db = await get_db()
+    try:
+        await db.execute("INSERT INTO garmin_link_generations VALUES (?, 2)", (person_id,))
+        await db.commit()
+    finally:
+        await db.close()
+    new_dir = garmin_registry._generation_token_dir(person_id, 2)
+    new_dir.mkdir(parents=True, mode=0o700)
+    (new_dir / "garmin_tokens.json").touch()
+    garmin_client._clients[(person_id, 2)] = _FakeClient(2)
+
+
+async def test_call_sweep_skips_a_symlinked_generation_directory(initialized_db, monkeypatch, tmp_path, caplog):
+    """A ``generation-N`` symlink (a backup-restore artefact) is neither swept
+    nor allowed to fail the request: rmtree refuses symlinks, and the target
+    may be anything."""
+    person_id = await get_primary_person_id()
+    await _durable_generation_two(person_id)
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    (target / "keep.txt").write_text("keep", encoding="ascii")
+    link = garmin_registry._generation_token_dir(person_id, 1)
+    link.symlink_to(target, target_is_directory=True)
+    removed: list = []
+    real_remove = garmin_registry._remove_token_dir
+
+    def spy_remove(path):
+        removed.append(path)
+        real_remove(path)
+
+    monkeypatch.setattr(garmin_registry, "_remove_token_dir", spy_remove)
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
+    caplog.set_level(logging.WARNING, logger="shared.garmin_registry")
+
+    assert await garmin_registry.call(person_id, lambda client: client.generation) == 2
+    assert link not in removed, "the sweep must skip a symlink, not try to remove it"
+    assert caplog.records == []
+    assert link.is_symlink()
+    assert (target / "keep.txt").read_text(encoding="ascii") == "keep"
+
+
+async def test_call_survives_an_obsolete_generation_it_cannot_remove(initialized_db, monkeypatch, caplog):
+    """The sweep is best effort, like _remove_superseded_generation: an
+    undeletable obsolete generation is inert residue, not a failed request."""
+    person_id = await get_primary_person_id()
+    await _durable_generation_two(person_id)
+    old_dir = garmin_registry._generation_token_dir(person_id, 1)
+    old_dir.mkdir(mode=0o700)
+    real_remove = garmin_registry._remove_token_dir
+
+    def stubborn_remove(path):
+        if path == old_dir:
+            raise PermissionError("directory-detail-must-not-escape")
+        real_remove(path)
+
+    monkeypatch.setattr(garmin_registry, "_remove_token_dir", stubborn_remove)
+    monkeypatch.setattr(garmin_registry.time, "time", lambda: 100.0)
+    caplog.set_level(logging.WARNING, logger="shared.garmin_registry")
+
+    assert await garmin_registry.call(person_id, lambda client: client.generation) == 2
+    assert old_dir.exists()
+    assert "PermissionError" in caplog.text
+    assert "generation 1 " in caplog.text, "the warning names which generation is left behind"
+    assert "directory-detail" not in caplog.text
 
 
 

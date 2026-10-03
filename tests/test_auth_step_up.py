@@ -36,3 +36,21 @@ async def test_sixth_failed_step_up_in_a_window_is_throttled_before_scrypt(initi
     now += 15 * 60 + 1
     await auth._require_step_up(identity, "correct horse")  # window expired: success, and it clears the entry
     assert user_id not in auth._step_up_failures
+
+
+def test_pruning_every_expired_failure_drops_the_user_entry():
+    """Only a successful step-up used to pop the key, so a user who failed
+    and never came back kept an empty deque forever."""
+    now = 10_000.0
+    auth._step_up_failures[7] = auth.deque([now - auth._STEP_UP_WINDOW_SECONDS - 1, now - auth._STEP_UP_WINDOW_SECONDS])
+
+    assert auth._step_up_retry_after(7, now) is None
+    assert 7 not in auth._step_up_failures
+
+
+def test_pruning_keeps_the_entry_while_a_failure_is_still_in_the_window():
+    now = 10_000.0
+    auth._step_up_failures[7] = auth.deque([now - auth._STEP_UP_WINDOW_SECONDS - 1, now - 1])
+
+    assert auth._step_up_retry_after(7, now) is None
+    assert list(auth._step_up_failures[7]) == [now - 1]

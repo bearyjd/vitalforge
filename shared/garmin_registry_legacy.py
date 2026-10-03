@@ -93,6 +93,13 @@ async def _adopt_legacy_store_locked(root: Path, canonical_email: str) -> bool:
     have reserved its generation in the meantime.
     """
     if await _legacy_adoption_recorded():
+        if await asyncio.to_thread(_looks_like_legacy_token_store, root):
+            # Live credential residue (e.g. a restored .garth backup): named,
+            # never read, adopted or deleted -- an operator decides what it is.
+            logger.warning(
+                "Legacy Garmin token store garmin_tokens.json is back at the token root after adoption; "
+                "it is never used and is left in place for an operator to remove"
+            )
         logger.info("Legacy Garmin token-store adoption skipped: marker already recorded")
         return False
     person_id = await _adoptable_primary_person(canonical_email)
@@ -117,8 +124,9 @@ async def _adopt_for_person_locked(person_id: int, canonical_email: str, root: P
     """Both flocks are held.  The moved-store branch exists for a process
     killed between the file move and the database commit: the flat store is
     already under ``generation-1`` and only the publication is missing."""
-    durable = garmin_registry.resolve_token_dir(person_id, _LEGACY_GENERATION)
-    if _looks_like_legacy_token_store(durable):
+    # Filesystem checks (and resolve_token_dir's root mkdir/chmod) stay off the loop.
+    durable = await asyncio.to_thread(garmin_registry.resolve_token_dir, person_id, _LEGACY_GENERATION)
+    if await asyncio.to_thread(_looks_like_legacy_token_store, durable):
         if not await _verify_token_store(person_id, canonical_email, durable):
             return False
         published = await _publish_legacy_adoption(person_id, canonical_email)
@@ -128,7 +136,7 @@ async def _adopt_for_person_locked(person_id: int, canonical_email: str, root: P
             )
         return published
     await _warn_about_orphaned_moved_stores(root, person_id)
-    if not _looks_like_legacy_token_store(root):
+    if not await asyncio.to_thread(_looks_like_legacy_token_store, root):
         logger.info("Legacy Garmin token-store adoption skipped: no flat token store is present")
         return False
     return await _adopt_flat_store(person_id, canonical_email, root, durable)
@@ -136,10 +144,12 @@ async def _adopt_for_person_locked(person_id: int, canonical_email: str, root: P
 
 def _moved_store_person_ids(root: Path) -> list[int]:
     """Person ids owning a ``generation-1`` token file, from names alone."""
+    person_prefix = garmin_registry_common.PERSON_DIR_PREFIX
+    generation_dir = f"{garmin_registry_common.GENERATION_DIR_PREFIX}{_LEGACY_GENERATION}"
     person_ids: list[int] = []
-    for token_path in root.glob("person-*/generation-1/garmin_tokens.json"):
-        suffix = token_path.parent.parent.name.removeprefix("person-")
-        if suffix.isdigit():
+    for token_path in root.glob(f"{person_prefix}*/{generation_dir}/garmin_tokens.json"):
+        suffix = token_path.parent.parent.name.removeprefix(person_prefix)
+        if suffix.isascii() and suffix.isdecimal():  # isdigit() admits '²' (int() rejects it) and '٣'
             person_ids.append(int(suffix))
     return person_ids
 
@@ -156,19 +166,23 @@ async def _warn_about_orphaned_moved_stores(root: Path, primary_id: int) -> None
     candidates = [pid for pid in await asyncio.to_thread(_moved_store_person_ids, root) if pid != primary_id]
     if not candidates:
         return
+    placeholders = ", ".join("?" for _ in candidates)  # only "?" markers; the ids are bound
     db = await get_db()
     try:
-        for person_id in candidates:
-            ledger = await (
-                await db.execute("SELECT 1 FROM garmin_link_generations WHERE person_id = ?", (person_id,))
-            ).fetchone()
-            if ledger is None:
-                logger.warning(
-                    "Legacy Garmin token store moved for person %s was never published; leaving it in place",
-                    person_id,
-                )
+        rows = await (
+            await db.execute(
+                f"SELECT person_id FROM garmin_link_generations WHERE person_id IN ({placeholders})", candidates
+            )
+        ).fetchall()
     finally:
         await db.close()
+    published = {int(row["person_id"]) for row in rows}
+    for person_id in candidates:
+        if person_id not in published:
+            logger.warning(
+                "Legacy Garmin token store moved for person %s was never published; leaving it in place",
+                person_id,
+            )
 
 
 async def _adopt_flat_store(person_id: int, canonical_email: str, root: Path, durable: Path) -> bool:
@@ -282,7 +296,9 @@ async def _adoptable_primary_person_in(db, canonical_email: str) -> int | None:
     ``generation-1`` directory with no ledger row can only be an interrupted
     adoption.
     """
-    primary = await (await db.execute("SELECT id FROM persons WHERE is_primary = 1")).fetchone()
+    primary = await (
+        await db.execute("SELECT id FROM persons WHERE is_primary = 1 AND archived_at IS NULL")
+    ).fetchone()
     if primary is None:
         return None
     person_id = int(primary["id"])
