@@ -159,15 +159,16 @@ def _refuse_a_shared_directory(root: Path) -> None:
 
 
 def _is_trusted_sticky(found: os.stat_result) -> bool:
-    """A root-owned sticky directory (``/tmp``): others may write it, but cannot
-    rename or remove an entry they do not own."""
-    return found.st_uid == 0 and bool(found.st_mode & stat.S_ISVTX)
+    """A sticky directory owned by root (``/tmp``) or by this process: others
+    may write it, but cannot rename or remove an entry they do not own, and
+    its owner is already trusted.  One owned by any other user is not."""
+    return found.st_uid in (0, os.geteuid()) and bool(found.st_mode & stat.S_ISVTX)
 
 
 def first_writable_ancestor(root: Path) -> Path | None:
     """The highest existing ancestor of ``root`` (not the root itself, which
     the registry makes 0700) that is group- or other-writable, unless it is a
-    root-owned sticky directory.  Advisory only: refusing would reject a
+    sticky directory root or this process owns.  Advisory only: refusing would reject a
     root-owned 0775 ``/srv``.  A missing ancestor ends the walk; never raises."""
     for ancestor in reversed(root.parents):
         try:

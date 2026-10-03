@@ -276,15 +276,15 @@ _ANCESTOR_WARNING = "GARTH_TOKEN_DIR is below a directory other users can write 
 
 @pytest.fixture
 def _tmp_is_trusted(monkeypatch):
-    """The real exemption is a ROOT-owned sticky directory, and a test cannot
-    make one; this sandbox's /tmp is even owned by an unmapped uid.  Exempt
-    every sticky directory this process does not own (so the real /tmp above
-    tmp_path, whoever owns it), keeping a self-owned sticky one reportable.
-    ``_is_trusted_sticky`` itself is pinned against fabricated stats below."""
+    """The real /tmp above tmp_path is sticky but, in some sandboxes, owned by
+    an unmapped uid rather than root.  Exempt exactly that directory (by
+    device and inode) so the walk's verdict depends only on the tree a test
+    builds.  ``_is_trusted_sticky`` itself is pinned against fabricated stats."""
     real = garmin_registry_common._is_trusted_sticky
+    system_tmp = os.stat("/tmp")
 
     def trusted(found):
-        return real(found) or (bool(found.st_mode & stat.S_ISVTX) and found.st_uid != os.geteuid())
+        return real(found) or (found.st_dev, found.st_ino) == (system_tmp.st_dev, system_tmp.st_ino)
 
     monkeypatch.setattr(garmin_registry_common, "_is_trusted_sticky", trusted)
 
@@ -299,7 +299,7 @@ def _volume(tmp_path: Path, *modes: int) -> Path:
     return directory
 
 
-@pytest.mark.parametrize("mode", [0o775, 0o757, 0o777, 0o1777], ids=["group-w", "other-w", "both-w", "self-owned-sticky"])
+@pytest.mark.parametrize("mode", [0o775, 0o757, 0o777], ids=["group-w", "other-w", "both-w"])
 def test_a_writable_ancestor_is_named(mode, _tmp_is_trusted, tmp_path):
     writable = _volume(tmp_path, mode)
     root = _volume(writable, 0o755) / "garth"
@@ -330,13 +330,36 @@ def _stat(mode: int, uid: int) -> os.stat_result:
     return os.stat_result((stat.S_IFDIR | mode, 0, 0, 0, uid, 0, 0, 0, 0, 0))
 
 
-def test_only_a_root_owned_sticky_directory_is_exempt():
+def test_only_a_sticky_directory_owned_by_root_or_this_process_is_exempt():
+    """Another user cannot delete or replace entries of a sticky directory
+    root or the service owns; one owned by any OTHER user, they can."""
     trusted = garmin_registry_common._is_trusted_sticky
-    other = os.geteuid() or 1000
+    me = os.geteuid()
+    other = next(uid for uid in (1000, 1001, 4242) if uid not in (0, me))
 
     assert trusted(_stat(0o1777, 0))
+    assert trusted(_stat(0o1777, me)), "sticky and the service's own"
+    assert trusted(_stat(0o1775, me)), "group-writable but sticky and the service's own"
     assert not trusted(_stat(0o0777, 0)), "not sticky"
-    assert not trusted(_stat(0o1777, other)), "sticky but not root's"
+    assert not trusted(_stat(0o0775, me)), "group-writable, not sticky: still reported"
+    assert not trusted(_stat(0o1777, other)), "sticky but another user's"
+    assert not trusted(_stat(0o1775, other)), "sticky, group-writable, another user's"
+
+
+def test_a_self_owned_sticky_ancestor_is_not_reported(_tmp_is_trusted, tmp_path):
+    root = _volume(tmp_path, 0o1777, 0o755) / "garth"
+
+    assert garmin_registry_common.first_writable_ancestor(root) is None
+
+
+def test_a_sticky_ancestor_owned_by_another_user_is_reported(_tmp_is_trusted, monkeypatch, tmp_path):
+    """A test cannot chown to another user, so this process is made to look
+    like a different uid: its own sticky directory then reads as foreign."""
+    writable = _volume(tmp_path, 0o1777)
+    root = _volume(writable, 0o755) / "garth"
+    monkeypatch.setattr(garmin_registry_common.os, "geteuid", lambda: os.stat(writable).st_uid + 1)
+
+    assert garmin_registry_common.first_writable_ancestor(root) == writable
 
 
 def test_boot_warns_naming_the_ancestor_and_still_uses_the_root(_tmp_is_trusted, monkeypatch, tmp_path, caplog):
