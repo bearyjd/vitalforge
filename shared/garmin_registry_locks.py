@@ -30,6 +30,8 @@ def person_lock_key(person_id: int) -> LockKey:
     return ("person", person_id)
 
 
+# Runs on a default-executor thread with no timeout: one thread per key whose
+# flock the other process holds (scaling note only; persons are single-digit).
 def _acquire_lock(lock_path: Path):
     handle = open(lock_path, "a")
     try:

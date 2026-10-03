@@ -54,6 +54,9 @@ def canonical_email(email: str) -> str:
     """Canonicalize account identity without attempting email validation."""
     if not isinstance(email, str):
         raise GarminLinkInputError()
+    # casefold, deliberately kept: this is the garmin_links uniqueness key, and
+    # Garmin addresses are ASCII in practice, where it equals lower().  It also
+    # folds non-ASCII (``ß`` -> ``ss``); tests/test_garmin_registry_common.py pins that.
     canonical = email.strip().casefold()
     if not canonical:
         raise GarminLinkInputError()
