@@ -418,9 +418,9 @@ This release moves Garmin from one deployment-wide credential in `.env` to a lin
    legacy-store lock and the primary person's lock while it waits for a Garmin call permit
    (at most three call intervals, so 6 s with the default `GARMIN_MIN_CALL_INTERVAL_SECONDS`
    and 180 s at the clamp) and resumes the token store; that resume is bounded only by the
-   Garmin SDK's own per-request timeouts (the cold-login worst case is about 455 s, per the
-   header comment in `vitalforge_weight/garmin_claim.py`, which is long enough to trip a
-   healthcheck or `start_period` on the other service). The other service's startup waits on the
+   Garmin SDK's own per-request timeouts (about 394 s for the login alone, per the header
+   comment in `vitalforge_weight/garmin_claim.py`, plus the permit wait; long enough that
+   Docker may report the other service unhealthy while it waits). The other service's startup waits on the
    legacy-store lock, with no timeout of its own, until adoption finishes.
 4. **`GARMIN_PASSWORD` is no longer read.** A token Garmin later rejects is not re-logged-in
    from `.env`; the person's status shows `auth_failed` and the fix is the `relink` route.
