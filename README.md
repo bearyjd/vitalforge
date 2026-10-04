@@ -239,16 +239,18 @@ data is there for anyone querying the API directly.
 **Garmin throttling (`429`).** When Garmin answers a person's sync with a `429`, that person's
 scheduled syncs are skipped for 15 minutes; each further consecutive `429` doubles the wait (15
 minutes, 30 minutes, 1, 2, 4, then 6 hours, which is the cap). The scheduler sleeps
-`SYNC_INTERVAL_HOURS` (default 2) after each tick and each tick syncs one person, so a backoff
-only delays a person when it outlasts their normal turn (the interval times the number of
-linked people): with the default, the 4 and 6 hour steps for one linked person, only the 6
-hour step for two, none for three or more. The state lives in the database
-(`sync_status.backoff_until` and `backoff_streak`), so a restart does not reset it. A sync that
-runs to the end with at least one answer from Garmin (even with some metrics skipped) clears it;
-one that stops early for any other reason, gets no answers, or crashes leaves it as it was. A
-manual sync is not blocked by a backoff in progress, but its result updates it like any other.
-A person's first scheduled sync after boot is a 90-day backfill, retried while it stops early;
-once two of those have been throttled, the person drops to the 3-day window.
+`SYNC_INTERVAL_HOURS` (default 2) after each tick and each tick syncs one person, so between
+restarts a backoff only delays a person when it outlasts their normal turn (the interval times
+the number of linked people): with the default, the 4 and 6 hour steps for one linked person,
+only the 6 hour step for two, none for three or more. The state lives in the database
+(`sync_status.backoff_until` and `backoff_streak`), so a restart does not reset it; the first
+tick runs at boot, so even a short backoff still running then pushes that person to a later
+tick. A sync that runs to the end with at least one answer from Garmin (even with some metrics
+skipped) clears it; one that stops early for any other reason, gets no answers, or crashes
+leaves it as it was. A manual sync is not blocked by a backoff in progress, but its result
+updates it like any other. A person's first scheduled sync after boot is a 90-day backfill,
+retried while it stops early; once two of those have been throttled, the person drops to the
+3-day window.
 
 ### Recommendations engine
 
