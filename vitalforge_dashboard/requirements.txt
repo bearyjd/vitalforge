@@ -15,7 +15,7 @@ aiosqlite==0.22.1
 # garmin_client.py silently until 2026-08-22 -- see that file's authenticate()
 # and tests/test_garmin_client_api.py. Before bumping this again, re-read
 # authenticate() against the new version's source, not just the changelog.
-garminconnect==0.3.16
+garminconnect==0.3.17
 python-multipart==0.0.32
 anthropic>=0.40.0
 # Exact-pinned, not a range: this signs the vf_session cookie for BOTH
