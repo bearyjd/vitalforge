@@ -30,6 +30,8 @@ shared/                   # imported by BOTH services as a real installed packag
   auth.py                 # cookie/HMAC session auth + login page HTML + FastAPI middleware
   database.py             # aiosqlite connection + schema; migrations.py runs one-shot schema
                           # migrations on top of it (001-person-id-rebuild, Phase 1)
+  database_bootstrap.py   # post-migration repairs split out of database.py
+                          # (_attribute_orphaned_weight_log_rows)
   database_columns.py     # pure data: the `*_ADDITIVE_COLUMNS` lists init_db() hands to `_add_columns`
                           # (split out of database.py to stay under the line ceiling)
   env_paths.py            # path_from_env / refuse_leading_tilde: import-time read of a path-valued env
@@ -80,12 +82,9 @@ docker-compose.prod.yml   # PROD — pulls prebuilt images from Docker Hub / GHC
   (`WORKDIR /app` in the images, `pythonpath = ["."]` for tests). Do not add them to
   `pyproject.toml` `packages`: each Dockerfile runs `pip install -e .` BEFORE copying its
   service directory, so listing them breaks the image build.
-- **`vitalforge_dashboard/app.py` still carries one real `sys.path` hack**, and it is for its
-  OWN siblings, not for `shared`: it does `sys.path.insert(0, Path(__file__).parent)` then
-  imports `fit_import`, `correlations`, `goals`, `readiness`, `recommendations`, `sync` as
-  flat top-level modules. That is why those names are importable at all. Now that the
-  directory has a valid identifier, those can become `from vitalforge_dashboard.goals import
-  ...` and the hack can go — a follow-up, deliberately not bundled into the rename.
+- **`vitalforge_dashboard/app.py` imports its siblings as a package** (`from
+  vitalforge_dashboard.goals import ...`); its old `sys.path.insert` hack and the flat
+  top-level imports it served are gone (b20b56c). Don't reintroduce either.
 - **`VITALFORGE_SECRET` and the session cookie are shared across both services.** The same
   serializer secret and cookie name (`vf_session`) are used in both apps. This is intentional
   (single login covers both services when behind the same domain), not a bug — don't
@@ -109,8 +108,9 @@ docker-compose.prod.yml   # PROD — pulls prebuilt images from Docker Hub / GHC
   directory to run either service against an isolated database without touching the real
   `/app/data` volume. Both are read at import time; in tests, patch the module attribute
   (`tests/conftest.py::tmp_db_path` does), not just the env var. For both, a blank or
-  whitespace-only value is UNSET (the default, nothing logged: compose's `${NAME:-}` passes
-  one) and a non-blank value is used as given, never stripped. `DB_PATH` is read through
+  whitespace-only value is UNSET (the default, nothing logged: a bare `NAME=` line in `.env`,
+  which compose's `env_file` passes as an empty string, is one) and a non-blank value is never
+  trimmed. `DB_PATH` is read through
   `shared/env_paths.path_from_env`: a value starting with `~` is REFUSED AT IMPORT -- a
   `ValueError` naming the variable, never the value, so the service does not start (nothing
   expands the `~`; expanding it would put the file under HOME, `/app`, the image). A relative
