@@ -92,6 +92,7 @@ Visit `http://localhost:8085` for weight logging and `http://localhost:8086` for
 | `GARMIN_MIN_CALL_INTERVAL_SECONDS` | No | Minimum spacing between any two Garmin Connect calls across both services (default `2`, clamped to 1–60; a non-numeric value falls back to the default). A call that would arrive sooner is refused with `429` and a `Retry-After` |
 | `GARTH_TOKEN_DIR` | No | Where Garmin session tokens are kept (default `/app/data/.garth`, on the data volume). Blank means the default. Leave it unset under Docker Compose: a root outside `/app/data` is not on the volume and loses its tokens when the container is recreated. `/`, the home directory and the working directory are refused and disable Garmin; see [Storage paths](#storage-paths) |
 | `DB_PATH` | No | The SQLite database file (default `/app/data/fitness.db`). Blank means the default. A value starting with `~` stops the service from starting; see [Storage paths](#storage-paths) |
+| `SYNC_INTERVAL_HOURS` | No | Hours between scheduled Garmin syncs (default `2`). Each tick syncs one linked person, so a person's turn comes round every `SYNC_INTERVAL_HOURS` times the number of linked people |
 | `ANTHROPIC_API_KEY` | No | Claude API key for AI recommendations (rules engine works without it) |
 | `ANTHROPIC_BASE_URL` | No | Custom API base URL (e.g. `http://localhost:4000` for LiteLLM proxy) |
 | `VITALFORGE_USER` | No | One-time bootstrap username (default: `admin`) — seeds the first admin account on first boot if no users exist yet; not read for ongoing auth after that (manage accounts from `/auth/admin/users` instead) |
@@ -117,18 +118,19 @@ python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 services must see the same values: they share one database and one token tree.
 
 - **Blank means unset.** An empty or whitespace-only value (such as a bare `GARTH_TOKEN_DIR=`
-  line in `.env`) selects the default and logs nothing. A non-blank value is used exactly as
-  written, leading and trailing spaces included.
+  line in `.env`, which `env_file` passes as an empty string) selects the default and logs
+  nothing. A non-blank value is not trimmed: leading and trailing spaces stay part of the path.
 - **`DB_PATH` must not start with `~`.** Nothing expands it, and expanding it would put the
   database in `/app`, the container image's own layer rather than the data volume. The service
   refuses to start instead. The container logs `ValueError: DB_PATH must not start with '~' (it
   is never expanded); write the path out in full` (never the value itself) and, under
-  `restart: unless-stopped`, restarts in a loop until `.env` is fixed. A relative path is still
+  `restart: unless-stopped`, restarts in a loop. Fix `.env`, then run `docker compose up -d` to
+  recreate the containers; a restart keeps the old environment. A relative path is still
   accepted; it is relative to `/app` in the images.
 - **`GARTH_TOKEN_DIR` may not be `/`, the home directory or the working directory.** The
-  registry sets its token root to mode `0700` and keeps lock files there, so it must be a
-  directory of its own. In the images the home directory and the working directory are both
-  `/app`, so `~`, `.` and `/app` are refused. Only those exact directories are refused: `~/garth`
+  registry sets its token root to mode `0700` and keeps lock files there, so it must not be one
+  of these shared directories. In the images the home directory and the working directory are
+  both `/app`, so `~`, `.` and `/app` are refused. Only those exact directories are refused: `~/garth`
   and `/home` are accepted, but `~/garth` is `/app/garth`, outside the data volume, so its tokens
   are lost whenever the container is recreated. Keep the root under `/app/data`. A `~user` path, a
   `..` component, a symlink loop and a symlink owned by another user are refused as well.
@@ -146,10 +148,17 @@ component`, `a symlink owned by another user`, `a symlink loop`) or an error typ
 `OSError`; the path itself is never logged. This line, and the writable-directory warning below,
 print before the services configure their log format, so they carry no timestamp or level in
 front. A warning `Legacy Garmin token-store adoption could not prepare its token root` follows
-once startup reaches the lifespan. Until the variable is fixed and the services are restarted,
-weigh-ins are saved locally with `synced_to_garmin: false`, and link, relink and unlink answer
-`502`. Archiving a person still succeeds, but their token directories are not removed; see
-[Linking Garmin](#linking-garmin).
+once startup reaches the lifespan. Until `.env` is fixed and the containers are recreated
+(`docker compose up -d`; a restart keeps the old environment), weigh-ins are saved locally with
+`synced_to_garmin: false`, link, relink and unlink answer `502`, and the dashboard's syncs still
+run but every read fails without contacting Garmin, so each sync records `completed with N
+errors` and logs a warning per read. Archiving a person still succeeds, but their token
+directories are not removed; see [Linking Garmin](#linking-garmin).
+
+The same `could not prepare its token root` warning with no `GARTH_TOKEN_DIR is unusable` line
+before it means the root passed these checks but the service user cannot create it or make it
+private. Check the owner and permissions of the directory and of its parent. Garmin is unusable
+in the same way (the same `502`s and failed syncs) until that is fixed.
 
 Two other warnings do not stop either service. The first is advisory; the second means Garmin
 logins will fail until it is fixed:
@@ -167,8 +176,8 @@ logins will fail until it is fixed:
   installed `garminconnect` would address a different directory or refuses the root or a name
   VitalForge creates below it (a person's `generation-<n>` directory or a hidden staging
   directory); it can appear after a `garminconnect` upgrade. The reason is `another directory` or
-  an error type such as `ValueError`. It is not logged for a refused root; look for the `ERROR`
-  above instead.
+  an error type such as `ValueError`. It is not logged for a refused root; look for the
+  `GARTH_TOKEN_DIR is unusable` line above instead.
 
 ## Architecture
 
@@ -203,8 +212,11 @@ vitalforge/
 
 ### Data sync
 
-The dashboard automatically syncs the primary person's data from Garmin Connect every 2 hours.
-You can also trigger a manual sync for any person you hold `manage` on from the dashboard UI.
+The dashboard automatically syncs from Garmin Connect on a schedule: every 2 hours
+(`SYNC_INTERVAL_HOURS`) one tick syncs the linked, non-archived person whose last sync is oldest
+(`next_person_to_sync`), so with several linked people each person's turn comes round every
+2 hours times the number of people. You can also trigger a manual sync for any person you hold
+`manage` on from the dashboard UI.
 Both need that person to have a Garmin link: a manual sync on an unlinked person is refused
 with `{"status": "link_required", ...}` and nothing is started. Synced metrics:
 
@@ -224,12 +236,15 @@ data is there for anyone querying the API directly.
 
 **Garmin throttling (`429`).** When Garmin answers a person's sync with a `429`, that person's
 scheduled syncs are skipped for 15 minutes; each further consecutive `429` doubles the wait (15
-minutes, 30 minutes, 1, 2, 4, then 6 hours, which is the cap). The state lives in the database
-(`sync_status.backoff_until` and `backoff_streak`), so a restart does not reset it. A sync that
-gets real answers from Garmin clears it; a network error, a relink prompt or a crash leaves it
-as it was. A manual sync is not blocked by a backoff in progress, but its result updates it like
-any other. A person's first scheduled sync after boot is a 90-day backfill, retried while it
-stops early; once two of those have been throttled, the person drops to the 3-day window.
+minutes, 30 minutes, 1, 2, 4, then 6 hours, which is the cap). The scheduler sleeps
+`SYNC_INTERVAL_HOURS` (default 2) after each tick, so with the default only the 4 and 6 hour
+steps actually skip a tick. The state lives in the database (`sync_status.backoff_until` and
+`backoff_streak`), so a restart does not reset it. A sync that runs to the end with at least one
+answer from Garmin (even with some metrics skipped) clears it; one that stops early for any
+other reason, gets no answers, or crashes leaves it as it was. A manual sync is not blocked by a
+backoff in progress, but its result updates it like any other. A person's first scheduled sync
+after boot is a 90-day backfill, retried while it stops early; once two of those have been
+throttled, the person drops to the 3-day window.
 
 ### Recommendations engine
 
@@ -302,9 +317,10 @@ A few behaviours are deliberate and worth knowing before they surprise you:
   dashboard, and `/p/{slug}/` stops resolving. **Slugs are never reused**, archived ones
   included — a freed slug would let an old bookmark open a different person's health data.
   For the same reason a slug cannot be renamed after creation.
-- **Exactly one person is primary**, and scheduled Garmin syncs follow them. Garmin links are
-  managed per person, so promotion does not move or change a person's Garmin link. The primary
-  person cannot be archived; promote someone else first.
+- **Exactly one person is primary**: the only person a pre-existing `.garth` token store is
+  adopted for. Scheduled Garmin syncs rotate over every linked person, not just the primary.
+  Garmin links are managed per person, so promotion does not move or change a person's Garmin
+  link. The primary person cannot be archived; promote someone else first.
 - **A person can end up with zero grants** — by revoking the last one, or by deleting the
   only account that held it. That is allowed on purpose: any administrator can still reach
   them and restore access, and the alternative would make deleting an *account* fail for
@@ -391,9 +407,10 @@ Archiving a person removes their link and tokens. The exception is a deployment 
 `GARTH_TOKEN_DIR` was refused at startup (see [Storage paths](#storage-paths)): the archive
 still succeeds and removes the link, but the person's token directories stay on disk and the log
 says `Archived person's Garmin token directories were NOT removed`. After fixing
-`GARTH_TOKEN_DIR` and restarting, an administrator can repeat the archive
-(`POST /api/persons/{id}/archive`, which is idempotent) to remove them, or delete
-`person-<id>` under the token root by hand. Unlinking in that state fails with `502`.
+`GARTH_TOKEN_DIR` and recreating the containers (`docker compose up -d`), an administrator can
+repeat the archive (`POST /api/persons/{id}/archive`, which is idempotent) to remove them from
+the current token root, or delete `person-<id>` by hand from whichever root the tokens are
+actually in. Unlinking in that state fails with `502`.
 
 ## Deployment
 
@@ -520,13 +537,22 @@ differently. Check it before `docker compose up`:
 
 - **A `DB_PATH` starting with `~` no longer starts.** It used to be taken literally: the database
   was created in a directory named `~` under the working directory (`/app` in the images),
-  outside the data volume. Write the path out in full.
+  inside each container's own writable layer and outside the data volume. Each service has its
+  own copy, holding only what that service wrote, and it exists only inside the running
+  container: it is lost when `docker compose up` recreates it. Copy it out of both containers
+  first (for example `docker compose cp vitalforge-weight:'/app/~/fitness.db' .`, then the same
+  for `vitalforge-dashboard`; use your own file name, and take any `-wal` and `-shm` files next
+  to it), and put the one you keep into the data volume before upgrading. Then write `DB_PATH`
+  out in full, or remove it.
 - **An empty `GARTH_TOKEN_DIR=` now means the default.** It used to resolve to the working
-  directory (a whitespace-only value, to a directory named by that whitespace under it). Tokens
-  kept there are not moved to `/app/data/.garth`, so a person whose link no longer resumes needs
-  a `relink`.
+  directory (a whitespace-only value, to a directory named by that whitespace under it). Every
+  person linked while it was blank kept their tokens in that directory, not on the volume; after
+  the upgrade they report `auth_failed` and need a `relink`. Outside Docker, delete the old
+  `person-*` and `.person-*` entries from that directory: they are live Garmin session tokens.
 - **`GARTH_TOKEN_DIR` set to `/`, the home directory or the working directory now disables
-  Garmin** (an `ERROR` at startup, see above) instead of using that directory as the token root.
+  Garmin** (the `GARTH_TOKEN_DIR is unusable` line at startup, see above) instead of trying to
+  use that directory as the token root. People linked under such a root need a `relink` once
+  the variable points somewhere usable.
 
 ## Nginx (optional)
 
