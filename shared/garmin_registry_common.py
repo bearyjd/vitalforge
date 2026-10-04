@@ -189,7 +189,8 @@ def configured_token_root(logger: logging.Logger) -> Path | None:
     crashing both services at import.  Only the normalizer's own fixed refusals
     are logged by text; an OSError or RuntimeError carries the path.  Logs
     through the caller's ``logger`` (the facade's), where boot errors belong.
-    A blank value (compose's ``${GARTH_TOKEN_DIR:-}``) is unset, not the cwd.
+    A blank value (a bare ``GARTH_TOKEN_DIR=`` line in ``.env``, which compose's
+    ``env_file`` passes as an empty string) is unset, not the cwd.
     A writable ancestor is only warned about, by its (repr'd) path."""
     configured = os.getenv("GARTH_TOKEN_DIR", "")
     try:
