@@ -30,13 +30,20 @@ shared/                   # imported by BOTH services as a real installed packag
   auth.py                 # cookie/HMAC session auth + login page HTML + FastAPI middleware
   database.py             # aiosqlite connection + schema; migrations.py runs one-shot schema
                           # migrations on top of it (001-person-id-rebuild, Phase 1)
+  database_bootstrap.py   # post-migration repairs split out of database.py
+                          # (_attribute_orphaned_weight_log_rows)
+  database_columns.py     # pure data: the `*_ADDITIVE_COLUMNS` lists init_db() hands to `_add_columns`
+                          # (split out of database.py to stay under the line ceiling)
+  env_paths.py            # path_from_env / refuse_leading_tilde: import-time read of a path-valued env
+                          # var (DB_PATH's: blank = unset, leading `~` refused); stdlib only
   garmin_registry.py      # the facade: per-person Garmin links (link/relink/unlink), token dirs
                           # + GARTH_TOKEN_DIR (the monkeypatch seam), lock paths + person_flock /
                           # legacy_store_flock, call/call_paced. Imports common/runtime/errors/locks
                           # at the top; none of those imports it back (tests/test_registry_layering.py)
   garmin_registry_common.py  # leaf: link-state / attempt-limit constants, utc_now, canonical_email,
-                             # call_interval_seconds, normalize_token_root (+ TokenRootRefused, the
-                             # import-time GARTH_TOKEN_DIR check); imports only garmin_registry_errors
+                             # call_interval_seconds, normalize_token_root (+ TokenRootRefused),
+                             # configured_token_root / first_writable_ancestor (the import-time
+                             # GARTH_TOKEN_DIR read and checks); imports only garmin_registry_errors
   garmin_registry_runtime.py # call permits, link-attempt quota, auth stamps, error classification,
                              # link-row publication (_publish_link); never imports the facade
   garmin_registry_legacy.py  # one-time legacy .garth flat-store adoption (bootstrap_legacy_token_store);
@@ -75,12 +82,9 @@ docker-compose.prod.yml   # PROD — pulls prebuilt images from Docker Hub / GHC
   (`WORKDIR /app` in the images, `pythonpath = ["."]` for tests). Do not add them to
   `pyproject.toml` `packages`: each Dockerfile runs `pip install -e .` BEFORE copying its
   service directory, so listing them breaks the image build.
-- **`vitalforge_dashboard/app.py` still carries one real `sys.path` hack**, and it is for its
-  OWN siblings, not for `shared`: it does `sys.path.insert(0, Path(__file__).parent)` then
-  imports `fit_import`, `correlations`, `goals`, `readiness`, `recommendations`, `sync` as
-  flat top-level modules. That is why those names are importable at all. Now that the
-  directory has a valid identifier, those can become `from vitalforge_dashboard.goals import
-  ...` and the hack can go — a follow-up, deliberately not bundled into the rename.
+- **`vitalforge_dashboard/app.py` imports its siblings as a package** (`from
+  vitalforge_dashboard.goals import ...`); its old `sys.path.insert` hack and the flat
+  top-level imports it served are gone (b20b56c). Don't reintroduce either.
 - **`VITALFORGE_SECRET` and the session cookie are shared across both services.** The same
   serializer secret and cookie name (`vf_session`) are used in both apps. This is intentional
   (single login covers both services when behind the same domain), not a bug — don't
@@ -103,12 +107,34 @@ docker-compose.prod.yml   # PROD — pulls prebuilt images from Docker Hub / GHC
   `shared/garmin_registry.py`), defaulting to `/app/data/...`. Point these at a scratch
   directory to run either service against an isolated database without touching the real
   `/app/data` volume. Both are read at import time; in tests, patch the module attribute
-  (`tests/conftest.py::tmp_db_path` does), not just the env var. `GARTH_TOKEN_DIR` is
-  normalized ONCE, at import (`garmin_registry_common.normalize_token_root`): `~` expanded,
-  `~name` and `..` refused, the root AND its ancestors resolved, symlinks owned by another user refused;
-  a patched value is used as given. An unusable value logs a boot ERROR and disables Garmin
-  (the global is `None`) instead of crashing; `check_token_root()` warns if garth and the
-  registry disagree. Under compose the root must live under `/app/data`: `~` is `/app`, the image.
+  (`tests/conftest.py::tmp_db_path` does), not just the env var. For both, a blank or
+  whitespace-only value is UNSET (the default, nothing logged: a bare `NAME=` line in `.env`,
+  which compose's `env_file` passes as an empty string, is one) and a non-blank value is never
+  trimmed. `DB_PATH` is read through
+  `shared/env_paths.path_from_env`: a value starting with `~` is REFUSED AT IMPORT -- a
+  `ValueError` naming the variable, never the value, so the service does not start (nothing
+  expands the `~`; expanding it would put the file under HOME, `/app`, the image). A relative
+  `DB_PATH` is still accepted.
+- **`GARTH_TOKEN_DIR` is normalized ONCE, at import** (`garmin_registry_common.configured_token_root`,
+  which calls `normalize_token_root`): `~` expanded, `~name` and `..` refused, the root AND its
+  ancestors resolved, symlinks owned by another user refused; a patched value is used as given.
+  A root that resolves to `/`, `$HOME` or the cwd is refused too (`_refuse_a_shared_directory`,
+  realpath to realpath; the message names every match, and in the images HOME and WORKDIR are
+  both `/app`, so a bare `~` or `.` reads "the working directory and the home directory"). Only
+  those exact directories: `~/garth` and `/home` pass. A refusal logs a boot ERROR and disables
+  Garmin (the global is `None`) instead of crashing. Archiving a person then succeeds without
+  the person flock but leaves their token directories (it warns they were NOT removed; re-run the
+  archive after fixing the variable), while unlink returns 502. Under compose the root must live
+  under `/app/data` (the volume): `~/garth` is accepted but is `/app/garth`, the image's ephemeral
+  layer, so its tokens vanish when the container is recreated.
+- **Two token-root checks only warn at boot, never raise.** `configured_token_root` logs one
+  WARNING naming the highest ancestor (`first_writable_ancestor`) that is group- or other-writable;
+  the root itself is not checked (the registry chmods it 0700), and a sticky directory owned by
+  root or by the service's own uid is exempt. `check_token_root()` (called from
+  `bootstrap_legacy_token_store` once the root is usable, so not for a refused one) probes the root
+  plus the names garth receives below it (`person-1/generation-1` and a
+  `.person-1-generation-1-probe.staging`), creating nothing below the root, and logs one
+  path-free WARNING if garth and the registry disagree.
 - **`shared/garmin_registry.call` is the only Garmin boundary.** Nothing else may
   authenticate or hold a Garmin client: `call()` resolves the person's durable link, picks
   the `(person_id, generation)` client (cold-loading tokens from that generation's directory

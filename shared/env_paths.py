@@ -18,7 +18,8 @@ def refuse_leading_tilde(name: str, value: str) -> str:
 
 
 def path_from_env(name: str, default: str) -> str:
-    """The variable's value, with a blank or whitespace-only one (compose's
-    ``${NAME:-}``) treated as unset; a leading ``~`` is refused."""
+    """The variable's value, with a blank or whitespace-only one (a bare
+    ``NAME=`` line in ``.env``, which compose's ``env_file`` passes as an empty
+    string) treated as unset; a leading ``~`` is refused."""
     value = os.getenv(name, "")
     return refuse_leading_tilde(name, value if value.strip() else default)
