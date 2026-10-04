@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator, Callable
@@ -25,17 +26,20 @@ LEGACY_STORE_LOCK_KEY: LockKey = ("legacy-store",)
 
 _process_local_locks: dict[tuple[asyncio.AbstractEventLoop, LockKey], asyncio.Lock] = {}
 
+# A blocked flock must never consume the event loop's default-executor
+# capacity.  The registry can hold a flock while work elsewhere needs that
+# executor.  Closing has its own worker, so a queue of blocked acquisitions
+# cannot prevent a holder from releasing.  Keeping both pools bounded also
+# prevents an unbounded number of cross-process waiters from creating threads
+# during a burst.
+_FLOCK_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="vf-flock")
+_FLOCK_RELEASE_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vf-flock-release")
+
 
 def person_lock_key(person_id: int) -> LockKey:
     return ("person", person_id)
 
 
-# Runs on a default-executor thread with no timeout: one thread per key whose
-# flock the other process holds.  A holder needs a pool thread too (at least
-# to release, in _close_lock_handle), so if EACH service is waiting on as many
-# distinct people's locks as its pool has threads (min(32, cpu+4); about ten
-# people's Garmin calls at once across both services), both services hang
-# until restarted.  Reproduced in review; main behaves the same.  See #95.
 def _acquire_lock(lock_path: Path):
     handle = open(lock_path, "a")
     try:
@@ -90,8 +94,9 @@ async def flock_scope(local_key: LockKey, lock_path: Callable[[], Path]) -> Asyn
         # Usually no flock is held here.  Inside the boot-time adoption the
         # legacy-store flock is (person_flock nests in it); harmless, as the
         # other service can add at most one waiting thread on that lock.
-        path = await asyncio.to_thread(lock_path)
-        acquire_task = asyncio.create_task(asyncio.to_thread(_acquire_lock, path))
+        loop = asyncio.get_running_loop()
+        path = await loop.run_in_executor(_FLOCK_EXECUTOR, lock_path)
+        acquire_task = loop.run_in_executor(_FLOCK_EXECUTOR, _acquire_lock, path)
         try:
             handle = await asyncio.shield(acquire_task)
         except asyncio.CancelledError:
@@ -107,27 +112,29 @@ async def flock_scope(local_key: LockKey, lock_path: Callable[[], Path]) -> Asyn
             await _close_lock_handle(handle)
 
 
-def _close_acquired_handle_when_done(task: asyncio.Task) -> None:
+def _close_acquired_handle_when_done(task: asyncio.Future) -> None:
     """Arrange cleanup for a cancelled flock acquisition without leaking it."""
-    def close_handle(completed: asyncio.Task) -> None:
+    def close_handle(completed: asyncio.Future) -> None:
         if completed.cancelled():
             return
         try:
             handle = completed.result()
         except BaseException:
             return
-        handle.close()
+        close_task = completed.get_loop().run_in_executor(_FLOCK_RELEASE_EXECUTOR, handle.close)
+        close_task.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
 
     task.add_done_callback(close_handle)
 
 
 async def _close_lock_handle(handle) -> None:
-    """Close a flock descriptor even if cleanup itself is cancelled twice.
+    """Close a flock descriptor without depending on the default executor.
 
-    This release needs a default-executor thread; see :func:`_acquire_lock`
-    for the hang that causes when waiters fill the pool.
+    The dedicated release worker stays available when both the default pool
+    and the bounded acquisition pool are occupied by blocked work.
     """
-    close_task = asyncio.create_task(asyncio.to_thread(handle.close))
+    loop = asyncio.get_running_loop()
+    close_task = loop.run_in_executor(_FLOCK_RELEASE_EXECUTOR, handle.close)
     try:
         await asyncio.shield(close_task)
     except asyncio.CancelledError:

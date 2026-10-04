@@ -66,7 +66,6 @@ async def get_db(isolation_level: str | None = "") -> aiosqlite.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     db = await aiosqlite.connect(str(DB_PATH), isolation_level=isolation_level)
     db.row_factory = aiosqlite.Row
-    await db.execute("PRAGMA journal_mode=WAL")
     # 30s, not aiosqlite's 5s default: a migration (shared/migrations.py's
     # run_migration) can legitimately hold the write lock longer than 5s on
     # a database with years of history, and every connection that might
@@ -74,7 +73,19 @@ async def get_db(isolation_level: str | None = "") -> aiosqlite.Connection:
     # rather than surface "database is locked" as a request-path 500 or a
     # boot-loop in the other service. See the multi-tenancy design spec's
     # section (c) for the full reasoning.
-    await db.execute("PRAGMA busy_timeout = 30000")
+    #
+    # This must precede journal_mode=WAL: enabling WAL can itself need an
+    # exclusive lock when both containers cold-start against the same file.
+    # Setting it afterward leaves that first lock-taking operation at
+    # sqlite's short default timeout.
+    # Both PRAGMAs return a row.  Close their cursors before handing the
+    # connection to a caller: leaving journal_mode's result pending keeps a
+    # schema statement active, so an immediate DROP/ALTER on this same
+    # connection fails with "database table is locked".
+    cursor = await db.execute("PRAGMA busy_timeout = 30000")
+    await cursor.close()
+    cursor = await db.execute("PRAGMA journal_mode=WAL")
+    await cursor.close()
     return db
 
 

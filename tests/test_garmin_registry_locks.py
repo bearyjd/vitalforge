@@ -12,6 +12,7 @@ guard fails here rather than hanging a boot.
 
 import asyncio
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -114,3 +115,90 @@ async def test_flock_scope_prepares_its_lock_path_off_the_event_loop(tmp_path):
             pass
     assert ran_on and ran_on[0] != loop_thread, "lock_path() ran on the event loop thread"
     assert local_lock_held == [True], "lock_path() must still run under the process-local lock"
+
+
+async def test_flock_scope_acquires_and_releases_when_default_executor_is_busy(tmp_path):
+    """A default-executor starvation must not pin a held flock (#95).
+
+    The one available default worker is deliberately blocked.  Entering and
+    leaving the scope still completes because path preparation/acquisition use
+    the dedicated bounded flock executor and descriptor close is local.
+    """
+    loop = asyncio.get_running_loop()
+    prior_default_executor = loop._default_executor
+    default_executor = ThreadPoolExecutor(max_workers=1)
+    loop.set_default_executor(default_executor)
+    blocker_started = asyncio.Event()
+    unblock_default_executor = threading.Event()
+
+    def occupy_default_executor():
+        loop.call_soon_threadsafe(blocker_started.set)
+        unblock_default_executor.wait()
+
+    blocker = loop.run_in_executor(None, occupy_default_executor)
+    try:
+        await asyncio.wait_for(blocker_started.wait(), timeout=2)
+        key = garmin_registry_locks.person_lock_key(100)
+        async with asyncio.timeout(2):
+            async with garmin_registry_locks.flock_scope(key, lambda: tmp_path / "probe.lock"):
+                pass
+    finally:
+        unblock_default_executor.set()
+        await blocker
+        loop._default_executor = prior_default_executor
+        default_executor.shutdown(wait=True)
+
+
+async def test_cancelling_after_flock_worker_dispatch_closes_the_late_handle(monkeypatch):
+    """Cancellation after dispatch cannot leak a handle acquired later (#95)."""
+    loop = asyncio.get_running_loop()
+    dispatched_worker = loop.create_future()
+    acquisition_dispatched = asyncio.Event()
+    release_calls: list[object] = []
+
+    class FakeHandle:
+        def close(self):
+            release_calls.append(self)
+
+    original_run_in_executor = loop.run_in_executor
+
+    acquisition_submissions = 0
+
+    def run_executor_inline(executor, callback, *args):
+        nonlocal acquisition_submissions
+        if executor is garmin_registry_locks._FLOCK_EXECUTOR:
+            acquisition_submissions += 1
+            if acquisition_submissions == 1:
+                completed = loop.create_future()
+                completed.set_result(callback(*args))
+                return completed
+            assert acquisition_submissions == 2, "flock_scope submitted more than path preparation and acquisition"
+            acquisition_dispatched.set()
+            return dispatched_worker
+        if executor is garmin_registry_locks._FLOCK_RELEASE_EXECUTOR:
+            callback(*args)
+        else:
+            return original_run_in_executor(executor, callback, *args)
+        completed = loop.create_future()
+        completed.set_result(None)
+        return completed
+
+    monkeypatch.setattr(loop, "run_in_executor", run_executor_inline)
+
+    async def wait_for_flock():
+        async with garmin_registry_locks.flock_scope(
+            garmin_registry_locks.person_lock_key(101), lambda: object()
+        ):
+            pytest.fail("a cancelled acquisition must not enter the flock")
+
+    waiter = asyncio.create_task(wait_for_flock())
+    await asyncio.wait_for(acquisition_dispatched.wait(), timeout=2)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    handle = FakeHandle()
+    dispatched_worker.set_result(handle)
+    await asyncio.sleep(0)
+    assert acquisition_submissions == 2
+    assert release_calls == [handle]

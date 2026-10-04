@@ -142,6 +142,40 @@ async def test_get_db_sets_a_30_second_busy_timeout(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_db_sets_busy_timeout_before_enabling_wal(tmp_path, monkeypatch):
+    """WAL setup can take a database lock during a concurrent cold start, so
+    it must receive get_db()'s extended timeout rather than sqlite's default.
+    """
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    executed = []
+    real_execute = aiosqlite.Connection.execute
+
+    async def recording_execute(self, sql, parameters=None):
+        executed.append(sql)
+        return await real_execute(self, sql, parameters)
+
+    monkeypatch.setattr(aiosqlite.Connection, "execute", recording_execute)
+    db = await database.get_db()
+    try:
+        pragmas = [sql for sql in executed if sql.startswith("PRAGMA")]
+        assert pragmas[:2] == ["PRAGMA busy_timeout = 30000", "PRAGMA journal_mode=WAL"]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_get_db_finalizes_wal_pragma_before_returning_connection(tmp_path, monkeypatch):
+    """A caller may issue schema DDL immediately after opening a connection."""
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    db = await database.get_db()
+    try:
+        await db.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
+        await db.execute("DROP TABLE probe")
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_add_columns_skips_alter_when_column_already_present(tmp_path, monkeypatch):
     """Latency-only behavior: when the shape pre-check sees the column
     already exists, _add_columns must not even attempt the ALTER TABLE

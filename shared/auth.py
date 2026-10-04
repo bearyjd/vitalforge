@@ -14,8 +14,14 @@ from typing import Literal, NamedTuple
 import aiosqlite
 from fastapi import HTTPException, Request
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
-from pydantic import BaseModel, ConfigDict
 
+from shared.auth_models import (
+    CreateTokenIn,  # noqa: F401
+    CreateUserIn,  # noqa: F401
+    PasswordChangeIn,  # noqa: F401
+    RevokeTokenIn,  # noqa: F401
+    UpdateUserIn,  # noqa: F401
+)
 from shared.database import get_db
 
 logger = logging.getLogger(__name__)
@@ -509,30 +515,71 @@ _STEP_UP_WINDOW_SECONDS = 15 * 60
 # cookie down; the durable per-user window in garmin_link_attempts still
 # bounds what a successful step-up can do with Garmin.
 _step_up_failures: dict[int, deque[float]] = {}
+# Password verification awaits SQLite and scrypt work. Keep in-flight attempts
+# separately so checking the limit and admitting an attempt is one synchronous
+# operation, rather than allowing a burst to pass the check before any failure
+# is recorded. The entries are removed as soon as their verification finishes.
+_step_up_pending: dict[int, dict[object, float]] = {}
 
 
 def _step_up_retry_after(user_id: int, now: float) -> int | None:
     failures = _step_up_failures.get(user_id)
-    if not failures:
+    if failures:
+        while failures and failures[0] <= now - _STEP_UP_WINDOW_SECONDS:
+            failures.popleft()
+        if not failures:
+            _step_up_failures.pop(user_id, None)
+            failures = None
+    pending = _step_up_pending.get(user_id, {})
+    if not failures and not pending:
         return None
-    while failures and failures[0] <= now - _STEP_UP_WINDOW_SECONDS:
-        failures.popleft()
-    if not failures:
-        _step_up_failures.pop(user_id, None)
+    if len(failures or ()) + len(pending) < _STEP_UP_FAILURE_LIMIT:
         return None
-    if len(failures) < _STEP_UP_FAILURE_LIMIT:
+    oldest_candidates = list(pending.values())
+    if failures:
+        oldest_candidates.append(failures[0])
+    oldest = min(oldest_candidates)
+    return max(1, int(oldest + _STEP_UP_WINDOW_SECONDS - now) + 1)
+
+
+def _reserve_step_up_attempt(user_id: int, now: float) -> object | None:
+    """Atomically admit one password verification, or return None if limited.
+
+    This function deliberately contains no await. Asyncio cannot interleave
+    two callers between the limit check and the pending reservation, so at
+    most ``_STEP_UP_FAILURE_LIMIT`` verifications can be in flight per user.
+    """
+    if _step_up_retry_after(user_id, now) is not None:
         return None
-    return max(1, int(failures[0] + _STEP_UP_WINDOW_SECONDS - now) + 1)
+    reservation = object()
+    _step_up_pending.setdefault(user_id, {})[reservation] = now
+    return reservation
+
+
+def _release_step_up_reservation(user_id: int, reservation: object) -> None:
+    pending = _step_up_pending.get(user_id)
+    if pending is None:
+        return
+    pending.pop(reservation, None)
+    if not pending:
+        _step_up_pending.pop(user_id, None)
 
 
 async def _require_step_up(identity: _Identity, current_password: str):
     if identity.user_id is None:
         raise HTTPException(status_code=401, detail="Current password incorrect")
     now = time.time()
-    retry_after = _step_up_retry_after(identity.user_id, now)
-    if retry_after is not None:
+    reservation = _reserve_step_up_attempt(identity.user_id, now)
+    if reservation is None:
+        retry_after = _step_up_retry_after(identity.user_id, now)
+        # The immediately preceding reservation check established this is
+        # non-None; keep this bounded fallback in case the limiter changes.
+        retry_after = retry_after if retry_after is not None else 1
         raise HTTPException(status_code=429, detail="Too many attempts", headers={"Retry-After": str(retry_after)})
-    verified = await _authenticate_credentials(identity.username, current_password)
+    try:
+        verified = await _authenticate_credentials(identity.username, current_password)
+    finally:
+        _release_step_up_reservation(identity.user_id, reservation)
     if (
         verified is None
         or verified[0] != identity.user_id
@@ -734,43 +781,3 @@ async def _resolve_bearer_token(request: Request) -> _Identity | None:
         )
     finally:
         await db.close()
-
-
-
-
-
-
-
-class PasswordChangeIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    current_password: str
-    new_password: str
-
-
-class CreateUserIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    username: str
-    password: str
-    role: Literal["admin", "user"] = "user"
-
-
-class UpdateUserIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    role: Literal["admin", "user"] | None = None
-    password: str | None = None
-
-
-class CreateTokenIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    label: str
-    current_password: str
-
-
-class RevokeTokenIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    current_password: str

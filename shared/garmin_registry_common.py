@@ -97,6 +97,50 @@ def _stat_if_present(path: Path, *, follow_symlinks: bool) -> os.stat_result | N
         raise
 
 
+def _audit_symlink_owners(configured: Path) -> None:
+    """Follow ``configured`` just far enough to vet every symlink it uses.
+
+    ``realpath`` only returns the final spelling; it offers no opportunity to
+    inspect the links it traversed.  Keep this as an audit, rather than using
+    it as the result, so the normalizer still returns the standard library's
+    final realpath result.  A missing suffix is valid on first boot and ends
+    the audit just as a kernel lookup would.
+    """
+    current = Path("/")
+    remaining = list(configured.parts[1:])
+    symlinks_followed = 0
+
+    while remaining:
+        component = remaining.pop(0)
+        if component == ".":
+            continue
+        if component == "..":
+            # Only symlink targets can supply this: raw input was refused
+            # above.  It has normal filesystem traversal semantics here.
+            current = current.parent
+            continue
+
+        current /= component
+        found = _stat_if_present(current, follow_symlinks=False)
+        if found is None:
+            return
+        if not stat.S_ISLNK(found.st_mode):
+            continue
+        if not _trusted_symlink_owner(found.st_uid):
+            raise TokenRootRefused("a symlink owned by another user")
+
+        symlinks_followed += 1
+        if symlinks_followed > 40:  # POSIX/Linux symlink-resolution ceiling
+            raise TokenRootRefused("a symlink loop")
+        target = Path(os.readlink(current))
+        if target.is_absolute():
+            current = Path("/")
+            remaining = list(target.parts[1:]) + remaining
+        else:
+            current = current.parent
+            remaining = list(target.parts) + remaining
+
+
 def normalize_token_root(raw: str | os.PathLike[str]) -> Path:
     """The directory garth itself will address for a configured token root.
 
@@ -109,13 +153,13 @@ def normalize_token_root(raw: str | os.PathLike[str]) -> Path:
     the root.  Handed the literal path, garminconnect's guard refused both;
     the kernel's ``protected_symlinks`` refuses only a trailing follow, so
     it also refused one AT the root, never one above it.  That posture is
-    kept: every symlink in the configured path's own chain, walked top-down,
-    must be owned by root or this process -- as the legitimate ones are:
+    kept: every symlink followed while resolving the configured path --
+    including links inside a trusted link's target -- must be owned by root or
+    this process, as the legitimate ones are:
     macOS ``/tmp`` and ``/var``, Silverblue ``/home``, an operator's own
     volume link.  ``~name``, a ``..`` component and a symlink loop are
     refused outright, as is a root that resolves to ``/``, ``$HOME`` or the
-    cwd (see :func:`_refuse_a_shared_directory`).  Limits: a symlink inside a
-    trusted symlink's TARGET is not checked, and the check and the realpath
+    cwd (see :func:`_refuse_a_shared_directory`).  The check and the realpath
     are a boot-time TOCTOU pair.  Everything below the root is left to
     garminconnect's refusal on garth's own I/O.  ``os.path.realpath``, not
     ``Path.resolve()``: on 3.12 the latter raises RuntimeError, path in the
@@ -129,10 +173,7 @@ def normalize_token_root(raw: str | os.PathLike[str]) -> Path:
     # realpath collapses '..' lexically; the lstat walk cannot follow it past a missing component.
     if ".." in configured.parts:
         raise TokenRootRefused("a '..' component")
-    for component in (*reversed(configured.parents), configured):
-        found = _stat_if_present(component, follow_symlinks=False)
-        if found is not None and stat.S_ISLNK(found.st_mode) and not _trusted_symlink_owner(found.st_uid):
-            raise TokenRootRefused("a symlink owned by another user")
+    _audit_symlink_owners(configured)
     root = Path(os.path.realpath(configured))
     _stat_if_present(root, follow_symlinks=True)  # non-strict realpath leaves a loop in place
     _refuse_a_shared_directory(root)

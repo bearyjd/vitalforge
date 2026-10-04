@@ -246,6 +246,41 @@ def test_a_symlink_owned_by_another_user_is_refused(where, monkeypatch, tmp_path
     assert _normalize(tmp_path / "plain" / "garth") == tmp_path / "plain" / "garth", "no symlink, nothing to distrust"
 
 
+@pytest.mark.parametrize("relative", [False, True])
+def test_nested_symlink_targets_are_audited_and_resolved(relative, tmp_path):
+    """A trusted outer link cannot launder a link in its target tree (#92)."""
+    real = tmp_path / "real"
+    real.mkdir()
+    (tmp_path / "inner").symlink_to(real, target_is_directory=True)
+    outer_target = Path("inner") if relative else tmp_path / "inner"
+    (tmp_path / "outer").symlink_to(outer_target, target_is_directory=True)
+
+    assert _normalize(tmp_path / "outer" / "garth") == real / "garth"
+
+
+def test_foreign_symlink_inside_a_trusted_target_is_refused(monkeypatch, tmp_path):
+    """Simulate the outer link being trusted but its target's link foreign."""
+    real = tmp_path / "real"
+    real.mkdir()
+    (tmp_path / "inner").symlink_to(real, target_is_directory=True)
+    (tmp_path / "outer").symlink_to(tmp_path / "inner", target_is_directory=True)
+    actual = garmin_registry_common._trusted_symlink_owner
+    checks = iter((True, False))
+    monkeypatch.setattr(garmin_registry_common, "_trusted_symlink_owner", lambda uid: next(checks, actual(uid)))
+
+    with pytest.raises(ValueError, match=r"^a symlink owned by another user$"):
+        _normalize(tmp_path / "outer" / "garth")
+
+
+def test_nested_symlink_loop_is_refused_by_name(tmp_path):
+    """An indirect loop, unlike a leaf loop, exercises target traversal."""
+    (tmp_path / "first").symlink_to("second", target_is_directory=True)
+    (tmp_path / "second").symlink_to("first", target_is_directory=True)
+
+    with pytest.raises(ValueError, match=r"^a symlink loop$"):
+        _normalize(tmp_path / "first" / "garth")
+
+
 def test_only_root_and_this_process_own_a_trusted_symlink():
     trusted = garmin_registry_common._trusted_symlink_owner
     other = next(uid for uid in itertools.count(1) if uid != os.geteuid())

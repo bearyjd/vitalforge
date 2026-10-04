@@ -109,6 +109,20 @@ ADMIN_PERSONS_PAGE_HTML = """<!DOCTYPE html>
             <button type="submit">Grant</button>
         </form>
 
+        <h2 id="garmin-heading">Garmin</h2>
+        <p class="muted" id="garmin-subject">Select a person above to manage their Garmin link.</p>
+        <p class="muted" id="garmin-status"></p>
+        <form id="garmin-link-form" style="display:none" onsubmit="return submitGarminLink(event)">
+            <input type="email" id="garmin-email" placeholder="Garmin email" autocomplete="username" required>
+            <input type="password" id="garmin-password" placeholder="Garmin password" autocomplete="current-password" required>
+            <input type="password" id="garmin-current-password" placeholder="Your VitalForge password" autocomplete="current-password" required>
+            <button type="submit" id="garmin-link-button">Link Garmin</button>
+        </form>
+        <form id="garmin-unlink-form" style="display:none" onsubmit="return unlinkGarmin(event)">
+            <input type="password" id="garmin-unlink-current-password" placeholder="Your VitalForge password" autocomplete="current-password" required>
+            <button class="danger" type="submit">Unlink Garmin</button>
+        </form>
+
         <p style="margin-top:1rem"><a href="/auth/admin/users">Users</a> &middot; <a href="/">Back</a></p>
     </div>
     <script>
@@ -260,7 +274,14 @@ ADMIN_PERSONS_PAGE_HTML = """<!DOCTYPE html>
             const res = await fetch(`/api/persons/${p.id}/archive`, { method: "POST" });
             if (res.ok) {
                 setSuccess("Person archived.");
-                if (selectedPerson && selectedPerson.id === p.id) selectPerson(p);
+                if (selectedPerson && selectedPerson.id === p.id) {
+                    // The list refresh is asynchronous, so `p` still has its
+                    // old archived_at value here. Mark the selected snapshot
+                    // immediately; otherwise Garmin status would briefly ask
+                    // a person-scoped route for an archived person and report
+                    // a misleading generic failure.
+                    await selectPerson({...p, archived_at: "archived"});
+                }
             } else {
                 setError(await failureDetail(res, "Failed to archive person."));
             }
@@ -274,6 +295,120 @@ ADMIN_PERSONS_PAGE_HTML = """<!DOCTYPE html>
             document.getElementById("grant-form").style.display = "block";
             await loadUserOptions();
             await loadGrants();
+            await loadGarminStatus();
+        }
+
+        function setGarminVisibility(show) {
+            document.getElementById("garmin-link-form").style.display = show ? "block" : "none";
+            document.getElementById("garmin-unlink-form").style.display = "none";
+        }
+
+        function garminStatusText(status) {
+            if (!status.linked) return "No Garmin account is linked.";
+            if (status.last_auth_error) return "Linked; the most recent Garmin check needs attention.";
+            return "Garmin account linked.";
+        }
+
+        async function loadGarminStatus() {
+            const subject = document.getElementById("garmin-subject");
+            const status = document.getElementById("garmin-status");
+            // A slower response for a previously selected person must not
+            // overwrite the current person's status or controls.
+            const person = selectedPerson;
+            if (!person || person.archived_at) {
+                subject.textContent = person ? "Archived people cannot have a Garmin link." :
+                    "Select a person above to manage their Garmin link.";
+                status.textContent = "";
+                setGarminVisibility(false);
+                return;
+            }
+            subject.textContent = `Garmin link for ${person.display_name}`;
+            status.textContent = "Checking Garmin link status…";
+            setGarminVisibility(false);
+            const res = await fetch(`/p/${encodeURIComponent(person.slug)}/api/garmin/status`);
+            if (selectedPerson !== person) return;
+            if (!res.ok) {
+                status.textContent = "Could not load Garmin link status.";
+                return;
+            }
+            const link = await res.json();
+            if (selectedPerson !== person) return;
+            status.textContent = garminStatusText(link);
+            document.getElementById("garmin-link-button").textContent = link.linked ? "Re-link Garmin" : "Link Garmin";
+            document.getElementById("garmin-unlink-form").style.display = link.linked ? "block" : "none";
+            document.getElementById("garmin-link-form").style.display = "block";
+        }
+
+        function garminFailureMessage(res) {
+            const messages = {
+                400: "Garmin credential changes require HTTPS.",
+                401: "Garmin authentication failed or your account changed.",
+                404: "Person not found.",
+                409: "That Garmin account is already linked.",
+                422: "Garmin link details are invalid.",
+                429: "Garmin is temporarily rate limited.",
+                502: "Garmin operation failed."
+            };
+            let message = messages[res.status] || "Garmin operation failed.";
+            const retryAfter = res.headers.get("Retry-After");
+            if (retryAfter && /^\\d{1,6}$/.test(retryAfter)) {
+                message += ` Try again in ${retryAfter} seconds.`;
+            }
+            return message;
+        }
+
+        async function submitGarminLink(e) {
+            e.preventDefault();
+            if (!selectedPerson) return false;
+            clearMessages();
+            const email = document.getElementById("garmin-email");
+            const password = document.getElementById("garmin-password");
+            const currentPassword = document.getElementById("garmin-current-password");
+            const linkButton = document.getElementById("garmin-link-button");
+            const relink = linkButton.textContent === "Re-link Garmin";
+            try {
+                const res = await fetch(`/p/${encodeURIComponent(selectedPerson.slug)}/api/garmin/${relink ? "relink" : "link"}`, {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({email: email.value, password: password.value, current_password: currentPassword.value})
+                });
+                if (!res.ok) {
+                    setError(garminFailureMessage(res));
+                    return false;
+                }
+                setSuccess(relink ? "Garmin account re-linked." : "Garmin account linked.");
+            } finally {
+                // Credentials never leave this submission and are never rendered or persisted.
+                email.value = "";
+                password.value = "";
+                currentPassword.value = "";
+            }
+            await loadGarminStatus();
+            return false;
+        }
+
+        async function unlinkGarmin(e) {
+            e.preventDefault();
+            if (!selectedPerson) return false;
+            clearMessages();
+            const currentPassword = document.getElementById("garmin-unlink-current-password");
+            try {
+                const res = await fetch(`/p/${encodeURIComponent(selectedPerson.slug)}/api/garmin/unlink`, {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({current_password: currentPassword.value})
+                });
+                if (!res.ok) {
+                    setError(garminFailureMessage(res));
+                    return false;
+                }
+                setSuccess("Garmin account unlinked.");
+            } finally {
+                // Do not retain a step-up password after either outcome.
+                currentPassword.value = "";
+            }
+            await loadGarminStatus();
+            return false;
         }
 
         async function loadUserOptions() {

@@ -62,6 +62,33 @@ logger = logging.getLogger(__name__)
 _MAX_DISPLAY_NAME = 100
 
 
+@contextlib.asynccontextmanager
+async def _archive_lifecycle_lock(person_id: int):
+    """Take the person flock when its token root can support one.
+
+    A root that passed import-time validation can still be unusable at runtime
+    (for example, when its parent is not writable by the service user).  In
+    that case no Garmin operation can acquire this flock either, so archive
+    has the same safe fallback as a root that was refused at boot: make the
+    durable credential unusable and leave filesystem cleanup for a retry.
+    """
+    if garmin_registry.GARTH_TOKEN_DIR is None:
+        yield False
+        return
+
+    acquired = False
+    try:
+        async with garmin_registry.person_flock(person_id):
+            acquired = True
+            yield True
+    except OSError:
+        # Do not turn a database or cleanup OSError into the fallback.  Once
+        # entered, those errors have their normal transactional semantics.
+        if acquired:
+            raise
+        yield False
+
+
 class CreatePersonIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -355,16 +382,12 @@ def add_person_routes(app):
         # call, link, and unlink.  Holding it through both the durable state
         # change and cleanup prevents an in-flight call from authenticating a
         # token store after this route has archived its owner.  With an
-        # unusable token root (None: Garmin disabled at boot) no call can be
-        # in flight within this service and the lock file has nowhere to
-        # live, so archive proceeds without it rather than failing as a bare
-        # 500; the token directories are then left for a re-run (see below).
-        lifecycle_lock = (
-            garmin_registry.person_flock(person_id)
-            if garmin_registry.GARTH_TOKEN_DIR is not None
-            else contextlib.nullcontext()
-        )
-        async with lifecycle_lock:
+        # unusable token root (either refused at boot or unable to create its
+        # lock at runtime) no call can be in flight within this service and
+        # the lock file has nowhere to live, so archive proceeds without it
+        # rather than failing as a bare 500; token directories are left for a
+        # re-run (see below).
+        async with _archive_lifecycle_lock(person_id) as token_root_locked:
             db = await get_db()
             try:
                 await db.execute("BEGIN IMMEDIATE")
@@ -422,16 +445,23 @@ def add_person_routes(app):
             # best effort: report only a fixed message (never an exception
             # whose text might contain a credential path) and let a later
             # idempotent archive retry it.
-            try:
-                await garmin_registry.forget_and_remove_person_token_store(person_id)
-            except Exception:
-                if garmin_registry.GARTH_TOKEN_DIR is None:
-                    logger.warning(
-                        "Archived person's Garmin token directories were NOT removed: GARTH_TOKEN_DIR is "
-                        "unusable. Fix GARTH_TOKEN_DIR, then re-run the archive (or remove the person's "
-                        "token directories by hand)"
-                    )
-                else:
+            if not token_root_locked:
+                # A flock could not be acquired, so do not race a future
+                # repair of the root by touching its filesystem. Cache
+                # eviction remains safe and makes the durable unlink final in
+                # this process.
+                await garmin_registry.forget_and_remove_person_token_store(
+                    person_id, remove_tokens=False
+                )
+                logger.warning(
+                    "Archived person's Garmin token directories were NOT removed: GARTH_TOKEN_DIR is "
+                    "unusable. Fix GARTH_TOKEN_DIR, then re-run the archive (or remove the person's "
+                    "token directories by hand)"
+                )
+            else:
+                try:
+                    await garmin_registry.forget_and_remove_person_token_store(person_id)
+                except Exception:
                     logger.warning("Archived person's Garmin token cleanup did not complete")
         return {"success": True, "archived_at": archived_at}
 

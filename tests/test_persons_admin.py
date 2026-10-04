@@ -554,6 +554,44 @@ async def test_archiving_still_takes_the_person_flock_when_the_root_is_usable(cl
     assert lock_file.is_file(), "archive no longer took the person flock"
 
 
+async def test_archiving_succeeds_when_a_configured_token_root_cannot_create_its_flock(
+    client, monkeypatch, tmp_path, caplog
+):
+    """A non-None root can fail only when the flock prepares it at runtime.
+
+    It gets the same archive fallback as a root refused at boot: durable
+    unlink succeeds, tokens remain for an operator retry, and no filesystem
+    path leaks through the warning (#98).
+    """
+    _, cookies = await _as("root", role="admin")
+    person_id = (await client.post("/api/persons", json={"display_name": "Bryn"}, cookies=cookies)).json()["id"]
+    await _seed_garmin_link(person_id, "linked")
+    garmin_client._clients[(person_id, 1)] = object()
+    monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", tmp_path / "garth")
+
+    class FailingFlock:
+        async def __aenter__(self):
+            raise OSError("configured token root cannot create a flock")
+
+        async def __aexit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(garmin_registry, "person_flock", lambda _person_id: FailingFlock())
+    caplog.set_level(logging.WARNING, logger="shared.persons_admin")
+
+    response = await client.post(f"/api/persons/{person_id}/archive", cookies=cookies)
+
+    assert response.status_code == 200
+    assert response.json()["archived_at"]
+    assert await _fetchone("SELECT archived_at FROM persons WHERE id = ?", (person_id,)) is not None
+    assert await _fetchone("SELECT 1 FROM garmin_links WHERE person_id = ?", (person_id,)) is None
+    assert not any(key[0] == person_id for key in garmin_client._clients)
+    assert caplog.messages == [
+        "Archived person's Garmin token directories were NOT removed: GARTH_TOKEN_DIR is unusable. "
+        "Fix GARTH_TOKEN_DIR, then re-run the archive (or remove the person's token directories by hand)"
+    ]
+
+
 async def test_archiving_deletes_a_retired_legacy_bound_row_without_touching_the_flat_root(client):
     """A row from the release that wrote 'legacy_bound' goes like any other;
     the flat root is never this person's to remove, and the one-time adoption
@@ -1044,6 +1082,35 @@ async def test_admin_persons_page_never_assigns_server_data_to_innerhtml(client)
     assert not re.search(r"\.innerHTML\s*=", html), "server data is being assigned to innerHTML"
     assert "td.textContent = text;" in html
     assert "opt.textContent = u.username;" in html
+
+
+async def test_admin_persons_page_uses_redacted_garmin_lifecycle_ui(client):
+    """The admin page is a browser shell over the already-authorized routes.
+
+    This protects the credential-handling contract from a future markup
+    cleanup: passwords remain form inputs, the page uses the person slug (not
+    an unscoped admin endpoint), does not persist fields in browser storage,
+    and surfaces only the API's bounded status/error vocabulary.
+    """
+    _, cookies = await _as("root", role="admin")
+    resp = await client.get("/auth/admin/persons", cookies=cookies)
+    assert resp.status_code == 200
+    html = resp.text
+
+    assert 'type="password" id="garmin-password"' in html
+    assert 'type="password" id="garmin-current-password"' in html
+    assert 'type="password" id="garmin-unlink-current-password"' in html
+    assert "/api/garmin/status" in html
+    assert "/api/garmin/${relink ? \"relink\" : \"link\"}" in html
+    assert "/api/garmin/unlink" in html
+    assert "Retry-After" in html
+    assert "const person = selectedPerson;" in html
+    assert html.count("if (selectedPerson !== person) return;") == 2
+    assert 'await selectPerson({...p, archived_at: "archived"});' in html
+    assert "localStorage" not in html
+    assert "sessionStorage" not in html
+    assert 'password.value = "";' in html
+    assert 'currentPassword.value = "";' in html
 
 
 async def test_patch_still_accepts_the_retired_acknowledge_flag(client):

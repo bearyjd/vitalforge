@@ -195,8 +195,10 @@ def _reset_step_up_failures():
     from shared import auth as shared_auth
 
     shared_auth._step_up_failures.clear()
+    shared_auth._step_up_pending.clear()
     yield
     shared_auth._step_up_failures.clear()
+    shared_auth._step_up_pending.clear()
 
 
 @pytest.fixture

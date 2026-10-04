@@ -671,8 +671,7 @@ async def _write_verified_snapshot(DB_PATH, snapshot_name, final, needs_snapshot
             return
         tmp = DB_PATH.parent / f"{snapshot_name}.partial"
         tmp.unlink(missing_ok=True)  # a previous kill can leave one; it is worthless
-        # get_db()'s own PRAGMA journal_mode/busy_timeout calls (and any
-        # SELECT needs_snapshot() may have issued) leave unfetched cursors
+        # The SELECT needs_snapshot() may leave an unfetched cursor
         # open on this connection; sqlite refuses VACUUM while ANY statement
         # on the connection is unfinalized ("cannot VACUUM - SQL statements
         # in progress"), which sqlite3/aiosqlite otherwise never surfaces

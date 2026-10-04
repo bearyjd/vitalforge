@@ -234,20 +234,24 @@ def _sweep_stale_staging_dirs(person_id: int) -> None:
             _remove_token_dir(child)
 
 
-async def forget_and_remove_person_token_store(person_id: int) -> None:
+async def forget_and_remove_person_token_store(person_id: int, *, remove_tokens: bool = True) -> None:
     """Evict a person's cached clients and remove its owned token directories.
 
-    The caller must already hold :func:`person_flock`.  Keeping the cache
-    eviction before the filesystem operation means a cleanup failure can leave
-    an inert artifact but never a usable in-process credential.  The flat
-    legacy root is never touched: once adopted, its store lives under
-    ``person-<id>/`` like any other, and the ``auth_migrations`` marker keeps
-    a later copy at the root from being adopted again.
+    The caller must already hold :func:`person_flock` when ``remove_tokens``
+    is true. Keeping the cache eviction before the filesystem operation means
+    a cleanup failure can leave an inert artifact but never a usable
+    in-process credential. ``remove_tokens=False`` is for archive's token-root
+    fallback, where a flock could not be acquired and filesystem cleanup would
+    be unsafe. The flat legacy root is never touched: once adopted, its store
+    lives under ``person-<id>/`` like any other, and the ``auth_migrations``
+    marker keeps a later copy at the root from being adopted again.
     """
     person_id = int(person_id)
     if person_id < 1:
         raise ValueError("person_id must be a positive integer")
     garmin_client.forget(person_id)
+    if not remove_tokens:
+        return
     await asyncio.to_thread(_remove_person_token_root, person_id)
     await asyncio.to_thread(_sweep_stale_staging_dirs, person_id)
 
