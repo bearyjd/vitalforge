@@ -134,6 +134,8 @@ services must see the same values: they share one database and one token tree.
   and `/home` are accepted, but `~/garth` is `/app/garth`, outside the data volume, so its tokens
   are lost whenever the container is recreated. Keep the root under `/app/data`. A `~user` path, a
   `..` component, a symlink loop and a symlink owned by another user are refused as well.
+  Ownership is checked for every symlink traversed, including nested links inside another
+  symlink's target; only root or the service user may own those links.
 
 A refused `GARTH_TOKEN_DIR` does not stop the services; it disables Garmin. At startup each
 service logs, at `ERROR` level,
@@ -158,9 +160,9 @@ directories are not removed; see [Linking Garmin](#linking-garmin).
 The same `could not prepare its token root` warning with no `GARTH_TOKEN_DIR is unusable` line
 before it means the root passed these checks but the service user cannot create it or make it
 private. Check the owner and permissions of the directory and of its parent. Garmin is unusable
-in the same way (the same `502`s and failed syncs) until that is fixed. Unlike a refused root,
-archiving a person fails there with a `500` and archives nothing
-([#98](https://github.com/bearyjd/vitalforge/issues/98)).
+in the same way (the same `502`s and failed syncs) until that is fixed. Archiving a person still
+succeeds if token-root lock setup fails: it removes their durable link and skips token cleanup,
+with the same warning and retry procedure as a refused root below.
 
 Two other warnings do not stop either service. The first is advisory; the second means Garmin
 logins will fail until it is fixed:
@@ -345,8 +347,15 @@ If a token is leaked, revoke that token. If the session signing secret is leaked
 
 Each person has their own Garmin Connect link, or none. A link is created by submitting that
 person's Garmin credentials once; only the resulting session tokens are kept (on disk, under
-`/app/data/.garth/person-<id>/generation-<n>/`), never the password. Both services mount the
-same four routes:
+`/app/data/.garth/person-<id>/generation-<n>/`), never the password.
+
+Administrators can manage links at `/auth/admin/persons` on either service. Select a person's
+**Access** button to load their Garmin status, then use **Link Garmin**, **Re-link Garmin** or
+**Unlink Garmin**. Link and re-link ask for that person's Garmin email and password plus your
+current VitalForge password; unlink asks for your current VitalForge password. Use HTTPS.
+The page shows redacted link status and hides credential controls for archived people.
+
+Both services mount the same four routes:
 
 | Method | Endpoint | Body | Description |
 |---|---|---|---|
@@ -411,7 +420,8 @@ fix is `relink`. A login that merely hit a transient block, network error, or th
 stops that sync, but reports its own code (`network`, `rate_limited`, `unknown`), leaves the
 link in place, and is simply retried at the next sync — only `auth_failed` needs a `relink`.
 Archiving a person removes their link and tokens. The exception is a deployment whose
-`GARTH_TOKEN_DIR` was refused at startup (see [Storage paths](#storage-paths)): the archive
+`GARTH_TOKEN_DIR` was refused at startup or cannot prepare its person lock at runtime (for
+example, the service user cannot create the token root; see [Storage paths](#storage-paths)): the archive
 still succeeds and removes the link, but the person's token directories stay on disk and the log
 says `Archived person's Garmin token directories were NOT removed`. After fixing
 `GARTH_TOKEN_DIR` and recreating the containers (`docker compose up -d`), an administrator can

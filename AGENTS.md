@@ -117,14 +117,18 @@ docker-compose.prod.yml   # PROD — pulls prebuilt images from Docker Hub / GHC
   `DB_PATH` is still accepted.
 - **`GARTH_TOKEN_DIR` is normalized ONCE, at import** (`garmin_registry_common.configured_token_root`,
   which calls `normalize_token_root`): `~` expanded, `~name` and `..` refused, the root AND its
-  ancestors resolved, symlinks owned by another user refused; a patched value is used as given.
+  ancestors resolved, every traversed symlink (including nested links in symlink targets)
+  audited for root/service-user ownership; a patched value is used as given.
   A root that resolves to `/`, `$HOME` or the cwd is refused too (`_refuse_a_shared_directory`,
   realpath to realpath; the message names every match, and in the images HOME and WORKDIR are
   both `/app`, so a bare `~` or `.` reads "the working directory and the home directory"). Only
   those exact directories: `~/garth` and `/home` pass. A refusal logs a boot ERROR and disables
   Garmin (the global is `None`) instead of crashing. Archiving a person then succeeds without
   the person flock but leaves their token directories (it warns they were NOT removed; re-run the
-  archive after fixing the variable), while unlink returns 502. Under compose the root must live
+  archive after fixing the variable), while unlink returns 502. The same archive fallback applies
+  when a non-None root cannot prepare its person lock at runtime: remove the durable link,
+  skip token cleanup, warn, and allow an idempotent archive retry after fixing the root.
+  Under compose the root must live
   under `/app/data` (the volume): `~/garth` is accepted but is `/app/garth`, the image's ephemeral
   layer, so its tokens vanish when the container is recreated.
 - **Two token-root checks only warn at boot, never raise.** `configured_token_root` logs one
