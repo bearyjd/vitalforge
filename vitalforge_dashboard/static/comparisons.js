@@ -148,6 +148,7 @@
         async fetch(base, days) {
             try {
                 const response = await fetch(`${base}/comparisons?days=${days}`);
+                if ([401, 403, 404].includes(response.status)) window.VFWeeklyReview?.revoke();
                 return response.ok ? await response.json() : null;
             } catch { return null; }
         }

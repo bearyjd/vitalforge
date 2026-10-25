@@ -338,6 +338,16 @@
             </div>
         </details>
 
+        <details class="data-details" id="weeklyReview">
+            <summary>Weekly review · generate on demand, rules only</summary>
+            <div class="details-body">
+            <p>Generate a descriptive summary of the last 7 calendar days against the 7 before them: changes with enough observations, existing rule findings, data coverage, your goals and one practical follow-up. Nothing is fetched until you click. It is not a diagnosis or treatment advice, and context notes are not used.</p>
+            <button type="button" class="btn" id="weeklyReviewGenerate">Generate review</button>
+            <p id="weeklyReviewStatus" role="status" aria-live="polite"></p>
+            <div id="weeklyReviewOutput"></div>
+            </div>
+        </details>
+
         <!-- Recommendations -->
         <div class="recs-section" id="recsSection" style="display:none">
             <div class="recs-header">
@@ -476,6 +486,7 @@
 
     <script src="/static/comparisons.js"></script>
     <script src="/static/context.js"></script>
+    <script src="/static/weekly-review.js"></script>
     <script>
         // ── Person scope ──
         // Every API call and in-app link on this page is built from these two
@@ -571,6 +582,7 @@
             btn.disabled = true; btn.textContent = "Syncing...";
             dashboardGeneration++;
             window.VFContext.clear();
+            window.VFWeeklyReview.clear();
             comparisonReport = null;
             destroyAllCharts();
             window.VFComparisons.clear("Sync requested; comparison evidence cleared until refreshed.");
@@ -587,7 +599,7 @@
                     el.classList.remove("syncing");
                     el.textContent = body.message || "Link Garmin before syncing";
                     btn.disabled = false; btn.textContent = "Sync";
-                    clearCacheAndReload();
+                    syncFinished();
                     return;
                 }
                 if (!res.ok) {
@@ -600,7 +612,7 @@
                     const detail = body && body.detail;
                     el.textContent = typeof detail === "string" ? detail : "Sync not available";
                     btn.disabled = false; btn.textContent = "Sync";
-                    clearCacheAndReload();
+                    syncFinished();
                     return;
                 }
                 const poll = setInterval(async () => {
@@ -608,14 +620,14 @@
                     if (status && !status.syncing) {
                         clearInterval(poll);
                         btn.disabled = false; btn.textContent = "Sync";
-                        updateSyncInfo(status); clearCacheAndReload();
+                        updateSyncInfo(status); syncFinished();
                         window.refreshDataQuality(currentDays);
                     }
                 }, 2000);
             } catch {
                 btn.disabled = false; btn.textContent = "Sync";
                 document.getElementById("syncInfo").textContent = "Sync not available";
-                clearCacheAndReload();
+                syncFinished();
             }
         }
 
@@ -644,6 +656,9 @@
             document.querySelectorAll(".unit-btn").forEach(b => b.classList.toggle("active", b.dataset.unit === unit));
             clearCacheAndReload();
         }
+
+        // A review generated while a sync was running describes pre-sync data: drop it when the sync ends.
+        function syncFinished() { window.VFWeeklyReview.clear(); clearCacheAndReload(); }
 
         function clearCacheAndReload() {
             Object.keys(metricCache).forEach(k => delete metricCache[k]);

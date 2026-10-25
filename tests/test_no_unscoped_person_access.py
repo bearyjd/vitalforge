@@ -364,3 +364,127 @@ def test_service_worker_cache_names_were_bumped():
         f"service worker cache not bumped for the person-scoped URL change: {stale}. "
         "Existing installs would serve the old shell against the new backend."
     )
+
+
+# Runtime sweep over the LIVE apps, so a route added in any add_*_routes module cannot be
+# forgotten the way a hand-maintained file list can. It walks Mounts recursively, includes
+# websocket and plain Starlette routes, and covers every path under /p/{any param}/ (not only
+# /api/). A route may only be exempt with a documented reason: it must authorize the person
+# some other way.
+_SLUG_PATH = re.compile(r"^/p/\{[^}/]+\}/")
+_MUTATING = {"POST", "PUT", "PATCH", "DELETE"}
+_LEVEL_RANK = {"view": 1, "manage": 2, "own": 3}
+# (METHOD, path) -> reason. Empty unless a route authorizes the person another way.
+_REQUIRE_PERSON_EXEMPT: dict[tuple[str, str], str] = {}
+# Mutating routes whose guard level is deliberately only "view", with the reason.
+_GOALS_REASON = (
+    "Goals are account-owned, not profile-owned: the person only feeds read-only progress, and "
+    "ownership is enforced per goal by _owned_goal_or_404 (see vitalforge_dashboard/app.py)."
+)
+_MUTATING_VIEW_LEVEL: dict[tuple[str, str], str] = {
+    ("POST", "/p/{slug}/api/goals"): _GOALS_REASON,
+    ("PATCH", "/p/{slug}/api/goals/{goal_id}"): _GOALS_REASON,
+}
+
+
+def _dependency_calls(dependant):
+    for child in dependant.dependencies:
+        yield child.call
+        yield from _dependency_calls(child)
+
+
+def _guard_level(dependant) -> str | None:
+    """The access level of the require_person dependency, read from its closure; None if absent."""
+    for call in _dependency_calls(dependant):
+        if getattr(call, "__qualname__", "").startswith("require_person."):
+            names = call.__code__.co_freevars
+            return call.__closure__[names.index("level")].cell_contents
+    return None
+
+
+def _walk(routes, prefix: str = ""):
+    for route in routes:
+        path = prefix + getattr(route, "path", "")
+        children = getattr(route, "routes", None) or getattr(getattr(route, "app", None), "routes", None)
+        if children and not hasattr(route, "dependant"):
+            yield from _walk(children, path)
+        else:
+            yield route, path
+
+
+def _slug_routes(app):
+    for route, path in _walk(app.routes):
+        if _SLUG_PATH.match(path) or _SLUG_PATH.match(path + "/"):
+            methods = sorted(getattr(route, "methods", None) or {"WEBSOCKET"})
+            yield route, path, methods
+
+
+def _route_problems(app) -> list[str]:
+    problems = []
+    for route, path, methods in _slug_routes(app):
+        dependant = getattr(route, "dependant", None)
+        level = _guard_level(dependant) if dependant is not None else None
+        for method in methods:
+            if (method, path) in _REQUIRE_PERSON_EXEMPT:
+                continue
+            if level is None:
+                problems.append(f"{method} {path}: no require_person guard")
+            elif method in _MUTATING and _LEVEL_RANK[level] < _LEVEL_RANK["manage"] \
+                    and (method, path) not in _MUTATING_VIEW_LEVEL:
+                problems.append(f"{method} {path}: mutating route guarded at {level!r}")
+    return problems
+
+
+def test_every_live_dashboard_slug_route_depends_on_require_person(dashboard_app_module):
+    assert _route_problems(dashboard_app_module.app) == []
+    paths = {path for _, path, _ in _slug_routes(dashboard_app_module.app)}
+    assert "/p/{slug}/api/weekly-review" in paths and "/p/{slug}/api/comparisons" in paths
+
+
+def test_every_live_weight_slug_route_depends_on_require_person(weight_app_module):
+    assert _route_problems(weight_app_module.app) == []
+    assert any(path.startswith("/p/{slug}/") for _, path, _ in _slug_routes(weight_app_module.app))
+
+
+def test_the_sweep_flags_unguarded_websocket_mounted_non_api_and_underprivileged_routes():
+    from fastapi import Depends, FastAPI, WebSocket
+    from starlette.applications import Starlette
+    from starlette.responses import PlainTextResponse
+    from starlette.routing import Mount, Route
+
+    from shared.auth import require_person
+
+    app = FastAPI()
+
+    @app.get("/p/{slug}/api/leaky")
+    async def leaky(slug: str):
+        return {}
+
+    @app.get("/p/{who}/page")
+    async def page_without_api(who: str):
+        return {}
+
+    @app.websocket("/p/{slug}/ws")
+    async def socket(websocket: WebSocket, slug: str):
+        await websocket.close()
+
+    @app.post("/p/{slug}/api/write", dependencies=[Depends(require_person("view"))])
+    async def under_privileged(slug: str):
+        return {}
+
+    @app.post("/p/{slug}/api/ok", dependencies=[Depends(require_person("manage"))])
+    async def fine(slug: str):
+        return {}
+
+    async def leaf(request):
+        return PlainTextResponse("x")
+
+    app.router.routes.append(Mount("/p/{slug}/sub", app=Starlette(routes=[Route("/leaf", leaf)])))
+    assert set(_route_problems(app)) == {
+        "GET /p/{slug}/api/leaky: no require_person guard",
+        "GET /p/{who}/page: no require_person guard",
+        "WEBSOCKET /p/{slug}/ws: no require_person guard",
+        "POST /p/{slug}/api/write: mutating route guarded at 'view'",
+        "GET /p/{slug}/sub/leaf: no require_person guard",
+        "HEAD /p/{slug}/sub/leaf: no require_person guard",
+    }
