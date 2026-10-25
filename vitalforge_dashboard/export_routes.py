@@ -7,7 +7,7 @@ import json
 import logging
 
 from fastapi import Depends, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from shared.auth import (
     require_person,
@@ -15,6 +15,8 @@ from shared.auth import (
 from shared.database import (
     get_db,
 )
+from vitalforge_dashboard.data_quality import PRIVATE_HEADERS, metric_snapshot
+from vitalforge_dashboard.metric_metadata import METRIC_METADATA
 from vitalforge_dashboard.metrics import METRIC_TABLES
 
 logger = logging.getLogger(__name__)
@@ -96,6 +98,23 @@ def add_export_routes(app):
 
     Mirrors shared/persons_admin.py's add_person_routes, and the weight
     service's add_weight_routes / add_activity_routes."""
+
+    @app.get("/p/{slug}/api/export/package")
+    async def export_package(
+        days: int = Query(default=30, ge=1, le=365),
+        person_id: int = Depends(require_person("view")),
+    ) -> JSONResponse:
+        quality, data = await metric_snapshot(person_id, days)
+        package = {
+            "schema_version": quality["schema_version"], "generated_at": quality["generated_at"],
+            "period": quality["period"],
+            "dictionary": {name: METRIC_METADATA[name] for name in data},
+            "data": data, "quality": quality,
+        }
+        return JSONResponse(package, headers={
+            **PRIVATE_HEADERS,
+            "Content-Disposition": f'attachment; filename="vitalforge-ai-export-{days}d.json"',
+        })
 
     @app.get("/p/{slug}/api/export")
     async def export_data(

@@ -37,6 +37,19 @@
             font-size: 0.8rem; transition: background 0.2s;
         }
         .btn:hover { background: #7c4dff; }
+        a.btn { text-decoration: none; }
+        .export-help { flex-basis: 100%; font-size: 0.75rem; color: #a0a0c0; line-height: 1.5; }
+        .data-details { background: #202038; border: 1px solid #353553; border-radius: 8px; margin-bottom: 1rem; }
+        .data-details summary { cursor: pointer; padding: 0.8rem 1rem; color: #c0c0e0; font-weight: 600; }
+        .data-details summary:focus-visible { outline: 2px solid #a7b3ff; outline-offset: 2px; }
+        .data-details .details-body { padding: 0 1rem 1rem; font-size: 0.8rem; line-height: 1.6; color: #b8b8d0; }
+        .details-body p + p { margin-top: 0.5rem; }
+        .quality-scroll { overflow-x: auto; margin-top: 0.75rem; }
+        .quality-table { width: 100%; border-collapse: collapse; text-align: left; font-size: 0.75rem; }
+        .quality-table th, .quality-table td { padding: 0.6rem; border-bottom: 1px solid #353553; vertical-align: top; }
+        .quality-table th { color: #d0d0ec; }
+        .quality-table small { display: block; color: #b8b8d0; }
+        .quality-table caption { text-align: left; padding-bottom: 0.5rem; }
         .btn:disabled { opacity: 0.5; cursor: not-allowed; }
         .btn-sm { padding: 0.3rem 0.6rem; font-size: 0.7rem; }
         .btn-ghost { background: transparent; color: #6060a0; border: 1px solid #2a2a4a; }
@@ -217,8 +230,37 @@
                     <button class="range-btn active" data-days="30" onclick="setRange(30)">30d</button>
                     <button class="range-btn" data-days="90" onclick="setRange(90)">90d</button>
                 </div>
+                <a class="btn" id="exportJson" href="/p/{{ person_slug }}/api/export?metric=all&amp;format=json&amp;days=30" aria-describedby="exportRange exportHelp">Download JSON</a>
+                <a class="btn" id="exportPackage" href="/p/{{ person_slug }}/api/export/package?days=30" aria-describedby="packageRange packageHelp">Download AI-ready JSON</a>
             </div>
+            <p class="export-help"><span id="exportRange">All metrics for this profile from the last 30 days.</span>
+                <span id="exportHelp">Upload the file to ChatGPT or Claude to explore your data. Uses stored units: weight and mass in grams, sleep duration in seconds.</span></p>
         </div>
+
+        <details class="data-details" id="packagePreview">
+            <summary>What’s in the AI-ready export?</summary>
+            <div class="details-body">
+                <p id="packageRange">All available metrics for this profile from the last 30 days.</p>
+                <p id="packageHelp">Includes dated measurements, a metric dictionary with units and source, and data quality for the selected range. Values keep their stored units: weight and mass in grams, sleep duration in seconds. Changing the display unit does not convert exports.</p>
+                <p>Source: Garmin Connect data stored by VitalForge; the original measuring device is unknown. Missing days are described for each metric. A missing value does not mean zero or prove a device is unsupported.</p>
+                <p>Excludes account credentials, profile details, recommendations, manually logged strength sessions, and imported activity files.</p>
+            </div>
+        </details>
+        <details class="data-details" id="dataQuality">
+            <summary>Data quality · selected range</summary>
+            <div class="details-body">
+                <p id="qualityStatus" role="status" aria-live="polite">Loading data quality…</p>
+                <p id="qualitySync"></p>
+                <p>Coverage counts calendar days with a recorded value, not device wear adherence. Today may be incomplete. The latest observation date is separate from the last sync attempt; sync results cannot identify errors for individual metrics. Snapshot metrics are not assessed as stale.</p>
+                <div class="quality-scroll" role="region" aria-label="Metric data quality" tabindex="0">
+                    <table class="quality-table" id="qualityTable" hidden>
+                        <caption>Stored metric units and calendar day coverage</caption>
+                        <thead><tr><th scope="col">Metric / unit</th><th scope="col">Latest observation</th><th scope="col">Calendar day coverage</th><th scope="col">Missing days</th><th scope="col">Availability / completeness</th><th scope="col">Freshness</th></tr></thead>
+                        <tbody id="qualityRows"></tbody>
+                    </table>
+                </div>
+            </div>
+        </details>
 
         <!-- Recommendations -->
         <div class="recs-section" id="recsSection" style="display:none">
@@ -472,6 +514,7 @@
                         clearInterval(poll);
                         btn.disabled = false; btn.textContent = "Sync";
                         updateSyncInfo(status); clearCacheAndReload();
+                        window.refreshDataQuality(currentDays);
                     }
                 }, 2000);
             } catch { btn.disabled = false; btn.textContent = "Sync"; }
@@ -483,13 +526,16 @@
             if (status.syncing) { el.textContent = "Syncing..."; el.classList.add("syncing"); return; }
             el.classList.remove("syncing");
             const d = new Date(status.last_sync_time);
-            el.textContent = `Last sync: ${d.toLocaleDateString(undefined, tzOption)} ${d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", ...tzOption })}`;
+            el.textContent = `Last sync attempt: ${d.toLocaleDateString(undefined, tzOption)} ${d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", ...tzOption })}`;
         }
 
         // ── Toggles ──
         function setRange(days) {
             currentDays = days;
             document.querySelectorAll(".range-btn").forEach(b => b.classList.toggle("active", parseInt(b.dataset.days) === days));
+            document.getElementById("exportJson").href = `${API_BASE}/export?metric=all&format=json&days=${days}`;
+            document.getElementById("exportRange").textContent = `All metrics for this profile from the last ${days} days.`;
+            window.refreshDataQuality(days);
             clearCacheAndReload();
         }
 
@@ -770,6 +816,7 @@
             loadRecommendations(false);
         })();
     </script>
+    <script src="/static/data-quality.js"></script>
     <script src="/static/correlations.js"></script>
 </body>
 </html>

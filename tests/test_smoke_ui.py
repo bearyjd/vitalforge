@@ -7,8 +7,10 @@ the same faked DB/Garmin fixtures as the HTTP API tests (see conftest.py),
 so no real Garmin account or `/app/data` access is involved.
 """
 
+import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -61,6 +63,139 @@ def test_dashboard_page_loads_without_console_errors(page, dashboard_live_server
     assert page.locator("#cardWeight").is_visible()
     assert page.locator("#syncBtn").is_visible()
     assert errors == []
+
+
+@pytest.mark.playwright
+def test_dashboard_download_json_follows_profile_and_range(page, dashboard_live_server):
+    """Download actual files and check range filtering and profile isolation."""
+    today = datetime.now(timezone.utc)
+    expected_steps = []
+    with sqlite3.connect(str(shared.database.DB_PATH)) as conn:
+        person_id = conn.execute("SELECT id FROM persons WHERE is_primary = 1").fetchone()[0]
+        other_id = conn.execute(
+            "INSERT INTO persons (slug, display_name, created_at) VALUES (?, ?, ?)",
+            ("export-other", "Other profile", today.isoformat()),
+        ).lastrowid
+        for age, value in [(2, 0), (14, 6400), (60, 4100), (100, 2300)]:
+            date = (today - timedelta(days=age)).strftime("%Y-%m-%d")
+            conn.execute("INSERT INTO steps (person_id, date, value) VALUES (?, ?, ?)", (person_id, date, value))
+            expected_steps.append((age, {"metric": "steps", "date": date, "value": value}))
+        recent_date = expected_steps[0][1]["date"]
+        conn.execute(
+            "INSERT INTO steps (person_id, date, value) VALUES (?, ?, ?)", (other_id, recent_date, 999999)
+        )
+        conn.execute(
+            "INSERT INTO weight_history (person_id, date, weight_grams) VALUES (?, ?, ?)",
+            (person_id, recent_date, 75000),
+        )
+        conn.execute(
+            "INSERT INTO sleep (person_id, date, duration_seconds) VALUES (?, ?, ?)",
+            (person_id, recent_date, 28800),
+        )
+
+    # The default link is useful even before the page's JavaScript runs.
+    response = page.goto(f"{dashboard_live_server}{PERSON_PREFIX}/")
+    assert f'href="{PERSON_PREFIX}/api/export?metric=all&amp;format=json&amp;days=30"' in response.text()
+    export_link = page.get_by_role("link", name="Download JSON", exact=True)
+    assert export_link.is_visible()
+    for days in (30, 7, 90):
+        if days != 30:
+            page.get_by_role("button", name=f"{days}d", exact=True).click()
+        assert page.locator("#exportRange").inner_text() == f"All metrics for this profile from the last {days} days."
+        assert export_link.get_attribute("aria-describedby") == "exportRange exportHelp"
+        with page.expect_download() as download_info:
+            export_link.click()
+        download = download_info.value
+        assert download.suggested_filename == f"vitalforge-export-all-{days}d.json"
+        request_url = urlsplit(download.url)
+        assert request_url.path == f"{PERSON_PREFIX}/api/export"
+        assert parse_qs(request_url.query) == {"metric": ["all"], "format": ["json"], "days": [str(days)]}
+        records = json.loads(download.path().read_text())
+        expected = [record for age, record in expected_steps if age <= days] + [
+            {"metric": "weight", "date": recent_date, "value": 75000},
+            {"metric": "sleep_duration", "date": recent_date, "value": 28800},
+        ]
+        assert sorted(records, key=lambda row: (row["metric"], row["date"])) == sorted(
+            expected, key=lambda row: (row["metric"], row["date"])
+        )
+
+        page.get_by_role("button", name="kg", exact=True).click()
+        package_link = page.get_by_role("link", name="Download AI-ready JSON", exact=True)
+        assert parse_qs(urlsplit(package_link.get_attribute("href")).query) == {"days": [str(days)]}
+        with page.expect_download() as package_info:
+            package_link.click()
+        package_download = package_info.value
+        assert package_download.suggested_filename == f"vitalforge-ai-export-{days}d.json"
+        package = json.loads(package_download.path().read_text())
+        assert package["period"]["days"] == days
+        assert package["quality"]["period"] == package["period"]
+        assert set(package["data"]) == set(package["dictionary"]) == set(package["quality"]["metrics"])
+        assert len(package["dictionary"]) == 16
+        assert package["quality"]["metrics"]["steps"]["observed_days"] == len([age for age, _ in expected_steps if age < days])
+        assert package["dictionary"]["weight"]["unit"] == "g"
+        assert package["dictionary"]["sleep_duration"]["unit"] == "seconds"
+        enriched_records = [dict(metric=name, **record) for name, series in package["data"].items() for record in series]
+        assert sorted(enriched_records, key=lambda row: (row["metric"], row["date"])) == sorted(
+            expected, key=lambda row: (row["metric"], row["date"])
+        )
+
+
+@pytest.mark.playwright
+def test_dashboard_quality_handles_zero_stale_snapshot_failure_and_races(page, dashboard_live_server):
+    pending = []
+
+    def report(days):
+        def metric(name, **values):
+            return dict(label=name, unit="count", expected_cadence="daily",
+                        latest_observation_date=None, observed_days=0, missing_days=days,
+                        coverage_percent=0, availability="empty", completeness="empty",
+                        freshness="unknown", **values)
+
+        recent = metric("Zero steps")
+        recent.update(latest_observation_date="2026-10-25", observed_days=1,
+                      missing_days=days - 1, coverage_percent=14.3,
+                      availability="available", completeness="partial", freshness="current")
+        stale = metric("Old pulse")
+        stale.update(latest_observation_date="2026-10-01", availability="available", freshness="stale")
+        snapshot = metric("Snapshot")
+        snapshot.update(expected_cadence="event", availability="available")
+        return dict(period=dict(start_date="2026-10-19", end_date="2026-10-25", days=days),
+                    sync=dict(last_attempt_at="2026-10-25T10:00:00Z", last_result="error",
+                              status="idle", metric_outcomes="unknown"),
+                    metrics=dict(steps=recent, pulse=stale, hrv=metric("No HRV"), snapshot=snapshot))
+
+    def handle(route):
+        days = int(parse_qs(urlsplit(route.request.url).query)["days"][0])
+        if days == 30:
+            pending.append(route)
+        elif days == 90:
+            route.fulfill(status=503, json={"detail": "unavailable"})
+        else:
+            route.fulfill(json=report(days))
+
+    page.route("**/api/data-quality?*", handle)
+    page.goto(f"{dashboard_live_server}{PERSON_PREFIX}/")
+    page.wait_for_function("document.getElementById('syncInfo').textContent !== 'Loading...'")
+    page.locator("#dataQuality summary").click()
+    page.get_by_role("button", name="7d", exact=True).click()
+    page.wait_for_function("document.querySelectorAll('#qualityRows tr').length === 4")
+    pending[0].fulfill(json=report(30))
+    page.wait_for_timeout(100)
+    assert "7 days" in page.locator("#qualityStatus").inner_text()
+    rows = page.locator("#qualityRows tr")
+    assert "1 / 7 days" in rows.nth(0).inner_text()
+    assert "Recent" in rows.nth(0).inner_text()
+    assert "Stale" in rows.nth(1).inner_text()
+    assert "No observations / No observations" in rows.nth(2).inner_text()
+    assert "Not assessed (snapshot)" in rows.nth(3).inner_text()
+    assert "Last sync attempt:" in page.locator("#qualitySync").inner_text()
+    assert "Per-metric sync results are unknown" in page.locator("#qualitySync").inner_text()
+    page.set_viewport_size({"width": 375, "height": 812})
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+    page.get_by_role("button", name="90d", exact=True).click()
+    page.wait_for_function("document.getElementById('qualityStatus').textContent.includes('unavailable')")
+    assert page.locator("#qualityTable").is_hidden()
+    assert page.locator("#qualityRows tr").count() == 0
 
 
 def _seed_resting_hr_and_steps_with_a_malformed_date():

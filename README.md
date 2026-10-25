@@ -735,6 +735,8 @@ the same weigh-in rather than a new one:
 | `GET` | `/p/{slug}/api/recommendations/rules-only` | Rules engine output without LLM |
 | `GET` | `/p/{slug}/api/correlations?metrics=a,b,c&days=30&lag=0&min_pairs=5` | Ad-hoc cross-metric correlation matrix |
 | `GET` | `/p/{slug}/api/export?metric=all\|{name}&days=30&format=csv\|json` | Download metric data as a CSV or JSON file |
+| `GET` | `/p/{slug}/api/export/package?days=30` | Download an AI-ready JSON package with metric definitions, stored units, source limitations, and data-quality metadata |
+| `GET` | `/p/{slug}/api/data-quality?days=30` | Per-metric observation dates and calendar-day coverage, plus the profile's latest sync attempt |
 | `GET` | `/p/{slug}/api/readiness` | Composite readiness/recovery score (0-100) |
 | `POST` / `GET` | `/p/{slug}/api/goals` | Create / list the caller's goals |
 | `GET` / `PATCH` | `/p/{slug}/api/goals/{id}` | Read / update one goal |
@@ -744,6 +746,30 @@ the same weigh-in rather than a new one:
 | `GET` | `/p/{slug}/api/activities/{id}` | One imported activity |
 
 Available metrics: `sleep_duration`, `sleep_score`, `resting_hr`, `hrv`, `body_battery`, `body_battery_low`, `stress`, `vo2max`, `weight`, `body_fat`, `body_water`, `bone_mass`, `muscle_mass`, `training_load`, `steps`, `active_calories`
+
+**Exporting for AI.** The dashboard offers an AI-ready JSON download for its selected
+7/30/90-day range, alongside the original raw JSON download. You choose whether to upload
+the file to ChatGPT, Claude, or another service; downloading it makes no AI or Garmin
+request. The versioned package includes all available metric series, their definitions
+and units, and the same quality information shown in the dashboard. It excludes profile
+and account identifiers, credentials, and free-form sync errors. Both new endpoints
+require view access to the selected profile, accept `days=1..365`, and return
+`Cache-Control: no-store, private`.
+
+The new package and quality report use exactly N calendar dates, from UTC today minus
+N−1 days through today, inclusive, and exclude future or invalid dates. Stored dates
+remain Garmin source calendar dates with unknown source timezone; they are not converted
+to UTC observations. The legacy CSV/JSON endpoint keeps its existing window semantics
+for compatibility. Coverage counts dates with a finite numeric value, including zero;
+missing records are never filled with zero. Today may be incomplete. Weight and other
+event/snapshot metrics do not imply a daily measurement schedule. Daily metrics are
+marked stale after more than three calendar days, a display rule rather than a medical
+threshold. A sync timestamp records the latest attempt, not necessarily a success, and
+the stored sync result cannot identify which individual metrics failed.
+
+The [health dashboard roadmap](docs/roadmaps/2026-10-25-health-dashboard.md) describes
+the staged follow-up work, including comparisons, context notes, reports, and an
+optional read-only AI connector.
 
 `weight`, `bone_mass`, and `muscle_mass` are in **grams** (matching the `_kg`-suffixed
 request fields' storage convention, confirmed against a real Garmin read-back — see
