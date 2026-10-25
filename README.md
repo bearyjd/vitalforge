@@ -738,6 +738,10 @@ the same weigh-in rather than a new one:
 | `GET` | `/p/{slug}/api/export/package?days=30` | Download an AI-ready JSON package with metric definitions, stored units, source limitations, and data-quality metadata |
 | `GET` | `/p/{slug}/api/data-quality?days=30` | Per-metric observation dates and calendar-day coverage, plus the profile's latest sync attempt |
 | `GET` | `/p/{slug}/api/comparisons?days=30` | Equal-period comparisons, descriptive historical ranges, and evidence for existing readiness/anomaly rules; accepts 7, 30, or 90 days |
+| `GET` | `/p/{slug}/api/context?days=30` | Logged notes/tags for the selected period, tag suggestions, saved routine plan, and editing capability |
+| `GET` / `PUT` / `DELETE` | `/p/{slug}/api/context/days/{date}` | Read, replace, or delete a daily context entry (`YYYY-MM-DD`) |
+| `GET` / `PUT` / `DELETE` | `/p/{slug}/api/context/experiment` | Read, replace, or remove the profile's one saved routine experiment |
+| `GET` | `/p/{slug}/api/context/associations?days=30` | Descriptive same-date associations for the saved experiment; accepts 7, 30, or 90 days |
 | `GET` | `/p/{slug}/api/readiness` | Composite readiness/recovery score (0-100) |
 | `POST` / `GET` | `/p/{slug}/api/goals` | Create / list the caller's goals |
 | `GET` / `PATCH` | `/p/{slug}/api/goals/{id}` | Read / update one goal |
@@ -771,6 +775,44 @@ the stored sync result cannot identify which individual metrics failed.
 The [health dashboard roadmap](docs/roadmaps/2026-10-25-health-dashboard.md) describes
 the staged follow-up work, including comparisons, context notes, reports, and an
 optional read-only AI connector.
+
+**Context notes, tags, and routines.** The expandable context section stores one note
+and up to 12 custom tags per chosen calendar date. People with view access to that
+profile can read its entries; manage access is required to change them. A saved day
+with an empty note and no tags is still explicitly logged. Deleting that day makes
+it unlogged again. Unlogged dates are unknown, not evidence that a routine was absent.
+Context markers and tooltip summaries annotate existing charts without adding metric
+observations; the date list also includes logged days with no measurement.
+
+One saved experiment identifies a user-chosen routine tag, daily metric, and date
+window. Saving or replacing a plan does not log adherence. Its analysis intersects the
+plan and selected period, pairing a metric with context on the same recorded date.
+Only explicitly logged tagged days and explicitly logged days without that tag enter
+the groups. At least three paired observations per group are needed to display a
+difference. Counts, dates, missing logging/readings, co-occurring tags, and historical
+observations remain visible. Differences describe an association; self-selection,
+time trends, other routines, and unknown source timezones limit interpretation.
+
+Notes, tags, and routine labels stay out of downloads by default and are never fed
+automatically into recommendations. The AI-ready export's unchecked **Include context**
+option adds selected-period entries and relevant saved-plan metadata through
+`include_context=true`. User-entered text can identify people; review it before sharing.
+The opt-in package reads context and metrics in the same SQLite snapshot. Raw JSON/CSV
+exports are unchanged. Entries are retained when a profile is archived, consistently
+with its health history, and its normal routes become inaccessible.
+
+New context mutations require `X-VitalForge-Write: context`; PUT bodies also require
+`Content-Type: application/json`. The fixed header protects browser writes through
+the existing disabled-CORS policy. Request bodies are limited to 32 KiB; notes to
+1,000 characters, tags to 40 characters each, experiment titles to 100 characters,
+and experiment windows to 365 inclusive dates. Private text is omitted from validation
+errors and application logs. Context endpoints use private/no-store response headers.
+
+Storage uses standalone additive tables initialized transactionally by both services.
+There is no change to an existing migration marker or metric-table shape. The previous
+image can still initialize the upgraded database and ignores the new tables; rolling
+back images retains context for a subsequent upgrade. Take the usual predeployment
+backup before upgrading.
 
 **Personal comparisons.** The dashboard compares the selected 7/30/90-day period with
 the equally long, immediately preceding period. Both periods use exact inclusive UTC

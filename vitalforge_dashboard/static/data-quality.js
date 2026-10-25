@@ -2,6 +2,7 @@
 (function () {
     "use strict";
     let requestVersion = 0;
+    let exportDays = 30;
     const byId = id => document.getElementById(id);
     const labels = {
         available: "Available", empty: "No observations", unavailable: "Unavailable",
@@ -24,9 +25,21 @@
         row.appendChild(td);
     }
 
+    window.updateContextExport = function () {
+        const include = byId("includeContext").checked;
+        byId("exportPackage").href = `${window.VF_API_BASE}/export/package?days=${exportDays}${include ? "&include_context=true" : ""}`;
+        window.VFContext?.exportPreview();
+    };
+    byId("includeContext").checked = false;
+    byId("includeContext").addEventListener("change", window.updateContextExport);
+    window.addEventListener("pageshow", () => {
+        byId("includeContext").checked = false;
+        window.updateContextExport();
+    });
     window.refreshDataQuality = async function (days) {
         const version = ++requestVersion;
-        byId("exportPackage").href = `${window.VF_API_BASE}/export/package?days=${days}`;
+        exportDays = days;
+        window.updateContextExport();
         byId("packageRange").textContent = `All available metrics for this profile from the last ${days} days.`;
         byId("qualityStatus").textContent = "Loading data quality…";
         byId("qualitySync").textContent = "";

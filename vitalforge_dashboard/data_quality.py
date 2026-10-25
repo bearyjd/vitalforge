@@ -63,7 +63,7 @@ def _sync_report(row, now: datetime) -> dict:
     }
 
 
-async def metric_snapshot(person_id: int, days: int) -> tuple[dict, dict]:
+async def profile_snapshot(person_id: int, days: int, *, include_context: bool = False) -> tuple[dict, dict, dict | None]:
     """Read one SQLite snapshot; source calendar dates are not timezone-converted.
 
     Query identifiers come exclusively from METRIC_TABLES. Failures propagate
@@ -82,6 +82,7 @@ async def metric_snapshot(person_id: int, days: int) -> tuple[dict, dict]:
         ),
     }
     metrics, data = {}, {}
+    context = None
     db = await get_db()
     try:
         await db.execute("BEGIN")
@@ -131,6 +132,10 @@ async def metric_snapshot(person_id: int, days: int) -> tuple[dict, dict]:
         )
         sync = _sync_report(await cursor.fetchone(), now)
         await cursor.close()
+        if include_context:
+            from vitalforge_dashboard.context_store import read_context
+
+            context = await read_context(db, person_id, start.isoformat(), today.isoformat())
     finally:
         await db.close()
     return {
@@ -144,4 +149,10 @@ async def metric_snapshot(person_id: int, days: int) -> tuple[dict, dict]:
             "Sync time records the last attempt, not the last success. Per-metric sync outcomes are unknown.",
             "Household scheduling and provider failures can delay updates; no per-person refresh interval is inferred.",
         ],
-    }, data
+    }, data, context
+
+
+async def metric_snapshot(person_id: int, days: int) -> tuple[dict, dict]:
+    """Compatibility wrapper; ordinary quality reads never query context tables."""
+    quality, data, _ = await profile_snapshot(person_id, days)
+    return quality, data
