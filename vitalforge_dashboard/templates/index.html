@@ -50,6 +50,18 @@
         .quality-table th { color: #d0d0ec; }
         .quality-table small { display: block; color: #b8b8d0; }
         .quality-table caption { text-align: left; padding-bottom: 0.5rem; }
+        .context-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 0.75rem; margin: 0.75rem 0; }
+        .context-form[hidden], .context-form [hidden] { display: none; }
+        #contextExportPreview, #contextPlanSummary { overflow-wrap: anywhere; }
+        .context-form label { display: flex; flex-direction: column; gap: 0.25rem; min-width: 0; }
+        .context-form input, .context-form textarea, .context-form select { background: #16213e; color: #e0e0ec; border: 1px solid #60608a; border-radius: 4px; padding: 0.5rem; width: 100%; box-sizing: border-box; font: inherit; }
+        .context-wide { grid-column: 1 / -1; }
+        .context-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+        .context-form label.context-check { display: block; }
+        .context-check input { width: auto; margin-right: 0.4rem; }
+        #contextEntries { padding-left: 1.25rem; overflow-wrap: anywhere; }
+        #contextEntries li { margin: 0.6rem 0; white-space: pre-wrap; }
+        #contextAssociation { white-space: pre-line; overflow-wrap: anywhere; }
         .btn:disabled { opacity: 0.5; cursor: not-allowed; }
         .btn-sm { padding: 0.3rem 0.6rem; font-size: 0.7rem; }
         .btn-ghost { background: transparent; color: #6060a0; border: 1px solid #2a2a4a; }
@@ -246,6 +258,9 @@
             <div class="details-body">
                 <p id="packageRange">All available metrics for this profile from the last 30 days.</p>
                 <p id="packageHelp">Includes dated measurements, a metric dictionary with units and source, and data quality for the selected range. Values keep their stored units: weight and mass in grams, sleep duration in seconds. Changing the display unit does not convert exports.</p>
+                <label class="context-check"><input type="checkbox" id="includeContext" autocomplete="off"> Include context notes, tags and the relevant routine plan in AI-ready JSON</label>
+                <p id="contextExportHelp">Context is excluded by default. Notes may identify you or other people. Select this only if you want to share them with the recipient of the file.</p>
+                <p id="contextExportPreview">Context notes, tags and routine plan are excluded.</p>
                 <p>Source: Garmin Connect data stored by VitalForge; the original measuring device is unknown. Missing days are described for each metric. A missing value does not mean zero or prove a device is unsupported.</p>
                 <p>Excludes account credentials, profile details, recommendations, manually logged strength sessions, and imported activity files.</p>
             </div>
@@ -263,6 +278,43 @@
                         <tbody id="qualityRows"></tbody>
                     </table>
                 </div>
+            </div>
+        </details>
+
+        <details class="data-details" id="contextSection">
+            <summary>Context notes, tags and a chosen routine</summary>
+            <div class="details-body">
+                <p>Anyone with view access to this profile can read these notes. They are shared profile context, not private notes for their author. Record only what you want those people to see.</p>
+                <p id="contextStatus" role="status" aria-live="polite">Loading context…</p>
+                <form id="contextDayForm" class="context-form" autocomplete="off" hidden>
+                    <label>Date (source calendar date)<input type="date" id="contextDate" required autocomplete="off"></label>
+                    <label class="context-wide">Daily note (optional, 1,000 characters)<textarea id="contextNote" maxlength="1000" rows="2" autocomplete="off" disabled></textarea></label>
+                    <label class="context-wide">Tags (comma separated, up to 12; 40 characters each)<input id="contextTags" type="text" maxlength="503" autocomplete="off" disabled></label>
+                    <p class="context-wide" id="contextSuggestions"></p>
+                    <p class="context-wide">Saving an empty note with no tags explicitly logs this day without tags. A day you have not logged is unknown, and is never a comparison day without the tag. Future dates can be logged; selected-range charts and evidence stop at today.</p>
+                    <div class="context-wide context-actions"><button class="btn" id="contextSave" disabled>Save day</button><button class="btn btn-ghost" type="button" id="contextDiscard" disabled>Discard draft</button><button class="btn btn-ghost" type="button" id="contextDelete" disabled>Delete day log</button></div>
+                    <p class="context-wide" id="contextDayStatus" role="status" aria-live="polite"></p>
+                </form>
+                <details><summary>Logged context · selected range and chart markers</summary>
+                    <p>Small gold markers identify logged dates on charts with a measurement that day. They do not add measurements. This list includes logged days without measurements.</p>
+                    <ul id="contextEntries"></ul>
+                </details>
+                <details><summary>One chosen routine plan and association evidence</summary>
+                    <p>A plan records your own label and intended dates, not confirmation that a routine happened. Log its tag on dates it happened, and explicitly log dates without it. A label is not a recommendation to start, stop or change any behavior.</p>
+                    <p id="contextPlanSummary"></p>
+                    <form id="contextPlanForm" class="context-form" autocomplete="off" hidden>
+                        <label>Plan title<input id="contextPlanTitle" maxlength="100" required autocomplete="off"></label>
+                        <label>Routine tag<input id="contextPlanTag" maxlength="40" required autocomplete="off"></label>
+                        <label>Daily metric<select id="contextPlanMetric" required></select></label>
+                        <label>Planned start<input type="date" id="contextPlanStart" required></label>
+                        <label>Planned end<input type="date" id="contextPlanEnd" required></label>
+                        <label class="context-wide context-check" id="contextReplaceLabel" hidden><input type="checkbox" id="contextReplace" autocomplete="off"> Replace the saved plan with these settings</label>
+                        <div class="context-wide context-actions"><button class="btn" id="contextPlanSave">Save routine plan</button><button type="button" class="btn btn-ghost" id="contextPlanDiscard">Discard plan draft</button><button type="button" class="btn btn-ghost" id="contextPlanDelete" hidden>Delete saved plan</button></div>
+                        <p id="contextPlanStatus" class="context-wide" role="status" aria-live="polite"></p>
+                    </form>
+                    <p>Association evidence uses only matching dates with a recorded daily metric and an explicit context log, within both the saved plan and selected range. At least 3 paired dates per group are required. Missing measurements stay missing. Other tags, recording choices, time trends and unmeasured factors can explain differences. This is descriptive evidence, not causation or treatment advice.</p>
+                    <p id="contextAssociation" role="status" aria-live="polite"></p>
+                </details>
             </div>
         </details>
 
@@ -423,6 +475,7 @@
     </div>
 
     <script src="/static/comparisons.js"></script>
+    <script src="/static/context.js"></script>
     <script>
         // ── Person scope ──
         // Every API call and in-app link on this page is built from these two
@@ -517,6 +570,7 @@
             const btn = document.getElementById("syncBtn");
             btn.disabled = true; btn.textContent = "Syncing...";
             dashboardGeneration++;
+            window.VFContext.clear();
             comparisonReport = null;
             destroyAllCharts();
             window.VFComparisons.clear("Sync requested; comparison evidence cleared until refreshed.");
@@ -784,6 +838,7 @@
         async function loadDashboard() {
             const generation = ++dashboardGeneration;
             const days = currentDays;
+            window.VFContext.refresh(days, currentUnit);
             comparisonReport = null;
             window.VFComparisons.clear();
             renderCalendarAlerts(null);

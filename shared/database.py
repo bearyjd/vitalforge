@@ -672,6 +672,12 @@ async def init_db():
     # After the migrations, because it needs the primary person 001 creates.
     await _attribute_orphaned_weight_log_rows()
 
+    # Standalone additive tables: no marker/rebuild, so preceding images can
+    # still boot and ignore them. The helper serializes both service boots.
+    from shared.context_schema import ensure_context_schema
+
+    await ensure_context_schema()
+
 
 async def get_primary_person_id() -> int:
     """Return the id of the durable primary person (persons.is_primary = 1).
