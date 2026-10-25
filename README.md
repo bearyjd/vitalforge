@@ -737,6 +737,7 @@ the same weigh-in rather than a new one:
 | `GET` | `/p/{slug}/api/export?metric=all\|{name}&days=30&format=csv\|json` | Download metric data as a CSV or JSON file |
 | `GET` | `/p/{slug}/api/export/package?days=30` | Download an AI-ready JSON package with metric definitions, stored units, source limitations, and data-quality metadata |
 | `GET` | `/p/{slug}/api/data-quality?days=30` | Per-metric observation dates and calendar-day coverage, plus the profile's latest sync attempt |
+| `GET` | `/p/{slug}/api/comparisons?days=30` | Equal-period comparisons, descriptive historical ranges, and evidence for existing readiness/anomaly rules; accepts 7, 30, or 90 days |
 | `GET` | `/p/{slug}/api/readiness` | Composite readiness/recovery score (0-100) |
 | `POST` / `GET` | `/p/{slug}/api/goals` | Create / list the caller's goals |
 | `GET` / `PATCH` | `/p/{slug}/api/goals/{id}` | Read / update one goal |
@@ -770,6 +771,26 @@ the stored sync result cannot identify which individual metrics failed.
 The [health dashboard roadmap](docs/roadmaps/2026-10-25-health-dashboard.md) describes
 the staged follow-up work, including comparisons, context notes, reports, and an
 optional read-only AI connector.
+
+**Personal comparisons.** The dashboard compares the selected 7/30/90-day period with
+the equally long, immediately preceding period. Both periods use exact inclusive UTC
+date boundaries and one sanitized local database snapshot. Source calendar dates retain
+their unknown timezone. Daily comparisons require observations on at least half the
+dates, rounded up, and at least three observations in each period. Sparse or stale
+inputs show their counts and observed means without a change interpretation. A zero
+previous mean leaves percentage change undefined; missing readings stay missing.
+Event/snapshot metrics show recorded counts and means without implying independent
+measurements or a daily measurement schedule.
+
+Sleep duration/score, HRV, resting heart rate, and stress charts can show the previous
+period's mean plus or minus one sample standard deviation. This shaded historical
+spread is descriptive, not a medical normal range or a confidence interval. Readiness
+keeps the existing HRV/resting-HR/sleep-score formula and explains missing or stale
+inputs. Notable-change evidence names the actual dates and sample counts behind the
+existing anomaly rule: latest three observations versus the preceding up to 21
+observations. A constant baseline is explicitly identified as an assigned rule flag
+rather than an estimated z-score. Findings and readiness use the last 30 calendar
+dates independently of the comparison range; today's data may be incomplete.
 
 `weight`, `bone_mass`, and `muscle_mass` are in **grams** (matching the `_kg`-suffixed
 request fields' storage convention, confirmed against a real Garmin read-back — see

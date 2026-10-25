@@ -200,6 +200,10 @@
         .corr-drilldown { margin-top: 1rem; padding-top: 1rem; border-top: 1px solid #2a2a4a; }
         .corr-empty { font-size: 0.8rem; color: #6060a0; padding: 1rem 0; }
 
+        #personalComparisons { margin: 1.25rem 0; }
+        #personalComparisons p, #personalComparisons li { font-size: .8rem; line-height: 1.6; }
+        #comparisonFindings p { overflow-wrap: anywhere; color: #8080a0; }
+        #readinessExplanation { font-size: .75rem; color: #8080a0; margin-top: .5rem; }
         @media (max-width: 600px) {
             .top-cards { grid-template-columns: repeat(2, 1fr); }
             .chart-row.two-col { grid-template-columns: 1fr; }
@@ -262,6 +266,26 @@
             </div>
         </details>
 
+        <details class="data-details" id="personalComparisons" aria-labelledby="comparisonHeading">
+            <summary id="comparisonHeading">Personal trends and period comparisons · windows, evidence and chart band method</summary>
+            <div class="details-body">
+            <p id="comparisonStatus" role="status" aria-live="polite">Loading personal comparisons…</p>
+            <p id="comparisonWindows"></p>
+            <p>Means use recorded observations only. Missing days stay missing. On sleep, HRV, resting heart rate and stress charts, shading describes the previous period’s mean ± 1 sample standard deviation. These are personal descriptive bands, not normal ranges, clinical targets or confidence intervals. Lines break at missing days; the rolling line is a 7 calendar day observed mean.</p>
+            <div class="quality-scroll" role="region" aria-label="Personal period comparisons" tabindex="0">
+                <table class="quality-table" id="comparisonTable" hidden>
+                    <caption>Current period compared with the immediately preceding equal calendar period</caption>
+                    <thead><tr><th scope="col">Metric</th><th scope="col">Current mean</th><th scope="col">Previous mean</th><th scope="col">Difference</th><th scope="col">Percent change</th><th scope="col">Sample counts</th><th scope="col">Evidence status / freshness</th><th scope="col">Personal baseline method</th></tr></thead>
+                    <tbody id="comparisonRows"></tbody>
+                </table>
+            </div>
+            <p id="comparisonNotes"></p>
+            <h3>Daily anomaly evidence</h3>
+            <p id="findingsPeriod"></p>
+            <ul id="comparisonFindings"></ul>
+            </div>
+        </details>
+
         <!-- Recommendations -->
         <div class="recs-section" id="recsSection" style="display:none">
             <div class="recs-header">
@@ -284,6 +308,11 @@
                 <div class="readiness-label">Readiness</div>
                 <div class="readiness-status" id="readinessStatus"></div>
                 <div class="readiness-components" id="readinessComponents"></div>
+                <details id="readinessEvidence">
+                    <summary>How this score uses observations</summary>
+                    <p id="readinessExplanation"></p>
+                    <div id="readinessComponentDetails"></div>
+                </details>
             </div>
         </div>
 
@@ -393,6 +422,7 @@
         <div class="chart-section" id="correlationsSection"></div>
     </div>
 
+    <script src="/static/comparisons.js"></script>
     <script>
         // ── Person scope ──
         // Every API call and in-app link on this page is built from these two
@@ -434,6 +464,10 @@
         let currentUnit = localStorage.getItem("vf_unit") || "{{ default_unit }}";
         const charts = {};
         const metricCache = {};
+        let dashboardGeneration = 0;
+        let comparisonReport = null;
+        let dashboardData = {};
+        let chartPeriod = null;
         const GRAMS_PER_LB = 453.592;
 
         // Init unit toggle
@@ -462,14 +496,14 @@
         function weightUnitLabel() { return currentUnit; }
 
         // ── API helpers ──
-        async function fetchMetric(name, days) {
+        async function fetchMetric(name, days, generation) {
             const key = `${name}_${days}`;
             if (metricCache[key]) return metricCache[key];
             try {
                 const res = await fetch(`${API_BASE}/metrics/${name}?days=${days}`);
                 if (!res.ok) return { data: [] };
                 const json = await res.json();
-                metricCache[key] = json;
+                if (generation === dashboardGeneration) metricCache[key] = json;
                 return json;
             } catch { return { data: [] }; }
         }
@@ -482,6 +516,11 @@
         async function triggerSync() {
             const btn = document.getElementById("syncBtn");
             btn.disabled = true; btn.textContent = "Syncing...";
+            dashboardGeneration++;
+            comparisonReport = null;
+            destroyAllCharts();
+            window.VFComparisons.clear("Sync requested; comparison evidence cleared until refreshed.");
+            renderCalendarAlerts(null);
             try {
                 const res = await fetch(`${API_BASE}/sync`, { method: "POST" });
                 const body = await res.json().catch(() => null);
@@ -494,6 +533,7 @@
                     el.classList.remove("syncing");
                     el.textContent = body.message || "Link Garmin before syncing";
                     btn.disabled = false; btn.textContent = "Sync";
+                    clearCacheAndReload();
                     return;
                 }
                 if (!res.ok) {
@@ -506,6 +546,7 @@
                     const detail = body && body.detail;
                     el.textContent = typeof detail === "string" ? detail : "Sync not available";
                     btn.disabled = false; btn.textContent = "Sync";
+                    clearCacheAndReload();
                     return;
                 }
                 const poll = setInterval(async () => {
@@ -517,7 +558,11 @@
                         window.refreshDataQuality(currentDays);
                     }
                 }, 2000);
-            } catch { btn.disabled = false; btn.textContent = "Sync"; }
+            } catch {
+                btn.disabled = false; btn.textContent = "Sync";
+                document.getElementById("syncInfo").textContent = "Sync not available";
+                clearCacheAndReload();
+            }
         }
 
         function updateSyncInfo(status) {
@@ -595,14 +640,9 @@
         function rawAndAvgDatasets(rawVals, avgVals, color, secondaryColor) {
             return [
                 { label: "Value", data: rawVals, borderColor: color || C.primary, backgroundColor: "transparent", borderWidth: 1, pointBackgroundColor: C.dot, pointRadius: 2, tension: 0.1 },
-                { label: "7d Avg", data: avgVals, borderColor: secondaryColor || C.secondary, backgroundColor: "transparent", borderWidth: 2.5, pointRadius: 0, tension: 0.4 }
+                { label: comparisonReport ? "7 calendar day observed mean" : "7d Avg", data: avgVals, borderColor: secondaryColor || C.secondary, backgroundColor: "transparent", borderWidth: 2.5, pointRadius: 0, tension: 0.4 }
             ];
         }
-
-        // ── Helpers ──
-        function avg(arr) { const v = arr.filter(x => x != null); return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null; }
-        function trendArrow(c, b) { if (c == null || b == null) return ""; const p = ((c - b) / b) * 100; return p > 1 ? " ↑" : p < -1 ? " ↓" : " →"; }
-        function trendClass(c, b, lower) { if (c == null || b == null) return "trend-stable"; const d = c - b; if (Math.abs(d / b) < 0.01) return "trend-stable"; const up = d > 0; return lower ? (up ? "trend-up" : "trend-down") : (up ? "trend-down" : "trend-up"); }
 
         // ── Recommendations ──
         async function loadRecommendations(refresh) {
@@ -637,108 +677,64 @@
 
         function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
 
-        // ── Readiness ──
-        const READINESS_LABELS = { hrv: "HRV", rhr: "RHR", sleep_score: "Sleep" };
-
-        async function loadReadiness() {
-            const tile = document.getElementById("readinessTile");
-            try {
-                const res = await fetch(`${API_BASE}/readiness`);
-                if (!res.ok) { tile.style.display = "none"; return; }
-                const data = await res.json();
-                if (data.score == null) { tile.style.display = "none"; return; }
-
-                tile.style.display = "";
-                const scoreEl = document.getElementById("readinessScoreValue");
-                scoreEl.textContent = data.score;
-                scoreEl.classList.remove("status-good", "status-warn", "status-low");
-                scoreEl.classList.add(data.score >= 70 ? "status-good" : data.score >= 40 ? "status-warn" : "status-low");
-
-                document.getElementById("readinessStatus").textContent =
-                    data.status === "partial_data" ? "Based on partial data" : "";
-
-                const comps = data.components || {};
-                document.getElementById("readinessComponents").innerHTML = Object.entries(READINESS_LABELS).map(([key, label]) => {
-                    const v = comps[key];
-                    return `<span class="${v == null ? "readiness-component-missing" : ""}">${label} ${v == null ? "--" : v}</span>`;
-                }).join("");
-            } catch { tile.style.display = "none"; }
-        }
-
-        // ── Alerts ──
-        function computeAlerts(metricData) {
-            const alerts = [];
-            const rhrData = metricData.resting_hr?.data || [];
-            if (rhrData.length >= 2) {
-                const a = avg(rhrData.map(d => d.value)), l = rhrData[rhrData.length - 1].value;
-                if (a && l > a * 1.1) alerts.push(`Resting HR elevated: ${l} bpm is ${Math.round(((l - a) / a) * 100)}% above your 30-day average (${Math.round(a)} bpm)`);
-            }
-            const hrvData = metricData.hrv?.data || [];
-            if (hrvData.length >= 7) {
-                const a = avg(hrvData.map(d => d.value)); let c = 0;
-                for (let i = hrvData.length - 1; i >= Math.max(0, hrvData.length - 7); i--) { if (hrvData[i].value < a) c++; else break; }
-                if (c >= 3) alerts.push(`HRV below baseline for ${c} consecutive days — consider a recovery day`);
-            }
-            const sleepData = metricData.sleep_duration?.data || [];
-            if (sleepData.length >= 3) {
-                let c = 0;
-                for (let i = sleepData.length - 1; i >= Math.max(0, sleepData.length - 7); i--) { if (sleepData[i].value < 6 * 3600) c++; else break; }
-                if (c >= 3) alerts.push(`Sleep under 6 hours for ${c} consecutive nights — sleep debt accumulating`);
-            }
-            return alerts;
-        }
-
-        function renderAlerts(alerts) {
-            document.getElementById("alerts").innerHTML = alerts.map((msg, i) =>
-                `<div class="alert-card"><span>${msg}</span><button class="alert-dismiss" onclick="this.parentElement.remove()">✕</button></div>`
-            ).join("");
-        }
-
         // ── Top Cards ──
+        function renderCalendarAlerts(report) {
+            const root = document.getElementById("alerts");
+            root.replaceChildren();
+            if (!report) return;
+            const messages = [];
+            const rhr = report.metrics.resting_hr;
+            const latestRhr = rhr?.data.at(-1)?.value;
+            if (Number.isFinite(latestRhr) && rhr.current.n >= 2 && latestRhr > rhr.current.mean * 1.1) {
+                messages.push(`Latest resting HR (${latestRhr} bpm) is more than 10% above the selected ${report.current_period.days}-calendar-day observed mean (${rhr.current.mean.toFixed(1)} bpm; n=${rhr.current.n}).`);
+            }
+            for (const [key, threshold, label] of [
+                ["hrv", report.metrics.hrv?.current.mean, "HRV below the selected-period observed mean"],
+                ["sleep_duration", 6 * 3600, "Sleep duration under 6 hours"]
+            ]) {
+                const metric = report.metrics[key];
+                if (!metric || !Number.isFinite(threshold)) continue;
+                let count = 0;
+                for (const point of metric.data.slice(-7).reverse()) {
+                    if (!Number.isFinite(point.value) || point.value >= threshold) break;
+                    count++;
+                }
+                if (count >= 3) messages.push(`${label} on the latest ${count} consecutive calendar dates, ending ${report.current_period.end_date}. Missing observations break a streak.`);
+            }
+            for (const message of messages) {
+                const card = document.createElement("div");
+                card.className = "alert-card";
+                card.textContent = message;
+                root.append(card);
+            }
+        }
+
         function updateTopCards(data) {
-            const wData = data.weight?.data || [];
-            if (wData.length) {
-                const latest = weightFromGrams(wData[wData.length - 1].value);
-                const recent7 = avg(wData.slice(-7).map(d => weightFromGrams(d.value)));
-                const arrow = trendArrow(latest, recent7);
-                const cls = trendClass(latest, recent7, true);
-                document.getElementById("cardWeight").innerHTML = `${latest.toFixed(1)}<span class="${cls}" style="font-size:0.9rem">${arrow}</span>`;
-                document.getElementById("cardWeightSub").textContent = `${weightUnitLabel()} · 7d avg ${recent7 ? recent7.toFixed(1) : "--"}`;
-            }
-            const vo2Data = data.vo2max?.data || [];
-            if (vo2Data.length) {
-                document.getElementById("cardVo2").textContent = vo2Data[vo2Data.length - 1].value;
-                document.getElementById("cardVo2Sub").textContent = "mL/kg/min";
-            }
-            const rhrData = data.resting_hr?.data || [];
-            if (rhrData.length) {
-                const tw = avg(rhrData.slice(-7).map(d => d.value)), lw = avg(rhrData.slice(-14, -7).map(d => d.value));
-                const v = tw ? Math.round(tw) : "--";
-                document.getElementById("cardRhr").innerHTML = `${v}<span class="${trendClass(tw, lw, true)}" style="font-size:0.9rem">${trendArrow(tw, lw)}</span>`;
-                document.getElementById("cardRhrSub").textContent = lw ? `bpm · last wk ${Math.round(lw)}` : "bpm";
-            }
-            const hrvData = data.hrv?.data || [];
-            if (hrvData.length) {
-                const a7 = avg(hrvData.slice(-7).map(d => d.value)), a30 = avg(hrvData.map(d => d.value));
-                const v = a7 ? Math.round(a7) : "--";
-                document.getElementById("cardHrv").innerHTML = `${v}<span class="${trendClass(a7, a30, false)}" style="font-size:0.9rem">${trendArrow(a7, a30)}</span>`;
-                document.getElementById("cardHrvSub").textContent = a30 ? `ms · 30d avg ${Math.round(a30)}` : "ms";
+            const latest = name => (data[name]?.data || []).filter(point => Number.isFinite(point.value)).at(-1);
+            for (const [metric, id, label] of [["weight", "Weight", weightUnitLabel()], ["vo2max", "Vo2", "mL/kg/min · repeated estimate"], ["resting_hr", "Rhr", "bpm"], ["hrv", "Hrv", "ms"]]) {
+                const point = latest(metric);
+                const value = point ? (metric === "weight" ? weightFromGrams(point.value).toFixed(1) : point.value) : "—";
+                document.getElementById(`card${id}`).textContent = value;
+                document.getElementById(`card${id}Sub`).textContent = point ? `${label} · latest ${point.date}` : "No observation in selected period";
             }
         }
 
         // ── Build Charts ──
-        function buildSleepCharts(data) {
-            const sd = data.sleep_duration?.data || [];
-            if (sd.length) createLineChart("chartSleepDuration", sd.map(d => d.date), rawAndAvgDatasets(sd.map(d => +(d.value / 3600).toFixed(2)), sd.map(d => +(d.moving_avg_7d / 3600).toFixed(2)), C.accent, C.primary));
-            const ss = data.sleep_score?.data || [];
-            if (ss.length) createLineChart("chartSleepScore", ss.map(d => d.date), rawAndAvgDatasets(ss.map(d => d.value), ss.map(d => d.moving_avg_7d), C.secondary, C.primary), { min: 0, max: 100 });
+        function buildPersonalChart(canvas, metric, color, secondary, config) {
+            const evidence = comparisonReport?.metrics[metric] || { ...dashboardData[metric], unit: metric === "sleep_duration" ? "seconds" : "", baseline: null };
+            if (!evidence.data?.some(point => Number.isFinite(point.value))) return;
+            const chart = window.VFComparisons.chartData(evidence, chartPeriod, currentUnit, color, secondary);
+            createLineChart(canvas, chart.labels, chart.datasets, config);
+        }
+
+        function buildSleepCharts() {
+            buildPersonalChart("chartSleepDuration", "sleep_duration", C.accent, C.primary);
+            buildPersonalChart("chartSleepScore", "sleep_score", C.secondary, C.primary, { min: 0, max: 100 });
         }
 
         function buildHeartCharts(data) {
-            const rhr = data.resting_hr?.data || [];
-            if (rhr.length) createLineChart("chartRhr", rhr.map(d => d.date), rawAndAvgDatasets(rhr.map(d => d.value), rhr.map(d => d.moving_avg_7d), C.primary, C.secondary));
-            const hrv = data.hrv?.data || [];
-            if (hrv.length) createLineChart("chartHrv", hrv.map(d => d.date), rawAndAvgDatasets(hrv.map(d => d.value), hrv.map(d => d.moving_avg_7d), C.accent, C.primary));
+            buildPersonalChart("chartRhr", "resting_hr", C.primary, C.secondary);
+            buildPersonalChart("chartHrv", "hrv", C.accent, C.primary);
 
             const bbH = data.body_battery?.data || [], bbL = data.body_battery_low?.data || [];
             if (bbH.length) {
@@ -761,17 +757,16 @@
             }
         }
 
-        function buildStressChart(data) {
-            const s = data.stress?.data || [];
-            if (s.length) createLineChart("chartStress", s.map(d => d.date), rawAndAvgDatasets(s.map(d => d.value), s.map(d => d.moving_avg_7d), "#ffa726", C.primary), { min: 0 });
+        function buildStressChart() {
+            buildPersonalChart("chartStress", "stress", "#ffa726", C.primary, { min: 0 });
         }
 
         function buildBodyCompCharts(data) {
             const w = data.weight?.data || [];
             document.getElementById("weightChartLabel").textContent = `Weight (${weightUnitLabel()})`;
             if (w.length) {
-                const raw = w.map(d => +weightFromGrams(d.value).toFixed(2));
-                const ma = w.map(d => +weightFromGrams(d.moving_avg_7d).toFixed(2));
+                const raw = w.map(d => Number.isFinite(d.value) ? +weightFromGrams(d.value).toFixed(2) : null);
+                const ma = w.map(d => Number.isFinite(d.moving_avg_7d) ? +weightFromGrams(d.moving_avg_7d).toFixed(2) : null);
                 createLineChart("chartWeight", w.map(d => d.date), rawAndAvgDatasets(raw, ma, C.primary, C.secondary));
             }
             const bf = data.body_fat?.data || [];
@@ -787,22 +782,39 @@
 
         // ── Main load ──
         async function loadDashboard() {
+            const generation = ++dashboardGeneration;
+            const days = currentDays;
+            comparisonReport = null;
+            window.VFComparisons.clear();
+            renderCalendarAlerts(null);
             const metrics = ["sleep_duration", "sleep_score", "resting_hr", "hrv", "body_battery", "body_battery_low", "stress", "vo2max", "weight", "body_fat", "training_load", "steps"];
-            const results = await Promise.all(metrics.map(m => fetchMetric(m, currentDays)));
-            const data = {}; metrics.forEach((n, i) => data[n] = results[i]);
-
-            if (currentDays >= 30) { renderAlerts(computeAlerts(data)); }
-            else {
-                const am = ["resting_hr", "hrv", "sleep_duration"];
-                const ar = await Promise.all(am.map(m => fetchMetric(m, 30)));
-                const ad = {}; am.forEach((n, i) => ad[n] = ar[i]);
-                renderAlerts(computeAlerts(ad));
+            const [results, report] = await Promise.all([
+                Promise.all(metrics.map(m => fetchMetric(m, days, generation))),
+                window.VFComparisons.fetch(API_BASE, days)
+            ]);
+            // One guard protects every dashboard chart, card and evidence panel.
+            if (generation !== dashboardGeneration) return;
+            const data = {}; metrics.forEach((name, index) => data[name] = results[index]);
+            comparisonReport = report;
+            const today = new Date();
+            const start = new Date(today);
+            start.setUTCDate(start.getUTCDate() - days + 1);
+            chartPeriod = report?.current_period || { start_date: start.toISOString().slice(0, 10), end_date: today.toISOString().slice(0, 10), days };
+            if (report) {
+                for (const name of metrics) {
+                    if (report.metrics[name]) data[name] = window.VFComparisons.observedSeries(report.metrics[name]);
+                }
+                window.VFComparisons.render(report, currentUnit);
+                renderCalendarAlerts(report);
+            } else {
+                for (const name of metrics) data[name] = window.VFComparisons.sanitizeSeries(data[name], chartPeriod);
+                window.VFComparisons.clear("Personal comparisons unavailable. No baseline bands or anomaly evidence are displayed.");
             }
-
+            dashboardData = data;
             updateTopCards(data);
-            buildSleepCharts(data);
+            buildSleepCharts();
             buildHeartCharts(data);
-            buildStressChart(data);
+            buildStressChart();
             buildBodyCompCharts(data);
             buildActivityCharts(data);
         }
@@ -812,7 +824,6 @@
             const status = await fetchSyncStatus();
             updateSyncInfo(status);
             await loadDashboard();
-            loadReadiness();
             loadRecommendations(false);
         })();
     </script>

@@ -26,6 +26,7 @@ from shared.database import (
 from shared.garmin_registry_legacy import bootstrap_legacy_token_store
 from shared.garmin_routes import add_garmin_routes
 from shared.persons_admin import add_person_routes
+from vitalforge_dashboard.comparison_routes import add_comparison_routes
 from vitalforge_dashboard.correlations import compute_cell
 from vitalforge_dashboard.data_quality_routes import add_data_quality_routes
 from vitalforge_dashboard.export_routes import add_export_routes
@@ -580,3 +581,4 @@ async def delete_goal_route(goal_id: int, request: Request):
 add_fit_activity_routes(app)
 add_export_routes(app)
 add_data_quality_routes(app)
+add_comparison_routes(app)
