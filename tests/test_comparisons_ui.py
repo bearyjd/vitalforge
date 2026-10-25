@@ -161,7 +161,9 @@ def test_comparison_error_insufficient_stale_and_safe_snapshot_cleanup(page, das
     assert len(_chart(page, "chartHrv")["datasets"]) == 4
     assert page.evaluate("window.bad === undefined")
     snapshot = page.locator("#comparisonRows tr[data-metric=muscle_mass]")
-    assert "Repeated estimates, not independent measurements" in snapshot.inner_text()
+    assert "Stored snapshots may repeat measurements; no change assessment or band" in snapshot.inner_text()
+    assert snapshot.locator("td").nth(5).inner_text() == "Stored row counts: current n=30; previous n=30"
+    assert "minimum" not in snapshot.inner_text()
     assert snapshot.locator("td").nth(3).inner_text() == "—"
     page.get_by_role("button", name="7d", exact=True).click()
     _wait_report(page, 7)

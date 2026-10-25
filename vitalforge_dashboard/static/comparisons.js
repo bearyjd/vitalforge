@@ -66,12 +66,12 @@
             const snapshot = metric.expected_cadence !== "daily";
             const row = document.createElement("tr");
             row.dataset.metric = key;
-            const status = snapshot ? "Repeated estimates, not independent measurements; no difference or band" : words(metric.status);
+            const status = snapshot ? "Stored snapshots may repeat measurements; no change assessment or band" : words(metric.status);
             const baseline = metric.baseline;
             const cells = [metric.label, display(metric.current.mean, metric, unit), display(metric.previous.mean, metric, unit),
                 snapshot ? "—" : display(metric.difference, metric, unit),
                 snapshot || !number(metric.percent_change) ? "—" : `${format(metric.percent_change)}%`,
-                `Current n=${metric.current.n}; previous n=${metric.previous.n}; minimum ${metric.minimum_samples}`,
+                snapshot ? `Stored row counts: current n=${metric.current.n}; previous n=${metric.previous.n}` : `Current n=${metric.current.n}; previous n=${metric.previous.n}; minimum ${metric.minimum_samples}`,
                 `${status} · ${words(metric.freshness)} · latest ${metric.latest_observation_date || "unavailable"}`,
                 !snapshot && baseline ? `Previous-period mean ± 1 sample SD: ${display(baseline.lower, metric, unit)} to ${display(baseline.upper, metric, unit)}; n=${baseline.n}; mean ${display(baseline.mean, metric, unit)}; SD ${display(baseline.sample_sd, metric, unit)}` : "Unavailable"];
             cells.forEach(value => { const cell = document.createElement("td"); cell.textContent = value; row.append(cell); });
