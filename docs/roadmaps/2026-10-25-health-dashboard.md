@@ -1,6 +1,6 @@
 # Health dashboard roadmap — 25 October 2026
 
-This roadmap is approved for staged delivery. The first release implements **Now 1** and **Now 2** below; later phases remain planned. Deployment is a separate release step. The first goal is to make personal data easier to understand and upload to an AI service the user already chooses. VitalForge's useful foundation is self-hosted Garmin history, profile isolation, and portable data.
+This roadmap is approved for staged delivery. The first release implements **Now 1** and **Now 2** below. The second release implements the personal comparisons, historical bands, and readiness/anomaly explanations in **Next 3**; goal controls and later phases remain planned. Deployment is a separate release step. The first goal is to make personal data easier to understand and upload to an AI service the user already chooses. VitalForge's useful foundation is self-hosted Garmin history, profile isolation, and portable data.
 
 ## Starting point
 
@@ -9,6 +9,8 @@ The repository already provides 16 metric APIs, CSV/JSON export, readiness with 
 The first release adds raw and AI-ready JSON download buttons for 7/30/90-day ranges, an export-content preview, and an expandable data-quality table. The enriched package has its own endpoint, preserving the existing export API. Some body-composition metrics have no dedicated dashboard chart, so expose additional charts only where the user actually needs them.
 
 The package and quality report share definitions and a consistent SQLite snapshot. Coverage uses exactly N inclusive calendar dates ending on today's UTC date; source dates keep their unknown timezone. Latest observations and the latest profile-wide sync attempt are reported separately. No schema migration or new external integration is required. Exporting does not contact Garmin or an AI provider.
+
+The second release compares adjacent equal-length 7/30/90-day periods and displays observation counts and descriptive previous-period ranges. Sparse/stale data suppresses change interpretation; snapshot series are labeled separately. Existing readiness and daily anomaly formulas are reused with explicit observation windows and supporting dates. Goal controls are deferred: targets belong to the account and are reused across profiles, while progress is evaluated for the selected profile. Their future UI must make that account-wide behavior clear, including the effect of edits and deletions.
 
 ## Priorities and delivery gates
 
