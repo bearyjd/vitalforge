@@ -162,6 +162,16 @@ async def compute_progress(
     "weight", not lbs/kg) -- callers are responsible for that agreement.
     """
     data = await get_metric(table, column, person_id, days=days)
+    return progress_from_rows(data, target_value, target_date, datetime.now(timezone.utc))
+
+
+def progress_from_rows(
+    data: list[dict], target_value: float, target_date: str | None, now: datetime
+) -> GoalProgress:
+    """compute_progress over already-read oldest-first rows, with the clock passed in.
+
+    Lets a caller that holds one consistent snapshot derive progress from it
+    and pin `now` to that snapshot instead of re-reading and re-timing."""
     latest_value = data[-1]["value"] if data else None
     slope = trend_slope(data) if data else None
 
@@ -169,13 +179,13 @@ async def compute_progress(
     if latest_value is not None:
         remaining = target_value - latest_value
         if remaining == 0:
-            eta_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            eta_date = now.strftime("%Y-%m-%d")
         elif slope not in (None, 0) and (remaining > 0) == (slope > 0):
             # Trend is moving toward the target -- project forward. A trend
             # moving away from it (opposite sign) has no finite forward ETA.
             steps_needed = remaining / slope
             if steps_needed >= 0:
-                eta_date = (datetime.now(timezone.utc) + timedelta(days=steps_needed)).strftime("%Y-%m-%d")
+                eta_date = (now + timedelta(days=steps_needed)).strftime("%Y-%m-%d")
 
     on_track = None
     if eta_date is not None:

@@ -80,6 +80,8 @@
     }
     function revoke() {
         revoked = true; canManage = false; ++dateVersion;
+        // Not a latch: a failed write here (e.g. manage downgraded to view) does not end view access.
+        window.VFWeeklyReview?.clear("Access to this profile may have changed. Generate the review again.");
         dayDirty = planDirty = dayReady = false;
         activeDate = null; plan = null; entries = [];
         el("contextNote").value = el("contextTags").value = "";

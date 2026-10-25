@@ -184,8 +184,13 @@ def _readiness(data: dict, metadata: dict, today: date) -> dict:
             "explanation": "Existing readiness formula: HRV 40%, resting HR 30%, Garmin sleep score 30%.", "notes": notes}
 
 
-async def comparison_report(person_id: int, days: int) -> dict:
-    quality, data = await metric_snapshot(person_id, max(2 * days, 30))
+async def comparison_report(person_id: int, days: int, snapshot: tuple[dict, dict] | None = None) -> dict:
+    """Build the report; `snapshot` is an optional (quality, data) pair already read for
+    at least max(2 * days, 30) days, so a caller can derive several reports from one read."""
+    quality, data = snapshot if snapshot is not None else await metric_snapshot(person_id, max(2 * days, 30))
+    needed = max(2 * days, 30)
+    if quality["period"]["days"] < needed:
+        raise ValueError(f"snapshot must cover at least {needed} days")
     today = date.fromisoformat(quality["period"]["end_date"])
     current, previous = _period(today, days), _period(today - timedelta(days=days), days)
     finding_period = _period(today, 30)
