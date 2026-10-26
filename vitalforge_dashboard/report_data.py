@@ -5,6 +5,7 @@ existing comparison report and the weekly-review finding builders. Display units
 explicit and independent of the dashboard's unit toggle. The report is descriptive only.
 """
 
+import re
 from datetime import datetime
 
 from shared.database import get_db
@@ -29,6 +30,17 @@ SYNC_LABELS = {
     "rate_limited": "Garmin request limit reached", "network": "Network error", "error": "Error",
 }
 NEVER_RECORDED = "Never recorded"
+# The metadata descriptions of converted metrics name the stored unit ("in grams"); the report shows
+# display units, so it must not print a description that contradicts them.
+DESCRIPTION_OVERRIDES = {
+    "sleep_duration": "Total sleep duration reported for the source date.",
+    "weight": "Body weight; original measurement method is unknown.",
+    "bone_mass": "Reported bone mass; original measurement method is unknown.",
+    "muscle_mass": "Reported muscle mass; original measurement method is unknown.",
+}
+# Rule prose can say "alert flag"; the report keeps the same neutral vocabulary as its labels.
+NEUTRAL_WORDS = ((re.compile(r"\balert flag\b", re.I), "notable marker"), (re.compile(r"\balert\b", re.I), "notable"),
+                 (re.compile(r"\bwarning\b", re.I), "worth noting"), (re.compile(r"\bflags?\b", re.I), "marker"))
 _DIAGNOSIS_LINES = tuple(line for line in LIMITATIONS if NOT_A_DIAGNOSIS_MARKER in line)
 if not _DIAGNOSIS_LINES:  # fail at import, not per request, if the shared wording ever drifts
     raise RuntimeError("weekly review limitations no longer state that the output is not a diagnosis")
@@ -95,7 +107,7 @@ def _metric_view(name: str, item: dict, metadata: dict, stable: set[str], days: 
     values = [None if row["value"] is None else row["value"] / divisor for row in item["data"]]
     return {
         "name": name, "label": metadata["label"], "unit": unit, "source": metadata["source"],
-        "description": metadata["description"], "cadence": item["expected_cadence"],
+        "description": DESCRIPTION_OVERRIDES.get(name, metadata["description"]), "cadence": item["expected_cadence"],
         "latest_observation_date": item["latest_observation_date"],
         "coverage": _coverage(item["current"]["n"], days),
         "current_mean": _shown(item["current"]["mean"], divisor), "current_n": item["current"]["n"],
@@ -128,11 +140,18 @@ def _sync_view(sync: dict) -> dict:
     }
 
 
+def _neutral(message: str) -> str:
+    for pattern, replacement in NEUTRAL_WORDS:
+        message = pattern.sub(replacement, message)
+    return message
+
+
 def _findings_view(comparison: dict, data: dict) -> list[dict]:
     start = comparison["findings_period"]["start_date"]
     recent = {metric: [row for row in rows if row["date"] >= start] for metric, rows in data.items()}
-    return [{"label": item["label"], "severity": SEVERITY_LABELS.get(item["severity"], UNKNOWN_SEVERITY_LABEL), "message": item["message"],
-             "dates": sorted(item["observation_dates"])} for item in build_findings(comparison, recent)]
+    return [{"label": item["label"], "severity": SEVERITY_LABELS.get(item["severity"], UNKNOWN_SEVERITY_LABEL), "message": _neutral(item["message"]),
+             "dates": sorted(item["observation_dates"]),
+             "baseline_dates": sorted(item.get("evidence", {}).get("baseline_dates") or [])} for item in build_findings(comparison, recent)]
 
 
 def _context_view(context: dict | None, period: dict) -> list[dict]:

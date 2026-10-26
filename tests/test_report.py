@@ -337,11 +337,53 @@ async def test_header_facts_window_sync_and_limitations(client):
     assert "7 calendar dates" not in html  # weekly-only limitation text must not leak into 30/90 reports
 
 
-async def test_findings_show_evidence_dates_for_the_last_30_dates(client):
+def findings_of(html: str) -> list[str]:
+    return [text_of(item) for item in re.findall(r'<div class="finding"[^>]*>.*?</div>', html, re.DOTALL)]
+
+
+async def test_findings_show_exact_evidence_dates_inside_the_finding(client):
     await seed("sleep", "duration_seconds", rows(0, 3, 6 * 3600) + rows(3, 10, 8 * 3600))
-    html = text_of(await page(client, "?days=90"))
-    assert "Sleep duration was under 7 hours in each of the latest 3 recorded observations" in html
-    assert day(2) in html and "last 30 calendar dates" in html
+    html = await page(client, "?days=90")
+    mine = [item for item in findings_of(html) if "Sleep duration was under 7 hours" in item]
+    assert len(mine) == 1
+    assert f"Evidence dates: {day(2)}, {day(1)}, {day(0)}." in mine[0]
+    assert "last 30 calendar dates" in text_of(html)
+
+
+async def test_findings_list_the_baseline_dates_behind_every_comparison(client):
+    await seed("hrv", "last_night_avg", rows(0, 7, 40) + rows(7, 14, 80))
+    mine = [item for item in findings_of(await page(client, "?days=7")) if "lower over the latest 7" in item]
+    assert len(mine) == 1
+    recent = ", ".join(sorted(day(offset) for offset in range(0, 7)))
+    compared = ", ".join(sorted(day(offset) for offset in range(7, 14)))
+    assert f"Evidence dates: {recent}." in mine[0]
+    assert f"Compared with: {compared}." in mine[0]
+
+
+async def test_finding_text_never_uses_alarm_words(client):
+    await seed("steps", "value", rows(0, 3, 20000) + rows(3, 30, 10000))
+    html = await page(client, "?days=30")
+    assert findings_of(html), "the constant-baseline case should produce a finding"
+    lowered = text_of(html).lower()
+    for word in ("alert", "warning", "flag"):
+        assert word not in lowered
+
+
+async def test_descriptions_never_name_a_unit_other_than_the_displayed_one(client):
+    from vitalforge_dashboard.metric_metadata import METRIC_METADATA
+    converted = {name: meta for name, meta in METRIC_METADATA.items() if meta["unit"] in report_data.DISPLAY_UNITS}
+    assert {"weight", "bone_mass", "muscle_mass", "sleep_duration"} <= set(converted)
+    await seed("weight_history", "weight_grams", rows(0, 1, 81500))
+    await seed("weight_history", "bone_mass_g", rows(1, 2, 3200))  # one row per date: separate dates, no overwrite
+    await seed("weight_history", "muscle_mass_g", rows(2, 3, 35000))
+    await seed("sleep", "duration_seconds", rows(0, 3, 27000))
+    html = await page(client, "?days=7")
+    for name, meta in converted.items():
+        shown, _ = report_data.DISPLAY_UNITS[meta["unit"]]
+        text = text_of(block(html, name))
+        assert f"({shown})" in text, name
+        for stored in ("grams", "seconds", " in g"):
+            assert stored not in text, (name, stored)
 
 
 async def test_no_findings_is_stated(client):

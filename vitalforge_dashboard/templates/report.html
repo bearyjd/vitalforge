@@ -90,7 +90,7 @@
   <h2>Rule findings</h2>
   <p class="muted">Findings use the last 30 calendar dates ending {{ report.findings_period.end_date }}, whichever period is selected, and only for metrics with recent data.</p>
   {% for f in report.findings %}
-  <div class="finding"><strong>{{ f.label }}</strong> ({{ f.severity }}): {{ f.message }} Evidence dates: {{ f.dates | join(", ") }}.</div>
+  <div class="finding" data-finding="{{ loop.index }}"><strong>{{ f.label }}</strong> ({{ f.severity }}): {{ f.message }} <span data-evidence>Evidence dates: {{ f.dates | join(", ") }}.</span>{% if f.baseline_dates %} <span data-compared-with>Compared with: {{ f.baseline_dates | join(", ") }}.</span>{% endif %}</div>
   {% else %}
   <p>No rule findings for the last 30 calendar dates.</p>
   {% endfor %}
