@@ -369,6 +369,46 @@ async def test_finding_text_never_uses_alarm_words(client):
         assert word not in lowered
 
 
+@pytest.mark.parametrize("raw, expected", [
+    ("the existing rule assigns an alert flag, not an estimated z-score", "the existing rule assigns a notable marker, not an estimated z-score"),
+    ("Alert: check", "Notice: check"),
+    ("two alert flags", "two notable markers"),
+    ("a warning here", "a note here"),
+    ("Warnings issued", "Notes issued"),
+    ("Flagged day", "Marked day"),
+    ("an alert", "a notice"),
+    ("alerts", "notices"),
+    ("Flagship metric", "Flagship metric"),
+])
+def test_neutral_wording_is_grammatical_and_keeps_case(raw, expected):
+    assert report_data._neutral(raw) == expected
+
+
+async def test_constant_baseline_sentence_is_exact_and_lists_the_anomaly_baseline(client):
+    await seed("steps", "value", rows(0, 3, 20000) + rows(3, 30, 10000))
+    html = await page(client, "?days=30")
+    text = text_of(html)
+    assert "the existing rule assigns a notable marker, not an estimated z-score" in text
+    assert "an notable" not in text
+    mine = [item for item in findings_of(html) if "notable marker" in item]
+    assert len(mine) == 1
+    baseline = ", ".join(sorted(day(offset) for offset in range(3, 24)))  # rows[-24:-3] of the 30 dates
+    assert f"Compared with: {baseline}." in mine[0]
+
+
+@pytest.mark.parametrize("table, column, recent, older, phrase", [
+    ("hrv", "last_night_avg", 48, 50, "Overnight HRV was below its observed 30-date average"),
+    ("resting_hr", "value", 70, 50, "The latest resting heart rate (70 bpm) is above its observed 30-date average"),
+])
+async def test_all_rows_baseline_rules_list_every_compared_date(client, table, column, recent, older, phrase):
+    latest_only = 1 if table == "resting_hr" else 3
+    await seed(table, column, rows(0, latest_only, recent) + rows(latest_only, 30, older))
+    mine = [item for item in findings_of(await page(client, "?days=30")) if phrase in item]
+    assert len(mine) == 1
+    everything = ", ".join(sorted(day(offset) for offset in range(0, 30)))
+    assert f"Compared with: {everything}." in mine[0]
+
+
 async def test_descriptions_never_name_a_unit_other_than_the_displayed_one(client):
     from vitalforge_dashboard.metric_metadata import METRIC_METADATA
     converted = {name: meta for name, meta in METRIC_METADATA.items() if meta["unit"] in report_data.DISPLAY_UNITS}

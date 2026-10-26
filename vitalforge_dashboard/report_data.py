@@ -39,8 +39,9 @@ DESCRIPTION_OVERRIDES = {
     "muscle_mass": "Reported muscle mass; original measurement method is unknown.",
 }
 # Rule prose can say "alert flag"; the report keeps the same neutral vocabulary as its labels.
-NEUTRAL_WORDS = ((re.compile(r"\balert flag\b", re.I), "notable marker"), (re.compile(r"\balert\b", re.I), "notable"),
-                 (re.compile(r"\bwarning\b", re.I), "worth noting"), (re.compile(r"\bflags?\b", re.I), "marker"))
+ALARM_PATTERN = re.compile(r"\b(?:(?P<article>an?)\s+)?(?P<word>alert flag|alert|warning|flag)(?P<suffix>s|ed|ged)?\b", re.I)
+NEUTRAL_NOUNS = {"alert flag": "notable marker", "alert": "notice", "warning": "note", "flag": "marker"}
+NEUTRAL_PAST = {"alert flag": "marked", "alert": "noted", "warning": "noted", "flag": "marked"}
 _DIAGNOSIS_LINES = tuple(line for line in LIMITATIONS if NOT_A_DIAGNOSIS_MARKER in line)
 if not _DIAGNOSIS_LINES:  # fail at import, not per request, if the shared wording ever drifts
     raise RuntimeError("weekly review limitations no longer state that the output is not a diagnosis")
@@ -140,10 +141,20 @@ def _sync_view(sync: dict) -> dict:
     }
 
 
+def _swap_alarm_word(match: re.Match) -> str:
+    word, suffix = match["word"].lower(), (match["suffix"] or "").lower()
+    if suffix in ("ed", "ged"):
+        replacement = NEUTRAL_PAST[word]
+    else:
+        replacement = NEUTRAL_NOUNS[word] + ("s" if suffix else "")
+    if match["article"]:  # re-pick a/an for the new first letter, keeping the original capitalization
+        article = "an" if replacement[0] in "aeiou" else "a"
+        return f"{article.capitalize() if match['article'][0].isupper() else article} {replacement}"
+    return replacement.capitalize() if match["word"][0].isupper() else replacement
+
+
 def _neutral(message: str) -> str:
-    for pattern, replacement in NEUTRAL_WORDS:
-        message = pattern.sub(replacement, message)
-    return message
+    return ALARM_PATTERN.sub(_swap_alarm_word, message)
 
 
 def _findings_view(comparison: dict, data: dict) -> list[dict]:
