@@ -739,6 +739,7 @@ the same weigh-in rather than a new one:
 | `GET` | `/p/{slug}/api/data-quality?days=30` | Per-metric observation dates and calendar-day coverage, plus the profile's latest sync attempt |
 | `GET` | `/p/{slug}/api/comparisons?days=30` | Equal-period comparisons, descriptive historical ranges, and evidence for existing readiness/anomaly rules; accepts 7, 30, or 90 days |
 | `GET` | `/p/{slug}/api/weekly-review` | On-demand rules-only weekly review: changes between the last two 7-day periods, existing rule findings with supporting dates, data coverage, your account's goals, and one fixed-template follow-up; never reads context notes |
+| `GET` | `/p/{slug}/report?days=30&include_identity=false&include_context=false` | Printable, server-rendered clinician report (print / Save as PDF; `days` is 7, 30, or 90): units, coverage, period comparisons, sparklines, rule findings, no goals, never public. The profile name and your notes/tags appear only when explicitly requested |
 | `GET` | `/p/{slug}/api/context?days=30` | Logged notes/tags for the selected period, tag suggestions, saved routine plan, and editing capability |
 | `GET` / `PUT` / `DELETE` | `/p/{slug}/api/context/days/{date}` | Read, replace, or delete a daily context entry (`YYYY-MM-DD`) |
 | `GET` / `PUT` / `DELETE` | `/p/{slug}/api/context/experiment` | Read, replace, or remove the profile's one saved routine experiment |

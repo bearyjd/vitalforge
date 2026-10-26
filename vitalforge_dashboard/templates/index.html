@@ -59,6 +59,7 @@
         .context-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
         .context-form label.context-check { display: block; }
         .context-check input { width: auto; margin-right: 0.4rem; }
+        #printableReport label.context-check { display: block; margin: 0.25rem 0; }
         #contextEntries { padding-left: 1.25rem; overflow-wrap: anywhere; }
         #contextEntries li { margin: 0.6rem 0; white-space: pre-wrap; }
         #contextAssociation { white-space: pre-line; overflow-wrap: anywhere; }
@@ -278,6 +279,22 @@
                         <tbody id="qualityRows"></tbody>
                     </table>
                 </div>
+            </div>
+        </details>
+
+        <details class="data-details" id="printableReport">
+            <summary>Printable report</summary>
+            <div class="details-body">
+                <p>Opens a plain, print-ready summary of this profile in a new tab. Use your browser’s Print command and choose “Save as PDF” to keep a copy. The report is not shared or published anywhere, and it makes no diagnosis.</p>
+                <p><label>Period <select id="reportDays" autocomplete="off">
+                    <option value="7">Last 7 days</option>
+                    <option value="30" selected>Last 30 days</option>
+                    <option value="90">Last 90 days</option>
+                </select></label></p>
+                <label class="context-check"><input type="checkbox" id="reportIdentity" autocomplete="off"> Include profile name</label>
+                <label class="context-check"><input type="checkbox" id="reportContext" autocomplete="off"> Include my notes and tags</label>
+                <p>The profile name and your notes may identify you or other people. They are left out unless you select them, and the choice resets when you reload this page.</p>
+                <p><a class="btn" id="reportLink" href="/p/{{ person_slug }}/report?days=30&amp;include_identity=false&amp;include_context=false" target="_blank" rel="noopener">Open printable report</a></p>
             </div>
         </details>
 
@@ -898,6 +915,7 @@
         })();
     </script>
     <script src="/static/data-quality.js"></script>
+    <script src="/static/report-link.js"></script>
     <script src="/static/correlations.js"></script>
 </body>
 </html>
