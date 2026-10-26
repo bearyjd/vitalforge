@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Health data report - last {{ report.days }} days</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #fff; color: #1a1a1a; font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 820px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 16px; margin: 22px 0 8px; border-bottom: 1px solid #bbb; padding-bottom: 3px; }
+  h3 { font-size: 15px; margin: 0 0 4px; }
+  .toolbar { display: flex; gap: 12px; align-items: center; margin-bottom: 14px; }
+  .toolbar a { font: inherit; padding: 6px 12px; border: 1px solid #555; border-radius: 4px; background: #f3f3f3; color: #1a1a1a; text-decoration: none; cursor: pointer; }
+  .meta { margin: 0; padding: 0; list-style: none; }
+  .meta li { margin: 2px 0; }
+  .metric { border: 1px solid #ccc; border-radius: 4px; padding: 10px 12px; margin: 10px 0; }
+  .metric p { margin: 3px 0; }
+  .muted { color: #444; font-size: 12.5px; }
+  .spark { display: block; margin: 6px 0; max-width: 100%; height: auto; }
+  .spark polyline { fill: none; stroke: #1f4e79; stroke-width: 1.5; }
+  .spark circle { fill: #1f4e79; }
+  table { border-collapse: collapse; margin: 6px 0; }
+  td, th { border: 1px solid #ccc; padding: 2px 8px; text-align: left; }
+  .appendix table { width: 100%; font-size: 12px; }
+  .note { white-space: pre-wrap; margin: 4px 0; }
+  ul.plain { padding-left: 18px; margin: 6px 0; }
+  @media print {
+    @page { margin: 14mm; }
+    body { font-size: 11pt; background: #fff; color: #000; }
+    main { max-width: none; padding: 0; }
+    .toolbar { display: none; }
+    .metric, .finding, .note, .appendix h3 { break-inside: avoid; page-break-inside: avoid; }
+    .appendix thead { display: table-header-group; }
+    .appendix tr { break-inside: avoid; page-break-inside: avoid; }
+    h2 { break-after: avoid; page-break-after: avoid; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <div class="toolbar">
+    <a href="/p/{{ person_slug }}/">Back to dashboard</a>
+    <span>Use your browser's Print command (Ctrl/Cmd+P) and choose Save as PDF.</span>
+  </div>
+
+  <h1>Health data report</h1>
+  <ul class="meta">
+    {% if report.display_name %}<li><strong>Profile:</strong> {{ report.display_name }}</li>{% endif %}
+    <li><strong>Selected period:</strong> Last {{ report.days }} days, {{ report.period.start_date }} to {{ report.period.end_date }} (inclusive)</li>
+    <li><strong>Compared with:</strong> previous {{ report.days }} days, {{ report.previous_period.start_date }} to {{ report.previous_period.end_date }}</li>
+    <li><strong>Generated</strong> {{ report.generated_at }}</li>
+    <li><strong>Date handling:</strong> The selection window is in {{ report.window_timezone }}. {{ report.date_semantics }}</li>
+    <li><strong>Last sync attempt:</strong> {{ report.sync.last_attempt_at }}. Result: {{ report.sync.result }}. Sync state: {{ report.sync.state }}.{% if report.sync.backoff_until %} Retry after: {{ report.sync.backoff_until }}.{% endif %}</li>
+  </ul>
+  <p class="muted">A descriptive summary of values synced from Garmin Connect and stored locally. It is not a diagnosis, clinical assessment or treatment advice.</p>
+
+  <h2>Metrics</h2>
+  {% if report.empty %}
+  <p>No observations were recorded in this period.</p>
+  {% endif %}
+  {% for m in report.metrics %}
+  <section class="metric" data-metric="{{ m.name }}" aria-labelledby="m-{{ m.name }}">
+    <h3 id="m-{{ m.name }}">{{ m.label }} <span class="muted">({{ m.unit }})</span></h3>
+    <p class="muted">{{ m.description }} Source: {{ m.source }}</p>
+    <p>Coverage: {{ m.coverage.observed_days }} of {{ m.coverage.days }} days ({{ m.coverage.coverage_percent }}%), {{ m.coverage.missing_days }} missing. {{ m.coverage.completeness | capitalize }}. Latest observation: {{ m.latest_observation_date or "none recorded" }}.</p>
+    <p>Current {{ report.days }} days: {{ m.current_n }} observations{% if m.current_mean is not none %}, mean {{ m.current_mean }} {{ m.unit }}{% endif %}.</p>
+    <p>Previous {{ report.days }} days: {{ m.previous_n }} observations{% if m.previous_mean is not none %}, mean {{ m.previous_mean }} {{ m.unit }}{% endif %}.</p>
+    <p>{{ m.interpretation.text }}{% if m.interpretation.difference %} Difference (current minus previous): {{ m.interpretation.difference }}{% if m.interpretation.percent %} ({{ m.interpretation.percent }}){% endif %}.{% endif %}</p>
+    {% if m.baseline %}<p class="muted">Previous-period range: {{ m.baseline.lower }} to {{ m.baseline.upper }} {{ m.baseline.unit }} (previous mean plus or minus one sample standard deviation, {{ m.baseline.n }} observations). This is a descriptive spread, not a normal range or reference range.</p>{% endif %}
+    <svg class="spark" role="img" aria-label="{{ m.label }}, {{ m.coverage.observed_days }} recorded values over {{ m.coverage.days }} days, {{ report.period.start_date }} to {{ report.period.end_date }}; breaks mark days with no value" viewBox="0 0 {{ m.spark.width }} {{ m.spark.height }}" width="{{ m.spark.width }}" height="{{ m.spark.height }}">
+      {% for points in m.spark.segments %}<polyline points="{{ points }}"/>{% endfor %}
+      {% for dot in m.spark.dots %}<circle cx="{{ dot.cx }}" cy="{{ dot.cy }}" r="1.6"/>{% endfor %}
+    </svg>
+    {% if m.scale %}<p class="muted">{{ m.scale }}</p>{% endif %}
+  </section>
+  {% endfor %}
+
+  {% if report.unrecorded %}
+  <h2>No observations in this period</h2>
+  <p class="muted">These metrics have no value between {{ report.period.start_date }} and {{ report.period.end_date }}.</p>
+  <ul class="plain">
+    {% for item in report.unrecorded %}<li>{{ item.label }} ({% if item.latest %}latest observation {{ item.latest }}{% else %}no value ever recorded{% endif %})</li>{% endfor %}
+  </ul>
+  {% endif %}
+
+  <h2>Rule findings</h2>
+  <p class="muted">Findings use the last 30 calendar dates ending {{ report.findings_period.end_date }}, whichever period is selected, and only for metrics with recent data.</p>
+  {% for f in report.findings %}
+  <div class="finding" data-finding="{{ loop.index }}"><strong>{{ f.label }}</strong> ({{ f.severity }}): {{ f.message }} <span data-evidence>Evidence dates: {{ f.dates | join(", ") }}.</span>{% if f.baseline_dates %} <span data-compared-with>Compared with: {{ f.baseline_dates | join(", ") }}.</span>{% endif %}</div>
+  {% else %}
+  <p>No rule findings for the last 30 calendar dates.</p>
+  {% endfor %}
+
+  {% if report.context is not none %}
+  <h2>Your notes</h2>
+  <p class="muted">Notes and tags entered by you for {{ report.period.start_date }} to {{ report.period.end_date }}. They are included because you chose to include them.</p>
+  {% for entry in report.context %}
+  <div class="note"><strong>{{ entry.date }}</strong>{% if entry.tags %} [{{ entry.tags | join(", ") }}]{% endif %}{% if entry.note %}: {{ entry.note }}{% endif %}</div>
+  {% else %}
+  <p>No notes or tags were logged in this period.</p>
+  {% endfor %}
+  {% endif %}
+
+  {% if report.metrics %}
+  <h2>Appendix: recorded values</h2>
+  <p class="muted">Every value recorded in the selected period, in the units shown. Dates with no value are not listed.</p>
+  {% for m in report.metrics %}
+  <section class="appendix" data-appendix="{{ m.name }}">
+    <h3>{{ m.label }} ({{ m.unit }})</h3>
+    <table>
+      <thead><tr>{% for _ in range(report.appendix_columns) %}<th scope="col">Date</th><th scope="col">Value</th>{% endfor %}</tr></thead>
+      <tbody>
+        {% for row in m.appendix %}<tr>{% for cell in row %}<td data-date="{{ cell.date }}">{{ cell.date }}</td><td>{{ cell.value }}</td>{% endfor %}</tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+  {% endfor %}
+  {% endif %}
+
+  <h2>Limitations</h2>
+  <ul class="plain">
+    {% for line in report.limitations %}<li>{{ line }}</li>{% endfor %}
+  </ul>
+</main>
+</body>
+</html>

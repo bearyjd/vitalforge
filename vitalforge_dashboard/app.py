@@ -48,6 +48,7 @@ from vitalforge_dashboard.goals import (
 from vitalforge_dashboard.metrics import METRIC_TABLES
 from vitalforge_dashboard.readiness import compute_readiness
 from vitalforge_dashboard.recommendations import get_recommendations, get_rules_only
+from vitalforge_dashboard.report_routes import add_report_routes
 from vitalforge_dashboard.sync import SyncRegistry, has_usable_garmin_link, run_sync, scheduled_sync
 from vitalforge_dashboard.weekly_review_routes import add_weekly_review_routes
 
@@ -586,3 +587,4 @@ add_data_quality_routes(app)
 add_comparison_routes(app)
 add_context_routes(app)
 add_weekly_review_routes(app)
+add_report_routes(app, templates)
