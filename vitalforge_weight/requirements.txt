@@ -5,8 +5,8 @@
 # be applied without moving fastapi too. 0.120 was the first release admitting
 # starlette 0.49.x; this goes to current instead, because 0.49.x is already far
 # behind and only the current line audits clean. See issue #37.
-fastapi==0.142.2
-starlette==1.7.0
+fastapi==0.162.0
+starlette==1.10.0
 uvicorn[standard]==0.54.0
 jinja2==3.1.6
 aiosqlite==0.22.1
@@ -16,7 +16,7 @@ aiosqlite==0.22.1
 # and tests/test_garmin_client_api.py. Before bumping this again, re-read
 # authenticate() against the new version's source, not just the changelog.
 garminconnect==0.3.17
-python-multipart==0.0.32
+python-multipart==0.0.33
 # Exact-pinned, not a range: this signs the vf_session cookie for BOTH
 # services off one shared secret. A range means the audited resolution and
 # the resolution baked into the image can differ, which makes a green
