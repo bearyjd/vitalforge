@@ -29,7 +29,7 @@ _SYNTHETIC_DI_REFRESH_TOKEN = "test-refresh-token"
 
 
 def test_installed_garminconnect_version_matches_tokenstore_contract():
-    """The token-store assertions below are deliberately pinned to 0.3.17.
+    """The token-store assertions below are deliberately pinned to 0.3.20.
 
     A dependency upgrade must explicitly re-validate this contract instead of
     silently inheriting assertions written for an older client. Re-validated
@@ -37,8 +37,12 @@ def test_installed_garminconnect_version_matches_tokenstore_contract():
     token_file_path are unchanged, and native token-store resume is preserved.
     The login path adds a diagnostic hint when only legacy garth token files
     exist; it does not adopt those files or change the native token format.
+    Re-validated for 0.3.17 -> 0.3.20: the token-store tests below (dump/load
+    round trip, directory -> garmin_tokens.json, resume without credentials)
+    pass unchanged on the installed 0.3.20. 0.3.19 split ``garminconnect.client``
+    into a package, but ``token_file_path`` and ``Client`` stay importable from it.
     """
-    assert version("garminconnect") == "0.3.17"
+    assert version("garminconnect") == "0.3.20"
 
 
 def test_garmin_constructor_accepts_email_and_password():
@@ -65,7 +69,7 @@ def test_garmin_client_has_no_garth_attribute():
 
 
 def test_directory_tokenstore_uses_garmin_tokens_json(tmp_path):
-    """garminconnect (0.3.11 through 0.3.17) maps a directory to one fixed token filename.
+    """garminconnect (0.3.11 through 0.3.20) maps a directory to one fixed token filename.
 
     Phase 3 must give each linked person a distinct directory, rather than
     inventing a filename or sharing the deployment-wide legacy directory.
@@ -219,8 +223,9 @@ def test_real_write_path_error_text_classifies(status, code, monkeypatch):
 
     ``add_body_composition`` and ``create_manual_activity`` go through the
     undecorated ``Client.post -> Client._run_request``, whose failure is a
-    ``GarminConnectConnectionError("API Error NNN ...")`` with no ``.response``,
-    so ``_error_code`` has only the text to go on. The parametrized cases in
+    ``GarminConnectConnectionError("API Error NNN ...")``. On 0.3.17 it had no
+    ``.response`` so ``_error_code`` had only the text to go on; from 0.3.19 the
+    response is attached too and either signal classifies it. The parametrized cases in
     test_garmin_registry.py hand-build that string; this drives the REAL
     library code through a stubbed session, so a bump that rewords it fails
     here instead of silently turning write-path 401s into ``network`` (no
@@ -241,10 +246,13 @@ def test_real_write_path_error_text_classifies(status, code, monkeypatch):
     with pytest.raises(GarminConnectConnectionError) as caught:
         client.post("connectapi", "/weight-service/user-weight", json={}, api=True)
 
-    # Text is all _error_code has here. If a future version attaches the
-    # response, classification may still work, but via a different path --
-    # re-read _error_code before loosening this.
-    assert getattr(caught.value, "response", None) is None
+    # Through 0.3.17 the text was all _error_code had. Since 0.3.19 ("HTTP
+    # errors keep their response") the exception also carries the response;
+    # _error_code reads its status_code first (_http_status) and falls back to
+    # the message text. Either way the classification below must hold, and a
+    # response, when attached, must agree with the status the stub returned.
+    response = getattr(caught.value, "response", None)
+    assert response is None or response.status_code == status
     # A 401 takes the refresh-and-retry path: exactly one retry.
     assert session.calls == (2 if status == 401 else 1)
     assert _error_code(caught.value) == code, repr(caught.value)
