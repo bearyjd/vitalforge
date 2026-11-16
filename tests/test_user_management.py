@@ -223,7 +223,7 @@ async def test_create_user_duplicate_username_rejected(client):
     await seed_user("bob")
     resp = await client.post(
         "/auth/admin/users",
-        json={"username": "bob", "password": "x", "role": "user"},
+        json={"username": "bob", "password": "bobs-password", "role": "user"},
         cookies=await _cookies_for("root"),
     )
     assert resp.status_code == 409
@@ -274,7 +274,7 @@ async def test_create_user_reserved_username_rejected(client, reserved):
     await seed_user("root", role="admin")
     resp = await client.post(
         "/auth/admin/users",
-        json={"username": reserved, "password": "x", "role": "admin"},
+        json={"username": reserved, "password": "reserved-password", "role": "admin"},
         cookies=await _cookies_for("root"),
     )
     assert resp.status_code == 422
@@ -762,6 +762,43 @@ async def test_demoted_admin_session_loses_admin_access_immediately(client):
     # Same cookie -- role is re-read live, not trusted from the signed payload.
     resp = await client.get("/auth/admin/users/list", cookies=cookie)
     assert resp.status_code == 403
+
+
+# --- Password strength policy --------------------------------------------------------
+
+
+async def test_change_own_password_too_short_rejected(client):
+    await seed_user("alice", password="old-password")
+    resp = await client.post(
+        "/auth/account/password",
+        json={"current_password": "old-password", "new_password": "short"},
+        cookies=await _cookies_for("alice"),
+    )
+    assert resp.status_code == 422
+    assert "at least" in resp.json()["detail"]
+    assert await shared_auth.check_credentials("alice", "old-password") is True  # unchanged
+
+
+async def test_admin_create_user_too_short_password_rejected(client):
+    await seed_user("root", role="admin")
+    resp = await client.post(
+        "/auth/admin/users",
+        json={"username": "bob", "password": "short", "role": "user"},
+        cookies=await _cookies_for("root"),
+    )
+    assert resp.status_code == 422
+    assert "at least" in resp.json()["detail"]
+    assert await shared_auth.get_current_user_role("bob") is None
+
+
+async def test_admin_reset_too_short_password_rejected(client):
+    await seed_user("root", role="admin")
+    bob_id = await seed_user("bob", password="old-password")
+    resp = await client.patch(
+        f"/auth/admin/users/{bob_id}", json={"password": "short"}, cookies=await _cookies_for("root")
+    )
+    assert resp.status_code == 422
+    assert await shared_auth.check_credentials("bob", "old-password") is True  # unchanged
 
 
 # --- API bearer tokens are revoked on password change ----------------------------
