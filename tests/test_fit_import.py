@@ -15,6 +15,8 @@ from httpx import ASGITransport, AsyncClient
 from shared.database import get_db
 from tests.conftest import PERSON_PREFIX
 from tests.fixtures.fit_builder import (
+    build_fit_file_with_float_array_field,
+    build_fit_file_with_float_distance,
     build_fit_file_with_non_numeric_calories,
     build_minimal_fit_file,
 )
@@ -211,6 +213,35 @@ async def test_malformed_session_field_rejected_not_500(client):
     assert await activity_count() == 0
 
 
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf")])
+async def test_non_finite_session_float_rejected_not_stored(client, bad):
+    """A float32 session field carrying inf/nan parses fine but must be
+    rejected at ingest (400), not stored where it later breaks JSON
+    responses."""
+    data = build_fit_file_with_float_distance(
+        start_time=datetime(2026, 8, 20, 7, 30, tzinfo=timezone.utc), distance=bad
+    )
+
+    resp = await client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("run.fit", data)})
+
+    assert resp.status_code == 400
+    assert await activity_count() == 0
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf")])
+async def test_non_finite_float_array_field_rejected_not_stored(client, bad):
+    """fitparse returns multi-element float fields as tuples; a non-finite
+    element must be rejected too, not smuggled into raw_summary."""
+    data = build_fit_file_with_float_array_field(
+        start_time=datetime(2026, 8, 20, 7, 30, tzinfo=timezone.utc), values=(bad, bad)
+    )
+
+    resp = await client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("run.fit", data)})
+
+    assert resp.status_code == 400
+    assert await activity_count() == 0
+
+
 async def test_oversized_file_rejected(client, dashboard_app_module, monkeypatch, dashboard_fit_module):
     monkeypatch.setattr(dashboard_fit_module.fit_import, "MAX_UPLOAD_BYTES", 100)
     oversized = make_fit_bytes() + b"\x00" * 500
@@ -219,6 +250,25 @@ async def test_oversized_file_rejected(client, dashboard_app_module, monkeypatch
 
     assert resp.status_code == 413
     assert await activity_count() == 0
+
+
+async def test_fit_parsing_runs_off_the_event_loop(client, dashboard_fit_module, monkeypatch):
+    """A crafted FIT must not block the event loop: parsing runs in a worker thread."""
+    import threading
+
+    real_parse = dashboard_fit_module.fit_import.parse_fit_bytes
+    seen = {}
+
+    def spy(data):
+        seen["thread"] = threading.current_thread()
+        return real_parse(data)
+
+    monkeypatch.setattr(dashboard_fit_module.fit_import, "parse_fit_bytes", spy)
+
+    resp = await client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("run.fit", make_fit_bytes())})
+
+    assert resp.status_code in (200, 201)
+    assert seen["thread"] is not threading.main_thread()
 
 
 async def test_list_and_get_activities(client):

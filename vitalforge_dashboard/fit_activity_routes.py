@@ -6,6 +6,7 @@ strength_sessions, which vitalforge_weight/activity_routes.py serves. CLAUDE.md 
 explicit that the two must not be unified; the module names should not blur that.
 """
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -82,7 +83,8 @@ def add_fit_activity_routes(app):
         data = await _read_upload_capped(file, fit_import.MAX_UPLOAD_BYTES)
 
         try:
-            record = fit_import.parse_fit_bytes(data)
+            # CPU-bound; run in a worker thread so a crafted file can't stall the event loop.
+            record = await asyncio.to_thread(fit_import.parse_fit_bytes, data)
         except fit_import.FitImportError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
