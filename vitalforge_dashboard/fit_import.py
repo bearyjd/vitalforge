@@ -8,6 +8,7 @@ sit next to this one and produce the same ActivityRecord shape.
 
 import hashlib
 import logging
+import math
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -110,6 +111,10 @@ def parse_fit_bytes(data: bytes) -> ActivityRecord:
             raise FitImportError("FIT file has no session message (not an activity file)")
 
         fields = {f.name: f.value for f in sessions[0]}
+
+        for name, value in fields.items():
+            if isinstance(value, float) and not math.isfinite(value):
+                raise FitImportError(f"FIT session field {name!r} is not a finite number")
 
         start_time = fields.get("start_time") or fields.get("timestamp")
         if not isinstance(start_time, datetime):
