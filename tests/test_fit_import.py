@@ -15,6 +15,8 @@ from httpx import ASGITransport, AsyncClient
 from shared.database import get_db
 from tests.conftest import PERSON_PREFIX
 from tests.fixtures.fit_builder import (
+    build_fit_file_with_float_array_field,
+    build_fit_file_with_float_distance,
     build_fit_file_with_non_numeric_calories,
     build_minimal_fit_file,
 )
@@ -203,6 +205,35 @@ async def test_malformed_session_field_rejected_not_500(client):
     unhandled 500."""
     data = build_fit_file_with_non_numeric_calories(
         start_time=datetime(2026, 8, 20, 7, 30, tzinfo=timezone.utc)
+    )
+
+    resp = await client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("run.fit", data)})
+
+    assert resp.status_code == 400
+    assert await activity_count() == 0
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf")])
+async def test_non_finite_session_float_rejected_not_stored(client, bad):
+    """A float32 session field carrying inf/nan parses fine but must be
+    rejected at ingest (400), not stored where it later breaks JSON
+    responses."""
+    data = build_fit_file_with_float_distance(
+        start_time=datetime(2026, 8, 20, 7, 30, tzinfo=timezone.utc), distance=bad
+    )
+
+    resp = await client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("run.fit", data)})
+
+    assert resp.status_code == 400
+    assert await activity_count() == 0
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf")])
+async def test_non_finite_float_array_field_rejected_not_stored(client, bad):
+    """fitparse returns multi-element float fields as tuples; a non-finite
+    element must be rejected too, not smuggled into raw_summary."""
+    data = build_fit_file_with_float_array_field(
+        start_time=datetime(2026, 8, 20, 7, 30, tzinfo=timezone.utc), values=(bad, bad)
     )
 
     resp = await client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("run.fit", data)})
