@@ -63,11 +63,17 @@ def add_auth_routes(app):
         body = await request.json()
         username = body.get("username", "")
         password = body.get("password", "")
-        client_ip = request.client.host if request.client else "unknown"
-        wait = login_throttle.retry_after(client_ip, username)
-        if wait:
+        client_ip = login_throttle.client_ip(
+            request.client.host if request.client else None, request.headers.get("x-real-ip")
+        )
+        reservation = login_throttle.reserve(client_ip, username)
+        if reservation is None:
+            wait = login_throttle.retry_after(client_ip, username) or 1
             raise HTTPException(status_code=429, detail="Too many attempts", headers={"Retry-After": str(wait)})
-        id_and_version = await auth._authenticate_credentials(username, password)
+        try:
+            id_and_version = await auth._authenticate_credentials(username, password)
+        finally:
+            login_throttle.release(reservation)
         if id_and_version is None:
             login_throttle.record_failure(client_ip, username)
             raise HTTPException(status_code=401, detail="Invalid credentials")
