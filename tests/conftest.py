@@ -201,6 +201,18 @@ def _reset_step_up_failures():
     shared_auth._step_up_pending.clear()
 
 
+@pytest.fixture(autouse=True)
+def _reset_login_throttle():
+    """Clear the module-level failed-login tracker around every test so
+    failed logins in one test cannot lock out the same client IP or username
+    in a later one."""
+    from shared import login_throttle
+
+    login_throttle.reset()
+    yield
+    login_throttle.reset()
+
+
 @pytest.fixture
 def tmp_db_path(tmp_path, monkeypatch):
     """Point `shared.database.DB_PATH` at an isolated tmp SQLite file.

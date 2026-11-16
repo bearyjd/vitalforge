@@ -22,7 +22,7 @@ import aiosqlite
 from fastapi import HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
-from shared import auth
+from shared import auth, login_throttle
 from shared.auth import (
     _COOKIE_NAME,
     _MAX_AGE,
@@ -63,9 +63,15 @@ def add_auth_routes(app):
         body = await request.json()
         username = body.get("username", "")
         password = body.get("password", "")
+        client_ip = request.client.host if request.client else "unknown"
+        wait = login_throttle.retry_after(client_ip, username)
+        if wait:
+            raise HTTPException(status_code=429, detail="Too many attempts", headers={"Retry-After": str(wait)})
         id_and_version = await auth._authenticate_credentials(username, password)
         if id_and_version is None:
+            login_throttle.record_failure(client_ip, username)
             raise HTTPException(status_code=401, detail="Invalid credentials")
+        login_throttle.record_success(username)
         user_id, session_version = id_and_version
         cookie = create_session_cookie(username, user_id, session_version)
         response = JSONResponse({"success": True})
