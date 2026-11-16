@@ -17,7 +17,7 @@ from shared import auth as shared_auth
 from shared.auth import create_session_cookie
 from shared.auth_routes import add_auth_routes
 from shared.database import get_db
-from tests.conftest import grant_person, primary_person_id, seed_user
+from tests.conftest import grant_person, primary_person_id, seed_token, seed_user
 
 
 def _build_app() -> FastAPI:
@@ -762,3 +762,40 @@ async def test_demoted_admin_session_loses_admin_access_immediately(client):
     # Same cookie -- role is re-read live, not trusted from the signed payload.
     resp = await client.get("/auth/admin/users/list", cookies=cookie)
     assert resp.status_code == 403
+
+
+# --- API bearer tokens are revoked on password change ----------------------------
+
+
+async def _bearer_status(client, raw_token: str) -> int:
+    resp = await client.get("/auth/tokens", headers={"Authorization": f"Bearer {raw_token}"})
+    return resp.status_code
+
+
+async def test_change_own_password_revokes_api_tokens(client):
+    user_id = await seed_user("alice", password="old-password")
+    _, raw = await seed_token(user_id)
+    assert await _bearer_status(client, raw) == 200
+
+    resp = await client.post(
+        "/auth/account/password",
+        json={"current_password": "old-password", "new_password": "new-password"},
+        cookies=await _cookies_for("alice"),
+    )
+    assert resp.status_code == 200
+    assert await _bearer_status(client, raw) == 401
+
+
+async def test_admin_password_reset_revokes_target_api_tokens_only(client):
+    await seed_user("root", role="admin")
+    bob_id = await seed_user("bob", password="old-password")
+    carol_id = await seed_user("carol", password="carol-password")
+    _, bob_raw = await seed_token(bob_id)
+    _, carol_raw = await seed_token(carol_id)
+
+    resp = await client.patch(
+        f"/auth/admin/users/{bob_id}", json={"password": "reset-password"}, cookies=await _cookies_for("root")
+    )
+    assert resp.status_code == 200
+    assert await _bearer_status(client, bob_raw) == 401
+    assert await _bearer_status(client, carol_raw) == 200

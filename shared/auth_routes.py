@@ -113,6 +113,10 @@ def add_auth_routes(app):
                 "UPDATE users SET password_hash = ?, session_version = session_version + 1 WHERE id = ?",
                 (_hash_password(data.new_password), identity.user_id),
             )
+            # Bearer tokens carry no session_version, so revoke them
+            # explicitly: a password change must cut off every credential
+            # issued under the old password.
+            await db.execute("DELETE FROM api_tokens WHERE user_id = ?", (identity.user_id,))
             await db.commit()
         finally:
             await db.close()
@@ -293,6 +297,9 @@ def add_auth_routes(app):
                     # above, which only handles `field = ?` pairs.
                     set_clause += ", session_version = session_version + 1"
                 await db.execute(f"UPDATE users SET {set_clause} WHERE id = ?", (*updates.values(), user_id))
+                if new_password:
+                    # Bearer tokens are not tied to session_version; revoke them too.
+                    await db.execute("DELETE FROM api_tokens WHERE user_id = ?", (user_id,))
             await db.commit()
         finally:
             await db.close()
