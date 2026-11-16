@@ -87,6 +87,16 @@ def _int_or_none(value) -> int | None:
     return None if value is None else int(value)
 
 
+def _is_non_finite(value: object) -> bool:
+    """True for a non-finite float, or a tuple/list (fitparse returns array
+    fields as tuples) containing one at any depth."""
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, (tuple, list)):
+        return any(_is_non_finite(v) for v in value)
+    return False
+
+
 def parse_fit_bytes(data: bytes) -> ActivityRecord:
     """Parse FIT bytes into an ActivityRecord using the file's `session`
     summary message. Never lets a `fitparse` exception (or any other parse
@@ -113,7 +123,7 @@ def parse_fit_bytes(data: bytes) -> ActivityRecord:
         fields = {f.name: f.value for f in sessions[0]}
 
         for name, value in fields.items():
-            if isinstance(value, float) and not math.isfinite(value):
+            if _is_non_finite(value):
                 raise FitImportError(f"FIT session field {name!r} is not a finite number")
 
         start_time = fields.get("start_time") or fields.get("timestamp")

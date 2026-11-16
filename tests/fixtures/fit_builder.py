@@ -204,3 +204,38 @@ def build_fit_file_with_float_distance(*, start_time: datetime, distance: float)
     header = struct.pack("<BBHI4s", 12, 0x10, 2078, len(records), b".FIT")
     crc = Crc.calculate(header + records)
     return header + records + struct.pack("<H", crc)
+
+
+def build_fit_file_with_float_array_field(*, start_time: datetime, values: tuple[float, float]) -> bytes:
+    """Structurally valid FIT file whose `session` message carries an unknown
+    field (200) declared float32 with size 8, so `fitparse` returns it as a
+    tuple of two floats (e.g. inf) that only lands in raw_summary."""
+    fit_ts = _to_fit_timestamp(start_time)
+
+    file_id_def = _definition_message(
+        local_type=0,
+        global_mesg_num=0,
+        fields=[(0, 1, _ENUM), (1, 2, _UINT16), (2, 2, _UINT16), (4, 4, _UINT32)],
+    )
+    file_id_data = _data_message(0, struct.pack("<BHHI", 4, 1, 1, fit_ts))
+
+    session_def = _definition_message(
+        local_type=1,
+        global_mesg_num=18,
+        fields=[
+            (253, 4, _UINT32),  # timestamp
+            (2, 4, _UINT32),  # start_time
+            (5, 1, _ENUM),  # sport
+            (7, 4, _UINT32),  # total_elapsed_time (scale 1000)
+            (200, 8, _FLOAT32),  # unknown field -- float32 array of 2
+        ],
+    )
+    session_data = _data_message(
+        1,
+        struct.pack("<IIBIff", fit_ts, fit_ts, 1, round(1800 * 1000), *values),
+    )
+
+    records = file_id_def + file_id_data + session_def + session_data
+    header = struct.pack("<BBHI4s", 12, 0x10, 2078, len(records), b".FIT")
+    crc = Crc.calculate(header + records)
+    return header + records + struct.pack("<H", crc)
