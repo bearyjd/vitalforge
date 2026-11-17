@@ -27,6 +27,7 @@ from shared.auth import (
     _COOKIE_NAME,
     _MAX_AGE,
     _RESERVED_USERNAMES,
+    MIN_PASSWORD_LENGTH,
     CreateTokenIn,
     CreateUserIn,
     PasswordChangeIn,
@@ -47,9 +48,6 @@ from shared.auth_pages import ACCOUNT_PAGE_HTML, ADMIN_USERS_PAGE_HTML, LOGIN_PA
 from shared.database import get_db
 
 logger = logging.getLogger(__name__)
-
-
-MIN_PASSWORD_LENGTH = 10
 
 
 def _require_strong_password(password: str) -> None:
