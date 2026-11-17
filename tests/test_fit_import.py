@@ -7,6 +7,7 @@ reject gracefully rather than 500.
 """
 
 import asyncio
+import dataclasses
 from datetime import datetime, timezone
 
 import pytest
@@ -240,6 +241,43 @@ async def test_non_finite_float_array_field_rejected_not_stored(client, bad):
 
     assert resp.status_code == 400
     assert await activity_count() == 0
+
+
+async def test_non_finite_raw_summary_at_write_rejected_not_500(client, dashboard_fit_module, monkeypatch):
+    """Defence in depth: even if a non-finite value got past the parser, the
+    write must refuse it (400) rather than serialize bare NaN/Infinity."""
+    real = dashboard_fit_module.fit_import.parse_fit_bytes
+
+    def poisoned(data):
+        record = real(data)
+        return dataclasses.replace(record, raw_summary={**record.raw_summary, "bad": float("nan")})
+
+    monkeypatch.setattr(dashboard_fit_module.fit_import, "parse_fit_bytes", poisoned)
+
+    resp = await client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("run.fit", make_fit_bytes())})
+
+    assert resp.status_code == 400
+    assert await activity_count() == 0
+
+
+async def test_get_activity_with_legacy_non_finite_raw_summary_returns_200(client):
+    """Rows stored before the ingest guard may hold bare Infinity/NaN in
+    raw_summary_json; the detail read must sanitize them to null, not 500."""
+    created = (await client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("run.fit", make_fit_bytes())})).json()
+    db = await get_db()
+    try:
+        await db.execute(
+            "UPDATE activities SET raw_summary_json = ? WHERE id = ?",
+            ('{"total_calories": 400, "a": Infinity, "b": -Infinity, "c": NaN, "d": [Infinity, 1.5]}', created["id"]),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+    detail = await client.get(f"{PERSON_PREFIX}/api/activities/{created['id']}")
+
+    assert detail.status_code == 200
+    assert detail.json()["raw_summary"] == {"total_calories": 400, "a": None, "b": None, "c": None, "d": [None, 1.5]}
 
 
 async def test_oversized_file_rejected(client, dashboard_app_module, monkeypatch, dashboard_fit_module):
