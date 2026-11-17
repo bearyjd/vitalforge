@@ -271,6 +271,39 @@ async def test_fit_parsing_runs_off_the_event_loop(client, dashboard_fit_module,
     assert seen["thread"] is not threading.main_thread()
 
 
+async def test_fit_parse_concurrency_is_bounded(client, dashboard_fit_module, monkeypatch):
+    """Parse threads must not pile up: concurrent uploads are capped at MAX_CONCURRENT_PARSES."""
+    import threading
+    import time
+
+    real_parse = dashboard_fit_module.fit_import.parse_fit_bytes
+    lock = threading.Lock()
+    state = {"active": 0, "peak": 0}
+
+    def spy(data):
+        with lock:
+            state["active"] += 1
+            state["peak"] = max(state["peak"], state["active"])
+        try:
+            time.sleep(0.15)
+            return real_parse(data)
+        finally:
+            with lock:
+                state["active"] -= 1
+
+    monkeypatch.setattr(dashboard_fit_module.fit_import, "parse_fit_bytes", spy)
+
+    limit = dashboard_fit_module.MAX_CONCURRENT_PARSES
+    uploads = [
+        client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("run.fit", make_fit_bytes())})
+        for _ in range(limit * 4)
+    ]
+    responses = await asyncio.gather(*uploads)
+
+    assert all(r.status_code in (200, 201) for r in responses)
+    assert 1 <= state["peak"] <= limit
+
+
 async def test_list_and_get_activities(client):
     data = make_fit_bytes()
     created = (await client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("run.fit", data)})).json()
