@@ -32,6 +32,11 @@ logger = logging.getLogger(__name__)
 ACTIVITY_NEAR_DUPLICATE_WINDOW_SECONDS = 120
 
 
+# Cap on FIT parses running at once. Parsing is CPU-bound in worker threads from the
+# default executor; without a bound, a burst of uploads occupies every executor thread
+# (also used by other to_thread callers) and the GIL keeps the loop sluggish.
+MAX_CONCURRENT_PARSES = 2
+
 _ACTIVITY_COLUMNS = (
     "id", "start_time_utc", "sport", "duration_seconds", "distance_m", "calories",
     "avg_hr", "max_hr", "elevation_gain_m", "source_format", "file_sha256", "imported_at",
@@ -67,6 +72,8 @@ def add_fit_activity_routes(app):
     Mirrors shared/persons_admin.py's add_person_routes, and the weight
     service's add_weight_routes / add_activity_routes."""
 
+    parse_slots = asyncio.Semaphore(MAX_CONCURRENT_PARSES)
+
     @app.post("/p/{slug}/api/import/activity")
     async def import_activity(
         file: UploadFile = File(...),
@@ -84,7 +91,8 @@ def add_fit_activity_routes(app):
 
         try:
             # CPU-bound; run in a worker thread so a crafted file can't stall the event loop.
-            record = await asyncio.to_thread(fit_import.parse_fit_bytes, data)
+            async with parse_slots:
+                record = await asyncio.to_thread(fit_import.parse_fit_bytes, data)
         except fit_import.FitImportError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
