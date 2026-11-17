@@ -216,6 +216,10 @@ class ActivityIn(BaseModel):
         # guessing wrong misfiles the activity by the offset amount.
         if self.start.tzinfo is None:
             raise ValueError("start must include a UTC offset")
+        # Compare before any arithmetic: an aware datetime near year 0001
+        # raises OverflowError on the subtraction below.
+        if self.start < CAPTURED_AT_EARLIEST:
+            raise ValueError("start must not be before 2000-01-01")
         skew = self.start - datetime.now(timezone.utc)
         if skew > timedelta(seconds=CAPTURED_AT_FUTURE_TOLERANCE_SECONDS):
             raise ValueError("start must not be in the future")
