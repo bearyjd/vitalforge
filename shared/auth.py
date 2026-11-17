@@ -684,12 +684,14 @@ async def bootstrap_first_admin():
         if len(_PASS) < MIN_PASSWORD_LENGTH:
             # Same policy the account/admin routes enforce (follow-up to #110);
             # otherwise VITALFORGE_PASS=x seeds an admin with a 1-char password.
-            logger.error(
-                "VITALFORGE_PASS is shorter than %d characters; refusing to seed the "
-                "first admin account. Set a longer VITALFORGE_PASS and restart.",
-                MIN_PASSWORD_LENGTH,
+            # Fail CLOSED: returning without seeding would leave the users
+            # table empty, which is the auth-disabled (open access) state, so
+            # abort startup instead (security review of the follow-up PR).
+            raise RuntimeError(
+                f"VITALFORGE_PASS is set but shorter than {MIN_PASSWORD_LENGTH} characters; "
+                "refusing to start with authentication disabled. Set a longer "
+                "VITALFORGE_PASS (or leave it empty for intentional open access) and restart."
             )
-            return
         try:
             await db.execute(
                 "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, 'admin', ?)",

@@ -645,10 +645,14 @@ async def test_bootstrap_first_admin_refuses_too_short_password(initialized_db, 
     """Follow-up to #110: the password-strength policy applied to every route
     that sets a password, but the env bootstrap seeded an admin from any
     non-empty VITALFORGE_PASS, so VITALFORGE_PASS=x produced an admin
-    account with a 1-character password."""
+    account with a 1-character password. It must fail CLOSED: silently
+    skipping the seed leaves the users table empty, which is the auth-disabled
+    (open access) state, so startup has to abort instead (security review of
+    the follow-up PR)."""
     monkeypatch.setattr(shared_auth, "_USER", "bootstrapped-admin")
     monkeypatch.setattr(shared_auth, "_PASS", "short")
-    await shared_auth.bootstrap_first_admin()
+    with pytest.raises(RuntimeError, match="VITALFORGE_PASS"):
+        await shared_auth.bootstrap_first_admin()
 
     db = await get_db()
     try:
@@ -656,6 +660,15 @@ async def test_bootstrap_first_admin_refuses_too_short_password(initialized_db, 
     finally:
         await db.close()
     assert count == 0
+    assert not await shared_auth._is_auth_configured()
+
+
+async def test_bootstrap_first_admin_accepts_minimum_length_password(initialized_db, monkeypatch):
+    """Boundary: exactly MIN_PASSWORD_LENGTH characters seeds normally."""
+    monkeypatch.setattr(shared_auth, "_USER", "bootstrapped-admin")
+    monkeypatch.setattr(shared_auth, "_PASS", "x" * shared_auth.MIN_PASSWORD_LENGTH)
+    await shared_auth.bootstrap_first_admin()
+    assert await shared_auth.get_current_user_role("bootstrapped-admin") == "admin"
 
 
 @pytest.mark.parametrize("reserved", ["anonymous", "api-token"])
