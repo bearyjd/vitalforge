@@ -67,6 +67,10 @@ _LEGACY_TOKEN_MIGRATION = "legacy-api-token-v1"
 # ambiguous real account with a formerly special identity.
 _RESERVED_USERNAMES = {"anonymous", "api-token"}
 
+# Minimum local-password length, enforced by every path that sets one: the
+# account/admin routes in auth_routes.py and the env bootstrap below.
+MIN_PASSWORD_LENGTH = 10
+
 # Person slugs live in shared/slugs.py: "safe as a path segment under
 # /p/{slug}/" is a different and larger rule than _RESERVED_USERNAMES' "safe
 # as a username", and keeping it out of here lets shared/migrations.py avoid
@@ -675,6 +679,15 @@ async def bootstrap_first_admin():
                 "VITALFORGE_USER=%r is a reserved name and cannot be used to seed the "
                 "first admin account. Set VITALFORGE_USER to something else and restart.",
                 _USER,
+            )
+            return
+        if len(_PASS) < MIN_PASSWORD_LENGTH:
+            # Same policy the account/admin routes enforce (follow-up to #110);
+            # otherwise VITALFORGE_PASS=x seeds an admin with a 1-char password.
+            logger.error(
+                "VITALFORGE_PASS is shorter than %d characters; refusing to seed the "
+                "first admin account. Set a longer VITALFORGE_PASS and restart.",
+                MIN_PASSWORD_LENGTH,
             )
             return
         try:
