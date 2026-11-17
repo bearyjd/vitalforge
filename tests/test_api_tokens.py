@@ -334,3 +334,27 @@ async def test_revoked_migrated_token_is_not_resurrected_on_restart(initialized_
 
     await bootstrap_migrated_token()
     assert await _token_count() == 0
+
+
+@pytest.mark.parametrize(
+    "method,path,body",
+    [
+        ("POST", "/auth/admin/users", {"username": "mallory", "password": "Str0ng-pass-phrase!", "role": "admin"}),
+        ("PATCH", "/auth/admin/users/{other}", {"password": "Str0ng-pass-phrase!"}),
+        ("DELETE", "/auth/admin/users/{other}", None),
+    ],
+)
+async def test_admin_bearer_token_cannot_mutate_users(client, method, path, body):
+    admin_id = await seed_user("token-admin", role="admin")
+    other_id = await seed_user("victim")
+    _, raw = await seed_token(admin_id, raw_token="admin-mutation-token")
+    resp = await client.request(
+        method,
+        path.format(other=other_id),
+        json=body,
+        headers={"Authorization": f"Bearer {raw}"},
+    )
+    assert resp.status_code == 403
+    cookie_resp = await client.get("/auth/admin/users/list", cookies=await _cookies_for("token-admin"))
+    assert [u["username"] for u in cookie_resp.json()].count("mallory") == 0
+    assert "victim" in [u["username"] for u in cookie_resp.json()]
