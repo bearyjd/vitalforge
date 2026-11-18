@@ -17,7 +17,7 @@ from shared import auth as shared_auth
 from shared.auth import create_session_cookie
 from shared.auth_routes import add_auth_routes
 from shared.database import get_db
-from tests.conftest import grant_person, primary_person_id, seed_user
+from tests.conftest import grant_person, primary_person_id, seed_token, seed_user
 
 
 def _build_app() -> FastAPI:
@@ -223,7 +223,7 @@ async def test_create_user_duplicate_username_rejected(client):
     await seed_user("bob")
     resp = await client.post(
         "/auth/admin/users",
-        json={"username": "bob", "password": "x", "role": "user"},
+        json={"username": "bob", "password": "bobs-password", "role": "user"},
         cookies=await _cookies_for("root"),
     )
     assert resp.status_code == 409
@@ -274,7 +274,7 @@ async def test_create_user_reserved_username_rejected(client, reserved):
     await seed_user("root", role="admin")
     resp = await client.post(
         "/auth/admin/users",
-        json={"username": reserved, "password": "x", "role": "admin"},
+        json={"username": reserved, "password": "reserved-password", "role": "admin"},
         cookies=await _cookies_for("root"),
     )
     assert resp.status_code == 422
@@ -641,6 +641,36 @@ async def test_bootstrap_first_admin_noop_when_a_user_already_exists(initialized
     assert await shared_auth.get_current_user_role("bootstrapped-admin") is None
 
 
+async def test_bootstrap_first_admin_refuses_too_short_password(initialized_db, monkeypatch):
+    """Follow-up to #110: the password-strength policy applied to every route
+    that sets a password, but the env bootstrap seeded an admin from any
+    non-empty VITALFORGE_PASS, so VITALFORGE_PASS=x produced an admin
+    account with a 1-character password. It must fail CLOSED: silently
+    skipping the seed leaves the users table empty, which is the auth-disabled
+    (open access) state, so startup has to abort instead (security review of
+    the follow-up PR)."""
+    monkeypatch.setattr(shared_auth, "_USER", "bootstrapped-admin")
+    monkeypatch.setattr(shared_auth, "_PASS", "short")
+    with pytest.raises(RuntimeError, match="VITALFORGE_PASS"):
+        await shared_auth.bootstrap_first_admin()
+
+    db = await get_db()
+    try:
+        count = (await (await db.execute("SELECT COUNT(*) FROM users")).fetchone())[0]
+    finally:
+        await db.close()
+    assert count == 0
+    assert not await shared_auth._is_auth_configured()
+
+
+async def test_bootstrap_first_admin_accepts_minimum_length_password(initialized_db, monkeypatch):
+    """Boundary: exactly MIN_PASSWORD_LENGTH characters seeds normally."""
+    monkeypatch.setattr(shared_auth, "_USER", "bootstrapped-admin")
+    monkeypatch.setattr(shared_auth, "_PASS", "x" * shared_auth.MIN_PASSWORD_LENGTH)
+    await shared_auth.bootstrap_first_admin()
+    assert await shared_auth.get_current_user_role("bootstrapped-admin") == "admin"
+
+
 @pytest.mark.parametrize("reserved", ["anonymous", "api-token"])
 async def test_bootstrap_first_admin_refuses_reserved_username(initialized_db, monkeypatch, reserved):
     """Fix-review finding: admin_create_user's _RESERVED_USERNAMES guard
@@ -762,3 +792,77 @@ async def test_demoted_admin_session_loses_admin_access_immediately(client):
     # Same cookie -- role is re-read live, not trusted from the signed payload.
     resp = await client.get("/auth/admin/users/list", cookies=cookie)
     assert resp.status_code == 403
+
+
+# --- Password strength policy --------------------------------------------------------
+
+
+async def test_change_own_password_too_short_rejected(client):
+    await seed_user("alice", password="old-password")
+    resp = await client.post(
+        "/auth/account/password",
+        json={"current_password": "old-password", "new_password": "short"},
+        cookies=await _cookies_for("alice"),
+    )
+    assert resp.status_code == 422
+    assert "at least" in resp.json()["detail"]
+    assert await shared_auth.check_credentials("alice", "old-password") is True  # unchanged
+
+
+async def test_admin_create_user_too_short_password_rejected(client):
+    await seed_user("root", role="admin")
+    resp = await client.post(
+        "/auth/admin/users",
+        json={"username": "bob", "password": "short", "role": "user"},
+        cookies=await _cookies_for("root"),
+    )
+    assert resp.status_code == 422
+    assert "at least" in resp.json()["detail"]
+    assert await shared_auth.get_current_user_role("bob") is None
+
+
+async def test_admin_reset_too_short_password_rejected(client):
+    await seed_user("root", role="admin")
+    bob_id = await seed_user("bob", password="old-password")
+    resp = await client.patch(
+        f"/auth/admin/users/{bob_id}", json={"password": "short"}, cookies=await _cookies_for("root")
+    )
+    assert resp.status_code == 422
+    assert await shared_auth.check_credentials("bob", "old-password") is True  # unchanged
+
+
+# --- API bearer tokens are revoked on password change ----------------------------
+
+
+async def _bearer_status(client, raw_token: str) -> int:
+    resp = await client.get("/auth/tokens", headers={"Authorization": f"Bearer {raw_token}"})
+    return resp.status_code
+
+
+async def test_change_own_password_revokes_api_tokens(client):
+    user_id = await seed_user("alice", password="old-password")
+    _, raw = await seed_token(user_id)
+    assert await _bearer_status(client, raw) == 200
+
+    resp = await client.post(
+        "/auth/account/password",
+        json={"current_password": "old-password", "new_password": "new-password"},
+        cookies=await _cookies_for("alice"),
+    )
+    assert resp.status_code == 200
+    assert await _bearer_status(client, raw) == 401
+
+
+async def test_admin_password_reset_revokes_target_api_tokens_only(client):
+    await seed_user("root", role="admin")
+    bob_id = await seed_user("bob", password="old-password")
+    carol_id = await seed_user("carol", password="carol-password")
+    _, bob_raw = await seed_token(bob_id)
+    _, carol_raw = await seed_token(carol_id)
+
+    resp = await client.patch(
+        f"/auth/admin/users/{bob_id}", json={"password": "reset-password"}, cookies=await _cookies_for("root")
+    )
+    assert resp.status_code == 200
+    assert await _bearer_status(client, bob_raw) == 401
+    assert await _bearer_status(client, carol_raw) == 200

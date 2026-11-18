@@ -27,6 +27,7 @@ from shared.auth import (
     _COOKIE_NAME,
     _MAX_AGE,
     _RESERVED_USERNAMES,
+    MIN_PASSWORD_LENGTH,
     CreateTokenIn,
     CreateUserIn,
     PasswordChangeIn,
@@ -47,6 +48,14 @@ from shared.auth_pages import ACCOUNT_PAGE_HTML, ADMIN_USERS_PAGE_HTML, LOGIN_PA
 from shared.database import get_db
 
 logger = logging.getLogger(__name__)
+
+
+def _require_strong_password(password: str) -> None:
+    """Minimum password policy for every path that sets a local password."""
+    if len(password) < MIN_PASSWORD_LENGTH:
+        raise HTTPException(
+            status_code=422, detail=f"Password must be at least {MIN_PASSWORD_LENGTH} characters"
+        )
 
 
 def add_auth_routes(app):
@@ -102,6 +111,7 @@ def add_auth_routes(app):
             raise HTTPException(status_code=401, detail="Current password incorrect")
         if not data.new_password:
             raise HTTPException(status_code=422, detail="New password required")
+        _require_strong_password(data.new_password)
         db = await get_db()
         try:
             # session_version bump invalidates every previously-issued
@@ -113,6 +123,10 @@ def add_auth_routes(app):
                 "UPDATE users SET password_hash = ?, session_version = session_version + 1 WHERE id = ?",
                 (_hash_password(data.new_password), identity.user_id),
             )
+            # Bearer tokens carry no session_version, so revoke them
+            # explicitly: a password change must cut off every credential
+            # issued under the old password.
+            await db.execute("DELETE FROM api_tokens WHERE user_id = ?", (identity.user_id,))
             await db.commit()
         finally:
             await db.close()
@@ -233,6 +247,7 @@ def add_auth_routes(app):
         username = data.username.strip()
         if not username or not data.password:
             raise HTTPException(status_code=422, detail="username and password are required")
+        _require_strong_password(data.password)
         if username in _RESERVED_USERNAMES:
             raise HTTPException(status_code=422, detail=f"'{username}' is a reserved username")
         db = await get_db()
@@ -254,6 +269,8 @@ def add_auth_routes(app):
         await _require_admin(request)
         new_role = data.role
         new_password = data.password
+        if new_password:
+            _require_strong_password(new_password)
         db = await get_db()
         try:
             # BEGIN IMMEDIATE makes the count-then-write atomic: two
@@ -293,6 +310,9 @@ def add_auth_routes(app):
                     # above, which only handles `field = ?` pairs.
                     set_clause += ", session_version = session_version + 1"
                 await db.execute(f"UPDATE users SET {set_clause} WHERE id = ?", (*updates.values(), user_id))
+                if new_password:
+                    # Bearer tokens are not tied to session_version; revoke them too.
+                    await db.execute("DELETE FROM api_tokens WHERE user_id = ?", (user_id,))
             await db.commit()
         finally:
             await db.close()

@@ -290,6 +290,58 @@ async def test_oversized_file_rejected(client, dashboard_app_module, monkeypatch
     assert await activity_count() == 0
 
 
+async def test_fit_parsing_runs_off_the_event_loop(client, dashboard_fit_module, monkeypatch):
+    """A crafted FIT must not block the event loop: parsing runs in a worker thread."""
+    import threading
+
+    real_parse = dashboard_fit_module.fit_import.parse_fit_bytes
+    seen = {}
+
+    def spy(data):
+        seen["thread"] = threading.current_thread()
+        return real_parse(data)
+
+    monkeypatch.setattr(dashboard_fit_module.fit_import, "parse_fit_bytes", spy)
+
+    resp = await client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("run.fit", make_fit_bytes())})
+
+    assert resp.status_code in (200, 201)
+    assert seen["thread"] is not threading.main_thread()
+
+
+async def test_fit_parse_concurrency_is_bounded(client, dashboard_fit_module, monkeypatch):
+    """Parse threads must not pile up: concurrent uploads are capped at MAX_CONCURRENT_PARSES."""
+    import threading
+    import time
+
+    real_parse = dashboard_fit_module.fit_import.parse_fit_bytes
+    lock = threading.Lock()
+    state = {"active": 0, "peak": 0}
+
+    def spy(data):
+        with lock:
+            state["active"] += 1
+            state["peak"] = max(state["peak"], state["active"])
+        try:
+            time.sleep(0.15)
+            return real_parse(data)
+        finally:
+            with lock:
+                state["active"] -= 1
+
+    monkeypatch.setattr(dashboard_fit_module.fit_import, "parse_fit_bytes", spy)
+
+    limit = dashboard_fit_module.MAX_CONCURRENT_PARSES
+    uploads = [
+        client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("run.fit", make_fit_bytes())})
+        for _ in range(limit * 4)
+    ]
+    responses = await asyncio.gather(*uploads)
+
+    assert all(r.status_code in (200, 201) for r in responses)
+    assert 1 <= state["peak"] <= limit
+
+
 async def test_list_and_get_activities(client):
     data = make_fit_bytes()
     created = (await client.post(f"{PERSON_PREFIX}/api/import/activity", files={"file": ("run.fit", data)})).json()

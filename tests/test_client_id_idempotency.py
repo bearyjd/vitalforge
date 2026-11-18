@@ -526,3 +526,17 @@ async def test_client_id_index_is_actually_partial(initialized_db):
         await db.close()
     assert row is not None, "idx_weight_log_person_client_id must exist"
     assert "WHERE client_id IS NOT NULL" in row["sql"]
+
+
+@pytest.mark.parametrize(
+    "captured_at",
+    ["0001-01-01T00:00:00+05:00", "0001-01-01T00:00:00Z", "1900-01-01T00:00:00+00:00"],
+)
+async def test_captured_at_implausibly_far_in_the_past_is_422_not_500(client, captured_at):
+    """Year-0001 values overflow when converted to UTC for the dedup anchor
+    (OverflowError -> unhandled 500). Reject below the floor at the model layer."""
+    resp = await client.post(
+        f"{PERSON_PREFIX}/api/weight",
+        json={"weight": 185.4, "unit": "lbs", "captured_at": captured_at},
+    )
+    assert resp.status_code == 422

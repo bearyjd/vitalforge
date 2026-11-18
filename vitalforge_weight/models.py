@@ -32,6 +32,11 @@ GRAMS_PER_KG = 1000
 # unlike DEDUP_WINDOW_SECONDS below (which the route, not the model, needs).
 CAPTURED_AT_FUTURE_TOLERANCE_SECONDS = 60
 
+# Earliest `captured_at` accepted. The past is otherwise unbounded by design
+# (months-later replays), but values near year 0001 overflow the UTC
+# conversion in the route and surfaced as an unhandled 500.
+CAPTURED_AT_EARLIEST = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
 
 class WeightIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -112,6 +117,10 @@ class WeightIn(BaseModel):
         # months-later replay's dedup match work at all), the future is
         # bounded: nothing legitimate reports a capture time ahead of when it
         # was sent, beyond ordinary clock skew.
+        # Compare before any arithmetic: an aware datetime
+        # near year 0001 raises OverflowError on any offset normalisation.
+        if self.captured_at < CAPTURED_AT_EARLIEST:
+            raise ValueError("captured_at must not be before 2000-01-01")
         skew = self.captured_at - datetime.now(timezone.utc)
         if skew > timedelta(seconds=CAPTURED_AT_FUTURE_TOLERANCE_SECONDS):
             raise ValueError("captured_at must not be in the future")

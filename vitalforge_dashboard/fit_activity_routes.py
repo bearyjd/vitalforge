@@ -6,6 +6,7 @@ strength_sessions, which vitalforge_weight/activity_routes.py serves. CLAUDE.md 
 explicit that the two must not be unified; the module names should not blur that.
 """
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -30,6 +31,11 @@ logger = logging.getLogger(__name__)
 # is the exact `file_sha256` match below.
 ACTIVITY_NEAR_DUPLICATE_WINDOW_SECONDS = 120
 
+
+# Cap on FIT parses running at once. Parsing is CPU-bound in worker threads from the
+# default executor; without a bound, a burst of uploads occupies every executor thread
+# (also used by other to_thread callers) and the GIL keeps the loop sluggish.
+MAX_CONCURRENT_PARSES = 2
 
 _ACTIVITY_COLUMNS = (
     "id", "start_time_utc", "sport", "duration_seconds", "distance_m", "calories",
@@ -66,6 +72,8 @@ def add_fit_activity_routes(app):
     Mirrors shared/persons_admin.py's add_person_routes, and the weight
     service's add_weight_routes / add_activity_routes."""
 
+    parse_slots = asyncio.Semaphore(MAX_CONCURRENT_PARSES)
+
     @app.post("/p/{slug}/api/import/activity")
     async def import_activity(
         file: UploadFile = File(...),
@@ -82,7 +90,9 @@ def add_fit_activity_routes(app):
         data = await _read_upload_capped(file, fit_import.MAX_UPLOAD_BYTES)
 
         try:
-            record = fit_import.parse_fit_bytes(data)
+            # CPU-bound; run in a worker thread so a crafted file can't stall the event loop.
+            async with parse_slots:
+                record = await asyncio.to_thread(fit_import.parse_fit_bytes, data)
         except fit_import.FitImportError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
