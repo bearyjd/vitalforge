@@ -31,7 +31,7 @@ from shared.auth import create_session_cookie, require_person
 from shared.auth_routes import add_auth_routes
 from shared.database import get_db
 from shared.persons_admin import add_person_routes
-from tests.conftest import grant_person, primary_person_id, seed_person, seed_user
+from tests.conftest import grant_person, primary_person_id, seed_person, seed_token, seed_user
 
 
 def _build_app() -> FastAPI:
@@ -145,6 +145,32 @@ async def test_open_access_mode_cannot_reach_the_person_admin_surface(client):
     # this mode, so the 403 above is the admin gate and not a dead app.
     reachable = await client.get("/p/primary/api/read")
     assert reachable.status_code == 200
+
+
+@pytest.mark.parametrize(
+    "method,path,body",
+    [
+        ("post", "/api/persons", {"display_name": "Bryn"}),
+        ("patch", "/api/persons/{pid}", {"display_name": "Renamed"}),
+        ("post", "/api/persons/{pid}/archive", None),
+        ("put", "/api/persons/{pid}/grants/{uid}", {"access": "own"}),
+        ("delete", "/api/persons/{pid}/grants/{uid}", None),
+    ],
+)
+async def test_admin_bearer_token_cannot_mutate_persons(client, method, path, body):
+    """An admin API bearer token has no step-up, so it must not change persons
+    or grants; the same admin's cookie session still can (positive control)."""
+    admin_id, admin_cookies = await _as("root", role="admin")
+    user_id = await seed_user("member")
+    pid = await seed_person("kid")
+    await grant_person(pid, user_id, "view")
+    _, raw = await seed_token(admin_id, raw_token="admin-person-token")
+    url = path.format(pid=pid, uid=user_id)
+    kwargs = {} if body is None else {"json": body}
+    resp = await client.request(method, url, headers={"Authorization": f"Bearer {raw}"}, **kwargs)
+    assert resp.status_code == 403, f"{method.upper()} {url} gave {resp.status_code}"
+    cookie_resp = await client.request(method, url, cookies=admin_cookies, **kwargs)
+    assert cookie_resp.status_code < 300, f"cookie control {cookie_resp.status_code}"
 
 
 # --- create -------------------------------------------------------------------

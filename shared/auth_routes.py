@@ -58,6 +58,20 @@ def _require_strong_password(password: str) -> None:
         )
 
 
+async def _require_admin_cookie_session(request: Request):
+    """_require_admin() for account-mutating admin routes: the admin must hold
+    a cookie session.  A long-lived API bearer token carries the owner's full
+    role with no step-up, so a leaked admin token must not be able to create,
+    modify or delete accounts."""
+    identity = await _require_admin(request)
+    if identity.source != "cookie":
+        raise HTTPException(status_code=403, detail="Admin session required")
+    return identity
+
+
+require_admin_cookie_session = _require_admin_cookie_session
+
+
 def add_auth_routes(app):
     """Add login/logout routes to a FastAPI app."""
 
@@ -243,7 +257,7 @@ def add_auth_routes(app):
 
     @app.post("/auth/admin/users")
     async def admin_create_user(request: Request, data: CreateUserIn):
-        await _require_admin(request)
+        await _require_admin_cookie_session(request)
         username = data.username.strip()
         if not username or not data.password:
             raise HTTPException(status_code=422, detail="username and password are required")
@@ -266,7 +280,7 @@ def add_auth_routes(app):
 
     @app.patch("/auth/admin/users/{user_id}")
     async def admin_update_user(request: Request, user_id: int, data: UpdateUserIn):
-        await _require_admin(request)
+        await _require_admin_cookie_session(request)
         new_role = data.role
         new_password = data.password
         if new_password:
@@ -320,7 +334,7 @@ def add_auth_routes(app):
 
     @app.delete("/auth/admin/users/{user_id}")
     async def admin_delete_user(request: Request, user_id: int):
-        await _require_admin(request)
+        await _require_admin_cookie_session(request)
         db = await get_db()
         try:
             # See admin_update_user's comment -- same TOCTOU race, same fix.
