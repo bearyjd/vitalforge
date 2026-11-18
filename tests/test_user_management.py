@@ -29,7 +29,7 @@ def _build_app() -> FastAPI:
 @pytest.fixture
 async def client(initialized_db):
     transport = ASGITransport(app=_build_app())
-    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+    async with AsyncClient(transport=transport, base_url="http://test", headers={"X-VitalForge-Write": "admin"}) as ac:
         yield ac
 
 

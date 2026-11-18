@@ -126,6 +126,7 @@ ADMIN_PERSONS_PAGE_HTML = """<!DOCTYPE html>
         <p style="margin-top:1rem"><a href="/auth/admin/users">Users</a> &middot; <a href="/">Back</a></p>
     </div>
     <script>
+        const WRITE_HEADER = {"X-VitalForge-Write": "admin"};
         // Every cell built from server data uses textContent/option.value,
         // never innerHTML -- a display name is untrusted input as far as this
         // page is concerned, and innerHTML would execute markup in it.
@@ -218,7 +219,7 @@ ADMIN_PERSONS_PAGE_HTML = """<!DOCTYPE html>
             if (slug) payload.slug = slug;
             const res = await fetch("/api/persons", {
                 method: "POST",
-                headers: {"Content-Type": "application/json"},
+                headers: {"Content-Type": "application/json", ...WRITE_HEADER},
                 body: JSON.stringify(payload)
             });
             if (res.ok) {
@@ -236,7 +237,7 @@ ADMIN_PERSONS_PAGE_HTML = """<!DOCTYPE html>
             clearMessages();
             const res = await fetch(`/api/persons/${id}`, {
                 method: "PATCH",
-                headers: {"Content-Type": "application/json"},
+                headers: {"Content-Type": "application/json", ...WRITE_HEADER},
                 body: JSON.stringify(payload)
             });
             if (res.ok) {
@@ -271,7 +272,7 @@ ADMIN_PERSONS_PAGE_HTML = """<!DOCTYPE html>
                 `every dashboard and their URL stops resolving. Slugs are never reused.`
             )) return;
             clearMessages();
-            const res = await fetch(`/api/persons/${p.id}/archive`, { method: "POST" });
+            const res = await fetch(`/api/persons/${p.id}/archive`, { method: "POST", headers: WRITE_HEADER });
             if (res.ok) {
                 setSuccess("Person archived.");
                 if (selectedPerson && selectedPerson.id === p.id) {
@@ -473,7 +474,7 @@ ADMIN_PERSONS_PAGE_HTML = """<!DOCTYPE html>
             clearMessages();
             const res = await fetch(`/api/persons/${selectedPerson.id}/grants/${userId}`, {
                 method: "PUT",
-                headers: {"Content-Type": "application/json"},
+                headers: {"Content-Type": "application/json", ...WRITE_HEADER},
                 body: JSON.stringify({access: access})
             });
             if (!res.ok) setError(await failureDetail(res, "Failed to set access."));
@@ -493,7 +494,7 @@ ADMIN_PERSONS_PAGE_HTML = """<!DOCTYPE html>
         async function revokeGrant(userId) {
             clearMessages();
             const res = await fetch(`/api/persons/${selectedPerson.id}/grants/${userId}`, {
-                method: "DELETE"
+                method: "DELETE", headers: WRITE_HEADER
             });
             if (!res.ok) setError(await failureDetail(res, "Failed to revoke access."));
             loadGrants();

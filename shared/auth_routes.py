@@ -45,6 +45,7 @@ from shared.auth import (
     require_auth,
 )
 from shared.auth_pages import ACCOUNT_PAGE_HTML, ADMIN_USERS_PAGE_HTML, LOGIN_PAGE_HTML
+from shared.csrf import require_admin_write_header
 from shared.database import get_db
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,7 @@ async def _require_admin_cookie_session(request: Request):
     identity = await _require_admin(request)
     if identity.source != "cookie":
         raise HTTPException(status_code=403, detail="Admin session required")
+    require_admin_write_header(request, identity)
     return identity
 
 
