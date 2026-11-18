@@ -244,6 +244,17 @@ async def test_future_start_beyond_tolerance_rejected_422(client):
     assert resp.status_code == 422
 
 
+@pytest.mark.parametrize(
+    "start",
+    ["0001-01-01T00:00:00+05:00", "0001-01-01T00:00:00Z", "1900-01-01T00:00:00+00:00"],
+)
+async def test_start_implausibly_far_in_the_past_is_422_not_500(client, start):
+    """Year-0001 values overflow in the `start - now` subtraction
+    (OverflowError -> unhandled 500). Reject below the floor at the model layer."""
+    resp = await client.post(f"{PERSON_PREFIX}/api/activity", json=body(start=start))
+    assert resp.status_code == 422
+
+
 async def test_start_within_60s_future_accepted(client):
     """Boundary: ordinary clock skew is tolerated, a real future capture is not."""
     near = (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat()

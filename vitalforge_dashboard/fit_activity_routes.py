@@ -98,7 +98,10 @@ def add_fit_activity_routes(app):
 
         file_hash = fit_import.compute_file_hash(data)
         imported_at = datetime.now(timezone.utc).isoformat()
-        raw_summary_json = json.dumps(record.raw_summary, default=str)
+        try:
+            raw_summary_json = json.dumps(record.raw_summary, default=str, allow_nan=False)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="FIT session contains a non-finite number")
 
         columns_sql = ", ".join(_ACTIVITY_COLUMNS)
 
@@ -223,5 +226,9 @@ def add_fit_activity_routes(app):
             raise HTTPException(status_code=404, detail="activity not found")
 
         result = _activity_row_to_dict(row)
-        result["raw_summary"] = json.loads(row["raw_summary_json"]) if row["raw_summary_json"] else None
+        # Rows stored before the ingest guard may hold bare Infinity/NaN, which
+        # json.loads accepts but the response encoder rejects; map them to null.
+        result["raw_summary"] = (
+            json.loads(row["raw_summary_json"], parse_constant=lambda _: None) if row["raw_summary_json"] else None
+        )
         return result
