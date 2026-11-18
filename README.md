@@ -289,7 +289,10 @@ blocks the other:
 - **Bearer-token auth** for unattended/machine clients (Tasker, scripts, the Bascule Android
   client). Each account creates named tokens from `/auth/account`; the raw value is shown
   only once and requests present it as `Authorization: Bearer <token>`. Only a SHA-256 hash
-  is stored. Tokens inherit their owner's current role and can be revoked independently.
+  is stored. Tokens inherit their owner's current role and can be revoked independently, with one
+  exception: even an admin token cannot create, edit or delete users, persons or grants
+  (those need a logged-in browser session and get `403` otherwise). Cookie-session
+  writes to those routes must also send `X-VitalForge-Write: admin` (the admin pages do).
   Existing `VITALFORGE_API_TOKEN` values are imported once for upgrade compatibility as a
   token owned by the first admin.
 
@@ -425,7 +428,8 @@ example, the service user cannot create the token root; see [Storage paths](#sto
 still succeeds and removes the link, but the person's token directories stay on disk and the log
 says `Archived person's Garmin token directories were NOT removed`. After fixing
 `GARTH_TOKEN_DIR` and recreating the containers (`docker compose up -d`), an administrator can
-repeat the archive (`POST /api/persons/{id}/archive`, which is idempotent) to remove them from
+repeat the archive from a logged-in browser session (`POST /api/persons/{id}/archive`, which
+is idempotent; an API token gets `403`) to remove them from
 the current token root, or delete `person-<id>` by hand from whichever root the tokens are
 actually in. Unlinking in that state fails with `502`.
 

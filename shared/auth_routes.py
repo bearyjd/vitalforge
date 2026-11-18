@@ -23,6 +23,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from shared import auth
+from shared.csrf import require_admin_write_header
 from shared.auth import (
     _COOKIE_NAME,
     _MAX_AGE,
@@ -66,6 +67,7 @@ async def _require_admin_cookie_session(request: Request):
     identity = await _require_admin(request)
     if identity.source != "cookie":
         raise HTTPException(status_code=403, detail="Admin session required")
+    require_admin_write_header(request, identity)
     return identity
 
 

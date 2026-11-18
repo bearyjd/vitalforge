@@ -353,6 +353,7 @@ ADMIN_USERS_PAGE_HTML = """<!DOCTYPE html>
         <p style="margin-top:1rem"><a href="/auth/admin/persons">People</a> &middot; <a href="/">Back</a></p>
     </div>
     <script>
+        const WRITE_HEADER = {"X-VitalForge-Write": "admin"};
         // Every cell built from server data uses textContent/option.value, never
         // innerHTML -- a username is untrusted input as far as this page is
         // concerned, and innerHTML would execute markup in it.
@@ -408,7 +409,7 @@ ADMIN_USERS_PAGE_HTML = """<!DOCTYPE html>
             document.getElementById("success").textContent = "";
             const res = await fetch("/auth/admin/users", {
                 method: "POST",
-                headers: {"Content-Type": "application/json"},
+                headers: {"Content-Type": "application/json", ...WRITE_HEADER},
                 body: JSON.stringify({
                     username: document.getElementById("new-username").value,
                     password: document.getElementById("new-password").value,
@@ -431,7 +432,7 @@ ADMIN_USERS_PAGE_HTML = """<!DOCTYPE html>
             document.getElementById("error").textContent = "";
             const res = await fetch(`/auth/admin/users/${id}`, {
                 method: "PATCH",
-                headers: {"Content-Type": "application/json"},
+                headers: {"Content-Type": "application/json", ...WRITE_HEADER},
                 body: JSON.stringify({role: role})
             });
             if (!res.ok) {
@@ -448,7 +449,7 @@ ADMIN_USERS_PAGE_HTML = """<!DOCTYPE html>
             if (!newPassword) return;
             const res = await fetch(`/auth/admin/users/${id}`, {
                 method: "PATCH",
-                headers: {"Content-Type": "application/json"},
+                headers: {"Content-Type": "application/json", ...WRITE_HEADER},
                 body: JSON.stringify({password: newPassword})
             });
             if (res.ok) {
@@ -461,7 +462,7 @@ ADMIN_USERS_PAGE_HTML = """<!DOCTYPE html>
 
         async function deleteUser(id) {
             document.getElementById("error").textContent = "";
-            const res = await fetch(`/auth/admin/users/${id}`, { method: "DELETE" });
+            const res = await fetch(`/auth/admin/users/${id}`, { method: "DELETE", headers: WRITE_HEADER });
             if (res.ok) {
                 loadUsers();
                 loadAllTokens();

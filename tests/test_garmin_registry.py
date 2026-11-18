@@ -1398,7 +1398,7 @@ async def test_marker_blocks_re_adoption_for_a_different_primary(initialized_db,
     app = FastAPI()
     add_person_routes(app)
     cookies = {"vf_session": create_session_cookie("promote-and-archive-admin", admin_id, 1)}
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test", headers={"X-VitalForge-Write": "admin"}) as client:
         archived = await client.post(f"/api/persons/{first_primary}/archive", cookies=cookies)
     assert archived.status_code == 200
     assert await _link_row(first_primary) is None

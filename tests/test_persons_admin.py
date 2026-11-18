@@ -56,6 +56,17 @@ async def client(initialized_db, monkeypatch, tmp_path):
     # the deployment's credential root.
     monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", tmp_path / "garth")
     transport = ASGITransport(app=_build_app())
+    async with AsyncClient(
+        transport=transport, base_url="http://test", headers={"X-VitalForge-Write": "admin"}
+    ) as ac:
+        yield ac
+
+
+@pytest.fixture
+async def bare_client(initialized_db, monkeypatch, tmp_path):
+    """Like `client` but WITHOUT the admin write header, for the CSRF guard tests."""
+    monkeypatch.setattr(garmin_registry, "GARTH_TOKEN_DIR", tmp_path / "garth")
+    transport = ASGITransport(app=_build_app())
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
 
@@ -1154,3 +1165,92 @@ async def test_patch_still_accepts_the_retired_acknowledge_flag(client):
     )
     assert response.status_code == 200, response.text
     assert "acknowledge_garmin_reassignment" not in response.json()
+
+
+# --- CSRF write guard on admin mutations ---------------------------------------
+
+_ADMIN_WRITES = [
+    ("post", "/api/persons", {"display_name": "Bryn"}),
+    ("patch", "/api/persons/{pid}", {"display_name": "Renamed"}),
+    ("post", "/api/persons/{pid}/archive", None),
+    ("put", "/api/persons/{pid}/grants/{uid}", {"access": "own"}),
+    ("delete", "/api/persons/{pid}/grants/{uid}", None),
+    ("post", "/auth/admin/users", {"username": "newbie", "password": "a-long-enough-pw", "role": "user"}),
+    ("patch", "/auth/admin/users/{uid}", {"role": "admin"}),
+    ("delete", "/auth/admin/users/{uid}", None),
+]
+
+
+async def _csrf_setup():
+    _, admin_cookies = await _as("root", role="admin")
+    user_id = await seed_user("member")
+    pid = await seed_person("kid")
+    await grant_person(pid, user_id, "view")
+    return admin_cookies, pid, user_id
+
+
+@pytest.mark.parametrize("method,path,body", _ADMIN_WRITES)
+async def test_admin_writes_reject_cookie_request_without_header(bare_client, method, path, body):
+    cookies, pid, uid = await _csrf_setup()
+    kwargs = {} if body is None else {"json": body}
+    resp = await bare_client.request(method, path.format(pid=pid, uid=uid), cookies=cookies, **kwargs)
+    assert resp.status_code == 403
+    assert "header" in resp.json()["detail"].lower()
+
+
+@pytest.mark.parametrize("method,path,body", _ADMIN_WRITES)
+async def test_admin_writes_reject_cross_site_even_with_header(bare_client, method, path, body):
+    cookies, pid, uid = await _csrf_setup()
+    kwargs = {} if body is None else {"json": body}
+    headers = {"X-VitalForge-Write": "admin", "Sec-Fetch-Site": "cross-site"}
+    resp = await bare_client.request(method, path.format(pid=pid, uid=uid), cookies=cookies, headers=headers, **kwargs)
+    assert resp.status_code == 403
+
+
+@pytest.mark.parametrize("method,path,body", _ADMIN_WRITES)
+async def test_admin_writes_accept_same_origin_with_header(bare_client, method, path, body):
+    cookies, pid, uid = await _csrf_setup()
+    kwargs = {} if body is None else {"json": body}
+    headers = {"X-VitalForge-Write": "admin", "Sec-Fetch-Site": "same-origin"}
+    resp = await bare_client.request(method, path.format(pid=pid, uid=uid), cookies=cookies, headers=headers, **kwargs)
+    assert resp.status_code < 300, f"{method} {path} gave {resp.status_code} {resp.text}"
+
+
+async def test_own_holder_grant_write_needs_header_but_bearer_does_not(bare_client):
+    """A non-admin `own` holder is guarded on cookie; their bearer token is exempt."""
+    owner_id, owner_cookies = await _as("owner")
+    target = await seed_user("target")
+    pid = await seed_person("kid")
+    await grant_person(pid, owner_id, "own")
+    url = f"/api/persons/{pid}/grants/{target}"
+    no_header = await bare_client.put(url, json={"access": "view"}, cookies=owner_cookies)
+    assert no_header.status_code == 403
+    with_header = await bare_client.put(
+        url, json={"access": "view"}, cookies=owner_cookies, headers={"X-VitalForge-Write": "admin"}
+    )
+    assert with_header.status_code < 300
+    _, raw = await seed_token(owner_id, raw_token="owner-token")
+    bearer = await bare_client.delete(url, headers={"Authorization": f"Bearer {raw}"})
+    assert bearer.status_code < 300
+
+
+def test_admin_page_js_sends_the_write_header():
+    """Every state-changing fetch to a guarded route in the admin pages carries the header."""
+    from shared.auth_pages import ADMIN_USERS_PAGE_HTML
+    from shared.persons_admin_page import ADMIN_PERSONS_PAGE_HTML
+
+    guarded = 0
+    for html in (ADMIN_PERSONS_PAGE_HTML, ADMIN_USERS_PAGE_HTML):
+        for call in re.findall(r"fetch\((?:[^;]|\n)*?\);", html):
+            if not re.search(r'method:\s*"(POST|PATCH|PUT|DELETE)"', call):
+                continue
+            if not re.search(r"/api/persons|/auth/admin/users", call):
+                continue
+            if "/archive" not in call and "/grants" not in call and "/api/persons\"" not in call \
+                    and "/api/persons/${id}`" not in call and "/auth/admin/users" not in call:
+                continue
+            guarded += 1
+            assert "WRITE_HEADER" in call, call
+    assert guarded >= 8
+    for html in (ADMIN_PERSONS_PAGE_HTML, ADMIN_USERS_PAGE_HTML):
+        assert 'const WRITE_HEADER = {"X-VitalForge-Write": "admin"}' in html
