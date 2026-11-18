@@ -69,6 +69,9 @@ async def _require_admin_cookie_session(request: Request):
     return identity
 
 
+require_admin_cookie_session = _require_admin_cookie_session
+
+
 def add_auth_routes(app):
     """Add login/logout routes to a FastAPI app."""
 

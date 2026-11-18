@@ -48,6 +48,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from shared import garmin_registry
 from shared.auth import Identity, get_current_identity, require_admin
+from shared.auth_routes import require_admin_cookie_session
 from shared.database import get_db
 from shared.persons_admin_page import ADMIN_PERSONS_PAGE_HTML
 from shared.slugs import RESERVED_SLUGS, SLUG_RE, slugify
@@ -212,7 +213,7 @@ async def _identity_and_grant_by_id(
     return identity, row["access"], True
 
 
-async def _require_person_owner(request: Request, person_id: int) -> Identity:
+async def _require_person_owner(request: Request, person_id: int, *, mutate: bool = False) -> Identity:
     """Authorize a grant-management request: admin, or `own` on this person.
 
     404 for everyone else, including "no such person" -- the two answers are
@@ -232,6 +233,9 @@ async def _require_person_owner(request: Request, person_id: int) -> Identity:
     if not exists:
         raise HTTPException(status_code=404, detail="Person not found")
     if identity.role == "admin":
+        # Mutations need the admin's cookie session: a bearer token has no step-up.
+        if mutate and identity.source != "cookie":
+            raise HTTPException(status_code=403, detail="Admin session required")
         return identity
     if access == "own":
         return identity
@@ -276,7 +280,7 @@ def add_person_routes(app):
         (spec f.6). Without it a freshly created person would be reachable only
         through the admin bypass, and the creator's own landing page would not
         offer them."""
-        identity = await require_admin(request)
+        identity = await require_admin_cookie_session(request)
         display_name = data.display_name.strip()
         if not display_name:
             raise HTTPException(status_code=422, detail="display_name is required")
@@ -317,7 +321,7 @@ def add_person_routes(app):
 
         See UpdatePersonIn for why `slug` is not patchable.
         """
-        await require_admin(request)
+        await require_admin_cookie_session(request)
         if data.is_primary is False:
             raise HTTPException(
                 status_code=422,
@@ -375,7 +379,7 @@ def add_person_routes(app):
         `archived_at` rather than moving it, so a double-click cannot rewrite
         history.
         """
-        await require_admin(request)
+        await require_admin_cookie_session(request)
         if person_id < 1:
             raise HTTPException(status_code=404, detail="Person not found")
         # This is the same cross-process lifecycle boundary used by a Garmin
@@ -502,7 +506,7 @@ def add_person_routes(app):
     async def upsert_grant(request: Request, person_id: int, user_id: int, data: GrantIn):
         """Grant or change one user's access to one person. Idempotent by id
         pair, so re-issuing at a different level is how a level is changed."""
-        actor = await _require_person_owner(request, person_id)
+        actor = await _require_person_owner(request, person_id, mutate=True)
         db = await get_db()
         try:
             # The target user is verified INSIDE the transaction because SQLite
@@ -570,7 +574,7 @@ def add_person_routes(app):
         would make deleting a user fail for reasons an admin cannot see from
         the users page. A zero-grant person stays reachable by any admin.
         """
-        await _require_person_owner(request, person_id)
+        await _require_person_owner(request, person_id, mutate=True)
         db = await get_db()
         try:
             await db.execute("BEGIN IMMEDIATE")
