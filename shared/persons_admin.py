@@ -48,8 +48,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from shared import garmin_registry
 from shared.auth import Identity, get_current_identity, require_admin
-from shared.csrf import require_admin_write_header
 from shared.auth_routes import require_admin_cookie_session
+from shared.csrf import require_admin_write_header
 from shared.database import get_db
 from shared.persons_admin_page import ADMIN_PERSONS_PAGE_HTML
 from shared.slugs import RESERVED_SLUGS, SLUG_RE, slugify

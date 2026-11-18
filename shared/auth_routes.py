@@ -23,7 +23,6 @@ from fastapi import HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from shared import auth
-from shared.csrf import require_admin_write_header
 from shared.auth import (
     _COOKIE_NAME,
     _MAX_AGE,
@@ -46,6 +45,7 @@ from shared.auth import (
     require_auth,
 )
 from shared.auth_pages import ACCOUNT_PAGE_HTML, ADMIN_USERS_PAGE_HTML, LOGIN_PAGE_HTML
+from shared.csrf import require_admin_write_header
 from shared.database import get_db
 
 logger = logging.getLogger(__name__)
