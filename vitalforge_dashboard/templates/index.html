@@ -355,6 +355,21 @@
             </div>
         </details>
 
+        <details class="data-details" id="goalsPanel">
+            <summary>Goals · create, edit and delete targets</summary>
+            <div class="details-body">
+            <form id="goalForm">
+                <label>Metric <select id="goalMetric" required></select></label>
+                <label>Target <input id="goalTarget" type="number" step="any" required></label>
+                <label>By <input id="goalDate" type="date"></label>
+                <button type="submit" class="btn" id="goalSave">Add goal</button>
+                <button type="button" class="btn" id="goalCancel" hidden>Cancel edit</button>
+            </form>
+            <p id="goalStatus" role="status" aria-live="polite"></p>
+            <ul id="goalList"></ul>
+            </div>
+        </details>
+
         <details class="data-details" id="weeklyReview">
             <summary>Weekly review · generate on demand, rules only</summary>
             <div class="details-body">
@@ -504,6 +519,7 @@
     <script src="/static/comparisons.js"></script>
     <script src="/static/context.js"></script>
     <script src="/static/weekly-review.js"></script>
+    <script src="/static/goals.js"></script>
     <script>
         // ── Person scope ──
         // Every API call and in-app link on this page is built from these two

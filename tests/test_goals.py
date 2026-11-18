@@ -29,9 +29,19 @@ from tests.conftest import PERSON_PREFIX, grant_person, primary_person_id, seed_
 from vitalforge_dashboard import goals
 from vitalforge_dashboard.metrics import METRIC_TABLES
 
+GOAL_WRITE = {"X-VitalForge-Write": "goals"}
+
 
 @pytest.fixture
 async def client(dashboard_app_module):
+    transport = ASGITransport(app=dashboard_app_module.app)
+    async with AsyncClient(transport=transport, base_url="http://test", headers=GOAL_WRITE) as ac:
+        yield ac
+
+
+@pytest.fixture
+async def bare_client(dashboard_app_module):
+    """No CSRF header: what a cross-site form or a script that forgot it sends."""
     transport = ASGITransport(app=dashboard_app_module.app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
@@ -373,3 +383,50 @@ async def test_compute_progress_no_data_returns_all_none(dashboard_app_module):
     assert progress.trend_slope is None
     assert progress.eta_date is None
     assert progress.on_track is None
+
+
+# ---------------------------------------------------------------------------
+# CSRF guard on state-changing routes (cookie sessions)
+# ---------------------------------------------------------------------------
+
+
+async def test_cookie_writes_require_csrf_header(bare_client):
+    await _seed_user_with_grant("alice", password="alice-pw")
+    cookies = await _cookies_for("alice")
+    body = {"metric": "steps", "target_value": 1000}
+
+    assert (await bare_client.post(f"{PERSON_PREFIX}/api/goals", json=body, cookies=cookies)).status_code == 403
+    assert await _goal_count() == 0
+
+    created = await bare_client.post(f"{PERSON_PREFIX}/api/goals", json=body, cookies=cookies, headers=GOAL_WRITE)
+    assert created.status_code == 201
+    goal_id = created.json()["id"]
+
+    assert (await bare_client.patch(f"{PERSON_PREFIX}/api/goals/{goal_id}", json={"target_value": 5}, cookies=cookies)).status_code == 403
+    assert (await bare_client.delete(f"/api/goals/{goal_id}", cookies=cookies)).status_code == 403
+    assert await _goal_count() == 1
+    assert (await bare_client.delete(f"/api/goals/{goal_id}", cookies=cookies, headers=GOAL_WRITE)).status_code == 200
+
+
+async def test_cross_site_write_rejected_even_with_header(bare_client):
+    await _seed_user_with_grant("alice", password="alice-pw")
+    cookies = await _cookies_for("alice")
+    resp = await bare_client.post(
+        f"{PERSON_PREFIX}/api/goals",
+        json={"metric": "steps", "target_value": 1000},
+        cookies=cookies,
+        headers={**GOAL_WRITE, "Sec-Fetch-Site": "cross-site"},
+    )
+    assert resp.status_code == 403
+    assert await _goal_count() == 0
+
+
+async def test_dashboard_page_ships_goal_controls(client):
+    # The page itself is the contract: controls live in the dashboard template and
+    # the script sends the CSRF header the API demands.
+    from pathlib import Path
+
+    root = Path(goals.__file__).parent
+    assert 'id="goalForm"' in (root / "templates" / "index.html").read_text()
+    assert "/static/goals.js" in (root / "templates" / "index.html").read_text()
+    assert "X-VitalForge-Write" in (root / "static" / "goals.js").read_text()

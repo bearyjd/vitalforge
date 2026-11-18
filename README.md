@@ -748,6 +748,8 @@ the same weigh-in rather than a new one:
 | `POST` / `GET` | `/p/{slug}/api/goals` | Create / list the caller's goals |
 | `GET` / `PATCH` | `/p/{slug}/api/goals/{id}` | Read / update one goal |
 | `DELETE` | `/api/goals/{id}` | Delete a goal. Account-scoped, not person-scoped, so it is the one goals route outside `/p/{slug}/` |
+
+Cookie-session writes (`POST`/`PATCH`/`DELETE`) must send `X-VitalForge-Write: goals` and are refused when `Sec-Fetch-Site: cross-site` (CSRF guard). Bearer-token clients are exempt.
 | `POST` | `/p/{slug}/api/import/activity` | Import a local FIT activity file |
 | `GET` | `/p/{slug}/api/activities` | Imported FIT activities |
 | `GET` | `/p/{slug}/api/activities/{id}` | One imported activity |

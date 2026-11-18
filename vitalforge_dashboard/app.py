@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from shared.auth import (
+    Identity,
     bootstrap_first_admin,
     bootstrap_migrated_token,
     get_current_identity,
@@ -501,6 +502,22 @@ def _validate_goal_metric(metric: str | None) -> None:
             detail=f"Unknown metric '{metric}'. Valid: {', '.join(valid_metrics())}",
         )
 
+async def _require_goal_write(request: Request) -> Identity:
+    """Authenticate, then CSRF-guard a state-changing goal route.
+
+    Same fixed-header scheme as context_routes.context_write_guard: a custom
+    header forces cross-origin browser requests through a CORS preflight, and
+    this app enables no CORS. Bearer clients are exempt -- they carry no ambient
+    credential a third-party page could ride. Auth runs first so an anonymous
+    caller still gets 401 rather than a 403 that hides it."""
+    identity = await require_account_identity(request)
+    if identity.source == "cookie" and (
+        request.headers.get("X-VitalForge-Write") != "goals"
+        or request.headers.get("Sec-Fetch-Site") == "cross-site"
+    ):
+        raise HTTPException(status_code=403, detail="Goal write header required")
+    return identity
+
 async def _goal_out(goal: dict, person_id: int) -> GoalOut:
     return GoalOut(**goal, progress=await progress_for_goal(goal, person_id))
 
@@ -541,7 +558,7 @@ async def create_goal_route(
     request: Request,
     person_id: int = Depends(require_person("view")),
 ):
-    identity = await require_account_identity(request)
+    identity = await _require_goal_write(request)
     _validate_goal_metric(data.metric)
     goal_id = await create_goal(identity.user_id, data)
     goal = await get_goal(goal_id)
@@ -565,6 +582,7 @@ async def patch_goal_route(
     request: Request,
     person_id: int = Depends(require_person("view")),
 ):
+    await _require_goal_write(request)
     await _owned_goal_or_404(request, goal_id)
     _validate_goal_metric(data.metric)
     updated = await update_goal(goal_id, data)
@@ -576,6 +594,7 @@ async def patch_goal_route(
 # require_person to authorize.
 @app.delete("/api/goals/{goal_id}")
 async def delete_goal_route(goal_id: int, request: Request):
+    await _require_goal_write(request)
     await _owned_goal_or_404(request, goal_id)
     await delete_goal(goal_id)
     return {"success": True}
