@@ -9,6 +9,7 @@ import pytest
 from playwright.sync_api import expect
 
 import shared.database
+import shared.db_connection
 from shared.auth import create_session_cookie
 from tests.conftest import PERSON_PREFIX
 
@@ -49,7 +50,7 @@ def _save(page):
 
 
 def _seed_metrics():
-    with sqlite3.connect(str(shared.database.DB_PATH)) as connection:
+    with sqlite3.connect(str(shared.db_connection.DB_PATH)) as connection:
         person = connection.execute("SELECT id FROM persons WHERE is_primary = 1").fetchone()[0]
         for age in range(8):
             if age == 3:
@@ -217,7 +218,7 @@ def test_context_real_viewer_is_readonly_and_revocation_clears_draft(page, dashb
     _ready(page, _date())
     page.locator("#contextNote").fill("Unsaved private draft")
     now = datetime.now(timezone.utc).isoformat()
-    with sqlite3.connect(str(shared.database.DB_PATH)) as connection:
+    with sqlite3.connect(str(shared.db_connection.DB_PATH)) as connection:
         person = connection.execute("SELECT id FROM persons WHERE is_primary = 1").fetchone()[0]
         user = connection.execute("INSERT INTO users (username,password_hash,role,created_at) VALUES ('contextviewer','unused','user',?)", (now,)).lastrowid
         connection.execute("INSERT INTO person_grants (person_id,user_id,access,granted_at) VALUES (?,?,'view',?)", (person, user, now))
@@ -242,7 +243,7 @@ def test_context_revoked_grant_404_clears_drafts_and_export_selection(page, dash
     secret_tag = "synthetic-revoked-secret-tag"
     _put(page, dashboard_live_server, f"/days/{_date()}", {"note": "Shared context", "tags": [secret_tag]})
     now = datetime.now(timezone.utc).isoformat()
-    with sqlite3.connect(str(shared.database.DB_PATH)) as connection:
+    with sqlite3.connect(str(shared.db_connection.DB_PATH)) as connection:
         person = connection.execute("SELECT id FROM persons WHERE is_primary = 1").fetchone()[0]
         user = connection.execute("INSERT INTO users (username,password_hash,role,created_at) VALUES ('contextmanager','unused','user',?)", (now,)).lastrowid
         connection.execute("INSERT INTO person_grants (person_id,user_id,access,granted_at) VALUES (?,?,'manage',?)", (person, user, now))
@@ -263,7 +264,7 @@ def test_context_revoked_grant_404_clears_drafts_and_export_selection(page, dash
     }""")
     page.mouse.move(hover["x"], hover["y"])
     page.wait_for_function("tag => Chart.getChart('chartSleepDuration').tooltip.afterBody.join(' ').includes(tag)", arg=secret_tag)
-    with sqlite3.connect(str(shared.database.DB_PATH)) as connection:
+    with sqlite3.connect(str(shared.db_connection.DB_PATH)) as connection:
         connection.execute("DELETE FROM person_grants WHERE user_id = ?", (user,))
     page.evaluate("VFContext.refresh(7, 'kg')")
     expect(page.locator("#contextStatus")).to_contain_text("Context access changed")

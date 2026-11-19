@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 import shared.database
+import shared.db_connection
 from tests.conftest import PERSON_PREFIX
 
 pytestmark = pytest.mark.playwright
@@ -16,7 +17,7 @@ pytestmark = pytest.mark.playwright
 
 def _seed_history():
     today = datetime.now(timezone.utc).date()
-    with sqlite3.connect(str(shared.database.DB_PATH)) as connection:
+    with sqlite3.connect(str(shared.db_connection.DB_PATH)) as connection:
         person = connection.execute("SELECT id FROM persons WHERE is_primary = 1").fetchone()[0]
         for age in range(-1, 31):
             date = (today - timedelta(days=age)).isoformat()
@@ -247,7 +248,7 @@ def test_sync_clears_evidence_and_refreshes_when_complete(page, dashboard_live_s
 
 def test_real_constant_baseline_anomaly_evidence_is_not_a_z_score(page, dashboard_live_server):
     today = datetime.now(timezone.utc).date()
-    with sqlite3.connect(str(shared.database.DB_PATH)) as connection:
+    with sqlite3.connect(str(shared.db_connection.DB_PATH)) as connection:
         person = connection.execute("SELECT id FROM persons WHERE is_primary = 1").fetchone()[0]
         for age in range(24):
             date = (today - timedelta(days=age)).isoformat()

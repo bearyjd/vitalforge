@@ -10,7 +10,7 @@ scoped to be immediately actionable — concrete files, commands, and acceptance
 
 Implemented: `pyproject.toml` (pytest/pytest-asyncio/httpx, `pythonpath = ["."]`,
 `asyncio_mode = "auto"`), `tests/conftest.py` (isolated tmp-path SQLite DB per test via
-`monkeypatch.setattr(shared.database, "DB_PATH", ...)`, `FakeGarminClient` patched onto
+`monkeypatch.setattr(shared.db_connection, "DB_PATH", ...)`, `FakeGarminClient` patched onto
 `shared.garmin_client._client`/`authenticate`, plus per-app-module patches for the two
 `vitalforge-*/app.py` files since they import `authenticate`/`push_weight` by name rather
 than via the module), `tests/test_weight_api.py` (9 tests), `tests/test_dashboard_api.py`
@@ -39,7 +39,7 @@ or Docker logs — every change requires a human in the loop to "look at it and 
   `[tool.pytest.ini_options] pythonpath = ["."]`. This also lets item 5 (packaging) piggyback
   on the same file.
 - `tests/conftest.py` — fixtures that:
-  - set `DB_PATH` and `GARTH_TOKEN_DIR` to a `tmp_path` before importing `shared.database` /
+  - set `DB_PATH` and `GARTH_TOKEN_DIR` to a `tmp_path` before importing `shared.db_connection` /
     `shared.garmin_client` (so tests never touch `/app/data` or a real `.garth` token cache),
   - monkeypatch `shared.garmin_client.authenticate` to a no-op and `shared.garmin_client._client`
     to a fake object exposing `add_body_composition`, `get_sleep_data`, `get_user_summary`,

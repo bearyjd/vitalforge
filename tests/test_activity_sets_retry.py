@@ -404,9 +404,9 @@ async def test_claim_is_held_during_the_sets_call(
     def observe(activity_id, payload):
         import sqlite3
 
-        from shared import database
+        from shared import db_connection
 
-        conn = sqlite3.connect(database.DB_PATH)
+        conn = sqlite3.connect(db_connection.DB_PATH)
         try:
             seen.append(conn.execute("SELECT garmin_claimed_at, garmin_status FROM strength_sessions").fetchone())
         finally:

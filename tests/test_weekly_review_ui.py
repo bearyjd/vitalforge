@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 import shared.database
+import shared.db_connection
 from tests.conftest import PERSON_PREFIX
 
 pytestmark = pytest.mark.playwright
@@ -16,7 +17,7 @@ SECTIONS = ("changes", "findings", "coverage", "goals", "follow-up")
 
 def _seed_weeks():
     today = datetime.now(timezone.utc).date()
-    with sqlite3.connect(str(shared.database.DB_PATH)) as connection:
+    with sqlite3.connect(str(shared.db_connection.DB_PATH)) as connection:
         person = connection.execute("SELECT id FROM persons WHERE is_primary = 1").fetchone()[0]
         for age in range(14):
             value = 80 if age < 7 else 40
@@ -142,7 +143,7 @@ def test_lost_access_detected_by_comparisons_clears_the_review(page, dashboard_l
 
 def test_unchanged_metric_is_shown_as_stable(page, dashboard_live_server):
     today = datetime.now(timezone.utc).date()
-    with sqlite3.connect(str(shared.database.DB_PATH)) as connection:
+    with sqlite3.connect(str(shared.db_connection.DB_PATH)) as connection:
         person = connection.execute("SELECT id FROM persons WHERE is_primary = 1").fetchone()[0]
         for age in range(14):
             connection.execute("INSERT INTO hrv (person_id, date, last_night_avg) VALUES (?, ?, ?)",

@@ -4,7 +4,7 @@
 cwd.  Expanding it instead would put the database in the container image's
 ephemeral layer (HOME is /app there), which is worse than a loud failure, so
 the value is refused at import with an error that names the variable but
-never echoes its value.  ``shared.database.DB_PATH`` is read at import and the
+never echoes its value.  ``shared.db_connection.DB_PATH`` is read at import and the
 suite patches the module attribute, so the import-time behaviour is checked in
 a fresh interpreter with an allowlisted environment.
 """
@@ -79,7 +79,7 @@ def _import_database(tmp_path: Path, db_path: str) -> subprocess.CompletedProces
     if "VIRTUAL_ENV" in os.environ:
         env["VIRTUAL_ENV"] = os.environ["VIRTUAL_ENV"]
     (tmp_path / "home").mkdir()
-    code = "import shared.database as d; print(d.DB_PATH)"
+    code = "import shared.db_connection as d; print(d.DB_PATH)"
     return subprocess.run([sys.executable, "-c", code], cwd=tmp_path, env=env, capture_output=True, text=True)
 
 

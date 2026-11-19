@@ -63,7 +63,7 @@ async def test_seed_person_grants_nothing_by_default(initialized_db):
     Asserts ZERO grants on the person, not zero grants for one named user:
     seed_person takes no user argument, so a per-user assertion could only
     ever be tautological. The realistic regression is someone mirroring
-    _grant_primary_person_to_first_admin (shared/database.py, one file over,
+    grant_primary_person_to_first_admin (shared/person_grants.py,
     doing exactly this) into seed_person -- that grants the FIRST ADMIN, whom
     a per-user check on some other username would never look at.
     """
@@ -126,7 +126,7 @@ async def test_grant_person_is_idempotent(initialized_db):
 
     This is a statement about the FIXTURE, not about production. The fixture
     uses INSERT OR REPLACE so a test can freely upgrade view -> own; the
-    lifespan path (_grant_primary_person_to_first_admin) uses INSERT OR IGNORE
+    lifespan path (grant_primary_person_to_first_admin) uses INSERT OR IGNORE
     and would leave the level at 'view'. Do not read this test as evidence
     about that path. Note OR REPLACE deletes and re-inserts, so re-granting
     also resets granted_at and clears granted_by.

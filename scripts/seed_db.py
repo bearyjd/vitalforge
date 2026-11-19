@@ -197,9 +197,9 @@ async def _resolve_person(database, slug: str | None) -> tuple[int, str, bool]:
 async def seed(db_path: Path, days: int, pattern: str, seed_value: int, person: str | None = None):
     os.environ["DB_PATH"] = str(db_path)
 
-    from shared import database
+    from shared import database, db_connection
 
-    database.DB_PATH = db_path  # module-level override, mirrors tests/conftest.py
+    db_connection.DB_PATH = db_path  # module-level override, mirrors tests/conftest.py
     await database.init_db()
 
     person_id, person_slug, person_created = await _resolve_person(database, person)

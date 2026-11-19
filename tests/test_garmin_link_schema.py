@@ -7,7 +7,7 @@ on rollback, whereas an unknown marker deliberately prevents startup.
 
 import pytest
 
-from shared import database, migrations
+from shared import database, db_connection, migrations
 from shared.database import get_db, get_primary_person_id
 from tests.conftest import seed_user
 
@@ -50,7 +50,7 @@ async def test_additive_garmin_tables_are_created_on_an_existing_database(
     production_schema_db, monkeypatch, table
 ):
     """An old database converges without adding a migration marker."""
-    monkeypatch.setattr(database, "DB_PATH", production_schema_db)
+    monkeypatch.setattr(db_connection, "DB_PATH", production_schema_db)
     await database.init_db()
     assert await _table_sql(table) is not None
 
@@ -303,11 +303,11 @@ async def test_garmin_schema_indexes_and_known_migration_markers(initialized_db)
 @pytest.mark.asyncio
 async def test_garmin_link_schema_parity_fresh_vs_existing_database(tmp_path, monkeypatch, production_schema_db):
     """The additive DDL has identical shapes on a new and an old image DB."""
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "fresh.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "fresh.db")
     await database.init_db()
     fresh_db = await database.get_db()
 
-    monkeypatch.setattr(database, "DB_PATH", production_schema_db)
+    monkeypatch.setattr(db_connection, "DB_PATH", production_schema_db)
     await database.init_db()
     existing_db = await database.get_db()
 

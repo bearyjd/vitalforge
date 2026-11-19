@@ -15,13 +15,14 @@ from typing import Awaitable, Callable
 
 import aiosqlite
 
-from shared.database import _grant_primary_person_to_first_admin, get_db
+from shared.db_connection import get_db
 from shared.garmin_registry_errors import (
     LEGACY_GARMIN_TARGET_RETIRED_ERROR as _LEGACY_GARMIN_TARGET_RETIRED_ERROR,
 )
 from shared.garmin_registry_errors import (
     STRENGTH_GARMIN_ERROR_CODES as _SAFE_STRENGTH_GARMIN_ERRORS,
 )
+from shared.person_grants import grant_primary_person_to_first_admin
 from shared.slugs import RESERVED_SLUGS, slugify
 
 logger = logging.getLogger(__name__)
@@ -145,7 +146,7 @@ async def _ensure_primary_person(db) -> int:
     # FRESH install the users table is still empty at this point, this call
     # no-ops, and that later lifespan call is what creates the grant. One
     # implementation, so the two paths cannot drift.
-    await _grant_primary_person_to_first_admin(db, person_id)
+    await grant_primary_person_to_first_admin(db, person_id)
     return person_id
 
 
@@ -613,7 +614,7 @@ async def ensure_pre_migration_snapshot(
     """
     # local, so DB_PATH is resolved per-call -- a module-top binding would
     # freeze the value at import and defeat DB_PATH overrides in tests.
-    from shared.database import DB_PATH
+    from shared.db_connection import DB_PATH
 
     final = DB_PATH.parent / snapshot_name
     if final.exists():
@@ -737,3 +738,23 @@ async def _write_verified_snapshot(DB_PATH, snapshot_name, final, needs_snapshot
 
     os.rename(tmp, final)
     logger.warning("Pre-migration snapshot written and verified: %s", final)
+
+
+async def run_schema_migrations() -> None:
+    """Public entry point: guard, snapshot and apply every pending migration.
+
+    BEFORE the migrations, not after: a database carrying a marker from a
+    newer image must be refused while this image has still changed nothing.
+    """
+    await assert_schema_understood()
+
+    await ensure_pre_migration_snapshot(_PERSON_ID_REBUILD_SNAPSHOT_NAME, _needs_person_id_rebuild)
+    await run_migration("001-person-id-rebuild", _apply_person_id_rebuild)
+    await run_migration("002-activities-person-id", _apply_activities_person_id)
+    # 003 is a table rebuild that an older image cannot boot against (its
+    # marker is unknown to that image), so it gets its own snapshot -- taken
+    # here, AFTER 001/002, which is what makes it the right file to restore
+    # for a rollback to the previous release rather than to a pre-001 one.
+    await ensure_pre_migration_snapshot(_STRENGTH_SESSIONS_SNAPSHOT_NAME, _needs_strength_sessions_rebuild)
+    await run_migration("003-strength-sessions-remove-garmin-target", _apply_strength_sessions_remove_garmin_target)
+    await run_migration("004-strength-sessions-redact-garmin-errors", _apply_strength_sessions_redact_garmin_errors)
