@@ -409,3 +409,10 @@ def test_full_ip_table_has_no_shared_overflow_bucket(monkeypatch):
             lt.record_failure(f"2001:db8:{n:x}::/64", f"junk{n}", 1.0)
     assert len(lt._by_ip) <= 50
     lt.release(lt.reserve("7.7.7.7", "alice", 2.0))
+
+
+def test_full_ip_table_warns_once_per_episode(monkeypatch, caplog):
+    monkeypatch.setattr(lt, "MAX_TRACKED_KEYS", 5)
+    for n in range(30):
+        lt.record_failure(f"203.0.113.{n}", "x", 1.0)
+    assert sum("IP table is full" in r.getMessage() for r in caplog.records) == 1

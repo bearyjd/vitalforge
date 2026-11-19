@@ -69,6 +69,7 @@ _pending_ip: dict[str, int] = {}
 _pending_username: dict[str, int] = {}
 _known_devices: dict[tuple[str, str], float] = {}
 _proxy_warned = False
+_ip_table_full_warned = False
 
 
 class ThrottledError(Exception):
@@ -88,13 +89,14 @@ class Reservation:
 
 
 def reset() -> None:
-    global _proxy_warned
+    global _proxy_warned, _ip_table_full_warned
     _by_ip.clear()
     _by_username.clear()
     _pending_ip.clear()
     _pending_username.clear()
     _known_devices.clear()
     _proxy_warned = False
+    _ip_table_full_warned = False
 
 
 def _delay_for(failures: int) -> int:
@@ -323,16 +325,26 @@ def _resolve_key(table: dict[str, _Entry], key: str, now: float) -> str | None:
     return _OVERFLOW_KEY if table is _by_username else None
 
 
+def _warn_table_full(kind: str, effect: str) -> None:
+    logger.warning(
+        "Login throttle %s table is full of live entries (%d): %s until entries decay (possible flood).",
+        kind,
+        MAX_TRACKED_KEYS,
+        effect,
+    )
+
+
 def _bump(table: dict[str, _Entry], key: str, now: float) -> None:
+    global _ip_table_full_warned
     slot = _resolve_key(table, key, now)
-    if slot is None or (slot == _OVERFLOW_KEY and slot not in table):
-        logger.warning(
-            "Login throttle %s table is full of live entries (%d): %s until entries "
-            "decay (possible flood).",
-            "IP" if table is _by_ip else "username",
-            MAX_TRACKED_KEYS,
-            "new IPs get no per-IP bucket" if slot is None else "new usernames share one overflow bucket",
-        )
+    if table is _by_ip:
+        # Once per full episode: every failure from an untracked IP lands here,
+        # so an unconditional warning would be attacker-driven log spam.
+        if slot is None and not _ip_table_full_warned:
+            _warn_table_full("IP", "new IPs get no per-IP bucket")
+        _ip_table_full_warned = slot is None
+    elif slot == _OVERFLOW_KEY and slot not in table:
+        _warn_table_full("username", "new usernames share one overflow bucket")
     if slot is None:
         return
     prev = table.get(slot)
