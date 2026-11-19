@@ -6,13 +6,21 @@ memory on purpose, like the step-up limiter in ``shared.auth``.  Backoff is
 capped so a spoofing attacker can only delay the real user by
 ``MAX_DELAY_SECONDS``.
 
-Fail safe: a loopback/private peer that is not a trusted proxy is almost
-certainly a reverse proxy, so every client would collapse into one shared IP
-bucket.  ``client_ip`` returns ``None`` for such peers and the IP bucket is
-skipped (the username bucket still applies).  There is deliberately no
-"clean-IP probe" slot: a single first-come slot per username is claimed by an
-IP-rotating attacker and multiplies its guesses without helping real users;
-real users are protected by the known-device bypass and the capped backoff.
+Proxy trust is explicit: ``VITALFORGE_TRUSTED_PROXY_IPS`` lists the exact
+addresses of the nginx hop.  It is validated at startup
+(``validate_trusted_proxy_config``, called from ``add_auth_routes``): a
+malformed entry stops the service instead of silently trusting nothing.
+
+Fail safe, never a shared bucket: a loopback/private peer that is not a trusted
+proxy is almost certainly an unconfigured reverse proxy, and a trusted proxy
+that sent no valid ``X-Forwarded-For`` gives no client address either.  In both
+cases ``client_ip`` returns ``None`` and the IP bucket is skipped (the username
+bucket still applies) rather than putting every client in one bucket.
+
+There is deliberately no "clean-IP probe" slot, and a successful login does not
+clear the username bucket: either would hand an IP-rotating attacker extra
+guesses.  Real users are protected by the known-device bypass and the capped
+backoff; a device that never logged in is delayed while an attack lasts.
 """
 
 import ipaddress
@@ -100,15 +108,47 @@ def _bucket_key(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str:
     return str(addr)
 
 
+def parse_trusted_proxies(raw: str) -> frozenset[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """Parse the comma-separated proxy list; raise ValueError on any entry that
+    is not a single IP address (no hostnames, ports or CIDR ranges)."""
+    entries = [v.strip() for v in raw.split(",") if v.strip()]
+    try:
+        return frozenset(ipaddress.ip_address(v) for v in entries)
+    except ValueError as exc:
+        raise ValueError(
+            f"{TRUSTED_PROXY_IPS_ENV} must be a comma-separated list of single IP addresses "
+            f"(the nginx hop as the app sees it; no hostnames, ports or CIDR ranges): {exc}"
+        ) from exc
+
+
+def validate_trusted_proxy_config() -> frozenset[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """Startup check: fail fast on a malformed value and log the effective mode."""
+    proxies = parse_trusted_proxies(os.environ.get(TRUSTED_PROXY_IPS_ENV, ""))
+    if proxies:
+        logger.info(
+            "Login throttle: X-Forwarded-For trusted only from %s",
+            ", ".join(sorted(str(p) for p in proxies)),
+        )
+    else:
+        logger.warning(
+            "Login throttle: %s is unset, so X-Forwarded-For is ignored. Fine for direct "
+            "connections; behind nginx set it to the address the app sees nginx connect from, "
+            "or the per-IP throttle is skipped for that proxy (per-username throttle only).",
+            TRUSTED_PROXY_IPS_ENV,
+        )
+    return proxies
+
+
 def client_ip(request: Request) -> str | None:
     """Throttle key for the client, or ``None`` when no trustworthy IP exists.
 
     ``X-Forwarded-For`` is honoured only from a trusted proxy peer; nginx
     overwrites the header with the address it saw, so the rightmost entry is
-    the one the trusted hop appended.  It is validated as an IP; anything else
-    falls back to the peer.  A loopback/private peer that is not trusted is
-    treated as an unconfigured reverse proxy: ``None`` (skip the IP bucket)
-    rather than one bucket shared by every client.
+    the one the trusted hop appended.  It must be a valid IP; a missing or
+    invalid value gives ``None``, never the proxy's own (shared) address.  A
+    loopback/private peer that is not trusted is treated as an unconfigured
+    reverse proxy: ``None`` (skip the IP bucket) rather than one bucket shared
+    by every client.
     """
     peer = request.client.host if request.client is not None else None
     if peer is None:
@@ -117,22 +157,21 @@ def client_ip(request: Request) -> str | None:
         peer_addr = ipaddress.ip_address(peer)
     except ValueError:
         return None
-    if peer in _trusted_proxies():
+    if peer_addr in _trusted_proxies():
         forwarded = request.headers.get("x-forwarded-for", "")
         last = forwarded.split(",")[-1].strip()
         try:
             return _bucket_key(ipaddress.ip_address(last))
         except ValueError:
-            return _bucket_key(peer_addr)
+            return None
     if _is_private(peer_addr):
         _warn_if_proxy_peer(peer)
         return None
     return _bucket_key(peer_addr)
 
 
-def _trusted_proxies() -> set[str]:
-    raw = os.environ.get(TRUSTED_PROXY_IPS_ENV, "")
-    return {v.strip() for v in raw.split(",") if v.strip()}
+def _trusted_proxies() -> frozenset[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    return parse_trusted_proxies(os.environ.get(TRUSTED_PROXY_IPS_ENV, ""))
 
 
 def _warn_if_proxy_peer(peer: str) -> None:
@@ -246,11 +285,13 @@ def record_failure(ip: str | None, username: str, now: float) -> None:
 
 
 def record_success(username: str, ip: str | None = None, now: float | None = None) -> None:
-    """Clear only the username entry; a valid login must not reset the IP's
-    count, or an attacker with one account could reset it at will.  With ``ip``,
-    also remember the (ip, username) pair as a known device."""
+    """Remember the (ip, username) pair as a known device.
+
+    Neither bucket is cleared: resetting the IP's count would let an attacker
+    with one account reset it at will, and resetting the username's count would
+    give an IP-rotating attacker a fresh free-failure allowance after every
+    legitimate login.  Both decay after ``RESET_AFTER_SECONDS`` of quiet."""
     ukey = _username_key(username)
-    _by_username.pop(ukey, None)
     if ip is not None and now is not None:
         if (ip, ukey) not in _known_devices and len(_known_devices) >= MAX_TRACKED_KEYS:
             oldest = min(_known_devices, key=_known_devices.__getitem__)

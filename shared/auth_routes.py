@@ -76,7 +76,12 @@ require_admin_cookie_session = _require_admin_cookie_session
 
 
 def add_auth_routes(app):
-    """Add login/logout routes to a FastAPI app."""
+    """Add login/logout routes to a FastAPI app.
+
+    Both services call this at import time, so a malformed
+    VITALFORGE_TRUSTED_PROXY_IPS stops startup here (fail fast).
+    """
+    login_throttle.validate_trusted_proxy_config()
 
     @app.get("/auth/login")
     async def login_page(request: Request):
