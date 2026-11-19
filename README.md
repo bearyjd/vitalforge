@@ -591,6 +591,8 @@ server_name dashboard.yourdomain.com;
 
 The nav bar in each service automatically detects whether you're behind nginx (subdomain routing) or using direct ports.
 
+The config sends a `Content-Security-Policy-Report-Only` header (no `'unsafe-inline'`, no nonces). It blocks nothing; violations appear in the browser console. Switch it to `Content-Security-Policy` only after a clean week.
+
 For SSL, add Let's Encrypt with certbot:
 
 ```bash
