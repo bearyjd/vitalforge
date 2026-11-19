@@ -92,15 +92,20 @@ def add_auth_routes(app):
         if not isinstance(username, str) or not isinstance(password, str):
             raise HTTPException(status_code=400, detail="Invalid credentials")
         ip = login_throttle.client_ip(request)
-        now = time.time()
-        wait = login_throttle.retry_after(ip, username, now)
-        if wait is not None:
-            raise HTTPException(status_code=429, detail="Too many attempts", headers={"Retry-After": str(wait)})
-        id_and_version = await auth._authenticate_credentials(username, password)
-        if id_and_version is None:
-            login_throttle.record_failure(ip, username, now)
-            raise HTTPException(status_code=401, detail="Invalid credentials")
-        login_throttle.record_success(username)
+        try:
+            reservation = login_throttle.reserve(ip, username, time.time())
+        except login_throttle.ThrottledError as exc:
+            raise HTTPException(
+                status_code=429, detail="Too many attempts", headers={"Retry-After": str(exc.wait)}
+            ) from exc
+        try:
+            id_and_version = await auth._authenticate_credentials(username, password)
+            if id_and_version is None:
+                login_throttle.record_failure(ip, username, time.time())
+                raise HTTPException(status_code=401, detail="Invalid credentials")
+            login_throttle.record_success(username, ip, time.time())
+        finally:
+            login_throttle.release(reservation)
         user_id, session_version = id_and_version
         cookie = create_session_cookie(username, user_id, session_version)
         response = JSONResponse({"success": True})

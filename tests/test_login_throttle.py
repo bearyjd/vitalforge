@@ -113,3 +113,67 @@ async def test_login_success_clears_username_backoff(client):
     assert r.status_code == 200
     assert lt.retry_after("x", "someone", 0.0) is None
     assert "someone" not in lt._by_username
+
+
+def test_reserve_counts_pending_toward_limit():
+    held = [lt.reserve("1.1.1.1", "alice", 0.0) for _ in range(lt.FREE_FAILURES)]
+    with pytest.raises(lt.ThrottledError):
+        lt.reserve("1.1.1.1", "alice", 0.0)
+    for r in held:
+        lt.release(r)
+    assert not lt._pending_ip and not lt._pending_username
+    lt.reserve("1.1.1.1", "alice", 0.0)
+
+
+def test_known_device_bypasses_username_bucket_only():
+    lt.record_success("alice", "7.7.7.7", 0.0)
+    for n in range(lt.FREE_FAILURES):
+        lt.record_failure(f"9.9.9.{n}", "alice", 1.0)
+    assert lt.retry_after("7.7.7.7", "alice", 1.0) is not None
+    res = lt.reserve("7.7.7.7", "alice", 1.0)
+    assert res.username_key is None
+    with pytest.raises(lt.ThrottledError):
+        lt.reserve("8.8.8.8", "alice", 1.0)
+    for n in range(lt.FREE_FAILURES):
+        lt.record_failure("7.7.7.7", "x", 1.0)
+    with pytest.raises(lt.ThrottledError):
+        lt.reserve("7.7.7.7", "alice", 1.0)
+
+
+def test_warns_once_for_private_peer_without_trusted_proxy(monkeypatch, caplog):
+    monkeypatch.delenv(lt.TRUSTED_PROXY_IPS_ENV, raising=False)
+    with caplog.at_level("WARNING"):
+        lt.client_ip(_Req("172.18.0.2"))
+        lt.client_ip(_Req("172.18.0.2"))
+    assert len([r for r in caplog.records if "reverse proxy" in r.message]) == 1
+
+
+def test_concurrent_burst_is_throttled(monkeypatch):
+    import asyncio
+
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+
+    from shared import auth, auth_routes
+
+    calls = 0
+
+    async def fake_auth(username, password):
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.01)
+        return None
+
+    monkeypatch.setattr(auth, "_authenticate_credentials", fake_auth)
+    app = FastAPI()
+    auth_routes.add_auth_routes(app)
+
+    async def run():
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            return await asyncio.gather(
+                *[c.post("/auth/login", json={"username": "alice", "password": "x"}) for _ in range(60)]
+            )
+
+    codes = [r.status_code for r in asyncio.run(run())]
+    assert calls <= lt.FREE_FAILURES
+    assert codes.count(429) >= 60 - lt.FREE_FAILURES
