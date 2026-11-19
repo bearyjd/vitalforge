@@ -591,7 +591,7 @@ server_name dashboard.yourdomain.com;
 
 The nav bar in each service automatically detects whether you're behind nginx (subdomain routing) or using direct ports.
 
-The config sends a `Content-Security-Policy-Report-Only` header (no `'unsafe-inline'`, no nonces). It blocks nothing; violations appear in the browser console. Switch it to `Content-Security-Policy` only after a clean week. The header is set inside each `server` block; if you add `add_header` (e.g. certbot `--hsts`) to a `location`, repeat the CSP line there or nginx drops it for that location.
+The config sends a `Content-Security-Policy-Report-Only` header (no `'unsafe-inline'`, no nonces). It blocks nothing; violations appear in the browser console. Switch it to `Content-Security-Policy` only after a clean week. The header is set inside each `server` block; if you add `add_header` (e.g. certbot `--hsts`) to a `location`, repeat the CSP line there or nginx drops it for that location. The same applies upward: since each `server` block declares `add_header`, any `add_header` at `http` level (HSTS, X-Frame-Options, etc.) is no longer inherited by these server blocks and must be repeated in each one.
 
 For SSL, add Let's Encrypt with certbot:
 

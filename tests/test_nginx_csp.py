@@ -103,3 +103,11 @@ def test_policy_locks_down_core_directives():
 def test_server_policies_identical():
     first, second = _policies()
     assert first == second
+
+
+def test_docs_warn_about_http_level_header_loss():
+    conf = (Path(__file__).resolve().parent.parent / "nginx" / "nginx.conf").read_text()
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text()
+    for text in (conf, readme):
+        assert "http-level" in text or "`http` level" in text
+        assert "HSTS" in text and "X-Frame-Options" in text
