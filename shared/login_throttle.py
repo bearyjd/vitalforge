@@ -13,8 +13,9 @@ malformed entry stops the service instead of silently trusting nothing.
 
 Fail safe, never a shared bucket: a loopback/private peer that is not a trusted
 proxy is almost certainly an unconfigured reverse proxy, and a trusted proxy
-that sent no valid ``X-Forwarded-For`` gives no client address either.  In both
-cases ``client_ip`` returns ``None`` and the IP bucket is skipped (the username
+that sent no valid ``X-Forwarded-For`` (or a loopback/private one, e.g. a front
+proxy on the host reaching nginx over loopback) gives no client address either.
+In all these cases ``client_ip`` returns ``None`` and the IP bucket is skipped (the username
 bucket still applies) rather than putting every client in one bucket.
 
 There is deliberately no "clean-IP probe" slot, and a successful login does not
@@ -52,6 +53,14 @@ class _Entry:
     last_failure: float
 
 
+# When the username table is full of live (non-stale) keys, failures for
+# untracked usernames go to this one shared entry instead of evicting a live
+# key: evicting would reset a blocked key's backoff (fail closed).  Usernames
+# are truncated to 256 characters, so no real key can equal it.  The IP table
+# has no overflow entry (it would be one IP bucket shared by every new client):
+# an untracked IP while it is full simply gets no IP bucket.
+_OVERFLOW_KEY = "\x00overflow" + "\x00" * 256
+
 _by_ip: dict[str, _Entry] = {}
 _by_username: dict[str, _Entry] = {}
 # In-flight (reserved, not yet resolved) attempts, so a concurrent burst cannot
@@ -72,6 +81,10 @@ class ThrottledError(Exception):
 class Reservation:
     ip: str | None  # None when the IP bucket is skipped (untrusted proxy peer)
     username_key: str | None  # None when the username bucket is bypassed
+    # The pending-count keys actually incremented (the overflow key when the
+    # table was full); ``release`` decrements exactly these.
+    ip_slot: str | None = None
+    username_slot: str | None = None
 
 
 def reset() -> None:
@@ -158,16 +171,32 @@ def client_ip(request: Request) -> str | None:
     except ValueError:
         return None
     if peer_addr in _trusted_proxies():
-        forwarded = request.headers.get("x-forwarded-for", "")
-        last = forwarded.split(",")[-1].strip()
-        try:
-            return _bucket_key(ipaddress.ip_address(last))
-        except ValueError:
-            return None
+        return _forwarded_client_key(request.headers.get("x-forwarded-for", ""))
     if _is_private(peer_addr):
         _warn_if_proxy_peer(peer)
         return None
     return _bucket_key(peer_addr)
+
+
+def _forwarded_client_key(forwarded: str) -> str | None:
+    """Bucket key for the rightmost ``X-Forwarded-For`` entry from a trusted hop.
+
+    A loopback/private forwarded address gets the same fail-safe as a private
+    peer: a front proxy on the host (cloudflared, Caddy, Tailscale) that reaches
+    nginx over loopback makes ``$remote_addr`` 127.0.0.1 for every client, and
+    that must not become one bucket shared by everyone.  The public address of
+    a CDN edge in front of nginx cannot be told apart this way; trust it in
+    nginx (``set_real_ip_from``) so ``$remote_addr`` is the real client.
+    """
+    last = forwarded.split(",")[-1].strip()
+    try:
+        addr = ipaddress.ip_address(last)
+    except ValueError:
+        return None
+    if _is_private(addr):
+        _warn_if_proxy_peer(str(addr))
+        return None
+    return _bucket_key(addr)
 
 
 def _trusted_proxies() -> frozenset[ipaddress.IPv4Address | ipaddress.IPv6Address]:
@@ -175,17 +204,18 @@ def _trusted_proxies() -> frozenset[ipaddress.IPv4Address | ipaddress.IPv6Addres
 
 
 def _warn_if_proxy_peer(peer: str) -> None:
-    """Warn (once) that a private/loopback untrusted peer disables the IP bucket."""
+    """Warn (once) that a private/loopback client address disables the IP bucket."""
     global _proxy_warned
     if _proxy_warned:
         return
     _proxy_warned = True
     logger.warning(
-        "Login from private/loopback peer %s that is not in %s: the per-IP login throttle "
-        "is skipped for such peers (only the per-username throttle applies). If this is a "
-        "reverse proxy, set %s to the address the app sees it connect from.",
+        "Login from private/loopback address %s (an untrusted peer, or the X-Forwarded-For "
+        "of a trusted one): the per-IP login throttle is skipped for such addresses (only "
+        "the per-username throttle applies). If this is a reverse proxy, set %s to the "
+        "address the app sees it connect from; if another proxy sits in front of nginx, "
+        "configure nginx real_ip for it so $remote_addr is the real client.",
         peer,
-        TRUSTED_PROXY_IPS_ENV,
         TRUSTED_PROXY_IPS_ENV,
     )
 
@@ -198,6 +228,10 @@ def _wait_for(
     In-flight attempts count toward the free-failure allowance, and once the
     allowance is spent only one attempt per key may be in flight.
     """
+    slot = _resolve_key(table, key, now)
+    if slot is None:
+        return None
+    key = slot
     entry = table.get(key)
     waiting = pending.get(key, 0)
     if entry is not None and entry.blocked_until > now:
@@ -227,11 +261,13 @@ def reserve(ip: str | None, username: str, now: float) -> Reservation:
     waits = [w for w in (ip_wait, user_wait) if w is not None]
     if waits:
         raise ThrottledError(max(1, int(max(waits)) + 1))
-    if ip is not None:
-        _pending_ip[ip] = _pending_ip.get(ip, 0) + 1
-    if use_username:
-        _pending_username[ukey] = _pending_username.get(ukey, 0) + 1
-    return Reservation(ip, ukey if use_username else None)
+    ip_slot = _resolve_key(_by_ip, ip, now) if ip is not None else None
+    user_slot = _resolve_key(_by_username, ukey, now) if use_username else None
+    if ip_slot is not None:
+        _pending_ip[ip_slot] = _pending_ip.get(ip_slot, 0) + 1
+    if user_slot is not None:
+        _pending_username[user_slot] = _pending_username.get(user_slot, 0) + 1
+    return Reservation(ip, ukey if use_username else None, ip_slot, user_slot)
 
 
 def _decrement(pending: dict[str, int], key: str) -> None:
@@ -243,10 +279,10 @@ def _decrement(pending: dict[str, int], key: str) -> None:
 
 
 def release(reservation: Reservation) -> None:
-    if reservation.ip is not None:
-        _decrement(_pending_ip, reservation.ip)
-    if reservation.username_key is not None:
-        _decrement(_pending_username, reservation.username_key)
+    if reservation.ip_slot is not None:
+        _decrement(_pending_ip, reservation.ip_slot)
+    if reservation.username_slot is not None:
+        _decrement(_pending_username, reservation.username_slot)
 
 
 def retry_after(ip: str | None, username: str, now: float) -> int | None:
@@ -256,7 +292,8 @@ def retry_after(ip: str | None, username: str, now: float) -> int | None:
     if ip is not None:
         keys.append((_by_ip, ip))
     for table, key in keys:
-        entry = table.get(key)
+        slot = _resolve_key(table, key, now)
+        entry = table.get(slot) if slot is not None else None
         if entry is not None and entry.blocked_until > now:
             waits.append(entry.blocked_until - now)
     if not waits:
@@ -264,17 +301,48 @@ def retry_after(ip: str | None, username: str, now: float) -> int | None:
     return max(1, int(max(waits)) + 1)
 
 
+def _tracked_count(table: dict[str, _Entry]) -> int:
+    return len(table) - (1 if _OVERFLOW_KEY in table else 0)
+
+
+def _resolve_key(table: dict[str, _Entry], key: str, now: float) -> str | None:
+    """The key to read/write for ``key`` when it is untracked and the table is
+    full of live entries: the overflow key for the username table, ``None``
+    (skip the bucket, never a shared one) for the IP table.
+
+    Only stale entries (quiet for ``RESET_AFTER_SECONDS``) are ever evicted;
+    a live entry, above all one with an active block, is never dropped to make
+    room, so flooding the table cannot reset a target's backoff.  The table is
+    bounded at ``MAX_TRACKED_KEYS`` plus the one overflow entry.
+    """
+    if key in table or _tracked_count(table) < MAX_TRACKED_KEYS:
+        return key
+    _evict_stale(table, now)
+    if _tracked_count(table) < MAX_TRACKED_KEYS:
+        return key
+    return _OVERFLOW_KEY if table is _by_username else None
+
+
 def _bump(table: dict[str, _Entry], key: str, now: float) -> None:
-    prev = table.get(key)
+    slot = _resolve_key(table, key, now)
+    if slot is None or (slot == _OVERFLOW_KEY and slot not in table):
+        logger.warning(
+            "Login throttle %s table is full of live entries (%d): %s until entries "
+            "decay (possible flood).",
+            "IP" if table is _by_ip else "username",
+            MAX_TRACKED_KEYS,
+            "new IPs get no per-IP bucket" if slot is None else "new usernames share one overflow bucket",
+        )
+    if slot is None:
+        return
+    prev = table.get(slot)
     failures = 1 if prev is None or now - prev.last_failure > RESET_AFTER_SECONDS else prev.failures + 1
-    if key not in table and len(table) >= MAX_TRACKED_KEYS:
-        _evict(table, now)
-    table[key] = _Entry(failures, now + _delay_for(failures), now)
+    table[slot] = _Entry(failures, now + _delay_for(failures), now)
 
 
-def _evict(table: dict[str, _Entry], now: float) -> None:
+def _evict_stale(table: dict[str, _Entry], now: float) -> None:
     stale = [k for k, e in table.items() if now - e.last_failure > RESET_AFTER_SECONDS]
-    for k in stale or [min(table, key=lambda k: table[k].last_failure)]:
+    for k in stale:
         table.pop(k, None)
 
 

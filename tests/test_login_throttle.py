@@ -61,7 +61,8 @@ def test_tables_are_bounded(monkeypatch):
     monkeypatch.setattr(lt, "MAX_TRACKED_KEYS", 5)
     for n in range(20):
         lt.record_failure(f"10.0.0.{n}", f"u{n}", float(n))
-    assert len(lt._by_ip) <= 5 and len(lt._by_username) <= 5
+    # MAX_TRACKED_KEYS live keys plus the one shared overflow entry
+    assert len(lt._by_ip) <= 5 + 1 and len(lt._by_username) <= 5 + 1
 
 
 class _Req:
@@ -338,3 +339,73 @@ def test_startup_logs_proxy_mode(monkeypatch, caplog):
     with caplog.at_level("WARNING", logger=lt.__name__):
         assert lt.validate_trusted_proxy_config() == frozenset()
     assert lt.TRUSTED_PROXY_IPS_ENV in caplog.text
+
+
+@pytest.mark.parametrize("forwarded", ["127.0.0.1", "10.1.2.3", "192.168.1.5", "::1", "fd00::1", "::ffff:127.0.0.1"])
+def test_private_xff_from_trusted_proxy_gets_no_ip_bucket(monkeypatch, forwarded):
+    # A front proxy on the host (cloudflared, Caddy, Tailscale) connecting to
+    # nginx over loopback makes $remote_addr 127.0.0.1 for EVERY client: that
+    # value must not become one shared IP bucket.
+    monkeypatch.setenv(lt.TRUSTED_PROXY_IPS_ENV, "172.20.0.1")
+    assert lt.client_ip(_Req("172.20.0.1", forwarded)) is None
+
+
+def test_loopback_front_proxy_attacker_cannot_block_known_user(monkeypatch):
+    monkeypatch.setenv(lt.TRUSTED_PROXY_IPS_ENV, "172.20.0.1")
+    req = _Req("172.20.0.1", "127.0.0.1")
+    res = lt.reserve(lt.client_ip(req), "alice", 0.0)
+    lt.record_success("alice", res.ip, 0.0)
+    lt.release(res)
+    for now in (1.0, 2.0, 3.0, 6.0):  # mallory, behind the same front proxy, fails on another account
+        res = lt.reserve(lt.client_ip(req), "mallory", now)
+        lt.record_failure(res.ip, "mallory", now)
+        lt.release(res)
+    lt.release(lt.reserve(lt.client_ip(req), "alice", 6.5))
+
+
+def _fill_username_table(start: float, count: int) -> None:
+    for n in range(count):
+        lt.record_failure(None, f"junk{n}", start + n * 0.001)
+
+
+def test_full_table_does_not_evict_an_active_block(monkeypatch):
+    monkeypatch.setattr(lt, "MAX_TRACKED_KEYS", 50)
+    now = 0.0
+    for _ in range(12):  # alice reaches the capped block
+        lt.record_failure(None, "alice", now)
+    blocked = lt.retry_after(None, "alice", now)
+    assert blocked is not None and blocked > 100
+    _fill_username_table(now, 200)  # flood with junk usernames, table full of live keys
+    assert "alice" in lt._by_username
+    assert lt._by_username["alice"].failures == 12
+    with pytest.raises(lt.ThrottledError):
+        lt.reserve(None, "alice", now + 1.0)
+
+
+def test_full_table_overflow_throttles_new_keys_fail_closed(monkeypatch):
+    monkeypatch.setattr(lt, "MAX_TRACKED_KEYS", 50)
+    _fill_username_table(0.0, 50 + lt.FREE_FAILURES + 2)  # overflow bucket past its free failures
+    assert len(lt._by_username) <= 50 + 1  # bounded: one extra overflow entry
+    with pytest.raises(lt.ThrottledError):
+        lt.reserve(None, "brand-new-user", 0.2)
+
+
+def test_overflow_and_stale_entries_decay(monkeypatch):
+    monkeypatch.setattr(lt, "MAX_TRACKED_KEYS", 50)
+    _fill_username_table(0.0, 60)
+    later = lt.RESET_AFTER_SECONDS + 10
+    lt.release(lt.reserve(None, "brand-new-user", later))
+    lt.record_failure(None, "brand-new-user", later)
+    assert "brand-new-user" in lt._by_username  # stale junk purged, real key tracked again
+
+
+def test_full_ip_table_has_no_shared_overflow_bucket(monkeypatch):
+    # An IP overflow would be one shared IP bucket: an attacker filling the IP
+    # table (cheap with an IPv6 /48) must not block a known device on a new IP.
+    monkeypatch.setattr(lt, "MAX_TRACKED_KEYS", 50)
+    lt.record_success("alice", "7.7.7.7", 0.0)
+    for n in range(50 + 20):
+        for _ in range(lt.FREE_FAILURES + 2):
+            lt.record_failure(f"2001:db8:{n:x}::/64", f"junk{n}", 1.0)
+    assert len(lt._by_ip) <= 50
+    lt.release(lt.reserve("7.7.7.7", "alice", 2.0))
