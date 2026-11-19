@@ -15,13 +15,14 @@ from typing import Awaitable, Callable
 
 import aiosqlite
 
-from shared.database import _grant_primary_person_to_first_admin, get_db
+from shared.database import get_db
 from shared.garmin_registry_errors import (
     LEGACY_GARMIN_TARGET_RETIRED_ERROR as _LEGACY_GARMIN_TARGET_RETIRED_ERROR,
 )
 from shared.garmin_registry_errors import (
     STRENGTH_GARMIN_ERROR_CODES as _SAFE_STRENGTH_GARMIN_ERRORS,
 )
+from shared.person_grants import grant_primary_person_to_first_admin
 from shared.slugs import RESERVED_SLUGS, slugify
 
 logger = logging.getLogger(__name__)
@@ -145,7 +146,7 @@ async def _ensure_primary_person(db) -> int:
     # FRESH install the users table is still empty at this point, this call
     # no-ops, and that later lifespan call is what creates the grant. One
     # implementation, so the two paths cannot drift.
-    await _grant_primary_person_to_first_admin(db, person_id)
+    await grant_primary_person_to_first_admin(db, person_id)
     return person_id
 
 
