@@ -76,7 +76,7 @@ def test_xff_rightmost_used_from_trusted_proxy(monkeypatch):
     monkeypatch.setenv(lt.TRUSTED_PROXY_IPS_ENV, "127.0.0.1")
     assert lt.client_ip(_Req("127.0.0.1", "6.6.6.6, 1.2.3.4")) == "1.2.3.4"
     assert lt.client_ip(_Req("127.0.0.1")) == "127.0.0.1"
-    assert lt.client_ip(_Req(None)) == "unknown"
+    assert lt.client_ip(_Req(None)) is None
 
 
 @pytest.fixture
@@ -132,21 +132,14 @@ def test_known_device_bypasses_username_bucket_only():
     assert lt.retry_after("7.7.7.7", "alice", 1.0) is not None
     res = lt.reserve("7.7.7.7", "alice", 1.0)
     assert res.username_key is None
-    lt.record_failure("8.8.8.8", "x", 1.0)  # an IP with failures gets no clean-IP probe
     with pytest.raises(lt.ThrottledError):
-        lt.reserve("8.8.8.8", "alice", 1.0)
+        lt.reserve("8.8.8.8", "alice", 1.0)  # no probe slot: unknown devices stay throttled
     for n in range(lt.FREE_FAILURES):
         lt.record_failure("7.7.7.7", "x", 1.0)
     with pytest.raises(lt.ThrottledError):
         lt.reserve("7.7.7.7", "alice", 1.0)
 
 
-def test_warns_once_for_private_peer_without_trusted_proxy(monkeypatch, caplog):
-    monkeypatch.delenv(lt.TRUSTED_PROXY_IPS_ENV, raising=False)
-    with caplog.at_level("WARNING"):
-        lt.client_ip(_Req("172.18.0.2"))
-        lt.client_ip(_Req("172.18.0.2"))
-    assert len([r for r in caplog.records if "reverse proxy" in r.message]) == 1
 
 
 def test_concurrent_burst_is_throttled(monkeypatch):
@@ -180,58 +173,87 @@ def test_concurrent_burst_is_throttled(monkeypatch):
     assert codes.count(429) >= 60 - lt.FREE_FAILURES
 
 
-def test_clean_ip_probe_reaches_password_check_while_username_blocked():
-    for n in range(lt.FREE_FAILURES + 2):
-        lt.record_failure(f"9.9.9.{n}", "alice", 1.0)
-    # dirty IP and a second clean IP in the same interval are refused
+def test_known_device_still_hits_ip_bucket():
+    lt.record_success("alice", "7.7.7.7", 0.0)
+    for _ in range(lt.FREE_FAILURES):
+        lt.record_failure("7.7.7.7", "x", 1.0)
     with pytest.raises(lt.ThrottledError):
-        lt.reserve("9.9.9.0", "alice", 2.0)
-    probe = lt.reserve("5.5.5.5", "alice", 2.0)
-    lt.release(probe)
-    with pytest.raises(lt.ThrottledError):
-        lt.reserve("6.6.6.6", "alice", 3.0)
-    lt.release(lt.reserve("6.6.6.6", "alice", 2.0 + lt.CLEAN_IP_PROBE_INTERVAL_SECONDS))
+        lt.reserve("7.7.7.7", "alice", 1.0)
 
 
-def test_rotating_ip_attacker_cannot_starve_username_for_a_day():
+def test_no_clean_ip_probe_rotating_ip_attacker_gets_capped_guesses():
     admitted = 0
-    for i in range(0, 24 * 3600, 300):  # attacker retries every 5 min from a new IP
+    for i in range(0, 24 * 3600, 1):  # attacker guesses every second from a fresh IP
         t = float(i)
+        ip = f"10.{i // 65536 % 256}.{i // 256 % 256}.{i % 256}"
         try:
-            res = lt.reserve(f"10.{i // 65536 % 256}.{i // 256 % 256}.{i % 256}", "alice", t)
+            res = lt.reserve(ip, "alice", t)
         except lt.ThrottledError:
             continue
         admitted += 1
         lt.record_failure(res.ip, "alice", t)
         lt.release(res)
-    assert admitted == 24 * 3600 // 300
+    # one guess per MAX_DELAY window once backed off, plus the free failures
+    assert admitted <= lt.FREE_FAILURES + 24 * 3600 // lt.MAX_DELAY_SECONDS + 10
 
 
-def test_probe_not_granted_to_ip_with_failures():
-    for n in range(lt.FREE_FAILURES):
-        lt.record_failure(f"9.9.9.{n}", "alice", 1.0)
-    lt.record_failure("5.5.5.5", "other", 1.0)
-    with pytest.raises(lt.ThrottledError):
-        lt.reserve("5.5.5.5", "alice", 2.0)
-
-
-def test_ip_block_flagged_and_known_device_still_hits_ip_bucket():
+def test_legitimate_known_device_logs_in_while_rotating_attacker_hammers():
     lt.record_success("alice", "7.7.7.7", 0.0)
-    for _ in range(lt.FREE_FAILURES):
-        lt.record_failure("7.7.7.7", "x", 1.0)
-    with pytest.raises(lt.ThrottledError) as exc:
-        lt.reserve("7.7.7.7", "alice", 1.0)
-    assert exc.value.ip_blocked
+    for i in range(50):
+        try:
+            res = lt.reserve(f"203.0.113.{i}", "alice", float(i))
+        except lt.ThrottledError:
+            continue
+        lt.record_failure(res.ip, "alice", float(i))
+        lt.release(res)
+    res = lt.reserve("7.7.7.7", "alice", 60.0)  # owner's known device is not blocked
+    lt.release(res)
 
 
-def test_warns_on_every_ip_block_of_untrusted_private_peer(monkeypatch, caplog):
-    monkeypatch.setenv(lt.TRUSTED_PROXY_IPS_ENV, "172.20.0.2")  # plausible but wrong
-    with caplog.at_level("WARNING"):
-        for _ in range(3):
-            lt.warn_if_shared_proxy_bucket(_Req("172.20.0.1"))
-    assert len([r for r in caplog.records if "IP bucket blocked" in r.message]) == 3
-    caplog.clear()
-    with caplog.at_level("WARNING"):
-        lt.warn_if_shared_proxy_bucket(_Req("172.20.0.2"))  # trusted
-        lt.warn_if_shared_proxy_bucket(_Req("8.8.8.8"))  # public
-    assert not caplog.records
+@pytest.mark.parametrize("trusted", [None, "172.20.0.2"])  # unset, or the old wrong example
+def test_private_untrusted_peer_skips_ip_bucket(monkeypatch, trusted):
+    if trusted is None:
+        monkeypatch.delenv(lt.TRUSTED_PROXY_IPS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(lt.TRUSTED_PROXY_IPS_ENV, trusted)
+    assert lt.client_ip(_Req("172.20.0.1", "6.6.6.6")) is None
+    assert lt.client_ip(_Req("127.0.0.1", "6.6.6.6")) is None
+
+
+def test_misconfigured_proxy_attacker_cannot_block_other_users_correct_login(monkeypatch):
+    monkeypatch.delenv(lt.TRUSTED_PROXY_IPS_ENV, raising=False)
+    now = 0.0
+    for _ in range(100):  # one anonymous client behind the proxy hammers "mallory"
+        ip = lt.client_ip(_Req("172.20.0.1", "6.6.6.6"))
+        try:
+            res = lt.reserve(ip, "mallory", now)
+        except lt.ThrottledError:
+            continue
+        lt.record_failure(res.ip, "mallory", now)
+        lt.release(res)
+    ip = lt.client_ip(_Req("172.20.0.1", "9.9.9.9"))
+    lt.release(lt.reserve(ip, "bob", now))  # a different user is not blocked
+
+
+def test_invalid_xff_falls_back_to_peer(monkeypatch):
+    monkeypatch.setenv(lt.TRUSTED_PROXY_IPS_ENV, "127.0.0.1")
+    assert lt.client_ip(_Req("127.0.0.1", "not-an-ip")) == "127.0.0.1"
+    assert lt.client_ip(_Req("127.0.0.1", "x" * 5000)) == "127.0.0.1"
+
+
+def test_ipv6_normalised_to_slash_64(monkeypatch):
+    monkeypatch.delenv(lt.TRUSTED_PROXY_IPS_ENV, raising=False)
+    a = lt.client_ip(_Req("2606:4700:1:2:aaaa::1"))
+    b = lt.client_ip(_Req("2606:4700:1:2:bbbb::9"))
+    c = lt.client_ip(_Req("2606:4700:1:3::1"))
+    assert a == b == "2606:4700:1:2::/64"
+    assert c != a
+
+
+def test_ipv6_rotation_within_64_is_one_ip_bucket(monkeypatch):
+    monkeypatch.delenv(lt.TRUSTED_PROXY_IPS_ENV, raising=False)
+    for n in range(lt.FREE_FAILURES):
+        ip = lt.client_ip(_Req(f"2606:4700:1:2::{n + 1}"))
+        lt.record_failure(ip, f"u{n}", 0.0)
+    with pytest.raises(lt.ThrottledError):
+        lt.reserve(lt.client_ip(_Req("2606:4700:1:2::ffff")), "fresh", 0.0)

@@ -5,6 +5,14 @@ lockout would let an attacker lock the real user out).  Per-process and in
 memory on purpose, like the step-up limiter in ``shared.auth``.  Backoff is
 capped so a spoofing attacker can only delay the real user by
 ``MAX_DELAY_SECONDS``.
+
+Fail safe: a loopback/private peer that is not a trusted proxy is almost
+certainly a reverse proxy, so every client would collapse into one shared IP
+bucket.  ``client_ip`` returns ``None`` for such peers and the IP bucket is
+skipped (the username bucket still applies).  There is deliberately no
+"clean-IP probe" slot: a single first-come slot per username is claimed by an
+IP-rotating attacker and multiplies its guesses without helping real users;
+real users are protected by the known-device bypass and the capped backoff.
 """
 
 import ipaddress
@@ -25,11 +33,6 @@ TRUSTED_PROXY_IPS_ENV = "VITALFORGE_TRUSTED_PROXY_IPS"
 # device": it bypasses the shared per-username bucket (still subject to its own
 # IP bucket) so an attacker cannot keep the real user blocked.
 KNOWN_DEVICE_TTL_SECONDS = 30 * 24 * 3600
-# While a username is backed off, one attempt per interval from an IP with no
-# recorded failures still reaches the password check, so an attacker rotating
-# source IPs cannot keep the real user locked out indefinitely.  The price is
-# at most one extra guess per username per interval.
-CLEAN_IP_PROBE_INTERVAL_SECONDS = 30
 
 logger = logging.getLogger(__name__)
 
@@ -48,20 +51,18 @@ _by_username: dict[str, _Entry] = {}
 _pending_ip: dict[str, int] = {}
 _pending_username: dict[str, int] = {}
 _known_devices: dict[tuple[str, str], float] = {}
-_last_probe: dict[str, float] = {}
 _proxy_warned = False
 
 
 class ThrottledError(Exception):
-    def __init__(self, wait: int, ip_blocked: bool = False) -> None:
+    def __init__(self, wait: int) -> None:
         super().__init__(f"throttled for {wait}s")
         self.wait = wait
-        self.ip_blocked = ip_blocked
 
 
 @dataclass(frozen=True)
 class Reservation:
-    ip: str
+    ip: str | None  # None when the IP bucket is skipped (untrusted proxy peer)
     username_key: str | None  # None when the username bucket is bypassed
 
 
@@ -72,7 +73,6 @@ def reset() -> None:
     _pending_ip.clear()
     _pending_username.clear()
     _known_devices.clear()
-    _last_probe.clear()
     _proxy_warned = False
 
 
@@ -86,22 +86,48 @@ def _username_key(username: str) -> str:
     return username.strip().lower()[:256]
 
 
-def client_ip(request: Request) -> str:
-    """Peer address; ``X-Forwarded-For`` only when the peer is a trusted proxy.
+def _is_private(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return addr.is_loopback or addr.is_private
 
-    nginx overwrites the header with the address it saw, so the rightmost
-    entry is the one the trusted hop appended.
+
+def _bucket_key(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str:
+    """IPv6 clients are bucketed by /64 (one subscriber holds a whole /64, so
+    per-/128 keys would give an attacker unlimited fresh IPs)."""
+    if isinstance(addr, ipaddress.IPv6Address):
+        if addr.ipv4_mapped is not None:
+            return str(addr.ipv4_mapped)
+        return str(ipaddress.ip_network(f"{addr}/64", strict=False))
+    return str(addr)
+
+
+def client_ip(request: Request) -> str | None:
+    """Throttle key for the client, or ``None`` when no trustworthy IP exists.
+
+    ``X-Forwarded-For`` is honoured only from a trusted proxy peer; nginx
+    overwrites the header with the address it saw, so the rightmost entry is
+    the one the trusted hop appended.  It is validated as an IP; anything else
+    falls back to the peer.  A loopback/private peer that is not trusted is
+    treated as an unconfigured reverse proxy: ``None`` (skip the IP bucket)
+    rather than one bucket shared by every client.
     """
-    peer = request.client.host if request.client is not None else "unknown"
-    trusted = _trusted_proxies()
-    if not trusted:
-        _warn_if_proxy_peer(peer)
-    if peer in trusted:
+    peer = request.client.host if request.client is not None else None
+    if peer is None:
+        return None
+    try:
+        peer_addr = ipaddress.ip_address(peer)
+    except ValueError:
+        return None
+    if peer in _trusted_proxies():
         forwarded = request.headers.get("x-forwarded-for", "")
         last = forwarded.split(",")[-1].strip()
-        if last:
-            return last
-    return peer
+        try:
+            return _bucket_key(ipaddress.ip_address(last))
+        except ValueError:
+            return _bucket_key(peer_addr)
+    if _is_private(peer_addr):
+        _warn_if_proxy_peer(peer)
+        return None
+    return _bucket_key(peer_addr)
 
 
 def _trusted_proxies() -> set[str]:
@@ -109,49 +135,20 @@ def _trusted_proxies() -> set[str]:
     return {v.strip() for v in raw.split(",") if v.strip()}
 
 
-def warn_if_shared_proxy_bucket(request: Request) -> None:
-    """Called when an IP bucket blocks a request.  A block on a private/loopback
-    peer that is not a trusted proxy usually means a reverse proxy (or a wrong
-    trust list) is collapsing every client into this one bucket.  Logged on
-    every such block, not once, so a wrong-but-non-empty trust list is visible."""
-    peer = request.client.host if request.client is not None else "unknown"
-    if peer in _trusted_proxies():
-        return
-    try:
-        addr = ipaddress.ip_address(peer)
-    except ValueError:
-        return
-    if addr.is_loopback or addr.is_private:
-        logger.warning(
-            "Login IP bucket blocked untrusted private/loopback peer %s: if this is your "
-            "reverse proxy, every user shares this bucket and one client can block all "
-            "logins. Set %s to the address the app sees the proxy connect from "
-            "(the docker bridge gateway when nginx runs on the host).",
-            peer,
-            TRUSTED_PROXY_IPS_ENV,
-        )
-
-
 def _warn_if_proxy_peer(peer: str) -> None:
-    """Loopback/private peer with no trusted proxy configured usually means a
-    reverse proxy: every user then shares one IP bucket."""
+    """Warn (once) that a private/loopback untrusted peer disables the IP bucket."""
     global _proxy_warned
     if _proxy_warned:
         return
-    try:
-        addr = ipaddress.ip_address(peer)
-    except ValueError:
-        return
-    if addr.is_loopback or addr.is_private:
-        _proxy_warned = True
-        logger.warning(
-            "Login from private/loopback peer %s and %s is unset: if this is a reverse "
-            "proxy, all users share one login-throttle IP bucket. Set %s to the proxy "
-            "address(es).",
-            peer,
-            TRUSTED_PROXY_IPS_ENV,
-            TRUSTED_PROXY_IPS_ENV,
-        )
+    _proxy_warned = True
+    logger.warning(
+        "Login from private/loopback peer %s that is not in %s: the per-IP login throttle "
+        "is skipped for such peers (only the per-username throttle applies). If this is a "
+        "reverse proxy, set %s to the address the app sees it connect from.",
+        peer,
+        TRUSTED_PROXY_IPS_ENV,
+        TRUSTED_PROXY_IPS_ENV,
+    )
 
 
 def _wait_for(
@@ -177,41 +174,22 @@ def _is_known_device(ip: str, username_key: str, now: float) -> bool:
     return seen is not None and now - seen <= KNOWN_DEVICE_TTL_SECONDS
 
 
-def _ip_is_clean(ip: str, now: float) -> bool:
-    entry = _by_ip.get(ip)
-    return entry is None or now - entry.last_failure > RESET_AFTER_SECONDS
-
-
-def _claim_probe_slot(ukey: str, now: float) -> bool:
-    last = _last_probe.get(ukey)
-    if last is not None and now - last < CLEAN_IP_PROBE_INTERVAL_SECONDS:
-        return False
-    if ukey not in _last_probe and len(_last_probe) >= MAX_TRACKED_KEYS:
-        stale = [k for k, t in _last_probe.items() if now - t >= CLEAN_IP_PROBE_INTERVAL_SECONDS]
-        for k in stale or [min(_last_probe, key=_last_probe.__getitem__)]:
-            _last_probe.pop(k, None)
-    _last_probe[ukey] = now
-    return True
-
-
-def reserve(ip: str, username: str, now: float) -> Reservation:
+def reserve(ip: str | None, username: str, now: float) -> Reservation:
     """Check and reserve in one synchronous step (no await between them).
 
-    Raises ThrottledError, otherwise returns a Reservation that the caller must
-    ``release`` in a ``finally`` block.
+    ``ip`` is None when the IP bucket does not apply.  Raises ThrottledError,
+    otherwise returns a Reservation that the caller must ``release`` in a
+    ``finally`` block.
     """
     ukey = _username_key(username)
-    use_username = not _is_known_device(ip, ukey, now)
-    ip_wait = _wait_for(_by_ip, _pending_ip, ip, now)
+    use_username = ip is None or not _is_known_device(ip, ukey, now)
+    ip_wait = _wait_for(_by_ip, _pending_ip, ip, now) if ip is not None else None
     user_wait = _wait_for(_by_username, _pending_username, ukey, now) if use_username else None
-    if ip_wait is not None:
-        raise ThrottledError(max(1, int(max(ip_wait, user_wait or 0)) + 1), ip_blocked=True)
-    if user_wait is not None:
-        entry = _by_username.get(ukey)
-        backed_off = entry is not None and entry.blocked_until > now
-        if not (backed_off and _ip_is_clean(ip, now) and _claim_probe_slot(ukey, now)):
-            raise ThrottledError(max(1, int(user_wait) + 1))
-    _pending_ip[ip] = _pending_ip.get(ip, 0) + 1
+    waits = [w for w in (ip_wait, user_wait) if w is not None]
+    if waits:
+        raise ThrottledError(max(1, int(max(waits)) + 1))
+    if ip is not None:
+        _pending_ip[ip] = _pending_ip.get(ip, 0) + 1
     if use_username:
         _pending_username[ukey] = _pending_username.get(ukey, 0) + 1
     return Reservation(ip, ukey if use_username else None)
@@ -226,15 +204,19 @@ def _decrement(pending: dict[str, int], key: str) -> None:
 
 
 def release(reservation: Reservation) -> None:
-    _decrement(_pending_ip, reservation.ip)
+    if reservation.ip is not None:
+        _decrement(_pending_ip, reservation.ip)
     if reservation.username_key is not None:
         _decrement(_pending_username, reservation.username_key)
 
 
-def retry_after(ip: str, username: str, now: float) -> int | None:
+def retry_after(ip: str | None, username: str, now: float) -> int | None:
     """Seconds to wait, or None if this attempt may proceed."""
     waits = []
-    for table, key in ((_by_ip, ip), (_by_username, _username_key(username))):
+    keys = [(_by_username, _username_key(username))]
+    if ip is not None:
+        keys.append((_by_ip, ip))
+    for table, key in keys:
         entry = table.get(key)
         if entry is not None and entry.blocked_until > now:
             waits.append(entry.blocked_until - now)
@@ -257,8 +239,9 @@ def _evict(table: dict[str, _Entry], now: float) -> None:
         table.pop(k, None)
 
 
-def record_failure(ip: str, username: str, now: float) -> None:
-    _bump(_by_ip, ip, now)
+def record_failure(ip: str | None, username: str, now: float) -> None:
+    if ip is not None:
+        _bump(_by_ip, ip, now)
     _bump(_by_username, _username_key(username), now)
 
 
