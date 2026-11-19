@@ -184,6 +184,16 @@ def fake_garmin_client(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _reset_login_throttle():
+    """Login brute-force throttle state is module-level; isolate tests."""
+    from shared import login_throttle
+
+    login_throttle.reset()
+    yield
+    login_throttle.reset()
+
+
+@pytest.fixture(autouse=True)
 def _reset_step_up_failures():
     """Clear the module-level failed-step-up-attempt tracker around every
     test. Without this, a test that throttles a user id (five failed step-up
