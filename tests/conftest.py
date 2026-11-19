@@ -205,8 +205,8 @@ def _reset_step_up_failures():
 def tmp_db_path(tmp_path, monkeypatch):
     """Point `shared.db_connection.DB_PATH` at an isolated tmp SQLite file.
 
-    Never touches the real fitness.db. `shared.database.get_db()` re-reads
-    the module-level `DB_PATH` global on every call, so patching it here
+    Never touches the real fitness.db. `get_db()` re-reads the
+    `shared.db_connection.DB_PATH` global on every call, so patching it here
     (even after `shared.database` has already been imported elsewhere)
     is sufficient to isolate every DB access made during the test.
 
