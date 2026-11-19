@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 import shared.database
+import shared.db_connection
 from tests.conftest import PERSON_PREFIX
 
 
@@ -70,7 +71,7 @@ def test_dashboard_download_json_follows_profile_and_range(page, dashboard_live_
     """Download actual files and check range filtering and profile isolation."""
     today = datetime.now(timezone.utc)
     expected_steps = []
-    with sqlite3.connect(str(shared.database.DB_PATH)) as conn:
+    with sqlite3.connect(str(shared.db_connection.DB_PATH)) as conn:
         person_id = conn.execute("SELECT id FROM persons WHERE is_primary = 1").fetchone()[0]
         other_id = conn.execute(
             "INSERT INTO persons (slug, display_name, created_at) VALUES (?, ?, ?)",
@@ -213,7 +214,7 @@ def _seed_resting_hr_and_steps_with_a_malformed_date():
     for the same reason -- shared.database.get_primary_person_id() is async
     and would hit the identical event-loop conflict.
     """
-    conn = sqlite3.connect(str(shared.database.DB_PATH))
+    conn = sqlite3.connect(str(shared.db_connection.DB_PATH))
     try:
         person_id = conn.execute("SELECT id FROM persons WHERE is_primary = 1").fetchone()[0]
         today = datetime.now(timezone.utc)
@@ -275,7 +276,7 @@ def _seed_recent_weigh_ins(count: int = 3):
     points, which is what makes the trend chart render at all. Same sync
     sqlite3 approach as `_seed_resting_hr_and_steps_with_a_malformed_date`
     and for the same event-loop reason."""
-    conn = sqlite3.connect(str(shared.database.DB_PATH))
+    conn = sqlite3.connect(str(shared.db_connection.DB_PATH))
     try:
         person_id = conn.execute("SELECT id FROM persons WHERE is_primary = 1").fetchone()[0]
         now = datetime.now(timezone.utc)

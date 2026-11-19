@@ -23,9 +23,9 @@ db_path = sys.argv[1]
 os.environ["DB_PATH"] = db_path
 sys.path.insert(0, sys.argv[2])
 
-from shared import database  # noqa: E402
+from shared import database, db_connection  # noqa: E402
 
-database.DB_PATH = Path(db_path)
+db_connection.DB_PATH = Path(db_path)
 
 
 async def main():

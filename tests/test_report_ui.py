@@ -7,6 +7,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 import shared.database
+import shared.db_connection
 from tests.conftest import PERSON_PREFIX
 
 pytestmark = pytest.mark.playwright
@@ -16,7 +17,7 @@ HOSTILE_NAME = "<script>window.reportBad=true</script>"
 
 def _seed(display_name: str | None = None):
     today = datetime.now(timezone.utc).date()
-    with sqlite3.connect(str(shared.database.DB_PATH)) as connection:
+    with sqlite3.connect(str(shared.db_connection.DB_PATH)) as connection:
         person = connection.execute("SELECT id FROM persons WHERE is_primary = 1").fetchone()[0]
         if display_name:
             connection.execute("UPDATE persons SET display_name = ? WHERE id = ?", (display_name, person))

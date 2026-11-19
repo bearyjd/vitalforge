@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from shared import database
+from shared import db_connection
 from shared.database import get_db, get_primary_person_id
 from tests.conftest import PERSON_PREFIX
 
@@ -172,7 +172,7 @@ async def test_concurrent_writer_not_blocked_by_garmin_push(client, weight_app_m
 
     monkeypatch.setattr(weight_routes_module, "push_weight", slow_push)
 
-    db_path = str(database.DB_PATH)
+    db_path = str(db_connection.DB_PATH)
     person_id = await get_primary_person_id()
     writer_succeeded = threading.Event()
     write_duration = {}
@@ -220,7 +220,7 @@ async def test_concurrent_writer_not_blocked_by_enrichment_push(client, weight_a
 
     monkeypatch.setattr(weight_routes_module, "push_weight", slow_push)
 
-    db_path = str(database.DB_PATH)
+    db_path = str(db_connection.DB_PATH)
     person_id = await get_primary_person_id()
     writer_succeeded = threading.Event()
     write_duration = {}

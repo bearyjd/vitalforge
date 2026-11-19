@@ -103,7 +103,7 @@ docker-compose.prod.yml   # PROD — pulls prebuilt images from Docker Hub / GHC
   the registry (`shared/garmin_registry` for routes and sync, `shared/garmin_registry_legacy`
   for the boot-time adoption). This means most dashboard bugs can be reproduced by seeding
   the local DB directly — no live Garmin account needed (see roadmap item 2).
-- **`DB_PATH` and `GARTH_TOKEN_DIR` are env-overridable** (`shared/database.py`,
+- **`DB_PATH` and `GARTH_TOKEN_DIR` are env-overridable** (`shared/db_connection.py`,
   `shared/garmin_registry.py`), defaulting to `/app/data/...`. Point these at a scratch
   directory to run either service against an isolated database without touching the real
   `/app/data` volume. Both are read at import time; in tests, patch the module attribute
@@ -221,7 +221,7 @@ dependencies (which is the point — `starlette` was transitive and unpinned unt
 PYSEC-2026-1942 bump), but an advisory in `pytest`/`ruff`/`playwright` must not block an
 image push for something that never ships in the image.
 Tests live in `tests/` and never touch real infrastructure: `tests/conftest.py` points
-`shared.database.DB_PATH` and `shared.garmin_registry.GARTH_TOKEN_DIR` at a per-test
+`shared.db_connection.DB_PATH` and `shared.garmin_registry.GARTH_TOKEN_DIR` at a per-test
 `tmp_path` and monkeypatches `shared.garmin_registry.call` to run operations against a
 fake client backed by canned fixtures in `tests/fixtures/garmin/` — no live Garmin
 account or `/app/data` access required. The

@@ -213,10 +213,10 @@ def _reset_step_up_failures():
 
 @pytest.fixture
 def tmp_db_path(tmp_path, monkeypatch):
-    """Point `shared.database.DB_PATH` at an isolated tmp SQLite file.
+    """Point `shared.db_connection.DB_PATH` at an isolated tmp SQLite file.
 
-    Never touches the real fitness.db. `shared.database.get_db()` re-reads
-    the module-level `DB_PATH` global on every call, so patching it here
+    Never touches the real fitness.db. `get_db()` re-reads the
+    `shared.db_connection.DB_PATH` global on every call, so patching it here
     (even after `shared.database` has already been imported elsewhere)
     is sufficient to isolate every DB access made during the test.
 
@@ -234,10 +234,10 @@ def tmp_db_path(tmp_path, monkeypatch):
     `garmin_registry_legacy` calls it as a facade attribute at adoption time,
     so this one patch covers every consumer.
     """
-    from shared import database, garmin_registry, garmin_registry_common
+    from shared import db_connection, garmin_registry, garmin_registry_common
 
     db_path = tmp_path / "vf-test.db"
-    monkeypatch.setattr(database, "DB_PATH", db_path)
+    monkeypatch.setattr(db_connection, "DB_PATH", db_path)
     monkeypatch.setenv("DB_PATH", str(db_path))
     monkeypatch.setenv("GARTH_TOKEN_DIR", str(tmp_path / "garth"))
     monkeypatch.setattr(
@@ -258,10 +258,10 @@ async def production_schema_db(tmp_path, monkeypatch):
     automatically from `weight_log`'s AUTOINCREMENT) -- see
     docs/prp/01-plan.md SS4.1.
     """
-    from shared import database
+    from shared import db_connection
 
     db_path = tmp_path / "production-schema.db"
-    monkeypatch.setattr(database, "DB_PATH", db_path)
+    monkeypatch.setattr(db_connection, "DB_PATH", db_path)
     monkeypatch.setenv("DB_PATH", str(db_path))
 
     statements = [

@@ -8,7 +8,7 @@ no-op for them.
 
 import pytest
 
-from shared import database, migrations
+from shared import database, db_connection, migrations
 from shared.database import get_db
 
 
@@ -32,7 +32,7 @@ async def test_table_created_on_an_existing_database(production_schema_db, monke
     """The upgrade path: a database dumped from production, which predates
     this table entirely. `CREATE TABLE IF NOT EXISTS` in the DDL block is the
     whole mechanism -- no marker, no rebuild."""
-    monkeypatch.setattr(database, "DB_PATH", production_schema_db)
+    monkeypatch.setattr(db_connection, "DB_PATH", production_schema_db)
     await database.init_db()
     assert await table_sql("strength_sessions") is not None
 
@@ -178,7 +178,7 @@ async def test_garmin_claimed_at_present_on_an_upgraded_database(production_sche
     unmerged branch -- no deployed database has the table at all, so there is
     no database that could have it WITHOUT this column. Pinned here so that
     stops being an assumption."""
-    monkeypatch.setattr(database, "DB_PATH", production_schema_db)
+    monkeypatch.setattr(db_connection, "DB_PATH", production_schema_db)
     await database.init_db()
     db = await get_db()
     try:

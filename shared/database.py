@@ -1,6 +1,3 @@
-from datetime import datetime, timezone
-from pathlib import Path
-
 import aiosqlite
 
 from shared.database_bootstrap import _attribute_orphaned_weight_log_rows
@@ -11,9 +8,9 @@ from shared.database_columns import (
     WEIGHT_HISTORY_ADDITIVE_COLUMNS,
     WEIGHT_LOG_ADDITIVE_COLUMNS,
 )
-from shared.env_paths import path_from_env
-
-DB_PATH = Path(path_from_env("DB_PATH", "/app/data/fitness.db"))
+from shared.db_connection import get_db
+from shared.migrations import SCHEMA_MIGRATIONS_TABLE_SQL, run_schema_migrations
+from shared.person_grants import grant_primary_person_to_first_admin
 
 
 async def _add_columns(db, table: str, column_ddls: list[str]):
@@ -49,64 +46,9 @@ async def _add_columns(db, table: str, column_ddls: list[str]):
                 raise
 
 
-async def get_db(isolation_level: str | None = "") -> aiosqlite.Connection:
-    """Open a connection to the SQLite database.
-
-    isolation_level defaults to "" (aiosqlite/sqlite3's own legacy default),
-    so every existing caller's behavior is unchanged. Pass None for
-    autocommit mode with explicit BEGIN/COMMIT/ROLLBACK control -- e.g.
-    shared/migrations.py's run_migration(), which issues DDL inside a
-    transaction it must be able to roll back as a unit. isolation_level is
-    set here, at connect() time -- setting it as a post-connect attribute
-    on the returned connection instead raises a cross-thread
-    ProgrammingError under aiosqlite (verified directly; this is a genuine
-    aiosqlite API constraint, not an artifact of any particular caller's
-    async setup).
-    """
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    db = await aiosqlite.connect(str(DB_PATH), isolation_level=isolation_level)
-    db.row_factory = aiosqlite.Row
-    # 30s, not aiosqlite's 5s default: a migration (shared/migrations.py's
-    # run_migration) can legitimately hold the write lock longer than 5s on
-    # a database with years of history, and every connection that might
-    # race it -- not just the migration's own -- needs to wait that out
-    # rather than surface "database is locked" as a request-path 500 or a
-    # boot-loop in the other service. See the multi-tenancy design spec's
-    # section (c) for the full reasoning.
-    #
-    # This must precede journal_mode=WAL: enabling WAL can itself need an
-    # exclusive lock when both containers cold-start against the same file.
-    # Setting it afterward leaves that first lock-taking operation at
-    # sqlite's short default timeout.
-    # Both PRAGMAs return a row.  Close their cursors before handing the
-    # connection to a caller: leaving journal_mode's result pending keeps a
-    # schema statement active, so an immediate DROP/ALTER on this same
-    # connection fails with "database table is locked".
-    cursor = await db.execute("PRAGMA busy_timeout = 30000")
-    await cursor.close()
-    cursor = await db.execute("PRAGMA journal_mode=WAL")
-    await cursor.close()
-    return db
-
-
 async def init_db():
     """Create all tables if they don't exist, then run any pending schema
     migrations."""
-    from shared.migrations import (
-        _PERSON_ID_REBUILD_SNAPSHOT_NAME,
-        _STRENGTH_SESSIONS_SNAPSHOT_NAME,
-        SCHEMA_MIGRATIONS_TABLE_SQL,
-        _apply_activities_person_id,
-        _apply_person_id_rebuild,
-        _apply_strength_sessions_redact_garmin_errors,
-        _apply_strength_sessions_remove_garmin_target,
-        _needs_person_id_rebuild,
-        _needs_strength_sessions_rebuild,
-        assert_schema_understood,
-        ensure_pre_migration_snapshot,
-        run_migration,
-    )
-
     db = await get_db()
     try:
         # Phase 1: weight log
@@ -643,18 +585,7 @@ async def init_db():
     # Running the guard afterwards would let a downgrade-boot write a
     # snapshot file and open a write transaction against a schema it has
     # already admitted it does not understand.
-    await assert_schema_understood()
-
-    await ensure_pre_migration_snapshot(_PERSON_ID_REBUILD_SNAPSHOT_NAME, _needs_person_id_rebuild)
-    await run_migration("001-person-id-rebuild", _apply_person_id_rebuild)
-    await run_migration("002-activities-person-id", _apply_activities_person_id)
-    # 003 is a table rebuild that an older image cannot boot against (its
-    # marker is unknown to that image), so it gets its own snapshot -- taken
-    # here, AFTER 001/002, which is what makes it the right file to restore
-    # for a rollback to the previous release rather than to a pre-001 one.
-    await ensure_pre_migration_snapshot(_STRENGTH_SESSIONS_SNAPSHOT_NAME, _needs_strength_sessions_rebuild)
-    await run_migration("003-strength-sessions-remove-garmin-target", _apply_strength_sessions_remove_garmin_target)
-    await run_migration("004-strength-sessions-redact-garmin-errors", _apply_strength_sessions_redact_garmin_errors)
+    await run_schema_migrations()
 
     # AFTER the migrations, not with the _add_columns calls in the DDL block:
     # 001 drops and recreates sync_status with its original five columns, so a
@@ -699,38 +630,6 @@ async def get_primary_person_id() -> int:
     return row["id"]
 
 
-async def _grant_primary_person_to_first_admin(db, person_id: int) -> None:
-    """Give the first admin an 'own' grant on `person_id` and make it their
-    default. Runs on the caller's connection and does not commit.
-
-    Idempotent by constraint rather than by pre-check: person_grants'
-    PRIMARY KEY (person_id, user_id) turns a re-run into a no-op INSERT, and
-    the UPDATE is guarded on `default_person_id IS NULL` so it can never
-    overwrite a default chosen later. Both services run this concurrently at
-    startup with no ordering between them -- the same race, answered the
-    same constraint-based way, as bootstrap_first_admin().
-
-    No-ops while no admin exists: a fresh install with VITALFORGE_PASS unset
-    has an empty users table, and the grant lands on the first boot after an
-    admin is finally seeded.
-    """
-    admin = await (await db.execute(
-        "SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1"
-    )).fetchone()
-    if admin is None:
-        return
-    now = datetime.now(timezone.utc).isoformat()
-    await db.execute(
-        "INSERT OR IGNORE INTO person_grants (person_id, user_id, access, granted_at) "
-        "VALUES (?, ?, 'own', ?)",
-        (person_id, admin["id"], now),
-    )
-    await db.execute(
-        "UPDATE users SET default_person_id = ? WHERE id = ? AND default_person_id IS NULL",
-        (person_id, admin["id"]),
-    )
-
-
 async def ensure_primary_person_grant() -> None:
     """Make sure the primary person actually has an owner.
 
@@ -750,7 +649,7 @@ async def ensure_primary_person_grant() -> None:
     person_id = await get_primary_person_id()
     db = await get_db()
     try:
-        await _grant_primary_person_to_first_admin(db, person_id)
+        await grant_primary_person_to_first_admin(db, person_id)
         await db.commit()
     finally:
         await db.close()

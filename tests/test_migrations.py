@@ -10,11 +10,12 @@ import aiosqlite
 import pytest
 
 import shared.database as database
+import shared.db_connection as db_connection
 import shared.migrations as migrations
 
 
 async def _fresh_db_with_migrations_table(tmp_path, monkeypatch):
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "test.db")
     db = await database.get_db()
     try:
         await db.execute(migrations.SCHEMA_MIGRATIONS_TABLE_SQL)
@@ -29,7 +30,7 @@ async def test_get_db_accepts_isolation_level_none(tmp_path, monkeypatch):
     require the caller to set db.isolation_level after connecting -- see
     Task 1's _run_rebuild_then_rollback comment for why the latter raises a
     cross-thread ProgrammingError under aiosqlite."""
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "test.db")
     db = await database.get_db(isolation_level=None)
     try:
         assert db.isolation_level is None
@@ -41,7 +42,7 @@ async def test_get_db_accepts_isolation_level_none(tmp_path, monkeypatch):
 async def test_get_db_default_isolation_level_unchanged(tmp_path, monkeypatch):
     """Every existing caller across both services calls get_db() with no
     arguments and must see identical behavior after this change."""
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "test.db")
     db = await database.get_db()
     try:
         assert db.isolation_level == ""
@@ -131,7 +132,7 @@ async def test_run_migration_concurrent_calls_apply_exactly_once(tmp_path, monke
 
 @pytest.mark.asyncio
 async def test_get_db_sets_a_30_second_busy_timeout(tmp_path, monkeypatch):
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "test.db")
     db = await database.get_db()
     try:
         cur = await db.execute("PRAGMA busy_timeout")
@@ -146,7 +147,7 @@ async def test_get_db_sets_busy_timeout_before_enabling_wal(tmp_path, monkeypatc
     """WAL setup can take a database lock during a concurrent cold start, so
     it must receive get_db()'s extended timeout rather than sqlite's default.
     """
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "test.db")
     executed = []
     real_execute = aiosqlite.Connection.execute
 
@@ -166,7 +167,7 @@ async def test_get_db_sets_busy_timeout_before_enabling_wal(tmp_path, monkeypatc
 @pytest.mark.asyncio
 async def test_get_db_finalizes_wal_pragma_before_returning_connection(tmp_path, monkeypatch):
     """A caller may issue schema DDL immediately after opening a connection."""
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "test.db")
     db = await database.get_db()
     try:
         await db.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
@@ -181,7 +182,7 @@ async def test_add_columns_skips_alter_when_column_already_present(tmp_path, mon
     already exists, _add_columns must not even attempt the ALTER TABLE
     (which would otherwise hit-and-swallow duplicate_column_name every
     time, wasting a lock wait under contention)."""
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "test.db")
     db = await database.get_db()
     try:
         await db.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY, existing_col TEXT)")
@@ -207,7 +208,7 @@ async def test_add_columns_skips_alter_when_column_already_present(tmp_path, mon
 @pytest.mark.asyncio
 async def test_add_columns_still_adds_missing_column(tmp_path, monkeypatch):
     """Correctness is unchanged: a genuinely-missing column is still added."""
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "test.db")
     db = await database.get_db()
     try:
         await db.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
@@ -224,7 +225,7 @@ async def test_add_columns_still_adds_missing_column(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_snapshot_created_and_verified_when_needed(tmp_path, monkeypatch):
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "fitness.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "fitness.db")
     db = await database.get_db()
     try:
         await db.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
@@ -250,7 +251,7 @@ async def test_snapshot_created_and_verified_when_needed(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_snapshot_skipped_when_not_needed(tmp_path, monkeypatch):
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "fitness.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "fitness.db")
     db = await database.get_db()
     await db.close()
 
@@ -264,7 +265,7 @@ async def test_snapshot_skipped_when_not_needed(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_snapshot_skipped_when_final_already_exists(tmp_path, monkeypatch):
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "fitness.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "fitness.db")
     tmp_path.mkdir(exist_ok=True)
     final = tmp_path / "test.pre-migration.db"
     final.write_bytes(b"already here")
@@ -283,7 +284,7 @@ async def test_snapshot_skipped_when_final_already_exists(tmp_path, monkeypatch)
 
 @pytest.mark.asyncio
 async def test_snapshot_respects_skip_env_var(tmp_path, monkeypatch):
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "fitness.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "fitness.db")
     monkeypatch.setenv("VITALFORGE_SKIP_MIGRATION_SNAPSHOT", "1")
     db = await database.get_db()
     await db.close()
@@ -301,7 +302,7 @@ async def test_snapshot_discards_a_corrupt_partial_and_retries(tmp_path, monkeyp
     """Simulates a container killed mid-VACUUM INTO: a .partial file exists
     from a prior interrupted attempt. A fresh call must discard it (not
     trust it) and produce a genuinely verified snapshot."""
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "fitness.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "fitness.db")
     db = await database.get_db()
     try:
         await db.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
@@ -351,7 +352,7 @@ async def test_snapshot_raises_actionable_error_when_integrity_check_itself_rais
     the genuine sqlite3.DatabaseError on its own, so this test exercises the
     actual production code path, not a hand-thrown substitute.
     """
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "fitness.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "fitness.db")
     db = await database.get_db()
     try:
         await db.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
@@ -398,7 +399,7 @@ async def test_concurrent_snapshot_callers_do_not_clobber_each_other(tmp_path, m
     flock is held per open file description, so two concurrent callers in one
     process contend exactly as two processes do, and this reproduces it.
     """
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "fitness.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "fitness.db")
     db = await database.get_db()
     try:
         await db.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY, payload TEXT)")
@@ -440,7 +441,7 @@ async def test_concurrent_snapshot_callers_do_not_clobber_each_other(tmp_path, m
 async def test_snapshot_loser_skips_a_redundant_vacuum(tmp_path, monkeypatch):
     """The loser must re-check final.exists() INSIDE the lock and return, not
     wait its turn and then take a second full copy of the database."""
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "fitness.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "fitness.db")
     db = await database.get_db()
     try:
         await db.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
@@ -471,7 +472,7 @@ async def test_snapshot_loser_skips_a_redundant_vacuum(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_assert_schema_understood_passes_on_empty_migrations_table(tmp_path, monkeypatch):
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "test.db")
     db = await database.get_db()
     try:
         await db.execute(migrations.SCHEMA_MIGRATIONS_TABLE_SQL)
@@ -484,7 +485,7 @@ async def test_assert_schema_understood_passes_on_empty_migrations_table(tmp_pat
 
 @pytest.mark.asyncio
 async def test_assert_schema_understood_passes_on_known_migrations(tmp_path, monkeypatch):
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "test.db")
     db = await database.get_db()
     try:
         await db.execute(migrations.SCHEMA_MIGRATIONS_TABLE_SQL)
@@ -501,7 +502,7 @@ async def test_assert_schema_understood_passes_on_known_migrations(tmp_path, mon
 
 @pytest.mark.asyncio
 async def test_assert_schema_understood_raises_on_unknown_migration(tmp_path, monkeypatch):
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "test.db")
     db = await database.get_db()
     try:
         await db.execute(migrations.SCHEMA_MIGRATIONS_TABLE_SQL)
@@ -522,7 +523,7 @@ async def test_assert_schema_understood_passes_against_a_just_migrated_db(tmp_pa
     is called with -- this is the exact bug class caught during spec review:
     a typo between the guard's known-names tuple and the actual migration
     name would make an image reject its own migration as unrecognized."""
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "test.db")
     db = await database.get_db()
     try:
         await db.execute(migrations.SCHEMA_MIGRATIONS_TABLE_SQL)
@@ -542,7 +543,7 @@ async def test_assert_schema_understood_passes_against_a_just_migrated_db(tmp_pa
 
 @pytest.mark.asyncio
 async def test_init_db_creates_schema_migrations_table(tmp_path, monkeypatch):
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "test.db")
     await database.init_db()
 
     db = await database.get_db()
@@ -559,7 +560,7 @@ async def test_init_db_creates_schema_migrations_table(tmp_path, monkeypatch):
 async def test_init_db_calls_the_schema_guard_and_passes_on_a_fresh_db(tmp_path, monkeypatch):
     """A fresh DB has zero migration markers, so the guard must pass --
     if init_db() raised here, EVERY fresh install would fail to boot."""
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "test.db")
     await database.init_db()  # must not raise
 
 
@@ -568,7 +569,7 @@ async def test_init_db_fails_lifespan_if_db_has_an_unknown_migration_marker(tmp_
     """Proves the guard is actually wired in, not just importable. Seeds an
     unknown marker directly (bypassing run_migration, which is fine here --
     this test only cares that init_db() calls assert_schema_understood)."""
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "test.db")
     await database.init_db()  # first boot: creates schema_migrations, passes
 
     db = await database.get_db()
@@ -591,7 +592,7 @@ async def test_init_db_fails_lifespan_if_db_has_an_unknown_migration_marker(tmp_
 
 @pytest.mark.asyncio
 async def test_fresh_db_gets_new_shape_directly_and_one_primary_person(tmp_path, monkeypatch):
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "test.db")
     await database.init_db()
 
     db = await database.get_db()
@@ -633,11 +634,11 @@ async def test_migration_preserves_row_counts_and_backfills_person_id(production
 
 @pytest.mark.asyncio
 async def test_schema_parity_fresh_vs_migrated(tmp_path, monkeypatch, production_schema_db):
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "fresh.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "fresh.db")
     await database.init_db()
     fresh_db = await database.get_db()
 
-    monkeypatch.setattr(database, "DB_PATH", production_schema_db)
+    monkeypatch.setattr(db_connection, "DB_PATH", production_schema_db)
     await database.init_db()
     migrated_db = await database.get_db()
 
@@ -795,7 +796,7 @@ async def test_snapshot_is_created_before_the_rebuild_runs(production_schema_db)
 
 @pytest.mark.asyncio
 async def test_snapshot_not_taken_on_a_fresh_db(tmp_path, monkeypatch):
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "fresh.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "fresh.db")
     await database.init_db()
     assert not (tmp_path / "fitness.pre-001-person-id.db").exists()
 
@@ -861,7 +862,7 @@ async def test_migration_alone_leaves_a_fresh_db_primary_person_unowned(tmp_path
     If this ever starts failing because the grant appears here, the lifespan
     call below is redundant and should be reconsidered -- not deleted
     silently."""
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "test.db")
     await database.init_db()
 
     db = await database.get_db()
@@ -875,7 +876,7 @@ async def test_migration_alone_leaves_a_fresh_db_primary_person_unowned(tmp_path
 async def test_fresh_install_lifespan_order_gives_the_admin_an_own_grant(tmp_path, monkeypatch):
     """The real lifespan sequence: init_db() -> bootstrap_first_admin() ->
     ensure_primary_person_grant() (see both services' app.py)."""
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "test.db")
     await database.init_db()
     admin_id = await _seed_admin()
     await database.ensure_primary_person_grant()
@@ -892,7 +893,7 @@ async def test_fresh_install_lifespan_order_gives_the_admin_an_own_grant(tmp_pat
 
 @pytest.mark.asyncio
 async def test_ensure_primary_person_grant_is_idempotent(tmp_path, monkeypatch):
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "test.db")
     await database.init_db()
     await _seed_admin()
     await database.ensure_primary_person_grant()
@@ -911,7 +912,7 @@ async def test_ensure_primary_person_grant_noops_without_an_admin(tmp_path, monk
     """A fresh install with VITALFORGE_PASS unset has an empty users table;
     the grant must simply wait for the boot after an admin is seeded rather
     than crash the lifespan."""
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "test.db")
     await database.init_db()
     await database.ensure_primary_person_grant()  # must not raise
 
@@ -934,7 +935,7 @@ async def test_ensure_primary_person_grant_noops_without_an_admin(tmp_path, monk
 async def test_ensure_primary_person_grant_never_overwrites_a_chosen_default(tmp_path, monkeypatch):
     """Phase 2 lets an account pick its own default person. A later boot must
     not silently drag it back to the primary."""
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "test.db")
     await database.init_db()
     admin_id = await _seed_admin()
     await database.ensure_primary_person_grant()
@@ -969,7 +970,7 @@ async def test_upgrade_with_an_existing_admin_grants_inside_the_migration(tmp_pa
     by _ensure_primary_person() during the migration itself, with no lifespan
     help. Exercised directly on a connection because run_migration() has
     already recorded its marker by the time a test could observe it."""
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "test.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "test.db")
     await database.init_db()
     admin_id = await _seed_admin()
 
@@ -1056,11 +1057,11 @@ async def test_activities_rebuild_preserves_rows_and_ids(production_schema_db):
 @pytest.mark.asyncio
 async def test_activities_schema_parity_fresh_vs_migrated(tmp_path, monkeypatch, production_schema_db):
     await _seed_legacy_activities(production_schema_db)
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "fresh.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "fresh.db")
     await database.init_db()
     fresh_db = await database.get_db()
 
-    monkeypatch.setattr(database, "DB_PATH", production_schema_db)
+    monkeypatch.setattr(db_connection, "DB_PATH", production_schema_db)
     await database.init_db()
     migrated_db = await database.get_db()
 
@@ -1187,7 +1188,7 @@ async def test_002_rekeys_activities_on_a_db_that_already_applied_001(tmp_path, 
     -- run_migration skips 001 wholesale once its marker exists -- while every
     /api/activities route queried a person_id column that was never added.
     """
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "mid.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "mid.db")
     await database.init_db()
 
     db = await database.get_db()
@@ -1398,7 +1399,7 @@ async def test_init_db_adds_garmin_name_prefix_to_a_deployed_strength_sessions(t
     supplies it and the ALTER path is never exercised. This builds the deployed
     shape on purpose.
     """
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "deployed.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "deployed.db")
     monkeypatch.setenv("DB_PATH", str(tmp_path / "deployed.db"))
 
     db = await database.get_db()
@@ -1450,7 +1451,7 @@ async def test_init_db_adds_garmin_name_prefix_to_a_deployed_strength_sessions(t
 @pytest.mark.asyncio
 async def test_003_removes_legacy_global_target_and_terminalizes_its_retry(tmp_path, monkeypatch):
     """A historical cross-account push must never be retried through a new link."""
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "legacy-target.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "legacy-target.db")
     monkeypatch.setenv("DB_PATH", str(tmp_path / "legacy-target.db"))
 
     db = await database.get_db()
@@ -1624,11 +1625,11 @@ async def test_strength_sessions_schema_parity_fresh_vs_migrated(tmp_path, monke
         "fixture must start from the deployed pre-003 shape or the rebuild never runs"
     )
 
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "fresh.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "fresh.db")
     await database.init_db()
     fresh_db = await database.get_db()
 
-    monkeypatch.setattr(database, "DB_PATH", migrated_path)
+    monkeypatch.setattr(db_connection, "DB_PATH", migrated_path)
     await database.init_db()
     migrated_db = await database.get_db()
 
@@ -1661,7 +1662,7 @@ async def test_strength_sessions_schema_parity_fresh_vs_migrated(tmp_path, monke
 
 @pytest.mark.asyncio
 async def test_pre_003_snapshot_not_taken_on_a_fresh_db(tmp_path, monkeypatch):
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "fresh.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "fresh.db")
     await database.init_db()
     assert not (tmp_path / migrations._STRENGTH_SESSIONS_SNAPSHOT_NAME).exists()
 
@@ -1674,7 +1675,7 @@ async def test_pre_003_snapshot_is_taken_only_while_garmin_target_exists(tmp_pat
     column is gone."""
     db_path = tmp_path / "pre-003.db"
     await _seed_pre_003_strength_sessions(db_path, rows=2)
-    monkeypatch.setattr(database, "DB_PATH", db_path)
+    monkeypatch.setattr(db_connection, "DB_PATH", db_path)
     await database.init_db()
 
     snapshot = tmp_path / migrations._STRENGTH_SESSIONS_SNAPSHOT_NAME
@@ -1727,7 +1728,7 @@ async def test_backoff_streak_survives_the_pre_001_rebuild(production_schema_db)
 
 @pytest.mark.asyncio
 async def test_backoff_streak_is_added_to_an_already_migrated_database(tmp_path, monkeypatch):
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "migrated.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "migrated.db")
     await database.init_db()
     db = await database.get_db()
     try:
@@ -1748,7 +1749,7 @@ async def test_the_previous_image_can_still_write_sync_status(tmp_path, monkeypa
     """Rollback safety. The pre-#88 image's run_sync upserts four columns and
     never names backoff_streak; the extra nullable column must not break it,
     and the ON CONFLICT form must not clear what it does not name."""
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "rollback.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "rollback.db")
     await database.init_db()
     person_id = await database.get_primary_person_id()
     db = await database.get_db()
