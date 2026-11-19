@@ -23,8 +23,28 @@ def _private_names_imported_from(module_file: str, source_module: str) -> list[s
     ]
 
 
-def test_migrations_imports_no_private_names_from_database():
-    assert _private_names_imported_from("migrations.py", "shared.database") == []
+def _modules_imported_by(module_file: str) -> set[str]:
+    tree = ast.parse((SHARED / module_file).read_text())
+    found: set[str] = set()
+    for node in ast.walk(tree):  # includes deferred, function-local imports
+        if isinstance(node, ast.ImportFrom) and node.module:
+            found.add(node.module)
+            if node.module == "shared":
+                found.update(f"shared.{a.name}" for a in node.names)
+        elif isinstance(node, ast.Import):
+            found.update(a.name for a in node.names)
+    return found
+
+
+def test_migrations_does_not_import_database_even_lazily():
+    # database -> migrations (public entry point only) is the one allowed
+    # direction; the reverse edge is what made the cycle.
+    assert "shared.database" not in _modules_imported_by("migrations.py")
+    assert "shared.db_connection" in _modules_imported_by("migrations.py")
+
+
+def test_database_imports_no_private_names_from_migrations():
+    assert _private_names_imported_from("database.py", "shared.migrations") == []
 
 
 def test_database_helper_not_redefined_in_database():
@@ -35,9 +55,9 @@ def test_database_helper_not_redefined_in_database():
 
 @pytest.mark.asyncio
 async def test_grant_is_idempotent_and_sets_default_person(tmp_path, monkeypatch):
-    import shared.database as database
+    import shared.db_connection as db_connection
 
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "t.db")
+    monkeypatch.setattr(db_connection, "DB_PATH", tmp_path / "t.db")
     await init_db()
     db = await get_db()
     try:

@@ -13,7 +13,7 @@ documented way to get dashboard data without a live Garmin account, so it
 being broken is not cosmetic.
 
 Run as a SUBPROCESS, not imported: seed() sets os.environ["DB_PATH"] and
-rebinds shared.database.DB_PATH at module scope, which would leak into every
+rebinds shared.db_connection.DB_PATH at module scope, which would leak into every
 test that ran afterward. The subprocess also exercises what actually broke --
 the CLI, as a person would invoke it.
 """
