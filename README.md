@@ -15,6 +15,8 @@ No opening apps, no navigating menus, no waiting for Bluetooth sync. Just weigh,
 
 From there, VitalForge grew into a full health dashboard that pulls all your Garmin data (sleep, HRV, resting HR, stress, body battery, VO2 max, training load) and surfaces trends and AI-powered recommendations.
 
+VitalForge complements [garmin-grafana](https://github.com/arpanghosh8453/garmin-grafana) rather than replacing it: grafana is the place for generic time-series charting, while VitalForge focuses on the tap-to-log weight workflow and opinionated trends and recommendations.
+
 ### Two services
 
 - **vitalforge-weight** (port 8085) — Mobile-first PWA for quick weight logging to Garmin Connect
