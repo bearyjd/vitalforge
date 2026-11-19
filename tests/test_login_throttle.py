@@ -132,6 +132,7 @@ def test_known_device_bypasses_username_bucket_only():
     assert lt.retry_after("7.7.7.7", "alice", 1.0) is not None
     res = lt.reserve("7.7.7.7", "alice", 1.0)
     assert res.username_key is None
+    lt.record_failure("8.8.8.8", "x", 1.0)  # an IP with failures gets no clean-IP probe
     with pytest.raises(lt.ThrottledError):
         lt.reserve("8.8.8.8", "alice", 1.0)
     for n in range(lt.FREE_FAILURES):
@@ -177,3 +178,60 @@ def test_concurrent_burst_is_throttled(monkeypatch):
     codes = [r.status_code for r in asyncio.run(run())]
     assert calls <= lt.FREE_FAILURES
     assert codes.count(429) >= 60 - lt.FREE_FAILURES
+
+
+def test_clean_ip_probe_reaches_password_check_while_username_blocked():
+    for n in range(lt.FREE_FAILURES + 2):
+        lt.record_failure(f"9.9.9.{n}", "alice", 1.0)
+    # dirty IP and a second clean IP in the same interval are refused
+    with pytest.raises(lt.ThrottledError):
+        lt.reserve("9.9.9.0", "alice", 2.0)
+    probe = lt.reserve("5.5.5.5", "alice", 2.0)
+    lt.release(probe)
+    with pytest.raises(lt.ThrottledError):
+        lt.reserve("6.6.6.6", "alice", 3.0)
+    lt.release(lt.reserve("6.6.6.6", "alice", 2.0 + lt.CLEAN_IP_PROBE_INTERVAL_SECONDS))
+
+
+def test_rotating_ip_attacker_cannot_starve_username_for_a_day():
+    admitted = 0
+    for i in range(0, 24 * 3600, 300):  # attacker retries every 5 min from a new IP
+        t = float(i)
+        try:
+            res = lt.reserve(f"10.{i // 65536 % 256}.{i // 256 % 256}.{i % 256}", "alice", t)
+        except lt.ThrottledError:
+            continue
+        admitted += 1
+        lt.record_failure(res.ip, "alice", t)
+        lt.release(res)
+    assert admitted == 24 * 3600 // 300
+
+
+def test_probe_not_granted_to_ip_with_failures():
+    for n in range(lt.FREE_FAILURES):
+        lt.record_failure(f"9.9.9.{n}", "alice", 1.0)
+    lt.record_failure("5.5.5.5", "other", 1.0)
+    with pytest.raises(lt.ThrottledError):
+        lt.reserve("5.5.5.5", "alice", 2.0)
+
+
+def test_ip_block_flagged_and_known_device_still_hits_ip_bucket():
+    lt.record_success("alice", "7.7.7.7", 0.0)
+    for _ in range(lt.FREE_FAILURES):
+        lt.record_failure("7.7.7.7", "x", 1.0)
+    with pytest.raises(lt.ThrottledError) as exc:
+        lt.reserve("7.7.7.7", "alice", 1.0)
+    assert exc.value.ip_blocked
+
+
+def test_warns_on_every_ip_block_of_untrusted_private_peer(monkeypatch, caplog):
+    monkeypatch.setenv(lt.TRUSTED_PROXY_IPS_ENV, "172.20.0.2")  # plausible but wrong
+    with caplog.at_level("WARNING"):
+        for _ in range(3):
+            lt.warn_if_shared_proxy_bucket(_Req("172.20.0.1"))
+    assert len([r for r in caplog.records if "IP bucket blocked" in r.message]) == 3
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        lt.warn_if_shared_proxy_bucket(_Req("172.20.0.2"))  # trusted
+        lt.warn_if_shared_proxy_bucket(_Req("8.8.8.8"))  # public
+    assert not caplog.records

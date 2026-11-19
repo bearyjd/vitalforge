@@ -95,6 +95,8 @@ def add_auth_routes(app):
         try:
             reservation = login_throttle.reserve(ip, username, time.time())
         except login_throttle.ThrottledError as exc:
+            if exc.ip_blocked:
+                login_throttle.warn_if_shared_proxy_bucket(request)
             raise HTTPException(
                 status_code=429, detail="Too many attempts", headers={"Retry-After": str(exc.wait)}
             ) from exc

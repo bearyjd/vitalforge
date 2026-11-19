@@ -25,6 +25,11 @@ TRUSTED_PROXY_IPS_ENV = "VITALFORGE_TRUSTED_PROXY_IPS"
 # device": it bypasses the shared per-username bucket (still subject to its own
 # IP bucket) so an attacker cannot keep the real user blocked.
 KNOWN_DEVICE_TTL_SECONDS = 30 * 24 * 3600
+# While a username is backed off, one attempt per interval from an IP with no
+# recorded failures still reaches the password check, so an attacker rotating
+# source IPs cannot keep the real user locked out indefinitely.  The price is
+# at most one extra guess per username per interval.
+CLEAN_IP_PROBE_INTERVAL_SECONDS = 30
 
 logger = logging.getLogger(__name__)
 
@@ -43,13 +48,15 @@ _by_username: dict[str, _Entry] = {}
 _pending_ip: dict[str, int] = {}
 _pending_username: dict[str, int] = {}
 _known_devices: dict[tuple[str, str], float] = {}
+_last_probe: dict[str, float] = {}
 _proxy_warned = False
 
 
 class ThrottledError(Exception):
-    def __init__(self, wait: int) -> None:
+    def __init__(self, wait: int, ip_blocked: bool = False) -> None:
         super().__init__(f"throttled for {wait}s")
         self.wait = wait
+        self.ip_blocked = ip_blocked
 
 
 @dataclass(frozen=True)
@@ -65,6 +72,7 @@ def reset() -> None:
     _pending_ip.clear()
     _pending_username.clear()
     _known_devices.clear()
+    _last_probe.clear()
     _proxy_warned = False
 
 
@@ -85,9 +93,7 @@ def client_ip(request: Request) -> str:
     entry is the one the trusted hop appended.
     """
     peer = request.client.host if request.client is not None else "unknown"
-    trusted = {
-        v.strip() for v in os.environ.get(TRUSTED_PROXY_IPS_ENV, "").split(",") if v.strip()
-    }
+    trusted = _trusted_proxies()
     if not trusted:
         _warn_if_proxy_peer(peer)
     if peer in trusted:
@@ -96,6 +102,34 @@ def client_ip(request: Request) -> str:
         if last:
             return last
     return peer
+
+
+def _trusted_proxies() -> set[str]:
+    raw = os.environ.get(TRUSTED_PROXY_IPS_ENV, "")
+    return {v.strip() for v in raw.split(",") if v.strip()}
+
+
+def warn_if_shared_proxy_bucket(request: Request) -> None:
+    """Called when an IP bucket blocks a request.  A block on a private/loopback
+    peer that is not a trusted proxy usually means a reverse proxy (or a wrong
+    trust list) is collapsing every client into this one bucket.  Logged on
+    every such block, not once, so a wrong-but-non-empty trust list is visible."""
+    peer = request.client.host if request.client is not None else "unknown"
+    if peer in _trusted_proxies():
+        return
+    try:
+        addr = ipaddress.ip_address(peer)
+    except ValueError:
+        return
+    if addr.is_loopback or addr.is_private:
+        logger.warning(
+            "Login IP bucket blocked untrusted private/loopback peer %s: if this is your "
+            "reverse proxy, every user shares this bucket and one client can block all "
+            "logins. Set %s to the address the app sees the proxy connect from "
+            "(the docker bridge gateway when nginx runs on the host).",
+            peer,
+            TRUSTED_PROXY_IPS_ENV,
+        )
 
 
 def _warn_if_proxy_peer(peer: str) -> None:
@@ -143,6 +177,23 @@ def _is_known_device(ip: str, username_key: str, now: float) -> bool:
     return seen is not None and now - seen <= KNOWN_DEVICE_TTL_SECONDS
 
 
+def _ip_is_clean(ip: str, now: float) -> bool:
+    entry = _by_ip.get(ip)
+    return entry is None or now - entry.last_failure > RESET_AFTER_SECONDS
+
+
+def _claim_probe_slot(ukey: str, now: float) -> bool:
+    last = _last_probe.get(ukey)
+    if last is not None and now - last < CLEAN_IP_PROBE_INTERVAL_SECONDS:
+        return False
+    if ukey not in _last_probe and len(_last_probe) >= MAX_TRACKED_KEYS:
+        stale = [k for k, t in _last_probe.items() if now - t >= CLEAN_IP_PROBE_INTERVAL_SECONDS]
+        for k in stale or [min(_last_probe, key=_last_probe.__getitem__)]:
+            _last_probe.pop(k, None)
+    _last_probe[ukey] = now
+    return True
+
+
 def reserve(ip: str, username: str, now: float) -> Reservation:
     """Check and reserve in one synchronous step (no await between them).
 
@@ -151,12 +202,15 @@ def reserve(ip: str, username: str, now: float) -> Reservation:
     """
     ukey = _username_key(username)
     use_username = not _is_known_device(ip, ukey, now)
-    checks = [(_by_ip, _pending_ip, ip)]
-    if use_username:
-        checks.append((_by_username, _pending_username, ukey))
-    waits = [w for w in (_wait_for(t, p, k, now) for t, p, k in checks) if w is not None]
-    if waits:
-        raise ThrottledError(max(1, int(max(waits)) + 1))
+    ip_wait = _wait_for(_by_ip, _pending_ip, ip, now)
+    user_wait = _wait_for(_by_username, _pending_username, ukey, now) if use_username else None
+    if ip_wait is not None:
+        raise ThrottledError(max(1, int(max(ip_wait, user_wait or 0)) + 1), ip_blocked=True)
+    if user_wait is not None:
+        entry = _by_username.get(ukey)
+        backed_off = entry is not None and entry.blocked_until > now
+        if not (backed_off and _ip_is_clean(ip, now) and _claim_probe_slot(ukey, now)):
+            raise ThrottledError(max(1, int(user_wait) + 1))
     _pending_ip[ip] = _pending_ip.get(ip, 0) + 1
     if use_username:
         _pending_username[ukey] = _pending_username.get(ukey, 0) + 1
