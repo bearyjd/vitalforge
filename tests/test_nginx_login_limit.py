@@ -42,11 +42,12 @@ def _login_locations() -> list[str]:
 
 def test_zone_keyed_on_client_ip_at_http_level():
     m = re.search(
-        r"(?m)^limit_req_zone\s+\$login_limit_key\s+zone=login:(\d+)m\s+rate=(\d+)r/m;",
+        r"(?m)^limit_req_zone\s+\$login_limit_key\s+zone=(\w+):(\d+)m\s+rate=(\d+)r/m;",
         _text(),
     )
-    assert m, "limit_req_zone login keyed on $login_limit_key missing"
-    assert int(m.group(2)) <= 10, "per-IP login rate must stay low"
+    assert m, "limit_req_zone keyed on $login_limit_key missing"
+    assert m.group(1) == "login"
+    assert int(m.group(3)) <= 10, "per-IP login rate must stay low"
 
 
 def test_key_is_client_ip_for_post_only():
@@ -58,8 +59,13 @@ def test_key_is_client_ip_for_post_only():
 
 
 def test_every_server_limits_login():
+    zone = re.search(
+        r"(?m)^limit_req_zone\s+\$login_limit_key\s+zone=(\w+):", _text()
+    ).group(1)
     for loc in _login_locations():
-        assert re.search(r"limit_req\s+zone=login\s+burst=\d+\s+nodelay;", loc)
+        m = re.search(r"limit_req\s+zone=(\w+)\s+burst=([1-9]|10)\s+nodelay;", loc)
+        assert m, "limit_req must use a pinned burst of 1-10"
+        assert m.group(1) == zone, "limit_req zone must match limit_req_zone name"
         assert re.search(r"limit_req_status\s+429;", loc)
 
 
@@ -72,3 +78,10 @@ def test_login_location_still_proxies():
 def test_login_location_does_not_override_add_header():
     for loc in _login_locations():
         assert "add_header" not in loc
+
+
+def test_login_page_shows_rate_limit_message_on_429():
+    from shared.auth_pages import LOGIN_PAGE_HTML
+
+    assert "res.status === 429" in LOGIN_PAGE_HTML
+    assert "Too many attempts, wait a minute" in LOGIN_PAGE_HTML

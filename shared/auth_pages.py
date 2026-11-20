@@ -79,7 +79,8 @@ LOGIN_PAGE_HTML = """<!DOCTYPE html>
             if (res.ok) {
                 window.location.href = "/";
             } else {
-                document.getElementById("error").textContent = "Invalid credentials";
+                document.getElementById("error").textContent =
+                    res.status === 429 ? "Too many attempts, wait a minute" : "Invalid credentials";
             }
             return false;
         }
