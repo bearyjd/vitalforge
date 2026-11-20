@@ -365,18 +365,25 @@ def test_empty_trusted_proxies_after_parsing_is_an_error(spec):
         lb._build_trusted(spec, route_text="")
 
 
+def test_scoped_ipv6_x_real_ip_does_not_raise():
+    assert lb.client_src("127.0.0.1", "fe80::1%eth0") == "fe80::/64"
+
+
 def test_compose_publishes_ports_ipv4_only():
     """Gateway trust is only sound if docker-proxy never fronts IPv6 clients."""
     import pathlib
-    import re
+
+    import yaml
 
     root = pathlib.Path(__file__).resolve().parent.parent
     for name in ("docker-compose.yml", "docker-compose.prod.yml"):
-        text = (root / name).read_text()
-        mappings = re.findall(r'^\s*-\s*"?([0-9.:]*:?(?:8085|8086):(?:8085|8086))"?\s*$', text, re.M)
-        assert mappings, name
-        for m in mappings:
-            assert m.startswith(("0.0.0.0:", "127.0.0.1:")), f"{name}: {m} is not IPv4-bound"
+        services = yaml.safe_load((root / name).read_text())["services"]
+        published = [p for svc in services.values() for p in svc.get("ports", [])]
+        assert published, name
+        for p in published:
+            assert isinstance(p, str), f"{name}: long-syntax port {p!r} not allowed"
+            host_ip = p.rsplit(":", 2)[0] if p.count(":") >= 2 else ""
+            assert host_ip in ("0.0.0.0", "127.0.0.1"), f"{name}: {p} is not IPv4-bound"
 
 
 def test_collision_shares_capped_delay_never_a_lock(clock, monkeypatch):
