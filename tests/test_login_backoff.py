@@ -167,6 +167,16 @@ def test_stolen_cookie_gets_its_own_small_backoff(clock):
     assert lb.lane_n("B", ident) == 0 and lb.lane_n("A", ident, "6.6.6.6") == 0
 
 
+def test_lane_d_keyed_per_jti_not_per_account(clock):
+    ident = lb.normalize_id("ivy")
+    first, second = _dev(ident, jti="jA"), _dev(ident, jti="jB")
+    with pytest.raises(lb.LoginBlocked):
+        for _ in range(12):
+            _fail(ident, "6.6.6.6", first)
+            clock[0] += 0.3
+    lb.reserve(ident, "6.6.6.6", second)  # other device unaffected
+
+
 def test_cookie_holder_not_blocked_by_attacker_on_same_source(clock):
     ident = lb.normalize_id("grace")
     for _ in range(30):
@@ -238,12 +248,35 @@ def test_x_real_ip_ignored_unless_peer_is_loopback():
     assert lb.client_src("::1", "1.2.3.4") == "1.2.3.4"
 
 
-def test_x_real_ip_trusted_from_configured_docker_gateway(monkeypatch):
+def test_nginx_on_host_via_docker_gateway_yields_distinct_src_keys():
+    # nginx on the host -> 127.0.0.1:8085 -> docker port publishing: peer is the bridge gateway
     peer = "172.18.0.1"
-    assert lb.client_src(peer, "203.0.113.9") == peer  # default list: gateway untrusted
-    monkeypatch.setattr(lb, "_TRUSTED", [lb.ipaddress.ip_network("172.18.0.1/32")])
-    assert lb.client_src(peer, "203.0.113.9") == "203.0.113.9"
+    a = lb.client_src(peer, "203.0.113.9")
+    b = lb.client_src(peer, "203.0.113.10")
+    assert a == "203.0.113.9" and b == "203.0.113.10" and a != b
+
+
+def test_trusted_peer_without_x_real_ip_does_not_collapse_clients():
+    peer = "172.18.0.1"
+    keys = {lb.client_src(peer, h) for h in (None, "", "not-an-ip", None)}
+    assert len(keys) == 4  # fail safe: never one shared lockable lane-A key
+    assert peer not in keys
+
+
+def test_untrusted_public_peer_ignores_x_real_ip():
+    assert lb.client_src("198.51.100.9", "1.2.3.4") == "198.51.100.9"
+
+
+def test_trusted_proxies_configurable(monkeypatch):
+    monkeypatch.setattr(lb, "_TRUSTED", lb._parse_trusted("172.18.0.1/32"))
+    assert lb.client_src("172.18.0.1", "203.0.113.9") == "203.0.113.9"
     assert lb.client_src("172.18.0.2", "203.0.113.9") == "172.18.0.2"
+
+
+def test_default_trusted_proxies_cover_loopback_and_private_ranges():
+    for peer in ("127.0.0.1", "::1", "10.1.2.3", "172.18.0.1", "192.168.1.5", "fd00::1"):
+        assert lb._is_trusted(peer), peer
+    assert not lb._is_trusted("198.51.100.9")
 
 
 def test_collision_shares_capped_delay_never_a_lock(clock, monkeypatch):

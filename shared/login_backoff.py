@@ -158,14 +158,20 @@ def _bump(table: list, lane: str, idx: int) -> None:
     table[idx] = (n, now + _delay(lane, n), now)
 
 
-# Peers allowed to set X-Real-IP.  Behind Docker's port publishing the peer is the
-# bridge gateway (e.g. 172.18.0.1), not loopback: set VITALFORGE_TRUSTED_PROXIES
-# to include it (comma-separated CIDRs) or publish ports on 127.0.0.1 only.
-_TRUSTED = [
-    ipaddress.ip_network(n.strip(), strict=False)
-    for n in os.environ.get("VITALFORGE_TRUSTED_PROXIES", "127.0.0.1/32,::1/128").split(",")
-    if n.strip()
-]
+# Peers allowed to set X-Real-IP.  The standard deployment runs nginx on the HOST
+# proxying to 127.0.0.1:8085/8086; through Docker port publishing the container
+# sees the bridge gateway (e.g. 172.18.0.1), not loopback.  Default: loopback plus
+# RFC1918 and IPv6 ULA.  Override with VITALFORGE_TRUSTED_PROXIES (comma-separated
+# CIDRs).  Residual risk: a client reaching the published port directly from a
+# trusted range can spoof X-Real-IP, but that only lets it pick its own lane-A key.
+_DEFAULT_TRUSTED = "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7"
+
+
+def _parse_trusted(spec: str) -> list:
+    return [ipaddress.ip_network(n.strip(), strict=False) for n in spec.split(",") if n.strip()]
+
+
+_TRUSTED = _parse_trusted(os.environ.get("VITALFORGE_TRUSTED_PROXIES", _DEFAULT_TRUSTED))
 
 
 def _is_trusted(peer: str) -> bool:
@@ -179,13 +185,20 @@ def _is_trusted(peer: str) -> bool:
 def client_src(peer: str | None, x_real_ip: str | None) -> str:
     """Rate-limit key for the caller: IPv6 by /64, IPv4-mapped unwrapped."""
     raw = peer or "unknown"
-    if _is_trusted(raw) and x_real_ip:
-        raw = x_real_ip.strip()
-    try:
-        ip = ipaddress.ip_address(raw)
-    except ValueError:
+    if _is_trusted(raw):
         try:
-            ip = ipaddress.ip_address(peer or "")
+            ip = ipaddress.ip_address((x_real_ip or "").strip())
+        except ValueError:
+            if ipaddress.ip_address(raw).is_loopback:
+                ip = ipaddress.ip_address(raw)
+            else:
+                # Proxy hop without a usable X-Real-IP: the peer is shared by every
+                # client, so a peer-keyed lane A would be lockable by anyone.  Use a
+                # one-off key; lanes B and G still bound guessing.
+                return "direct:" + secrets.token_hex(8)
+    else:
+        try:
+            ip = ipaddress.ip_address(raw)
         except ValueError:
             return "unknown"
     if isinstance(ip, ipaddress.IPv6Address):

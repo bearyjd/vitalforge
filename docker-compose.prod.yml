@@ -13,7 +13,7 @@ services:
   vitalforge-weight:
     image: bearyj/vitalforge-weight:latest
     ports:
-      - "127.0.0.1:8085:8085"
+      - "8085:8085"
     volumes:
       - vitalforge-data:/app/data
     env_file:
@@ -23,7 +23,7 @@ services:
   vitalforge-dashboard:
     image: bearyj/vitalforge-dashboard:latest
     ports:
-      - "127.0.0.1:8086:8086"
+      - "8086:8086"
     volumes:
       - vitalforge-data:/app/data
     env_file:
