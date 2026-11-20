@@ -51,7 +51,7 @@ Residual risks (documented, accepted):
 - Direct port access bypasses nginx, so lane S does not apply there and this
   module must stand alone: A/B/D/G still bound guessing, but one host can drain
   G (delaying new-device logins, never cookie holders).  The client address is
-  taken from X-Real-IP only when the TCP peer is loopback (nginx on the same
+  taken from X-Real-IP only when the TCP peer is in VITALFORGE_TRUSTED_PROXIES (default loopback) (nginx on the same
   host); otherwise the peer address is used and the header ignored.
 - The dashboard (:8086) and weight (:8085) apps are separate processes with
   separate memory: an attacker gets up to twice the budget, and a restart
@@ -62,6 +62,7 @@ import hashlib
 import hmac
 import ipaddress
 import math
+import os
 import secrets
 import time
 from dataclasses import dataclass
@@ -157,14 +158,28 @@ def _bump(table: list, lane: str, idx: int) -> None:
     table[idx] = (n, now + _delay(lane, n), now)
 
 
+# Peers allowed to set X-Real-IP.  Behind Docker's port publishing the peer is the
+# bridge gateway (e.g. 172.18.0.1), not loopback: set VITALFORGE_TRUSTED_PROXIES
+# to include it (comma-separated CIDRs) or publish ports on 127.0.0.1 only.
+_TRUSTED = [
+    ipaddress.ip_network(n.strip(), strict=False)
+    for n in os.environ.get("VITALFORGE_TRUSTED_PROXIES", "127.0.0.1/32,::1/128").split(",")
+    if n.strip()
+]
+
+
+def _is_trusted(peer: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(peer)
+    except ValueError:
+        return False
+    return any(ip.version == net.version and ip in net for net in _TRUSTED)
+
+
 def client_src(peer: str | None, x_real_ip: str | None) -> str:
     """Rate-limit key for the caller: IPv6 by /64, IPv4-mapped unwrapped."""
     raw = peer or "unknown"
-    try:
-        trusted_proxy = ipaddress.ip_address(raw).is_loopback
-    except ValueError:
-        trusted_proxy = False
-    if trusted_proxy and x_real_ip:
+    if _is_trusted(raw) and x_real_ip:
         raw = x_real_ip.strip()
     try:
         ip = ipaddress.ip_address(raw)

@@ -238,6 +238,14 @@ def test_x_real_ip_ignored_unless_peer_is_loopback():
     assert lb.client_src("::1", "1.2.3.4") == "1.2.3.4"
 
 
+def test_x_real_ip_trusted_from_configured_docker_gateway(monkeypatch):
+    peer = "172.18.0.1"
+    assert lb.client_src(peer, "203.0.113.9") == peer  # default list: gateway untrusted
+    monkeypatch.setattr(lb, "_TRUSTED", [lb.ipaddress.ip_network("172.18.0.1/32")])
+    assert lb.client_src(peer, "203.0.113.9") == "203.0.113.9"
+    assert lb.client_src("172.18.0.2", "203.0.113.9") == "172.18.0.2"
+
+
 def test_collision_shares_capped_delay_never_a_lock(clock, monkeypatch):
     """Collision policy: colliding keys share one slot (and so one counter),
     which is only ever a capped delay that ages out; cookie-holder lane D
@@ -344,8 +352,9 @@ async def test_cookie_revoked_on_password_change(client):
         await db.commit()
     finally:
         await db.close()
-    for _ in range(8):
-        await _login(client, "zed", "wrong-guess-xx", cookies={"vf_device": device})
+    # pre-fill lane A from the same source with NO cookie
+    for _ in range(5):
+        await _login(client, "zed", "wrong-guess-xx")
     # revoked cookie == no cookie: A/B apply, so the same source is now blocked
     resp = await _login(client, "zed", PW, cookies={"vf_device": device})
     assert resp.status_code == 429
@@ -356,8 +365,9 @@ async def test_cookie_for_other_account_gives_no_bypass(client):
     await seed_user("ya", password=PW)
     device = (await _login(client, "xa", PW)).cookies.get("vf_device")
     client.cookies.clear()
-    for _ in range(8):
-        await _login(client, "ya", "wrong-guess-xx", cookies={"vf_device": device})
+    # pre-fill ya's lane A without a cookie; xa's cookie must not bypass it
+    for _ in range(5):
+        await _login(client, "ya", "wrong-guess-xx")
     assert (await _login(client, "ya", PW, cookies={"vf_device": device})).status_code == 429
 
 
