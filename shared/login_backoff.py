@@ -51,8 +51,9 @@ Residual risks (documented, accepted):
 - Direct port access bypasses nginx, so lane S does not apply there and this
   module must stand alone: A/B/D/G still bound guessing, but one host can drain
   G (delaying new-device logins, never cookie holders).  The client address is
-  taken from X-Real-IP only when the TCP peer is in VITALFORGE_TRUSTED_PROXIES (default loopback) (nginx on the same
-  host); otherwise the peer address is used and the header ignored.
+  taken from X-Real-IP only when the TCP peer is trusted (loopback and the
+  detected default gateway, or exactly VITALFORGE_TRUSTED_PROXIES); otherwise
+  the peer address is used and the header ignored.  LAN peers are not trusted.
 - The dashboard (:8086) and weight (:8085) apps are separate processes with
   separate memory: an attacker gets up to twice the budget, and a restart
   clears state.  Single host, so clock skew does not matter.
@@ -158,20 +159,61 @@ def _bump(table: list, lane: str, idx: int) -> None:
     table[idx] = (n, now + _delay(lane, n), now)
 
 
-# Peers allowed to set X-Real-IP.  The standard deployment runs nginx on the HOST
-# proxying to 127.0.0.1:8085/8086; through Docker port publishing the container
-# sees the bridge gateway (e.g. 172.18.0.1), not loopback.  Default: loopback plus
-# RFC1918 and IPv6 ULA.  Override with VITALFORGE_TRUSTED_PROXIES (comma-separated
-# CIDRs).  Residual risk: a client reaching the published port directly from a
-# trusted range can spoof X-Real-IP, but that only lets it pick its own lane-A key.
-_DEFAULT_TRUSTED = "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7"
+# Peers allowed to set X-Real-IP: loopback plus the container's default gateway
+# (detected from /proc/net/route at startup), or exactly the CIDRs in
+# VITALFORGE_TRUSTED_PROXIES when set.  The standard deployment runs nginx on the
+# HOST proxying to 127.0.0.1:8085/8086; through Docker port publishing the
+# container sees the bridge gateway (e.g. 172.18.0.1), not loopback.  RFC1918 /
+# ULA ranges are deliberately NOT trusted: LAN hosts can reach the published
+# ports directly, and trusting them would let one choose another source's lane-A
+# key or dodge the per-source cap P on lane B by rotating X-Real-IP.  Every
+# other peer is keyed on its own address and the header is ignored.  If the
+# gateway cannot be detected only loopback is trusted (fail safe; set
+# VITALFORGE_TRUSTED_PROXIES).  Residual risk: a host that can originate traffic
+# AS the gateway (anything on the Docker host reaching the published port via
+# docker-proxy) can still choose its source key.  A trusted hop with a missing or
+# invalid X-Real-IP is keyed on the peer itself (one shared lane-A key for all
+# such requests; only lanes B and G bound that, never a random per-request key).
+_LOOPBACK_TRUSTED = "127.0.0.0/8,::1/128"
+_ROUTE_FILE = "/proc/net/route"
+
+
+def _default_gateway(route_text: str) -> str | None:
+    """Default-route gateway from /proc/net/route text, or None if undetectable."""
+    for line in route_text.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) >= 3 and fields[1] == "00000000":
+            try:
+                return str(ipaddress.IPv4Address(int(fields[2], 16).to_bytes(4, "little")))
+            except (ValueError, OverflowError):
+                return None
+    return None
 
 
 def _parse_trusted(spec: str) -> list:
     return [ipaddress.ip_network(n.strip(), strict=False) for n in spec.split(",") if n.strip()]
 
 
-_TRUSTED = _parse_trusted(os.environ.get("VITALFORGE_TRUSTED_PROXIES", _DEFAULT_TRUSTED))
+def _build_trusted(env_spec: str | None, route_text: str | None = None) -> list:
+    if env_spec:
+        try:
+            return _parse_trusted(env_spec)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid VITALFORGE_TRUSTED_PROXIES={env_spec!r}: expected comma-separated "
+                f"CIDRs such as '127.0.0.1/32,172.18.0.1/32' ({exc})"
+            ) from exc
+    if route_text is None:
+        try:
+            with open(_ROUTE_FILE) as fh:
+                route_text = fh.read()
+        except OSError:
+            route_text = ""
+    gateway = _default_gateway(route_text)
+    return _parse_trusted(_LOOPBACK_TRUSTED + (f",{gateway}/32" if gateway else ""))
+
+
+_TRUSTED = _build_trusted(os.environ.get("VITALFORGE_TRUSTED_PROXIES"))
 
 
 def _is_trusted(peer: str) -> bool:
@@ -183,24 +225,19 @@ def _is_trusted(peer: str) -> bool:
 
 
 def client_src(peer: str | None, x_real_ip: str | None) -> str:
-    """Rate-limit key for the caller: IPv6 by /64, IPv4-mapped unwrapped."""
+    """Rate-limit key for the caller: IPv6 by /64, IPv4-mapped unwrapped.
+    X-Real-IP is used only when the peer is trusted and the header is valid;
+    otherwise the peer's own address is the key."""
     raw = peer or "unknown"
+    try:
+        ip = ipaddress.ip_address(raw)
+    except ValueError:
+        return "unknown"
     if _is_trusted(raw):
         try:
             ip = ipaddress.ip_address((x_real_ip or "").strip())
         except ValueError:
-            if ipaddress.ip_address(raw).is_loopback:
-                ip = ipaddress.ip_address(raw)
-            else:
-                # Proxy hop without a usable X-Real-IP: the peer is shared by every
-                # client, so a peer-keyed lane A would be lockable by anyone.  Use a
-                # one-off key; lanes B and G still bound guessing.
-                return "direct:" + secrets.token_hex(8)
-    else:
-        try:
-            ip = ipaddress.ip_address(raw)
-        except ValueError:
-            return "unknown"
+            pass
     if isinstance(ip, ipaddress.IPv6Address):
         if ip.ipv4_mapped is not None:
             return str(ip.ipv4_mapped)

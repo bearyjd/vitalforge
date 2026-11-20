@@ -5,6 +5,7 @@ through POST /auth/login on a throwaway app, like test_user_management.py.
 """
 
 import asyncio
+import ipaddress
 
 import pytest
 from fastapi import FastAPI
@@ -242,29 +243,72 @@ def test_src_ipv6_is_masked_to_64_and_mapped_v4_unwrapped():
     assert lb.client_src(peer, "not-an-ip") == lb.client_src(peer, None) == "127.0.0.1"
 
 
-def test_x_real_ip_ignored_unless_peer_is_loopback():
+def test_x_real_ip_ignored_from_untrusted_peers_honoured_from_loopback():
     # direct-port access: the header is attacker-controlled, the peer is not
     assert lb.client_src("198.51.100.9", "1.2.3.4") == "198.51.100.9"
     assert lb.client_src("::1", "1.2.3.4") == "1.2.3.4"
+    assert lb.client_src("127.0.0.1", "1.2.3.4") == "1.2.3.4"
+    assert lb.client_src("127.0.0.1", None) == "127.0.0.1"
 
 
-def test_nginx_on_host_via_docker_gateway_yields_distinct_src_keys():
+GATEWAY = "172.18.0.1"
+
+
+@pytest.fixture
+def gateway_trusted(monkeypatch):
+    monkeypatch.setattr(lb, "_TRUSTED", lb._parse_trusted(f"127.0.0.0/8,::1/128,{GATEWAY}/32"))
+
+
+def test_nginx_on_host_via_docker_gateway_yields_distinct_src_keys(gateway_trusted):
     # nginx on the host -> 127.0.0.1:8085 -> docker port publishing: peer is the bridge gateway
-    peer = "172.18.0.1"
-    a = lb.client_src(peer, "203.0.113.9")
-    b = lb.client_src(peer, "203.0.113.10")
+    a = lb.client_src(GATEWAY, "203.0.113.9")
+    b = lb.client_src(GATEWAY, "203.0.113.10")
     assert a == "203.0.113.9" and b == "203.0.113.10" and a != b
 
 
-def test_trusted_peer_without_x_real_ip_does_not_collapse_clients():
-    peer = "172.18.0.1"
-    keys = {lb.client_src(peer, h) for h in (None, "", "not-an-ip", None)}
-    assert len(keys) == 4  # fail safe: never one shared lockable lane-A key
-    assert peer not in keys
+def test_gateway_hop_without_valid_x_real_ip_keys_on_peer(gateway_trusted):
+    # deterministic peer key (no random per-request key); lanes B/G bound the damage
+    keys = {lb.client_src(GATEWAY, h) for h in (None, "", "not-an-ip")}
+    assert keys == {GATEWAY}
 
 
-def test_untrusted_public_peer_ignores_x_real_ip():
-    assert lb.client_src("198.51.100.9", "1.2.3.4") == "198.51.100.9"
+@pytest.mark.parametrize("peer", ["192.168.1.50", "10.1.2.3", "172.19.0.7", "fd00::1"])
+def test_lan_peer_never_trusted_by_default(peer):
+    assert not lb._is_trusted(peer)
+    assert lb.client_src(peer, "203.0.113.9") == lb.client_src(peer, None) == lb.client_src(peer, "garbage")
+
+
+def test_lan_host_rotating_x_real_ip_adds_at_most_p_to_lane_b(clock):
+    ident = lb.normalize_id("victim")
+    for i in range(40):
+        src = lb.client_src("192.168.1.50", f"203.0.113.{i}")
+        try:
+            _fail(ident, src)
+        except lb.LoginBlocked as exc:
+            clock[0] += exc.retry_after
+    assert lb._ab[lb._slot_index("B", ident)][0] <= lb.P
+
+
+def test_lan_host_without_header_adds_at_most_p_to_lane_b(clock):
+    ident = lb.normalize_id("victim")
+    for _ in range(40):
+        src = lb.client_src("192.168.1.50", None)
+        try:
+            _fail(ident, src)
+        except lb.LoginBlocked as exc:
+            clock[0] += exc.retry_after
+    assert lb._ab[lb._slot_index("B", ident)][0] <= lb.P
+
+
+def test_lan_host_cannot_lock_another_sources_lane_a(clock):
+    ident = lb.normalize_id("victim")
+    victim_src = lb.client_src("127.0.0.1", "198.51.100.7")  # via nginx
+    for _ in range(40):
+        try:
+            _fail(ident, lb.client_src("192.168.1.50", "198.51.100.7"))  # spoofed
+        except lb.LoginBlocked as exc:
+            clock[0] += exc.retry_after
+    assert lb._ab[lb._slot_index("A", ident, victim_src)][0] == 0
 
 
 def test_trusted_proxies_configurable(monkeypatch):
@@ -273,10 +317,32 @@ def test_trusted_proxies_configurable(monkeypatch):
     assert lb.client_src("172.18.0.2", "203.0.113.9") == "172.18.0.2"
 
 
-def test_default_trusted_proxies_cover_loopback_and_private_ranges():
-    for peer in ("127.0.0.1", "::1", "10.1.2.3", "172.18.0.1", "192.168.1.5", "fd00::1"):
-        assert lb._is_trusted(peer), peer
-    assert not lb._is_trusted("198.51.100.9")
+def test_invalid_trusted_proxies_error_names_the_variable():
+    with pytest.raises(ValueError, match="VITALFORGE_TRUSTED_PROXIES.*not-a-cidr"):
+        lb._build_trusted("127.0.0.1/32,not-a-cidr", route_text="")
+
+
+ROUTE = (
+    "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n"
+    "eth0\t00000000\t0112A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n"
+    "eth0\t0012A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n"
+)
+
+
+def test_default_gateway_parsed_from_proc_net_route():
+    assert lb._default_gateway(ROUTE) == "192.168.18.1"
+    assert lb._default_gateway("") is None
+    assert lb._default_gateway("garbage\nno route here") is None
+
+
+def test_default_trust_is_loopback_plus_detected_gateway_or_loopback_only():
+    with_gw = lb._build_trusted(None, route_text=ROUTE)
+    assert any(ipaddress.ip_address("192.168.18.1") in n for n in with_gw if n.version == 4)
+    assert not any(ipaddress.ip_address("192.168.18.2") in n for n in with_gw if n.version == 4)
+    assert any(ipaddress.ip_address("127.0.0.1") in n for n in with_gw if n.version == 4)
+    assert not any(ipaddress.ip_address("192.168.1.50") in n for n in with_gw if n.version == 4)
+    lo_only = lb._build_trusted(None, route_text="")
+    assert not any(ipaddress.ip_address("192.168.18.1") in n for n in lo_only if n.version == 4)
 
 
 def test_collision_shares_capped_delay_never_a_lock(clock, monkeypatch):
