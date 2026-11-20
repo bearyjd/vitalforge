@@ -201,6 +201,19 @@ def _reset_step_up_failures():
     shared_auth._step_up_pending.clear()
 
 
+@pytest.fixture(autouse=True)
+def _reset_login_backoff():
+    """Clear shared.login_backoff's module-level lane tables around every
+    test, for the same reason as _reset_step_up_failures: any test that logs
+    in through /auth/login adds failures there, and a leftover entry would
+    surface as an unrelated 429 in a later test."""
+    from shared import login_backoff
+
+    login_backoff.reset()
+    yield
+    login_backoff.reset()
+
+
 @pytest.fixture
 def tmp_db_path(tmp_path, monkeypatch):
     """Point `shared.db_connection.DB_PATH` at an isolated tmp SQLite file.
