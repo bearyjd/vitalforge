@@ -53,7 +53,13 @@ Residual risks (documented, accepted):
   G (delaying new-device logins, never cookie holders).  The client address is
   taken from X-Real-IP only when the TCP peer is trusted (loopback and the
   detected default gateway, or exactly VITALFORGE_TRUSTED_PROXIES); otherwise
-  the peer address is used and the header ignored.  LAN peers are not trusted.
+  the peer address is used and the header ignored.  LAN peers are not trusted
+  when they reach the app as themselves.  Gateway trust is sound ONLY while the
+  published ports are IPv4-only (compose binds 0.0.0.0:PORT): docker-proxy
+  presents IPv6 clients as the gateway, so with an IPv6 publish binding any
+  IPv6-reachable LAN host would be trusted.  Remaining risk: any process on the
+  Docker host, and anything else that can reach the app as the gateway address,
+  can choose its source key.
 - The dashboard (:8086) and weight (:8085) apps are separate processes with
   separate memory: an attacker gets up to twice the budget, and a restart
   clears state.  Single host, so clock skew does not matter.
@@ -170,8 +176,10 @@ def _bump(table: list, lane: str, idx: int) -> None:
 # other peer is keyed on its own address and the header is ignored.  If the
 # gateway cannot be detected only loopback is trusted (fail safe; set
 # VITALFORGE_TRUSTED_PROXIES).  Residual risk: a host that can originate traffic
-# AS the gateway (anything on the Docker host reaching the published port via
-# docker-proxy) can still choose its source key.  A trusted hop with a missing or
+# AS the gateway can still choose its source key: processes on the Docker host
+# via docker-proxy, and any IPv6 LAN client if the ports are published on IPv6
+# (docker-proxy shows v6 clients as the gateway; compose therefore publishes
+# 0.0.0.0:PORT, IPv4-only, and this trust is unsound without that).  A trusted hop with a missing or
 # invalid X-Real-IP is keyed on the peer itself (one shared lane-A key for all
 # such requests; only lanes B and G bound that, never a random per-request key).
 _LOOPBACK_TRUSTED = "127.0.0.0/8,::1/128"
@@ -197,7 +205,10 @@ def _parse_trusted(spec: str) -> list:
 def _build_trusted(env_spec: str | None, route_text: str | None = None) -> list:
     if env_spec:
         try:
-            return _parse_trusted(env_spec)
+            nets = _parse_trusted(env_spec)
+            if not nets:
+                raise ValueError("no CIDRs after parsing")
+            return nets
         except ValueError as exc:
             raise ValueError(
                 f"Invalid VITALFORGE_TRUSTED_PROXIES={env_spec!r}: expected comma-separated "

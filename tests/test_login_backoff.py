@@ -273,12 +273,12 @@ def test_gateway_hop_without_valid_x_real_ip_keys_on_peer(gateway_trusted):
 
 
 @pytest.mark.parametrize("peer", ["192.168.1.50", "10.1.2.3", "172.19.0.7", "fd00::1"])
-def test_lan_peer_never_trusted_by_default(peer):
+def test_lan_peer_never_trusted_by_default(peer, gateway_trusted):
     assert not lb._is_trusted(peer)
     assert lb.client_src(peer, "203.0.113.9") == lb.client_src(peer, None) == lb.client_src(peer, "garbage")
 
 
-def test_lan_host_rotating_x_real_ip_adds_at_most_p_to_lane_b(clock):
+def test_lan_host_rotating_x_real_ip_adds_at_most_p_to_lane_b(clock, gateway_trusted):
     ident = lb.normalize_id("victim")
     for i in range(40):
         src = lb.client_src("192.168.1.50", f"203.0.113.{i}")
@@ -289,7 +289,7 @@ def test_lan_host_rotating_x_real_ip_adds_at_most_p_to_lane_b(clock):
     assert lb._ab[lb._slot_index("B", ident)][0] <= lb.P
 
 
-def test_lan_host_without_header_adds_at_most_p_to_lane_b(clock):
+def test_lan_host_without_header_adds_at_most_p_to_lane_b(clock, gateway_trusted):
     ident = lb.normalize_id("victim")
     for _ in range(40):
         src = lb.client_src("192.168.1.50", None)
@@ -300,7 +300,7 @@ def test_lan_host_without_header_adds_at_most_p_to_lane_b(clock):
     assert lb._ab[lb._slot_index("B", ident)][0] <= lb.P
 
 
-def test_lan_host_cannot_lock_another_sources_lane_a(clock):
+def test_lan_host_cannot_lock_another_sources_lane_a(clock, gateway_trusted):
     ident = lb.normalize_id("victim")
     victim_src = lb.client_src("127.0.0.1", "198.51.100.7")  # via nginx
     for _ in range(40):
@@ -324,6 +324,7 @@ def test_invalid_trusted_proxies_error_names_the_variable():
 
 ROUTE = (
     "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n"
+    "eth1\t0010A8C0\t0A10A8C0\t0003\t0\t0\t0\t00FFFFFF\t0\t0\t0\n"
     "eth0\t00000000\t0112A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n"
     "eth0\t0012A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n"
 )
@@ -343,6 +344,39 @@ def test_default_trust_is_loopback_plus_detected_gateway_or_loopback_only():
     assert not any(ipaddress.ip_address("192.168.1.50") in n for n in with_gw if n.version == 4)
     lo_only = lb._build_trusted(None, route_text="")
     assert not any(ipaddress.ip_address("192.168.18.1") in n for n in lo_only if n.version == 4)
+
+
+def test_trusted_proxies_env_replaces_loopback_not_merges():
+    trusted = lb._build_trusted("172.18.0.1/32", route_text=ROUTE)
+    assert not any(ipaddress.ip_address("127.0.0.1") in n for n in trusted if n.version == 4)
+    assert not any(ipaddress.ip_address("::1") in n for n in trusted if n.version == 6)
+    assert not any(ipaddress.ip_address("192.168.18.1") in n for n in trusted if n.version == 4)
+
+
+def test_missing_route_file_falls_back_to_loopback_only(monkeypatch, tmp_path):
+    monkeypatch.setattr(lb, "_ROUTE_FILE", str(tmp_path / "no-such-route"))
+    trusted = lb._build_trusted(None)
+    assert {str(n) for n in trusted} == {"127.0.0.0/8", "::1/128"}
+
+
+@pytest.mark.parametrize("spec", [" , ", ",", "  "])
+def test_empty_trusted_proxies_after_parsing_is_an_error(spec):
+    with pytest.raises(ValueError, match="VITALFORGE_TRUSTED_PROXIES"):
+        lb._build_trusted(spec, route_text="")
+
+
+def test_compose_publishes_ports_ipv4_only():
+    """Gateway trust is only sound if docker-proxy never fronts IPv6 clients."""
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    for name in ("docker-compose.yml", "docker-compose.prod.yml"):
+        text = (root / name).read_text()
+        mappings = re.findall(r'^\s*-\s*"?([0-9.:]*:?(?:8085|8086):(?:8085|8086))"?\s*$', text, re.M)
+        assert mappings, name
+        for m in mappings:
+            assert m.startswith(("0.0.0.0:", "127.0.0.1:")), f"{name}: {m} is not IPv4-bound"
 
 
 def test_collision_shares_capped_delay_never_a_lock(clock, monkeypatch):
