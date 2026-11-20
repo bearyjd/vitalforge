@@ -22,7 +22,7 @@ import aiosqlite
 from fastapi import HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
-from shared import auth
+from shared import auth, login_backoff
 from shared.auth import (
     _COOKIE_NAME,
     _MAX_AGE,
@@ -74,6 +74,20 @@ async def _require_admin_cookie_session(request: Request):
 require_admin_cookie_session = _require_admin_cookie_session
 
 
+async def _verified_device(request: Request, ident: str, username) -> dict | None:
+    """The device cookie, if it is signed, unexpired, bound to this identifier
+    AND still matches the account's session_version.  The signature and binding
+    are checked first with no DB access, so a forged cookie costs no query.
+    Anything else is treated exactly like no cookie."""
+    device = login_backoff.parse_device_cookie(request.cookies.get(login_backoff.DEVICE_COOKIE_NAME), ident)
+    if device is None or not isinstance(username, str):
+        return None
+    current = await auth._get_user_id_and_session_version(username)
+    if current is None or current != (device["uid"], device["sv"]):
+        return None
+    return device
+
+
 def add_auth_routes(app):
     """Add login/logout routes to a FastAPI app."""
 
@@ -88,19 +102,41 @@ def add_auth_routes(app):
         body = await request.json()
         username = body.get("username", "")
         password = body.get("password", "")
+        ident = login_backoff.normalize_id(username)
+        src = login_backoff.client_src(
+            request.client.host if request.client else None, request.headers.get("x-real-ip")
+        )
+        device = await _verified_device(request, ident, username)
+        try:
+            reservation = login_backoff.reserve(ident, src, device)
+        except login_backoff.LoginBlocked as blocked:
+            # Same body for real and unknown accounts; the password is not checked.
+            return JSONResponse(
+                {"detail": "Too many attempts"},
+                status_code=429,
+                headers={"Retry-After": str(blocked.retry_after)},
+            )
         id_and_version = await auth._authenticate_credentials(username, password)
         if id_and_version is None:
             raise HTTPException(status_code=401, detail="Invalid credentials")
+        login_backoff.record_success(reservation)
         user_id, session_version = id_and_version
         cookie = create_session_cookie(username, user_id, session_version)
         response = JSONResponse({"success": True})
+        secure = _request_is_https(request)
         response.set_cookie(
-            _COOKIE_NAME,
-            cookie,
-            max_age=_MAX_AGE,
+            _COOKIE_NAME, cookie, max_age=_MAX_AGE, httponly=True, samesite="lax", secure=secure
+        )
+        response.set_cookie(
+            login_backoff.DEVICE_COOKIE_NAME,
+            login_backoff.issue_device_cookie(
+                ident, user_id, session_version, device["jti"] if device else None
+            ),
+            max_age=login_backoff.DEVICE_COOKIE_MAX_AGE,
             httponly=True,
-            samesite="lax",
-            secure=_request_is_https(request),
+            samesite="strict",
+            secure=secure,
+            path="/auth/login",
         )
         return response
 

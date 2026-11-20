@@ -4,7 +4,7 @@ services:
       context: .
       dockerfile: vitalforge_weight/Dockerfile
     ports:
-      - "8085:8085"
+      - "0.0.0.0:8085:8085"
     volumes:
       - vitalforge-data:/app/data
     env_file:
@@ -16,7 +16,7 @@ services:
       context: .
       dockerfile: vitalforge_dashboard/Dockerfile
     ports:
-      - "8086:8086"
+      - "0.0.0.0:8086:8086"
     volumes:
       - vitalforge-data:/app/data
     env_file:
